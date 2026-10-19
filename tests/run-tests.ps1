@@ -23295,8 +23295,24 @@ Start-Sleep -Seconds 6
             Assert-Equal $process.Id ([int]$publication.shellPid) "publisher pid published"
             Assert-True (-not [string]::IsNullOrWhiteSpace([string]$publication.shellStartTimeUtc)) "publisher start time published"
 
-            $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)" -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "pwsh.exe" })
-            Assert-True ($children.Count -ge 1) "blocking child is running after the initial publication"
+            # The bootstrap publishes the initial record BEFORE it launches the
+            # child, so publication existence does not imply the child is already
+            # visible in the process table. A single snapshot here is a race on
+            # a slow host; wait for the actual condition instead of assuming the
+            # scheduler has run.
+            $child = $null
+            $childDeadline = (Get-Date).AddSeconds(10)
+
+            while ($null -eq $child -and (Get-Date) -lt $childDeadline) {
+                $child = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -eq "pwsh.exe" }) | Select-Object -First 1
+
+                if ($null -eq $child) {
+                    Start-Sleep -Milliseconds 100
+                }
+            }
+
+            Assert-True ($null -ne $child) "blocking child is running after the initial publication"
 
             $deadline = (Get-Date).AddSeconds(30)
 
