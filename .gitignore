@@ -1,0 +1,23 @@
+# Local / generated state
+# v2 runtime files normally live under the DevWS state root
+# (%LOCALAPPDATA%\DevWS\state); these rules keep a repository checkout clean
+# when development overrides point generated files here.
+workspace.json
+runtime-state.json
+install-metadata.json
+*-request.json
+*-done.json
+capture-*.txt
+app-*.ahk
+*.bak
+*.tmp
+
+# v1 leftovers (defensive; v1 wrote these under %USERPROFILE%\.ws)
+reset-before-*.txt
+focus-*.done
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

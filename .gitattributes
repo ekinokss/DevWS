@@ -1,0 +1,8 @@
+# Deterministic Windows runtime/script text.
+# Git may keep canonical LF blobs, but every checkout materializes CRLF
+# independent of core.autocrlf, so byte-copied deployed runtime files are
+# reproducible. Extensions match the source-managed manifest text types.
+*.ps1 text eol=crlf
+*.ahk text eol=crlf
+*.cmd text eol=crlf
+*.json text eol=crlf
