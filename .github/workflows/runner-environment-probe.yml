@@ -64,7 +64,7 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 0) { throw "probe exited with $code" }
 
-          $json | Set-Content -Path runner-probe.json -Encoding utf8
+          $json | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'runner-probe.json') -Encoding utf8
           $json | ForEach-Object { Write-Output $_ }
 
           ' ' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
