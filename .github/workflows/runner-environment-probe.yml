@@ -1,0 +1,85 @@
+name: Runner environment probe
+
+# MANUAL-ONLY EVIDENCE COLLECTION.
+#
+# This workflow is not the project's CI gate. It records what a GitHub-hosted
+# Windows runner actually provides so that CI architecture can be decided from
+# measurements instead of assumptions. It does not run the DevWS test suite, does
+# not install dependencies, and never weakens a production check.
+#
+# Dispatch it from the Actions tab ("Run workflow") or with:
+#   gh workflow run runner-environment-probe.yml --ref main
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Windows runner environment probe
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the measured target
+        shell: pwsh
+        run: |
+          $lines = @(
+            '## DevWS runner environment probe'
+            ''
+            '| Item | Value |'
+            '| --- | --- |'
+            "| Probed commit | ``$env:GITHUB_SHA`` |"
+            "| Ref | ``$env:GITHUB_REF`` |"
+            "| Workflow | ``$env:GITHUB_WORKFLOW`` |"
+            "| Job | ``$env:GITHUB_JOB`` |"
+            "| Runner image | ``$env:ImageOS $env:ImageVersion`` |"
+            "| Runner OS / arch | ``$env:RUNNER_OS / $env:RUNNER_ARCH`` |"
+            ''
+          )
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines | ForEach-Object { Write-Output $_ }
+
+      - name: Run the read-only environment probe (readable evidence)
+        shell: pwsh
+        run: |
+          $output = & pwsh -NoLogo -NoProfile -File tests/probe-ci-environment.ps1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $output | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($code -ne 0) { throw "probe exited with $code" }
+
+      - name: Run the read-only environment probe (JSON evidence)
+        shell: pwsh
+        run: |
+          $json = & pwsh -NoLogo -NoProfile -File tests/probe-ci-environment.ps1 -AsJson
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "probe exited with $code" }
+
+          $json | Set-Content -Path runner-probe.json -Encoding utf8
+          $json | ForEach-Object { Write-Output $_ }
+
+          ' ' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '### Machine-readable probe output' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```json' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $json | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Confirm the working tree was not modified
+        shell: pwsh
+        run: |
+          $status = @(git status --porcelain=v1)
+          if ($status.Count -ne 0) {
+            Write-Output 'Working tree changed during the probe:'
+            $status | ForEach-Object { Write-Output "  $_" }
+            throw 'the probe must be read-only'
+          }
+          Write-Output 'Working tree clean: the probe made no repository change.'
