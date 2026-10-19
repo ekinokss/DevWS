@@ -1,0 +1,229 @@
+name: Hosted suite compatibility census
+
+# MANUAL COMPATIBILITY CENSUS - NOT THE PERMANENT CI GATE.
+#
+# Runs the unaltered canonical test suite once on a GitHub-hosted Windows runner
+# and reports exactly what happens, so that permanent CI architecture can be
+# decided from measurement. Nothing is installed, no environment variable is
+# forced, no test is filtered and no production check is weakened.
+#
+# The workflow conclusion is truthful: if the canonical suite fails or skips
+# cases, this run fails too, after printing all evidence.
+#
+# Dispatch with:
+#   gh workflow run hosted-suite-census.yml --ref main
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    name: Canonical suite on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record the measured target
+        shell: pwsh
+        run: |
+          $lines = @(
+            '## DevWS hosted suite compatibility census'
+            ''
+            '| Item | Value |'
+            '| --- | --- |'
+            "| Commit | ``$env:GITHUB_SHA`` |"
+            "| Ref | ``$env:GITHUB_REF`` |"
+            "| Runner image | ``$env:ImageOS $env:ImageVersion`` |"
+            "| Runner OS / arch | ``$env:RUNNER_OS / $env:RUNNER_ARCH`` |"
+            ''
+            'This is a compatibility census, not the permanent CI gate. No dependency is installed and no test is filtered.'
+            ''
+          )
+          $lines | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines | ForEach-Object { Write-Output $_ }
+
+      - name: Runner precheck (environment probe)
+        shell: pwsh
+        run: |
+          $output = & pwsh -NoLogo -NoProfile -File tests/probe-ci-environment.ps1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          ' ' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '### Runner precheck' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $output | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($code -ne 0) { throw "environment probe exited with $code" }
+
+      - name: Canonical suite census
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $suitePath = 'tests/run-tests.ps1'
+          $logPath   = Join-Path $env:RUNNER_TEMP 'devws-canonical-suite.log'
+          $summary   = $env:GITHUB_STEP_SUMMARY
+
+          $started = Get-Date
+          $beforeStatus = @(git status --porcelain=v1)
+
+          # One unaltered canonical run. No -Group filter, no -RequireFullCoverage,
+          # no environment forcing and no dependency installation.
+          & pwsh -NoLogo -NoProfile -File $suitePath *> $logPath
+          $exitCode = $LASTEXITCODE
+          $elapsed  = (Get-Date) - $started
+
+          $afterStatus = @(git status --porcelain=v1)
+
+          $plain = @(Get-Content -LiteralPath $logPath | ForEach-Object { $_ -replace "`e\[[0-9;]*m", '' })
+
+          Write-Output '===== BEGIN CANONICAL SUITE OUTPUT ====='
+          $plain | ForEach-Object { Write-Output $_ }
+          Write-Output '===== END CANONICAL SUITE OUTPUT ====='
+          Write-Output ("Census: exit={0} elapsed={1} min" -f $exitCode, [Math]::Round($elapsed.TotalMinutes, 1))
+
+          function Read-CensusCount {
+              param([string]$Label)
+              $line = $plain | Where-Object { $_ -match ('^\s*' + [regex]::Escape($Label) + '\s*:') } | Select-Object -Last 1
+              if ($null -eq $line) { return 'not reported' }
+              if ($line -match ':\s*([0-9]+)') { return [int]$Matches[1] }
+              return 'not reported'
+          }
+
+          $counts = [ordered]@{
+              discovered     = Read-CensusCount 'discovered'
+              selected       = Read-CensusCount 'selected'
+              passed         = Read-CensusCount 'passed'
+              failed         = Read-CensusCount 'failed'
+              runtimeSkipped = Read-CensusCount 'runtime-skipped'
+              filterExcluded = Read-CensusCount 'filter-excluded'
+          }
+
+          # Case outcomes, with the reason line that follows each marker.
+          $failures = @()
+          $skips    = @()
+          for ($i = 0; $i -lt $plain.Count; $i++) {
+              $marker = $null
+              if ($plain[$i] -match '\[FAIL\]\s+(.+)$')   { $marker = 'fail'; $name = $Matches[1].Trim() }
+              elseif ($plain[$i] -match '\[skip\]\s+(.+)$') { $marker = 'skip'; $name = $Matches[1].Trim() }
+              if ($null -eq $marker) { continue }
+
+              $reason = ''
+              for ($j = $i + 1; $j -le [Math]::Min($i + 2, $plain.Count - 1); $j++) {
+                  if ($plain[$j] -match '^\s+\S') { $reason = $plain[$j].Trim(); break }
+              }
+
+              if ($marker -eq 'fail') { $failures += [pscustomobject]@{ Name = $name; Reason = $reason } }
+              else                    { $skips    += [pscustomobject]@{ Name = $name; Reason = $reason } }
+          }
+
+          # Map each case name to its canonical group from the test source.
+          $groupOf = @{}
+          $current = '(pre-group)'
+          foreach ($line in [IO.File]::ReadAllLines((Resolve-Path $suitePath))) {
+              if ($line -match "Start-TestGroup -Name '([^']+)'") { $current = $Matches[1] }
+              elseif ($line -match '^\s*Test-Case\s+"([^"]+)"')   { $groupOf[$Matches[1]] = $current }
+          }
+          foreach ($entry in @($failures) + @($skips)) {
+              $group = if ($groupOf.ContainsKey($entry.Name)) { $groupOf[$entry.Name] } else { '<unmapped>' }
+              $entry | Add-Member -NotePropertyName Group -NotePropertyValue $group -Force
+          }
+
+          # Readable evidence in the log.
+          Write-Output ''
+          Write-Output '===== CENSUS ACCOUNTING ====='
+          foreach ($key in $counts.Keys) { Write-Output ("  {0,-15} {1}" -f $key, $counts[$key]) }
+          Write-Output ("  worktree before : {0}" -f $(if ($beforeStatus.Count -eq 0) { 'clean' } else { 'DIRTY' }))
+          Write-Output ("  worktree after  : {0}" -f $(if ($afterStatus.Count -eq 0) { 'clean' } else { 'DIRTY' }))
+
+          Write-Output ''
+          Write-Output ("===== FAILING CASES ({0}) =====" -f $failures.Count)
+          if ($failures.Count -eq 0) { Write-Output '  none' }
+          foreach ($f in $failures) { Write-Output ("  [{0}] {1}" -f $f.Group, $f.Name); Write-Output ("        {0}" -f $f.Reason) }
+
+          Write-Output ''
+          Write-Output ("===== RUNTIME-SKIPPED CASES ({0}) =====" -f $skips.Count)
+          if ($skips.Count -eq 0) { Write-Output '  none' }
+          foreach ($s in $skips) { Write-Output ("  [{0}] {1}" -f $s.Group, $s.Name); Write-Output ("        {0}" -f $s.Reason) }
+
+          # Group-level table.
+          $groups = @($failures + $skips | Group-Object Group | ForEach-Object {
+              [pscustomobject]@{
+                  Group   = $_.Name
+                  Failed  = @($_.Group | Where-Object { $failures -contains $_ }).Count
+                  Skipped = @($_.Group | Where-Object { $skips -contains $_ }).Count
+              }
+          } | Sort-Object Group)
+
+          Write-Output ''
+          Write-Output '===== GROUP MAPPING ====='
+          if ($groups.Count -eq 0) { Write-Output '  none' }
+          foreach ($g in $groups) { Write-Output ("  {0,-24} failed={1} skipped={2}" -f $g.Group, $g.Failed, $g.Skipped) }
+
+          # Job summary.
+          $lines = [System.Collections.Generic.List[string]]::new()
+          $lines.Add('### Canonical suite result') | Out-Null
+          $lines.Add('') | Out-Null
+          $lines.Add(("Exit code ``{0}`` - elapsed {1} min" -f $exitCode, [Math]::Round($elapsed.TotalMinutes, 1))) | Out-Null
+          $lines.Add('') | Out-Null
+          $lines.Add('| Metric | Value |') | Out-Null
+          $lines.Add('| --- | --- |') | Out-Null
+          foreach ($key in $counts.Keys) { $lines.Add(("| {0} | {1} |" -f $key, $counts[$key])) | Out-Null }
+          $lines.Add(("| worktree before | {0} |" -f $(if ($beforeStatus.Count -eq 0) { 'clean' } else { 'DIRTY' }))) | Out-Null
+          $lines.Add(("| worktree after | {0} |" -f $(if ($afterStatus.Count -eq 0) { 'clean' } else { 'DIRTY' }))) | Out-Null
+          $lines.Add('') | Out-Null
+
+          $lines.Add(("#### Failing cases ({0})" -f $failures.Count)) | Out-Null
+          $lines.Add('') | Out-Null
+          if ($failures.Count -eq 0) { $lines.Add('None.') | Out-Null }
+          else {
+              $lines.Add('| Group | Case | Reported reason |') | Out-Null
+              $lines.Add('| --- | --- | --- |') | Out-Null
+              foreach ($f in $failures) {
+                  $reason = ($f.Reason -replace '\|', '\|')
+                  $lines.Add(("| {0} | {1} | {2} |" -f $f.Group, ($f.Name -replace '\|', '\|'), $reason)) | Out-Null
+              }
+          }
+          $lines.Add('') | Out-Null
+
+          $lines.Add(("#### Runtime-skipped cases ({0})" -f $skips.Count)) | Out-Null
+          $lines.Add('') | Out-Null
+          if ($skips.Count -eq 0) { $lines.Add('None.') | Out-Null }
+          else {
+              $lines.Add('| Group | Case | Reported reason |') | Out-Null
+              $lines.Add('| --- | --- | --- |') | Out-Null
+              foreach ($s in $skips) {
+                  $reason = ($s.Reason -replace '\|', '\|')
+                  $lines.Add(("| {0} | {1} | {2} |" -f $s.Group, ($s.Name -replace '\|', '\|'), $reason)) | Out-Null
+              }
+          }
+          $lines.Add('') | Out-Null
+          $lines.Add('> Group attribution is derived from the test registration in `tests/run-tests.ps1`.') | Out-Null
+          $lines.Add('> Environmental attribution is a review step, not an observation of this run.') | Out-Null
+          $lines.Add('') | Out-Null
+          $lines | Out-File -FilePath $summary -Append -Encoding utf8
+
+          # Truthful conclusion: a red census stays red after its evidence is printed.
+          if ($afterStatus.Count -ne 0) {
+              Write-Output 'Repository artifacts appeared during the canonical suite (reported, not deleted):'
+              $afterStatus | ForEach-Object { Write-Output ("  {0}" -f $_) }
+          }
+
+          $problems = @()
+          if ($exitCode -ne 0) { $problems += ("canonical suite exited {0}" -f $exitCode) }
+          if ($afterStatus.Count -ne 0) { $problems += 'repository artifacts appeared during the suite' }
+
+          if ($problems.Count -gt 0) {
+              Write-Output ('CENSUS RESULT: FAILED - ' + ($problems -join '; '))
+              exit 1
+          }
+
+          Write-Output 'CENSUS RESULT: PASSED - canonical suite completed with no failures and no runtime skips.'
