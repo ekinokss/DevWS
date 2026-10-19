@@ -7429,32 +7429,70 @@ function Find-DevWSReversiblyEncodedPrintableContent {
         }
     }
 
-    Test-Case "current status text reflects Pass 5 without erasing history" {
+    Test-Case "public documentation set is present, substantive, and referenced by source" {
         # Product invariant: always evaluated.
         $ws = Get-SourceOf "src\ws.ps1"
         Assert-NotContains $ws "not implemented yet" "CLI never claims unimplemented bindings"
         Assert-NotContains $ws "bindings must stay empty" "CLI never claims bindings must stay empty"
 
-        # Documentation invariant. This candidate deliberately ships no
-        # documentation set yet, so the case is conditionally SKIPPED (never
-        # silently passed) and evaluates again as soon as documentation lands.
-        $statusDocs = @(
-            "AGENTS.md",
+        # Public documentation invariant. The repository publishes a canonical
+        # documentation set for users, contributors and security reviewers:
+        # every required document must exist and carry real content, every
+        # document that current source references must exist at the referenced
+        # path, the front door must reach the detailed documents, and the
+        # public repository must not depend on private process documents.
+        #
+        # A missing or placeholder document FAILS this case; there is no skip
+        # path, so an incomplete documentation set can never be reported as a
+        # pass.
+        $requiredDocs = @(
             "README.md",
+            "CONTRIBUTING.md",
+            "SECURITY.md",
+            "PROVENANCE.md",
             "docs/architecture.md",
-            "docs/implementation-plan.md",
+            "docs/cli.md",
+            "docs/configuration.md",
+            "docs/installer.md",
+            "docs/future-work.md",
             "docs/workspace-sets-design.md"
         )
 
-        $present = @($statusDocs | Where-Object { Test-Path -LiteralPath (Join-Path $RepoRoot $_) })
+        foreach ($doc in $requiredDocs) {
+            $docPath = Join-Path $RepoRoot $doc
+            Assert-True (Test-Path -LiteralPath $docPath -PathType Leaf) "required public documentation is missing: $doc"
 
-        if ($present.Count -eq 0) {
-            Skip-Test "no documentation set is shipped in this candidate; the documentation status invariant is not applicable"
+            $docText = Get-SourceOf $doc
+
+            Assert-True ($docText -match '(?m)^#\s+\S') "public documentation has no top-level heading: $doc"
+            Assert-True (($docText -split "`n").Count -ge 20) "public documentation is too short to be usable: $doc"
+            Assert-True ($docText.Length -ge 500) "public documentation has too little content to be usable: $doc"
         }
 
-        foreach ($file in $present) {
-            $text = Get-SourceOf $file
-            Assert-Contains $text "Passes 1–5" "current Phase 8 pass status in $file"
+        # Documents referenced by current source must exist at exactly those
+        # paths, so the code and the documentation cannot drift apart.
+        $sourceReferencedDocs = @(
+            "docs/architecture.md",
+            "docs/configuration.md",
+            "docs/windows-integration-checklist.md"
+        )
+
+        foreach ($doc in $sourceReferencedDocs) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $RepoRoot $doc) -PathType Leaf) "a document referenced by source is missing: $doc"
+        }
+
+        # The front door must reach every detailed document.
+        $readmeText = Get-SourceOf "README.md"
+
+        foreach ($doc in $requiredDocs) {
+            if ($doc -eq "README.md") { continue }
+            Assert-Contains $readmeText $doc "README links to $doc"
+        }
+
+        # Private process documents are intentionally not part of the public
+        # repository, and must never be reintroduced to satisfy this contract.
+        foreach ($doc in @("AGENTS.md", "docs/implementation-plan.md", "docs/engineering-handoff.md")) {
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $doc))) "private process document must not be part of the public repository: $doc"
         }
     }
 
