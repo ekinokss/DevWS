@@ -1,0 +1,209 @@
+name: CI
+
+# PERMANENT HOSTED CI GATE.
+#
+# Runs the canonical DevWS test suite once on a GitHub-hosted windows-latest
+# runner. No self-hosted runner is used, and no production check is relaxed.
+#
+# Hosted Windows runs as a High-integrity Administrator whose UAC/token model
+# does not provide the genuine same-user linked filtered Medium token that a
+# normal UAC-enabled elevated workstation has. Production detects that, fails
+# closed, and reports TokenSource=unavailable. The single runtime skip this
+# gate accepts is therefore the real Medium-token protected-state integration
+# case, and only when its reason states that the Medium authority is genuinely
+# unavailable. Any other skip fails the gate.
+#
+# The strict local/release contract is stronger: tests/run-tests.ps1
+# -RequireFullCoverage must pass with zero skips on a validated UAC-enabled
+# elevated Windows environment, which exercises the positive linked-medium
+# path that hosted Windows cannot.
+#
+# AutoHotkey is a pinned portable ZIP extracted under RUNNER_TEMP; nothing is
+# installed system-wide and no installer is executed.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Superseded pull-request runs are cancelled; main and manual runs are not.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Canonical suite on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 35
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Runner environment probe (diagnostic context)
+        shell: pwsh
+        run: |
+          $output = & pwsh -NoLogo -NoProfile -File tests/probe-ci-environment.ps1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          '### Runner environment probe (diagnostic context, not a gate)' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $output | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($code -ne 0) { throw "environment probe exited with $code" }
+
+      - name: Provision pinned portable AutoHotkey v2
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version  = '2.0.30'
+          $url      = "https://github.com/AutoHotkey/AutoHotkey/releases/download/v$version/AutoHotkey_$version.zip"
+          $expected = '1e0ece7ecb2d5646e55758150472677996a57f9db5c83d2996d8b47b9e2f31a4'
+          $zip      = Join-Path $env:RUNNER_TEMP "AutoHotkey_$version.zip"
+          $dir      = Join-Path $env:RUNNER_TEMP "autohotkey-$version"
+
+          $ProgressPreference = 'SilentlyContinue'
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+              throw "AutoHotkey $version archive hash mismatch: expected $expected, got $actual"
+          }
+
+          if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+
+          $executables = @(Get-ChildItem -LiteralPath $dir -Recurse -Filter 'AutoHotkey64.exe' -File)
+          if ($executables.Count -ne 1) {
+              throw "expected exactly one AutoHotkey64.exe in the pinned archive, found $($executables.Count)"
+          }
+
+          # The supported repository-layout test/development override.
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ("DEVWS_AHK_PATH=" + $executables[0].FullName)
+
+          Write-Output "AutoHotkey v$version verified (SHA-256 $actual)"
+          Write-Output "DEVWS_AHK_PATH=$($executables[0].FullName)"
+
+      - name: Canonical suite and hosted contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $logPath = Join-Path $env:RUNNER_TEMP 'devws-ci-suite.log'
+
+          $before  = @(git status --porcelain=v1)
+          $started = Get-Date
+          & pwsh -NoLogo -NoProfile -File tests/run-tests.ps1 *> $logPath
+          $exitCode = $LASTEXITCODE
+          $elapsed  = (Get-Date) - $started
+          $after    = @(git status --porcelain=v1)
+
+          $lines = @(Get-Content -LiteralPath $logPath | ForEach-Object { $_ -replace "`e\[[0-9;]*m", '' })
+
+          Write-Output '===== BEGIN CANONICAL SUITE OUTPUT ====='
+          $lines | ForEach-Object { Write-Output $_ }
+          Write-Output '===== END CANONICAL SUITE OUTPUT ====='
+          Write-Output ("Suite exit={0}; elapsed={1} min" -f $exitCode, [Math]::Round($elapsed.TotalMinutes, 1))
+
+          function Get-Count([string]$label) {
+              $line = $lines | Where-Object { $_ -match ('^\s*' + [regex]::Escape($label) + '\s*:\s*[0-9]+') } | Select-Object -Last 1
+              if ($null -eq $line) { return -1 }
+              return [int]([regex]::Match($line, ':\s*([0-9]+)').Groups[1].Value)
+          }
+
+          $discovered = Get-Count 'discovered'
+          $selected   = Get-Count 'selected'
+          $passed     = Get-Count 'passed'
+          $failed     = Get-Count 'failed'
+          $skipped    = Get-Count 'runtime-skipped'
+          $excluded   = Get-Count 'filter-excluded'
+
+          # The single permitted hosted-environment skip. Identity AND reason are
+          # matched, so an arbitrary skip can never be accepted.
+          $allowedName   = 'anchor safety uses the real Medium-token access check'
+          $allowedReason = 'reliable Medium (filtered) token authority is unavailable'
+
+          $skips = @()
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match '^\s*\[skip\]\s+(.+?)\s*$') {
+                  $skipName   = $Matches[1]
+                  $skipReason = ''
+                  for ($j = $i + 1; $j -le [Math]::Min($i + 2, $lines.Count - 1); $j++) {
+                      if ($lines[$j] -match '^\s+\S') { $skipReason = $lines[$j].Trim(); break }
+                  }
+                  $skips += [pscustomobject]@{ Name = $skipName; Reason = $skipReason }
+              }
+          }
+
+          $problems = @()
+          if ($exitCode -ne 0) { $problems += "suite exited $exitCode" }
+          if ($before.Count -ne 0) { $problems += 'the checkout was not clean before the suite' }
+          if ($after.Count -ne 0) { $problems += 'the suite left repository artifacts' }
+          if ($discovered -lt 0 -or $selected -lt 0 -or $passed -lt 0 -or $failed -lt 0 -or $skipped -lt 0 -or $excluded -lt 0) {
+              $problems += 'the suite did not report its accounting'
+          }
+          else {
+              if ($discovered -ne ($selected + $excluded)) { $problems += "partition violated: discovered $discovered != selected $selected + filter-excluded $excluded" }
+              if ($selected -ne ($passed + $failed + $skipped)) { $problems += "partition violated: selected $selected != passed $passed + failed $failed + runtime-skipped $skipped" }
+              if ($failed -ne 0) { $problems += "$failed test failure(s)" }
+              if ($excluded -ne 0) { $problems += "$excluded filter-excluded case(s)" }
+              if ($skips.Count -ne $skipped) { $problems += "parsed $($skips.Count) skip line(s) but the suite reported $skipped runtime skip(s)" }
+          }
+
+          if ($skipped -eq 1) {
+              $only = $skips[0]
+              if ($skips.Count -eq 1 -and $only.Name -eq $allowedName -and $only.Reason.Contains($allowedReason)) {
+                  Write-Output ('ACCEPTED SKIP: ' + $only.Name)
+                  Write-Output ('  reason: ' + $only.Reason)
+              }
+              else {
+                  $problems += ('the only runtime skip was not the permitted Medium-token integration case: ' + (($skips | ForEach-Object { $_.Name + ' :: ' + $_.Reason }) -join ' | '))
+              }
+          }
+          elseif ($skipped -gt 1) {
+              $problems += "$skipped runtime skips; at most one (the Medium-token integration case) is permitted"
+          }
+
+          foreach ($skip in $skips) {
+              Write-Output ('SKIP: ' + $skip.Name)
+              Write-Output ('  reason: ' + $skip.Reason)
+          }
+
+          $summary = @(
+              '### Canonical suite result'
+              ''
+              '| Metric | Value |'
+              '| --- | --- |'
+              ("| discovered | {0} |" -f $discovered)
+              ("| selected | {0} |" -f $selected)
+              ("| passed | {0} |" -f $passed)
+              ("| failed | {0} |" -f $failed)
+              ("| runtime-skipped | {0} |" -f $skipped)
+              ("| filter-excluded | {0} |" -f $excluded)
+              ("| suite exit code | {0} |" -f $exitCode)
+              ("| elapsed | {0} min |" -f [Math]::Round($elapsed.TotalMinutes, 1))
+              ("| working tree before / after | {0} / {1} |" -f $(if ($before.Count -eq 0) { 'clean' } else { 'DIRTY' }), $(if ($after.Count -eq 0) { 'clean' } else { 'DIRTY' }))
+              ''
+              ("Runtime skips: {0} (permitted: 0, or 1 named Medium-token integration skip when the Medium authority is unavailable)." -f $skipped)
+              ''
+            )
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          if ($problems.Count -gt 0) {
+              Write-Output ('CI RESULT: FAILED - ' + ($problems -join '; '))
+              exit 1
+          }
+
+          if ($skipped -eq 0) {
+              Write-Output 'CI RESULT: PASSED - full hosted coverage, no runtime skips.'
+          }
+          else {
+              Write-Output 'CI RESULT: PASSED - only the explicit Medium-token integration skip was accepted.'
+          }

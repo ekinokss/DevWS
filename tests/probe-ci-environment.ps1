@@ -235,12 +235,12 @@ Add-Finding -Area 'hosted-runner-context' -Provenance 'EXPECTATION' `
     -Evidence 'Upstream GitHub documentation. Not a measurement of this process.'
 
 Add-Finding -Area 'diagnostic-workflow' -Provenance 'EXPECTATION' `
-    -Observation 'A manual-only diagnostic workflow (.github/workflows/runner-environment-probe.yml) dispatches this probe on windows-latest. It collects evidence; it is not a CI gate, and no CI compatibility is claimed until its results are reviewed.' `
-    -Evidence 'The workflow file exists in this repository. Whether any given run completed is visible in the Actions run history, not in this probe.'
+    -Observation 'A manual-only diagnostic workflow (.github/workflows/runner-environment-probe.yml) dispatches this probe on windows-latest for environment evidence. It is not a CI gate; the permanent gate is .github/workflows/ci.yml.' `
+    -Evidence 'Both workflow files exist in this repository. Whether any given run completed is visible in the Actions run history, not in this probe.'
 
 Add-Finding -Area 'suite-compatibility' -Provenance 'UNMEASURED' `
-    -Observation 'Whether the canonical hermetic suite passes on a GitHub-hosted Windows runner is NOT established here. This probe records environment facts only; no test matrix exists yet.' `
-    -Evidence 'Deliberate scope boundary of the measurement phase.'
+    -Observation 'This probe records environment facts only; it does not establish a suite result. The permanent hosted gate (.github/workflows/ci.yml) is the source of truth for whether the canonical suite passes on a hosted runner, and no past result implies that a future runner image behaves the same way.' `
+    -Evidence 'Deliberate scope boundary: the probe never runs the test suite. Read the CI run history for test compatibility.'
 
 # ---------------------------------------------------------------------------
 # Output

@@ -2,10 +2,12 @@ name: Hosted suite compatibility census
 
 # MANUAL COMPATIBILITY CENSUS - NOT THE PERMANENT CI GATE.
 #
-# Runs the unaltered canonical test suite once on a GitHub-hosted Windows runner
-# and reports exactly what happens, so that permanent CI architecture can be
-# decided from measurement. Nothing is installed, no environment variable is
-# forced, no test is filtered and no production check is weakened.
+# The permanent gate is .github/workflows/ci.yml. This workflow is retained as a
+# diagnostic: it runs the unaltered canonical test suite once on a GitHub-hosted
+# Windows runner and reports exactly what happens, without the AutoHotkey
+# provision and without the permanent gate's runtime-skip policy. Nothing is
+# installed, no environment variable is forced, no test is filtered and no
+# production check is weakened.
 #
 # The workflow conclusion is truthful: if the canonical suite fails or skips
 # cases, this run fails too, after printing all evidence.

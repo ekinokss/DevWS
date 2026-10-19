@@ -2,10 +2,11 @@ name: Runner environment probe
 
 # MANUAL-ONLY EVIDENCE COLLECTION.
 #
-# This workflow is not the project's CI gate. It records what a GitHub-hosted
-# Windows runner actually provides so that CI architecture can be decided from
-# measurements instead of assumptions. It does not run the DevWS test suite, does
-# not install dependencies, and never weakens a production check.
+# This workflow is NOT the project's CI gate; the permanent gate is
+# .github/workflows/ci.yml. This workflow records what a GitHub-hosted Windows
+# runner actually provides, so an environment can be inspected independently of
+# any test result. It does not run the DevWS test suite, does not install
+# dependencies, and never weakens a production check.
 #
 # Dispatch it from the Actions tab ("Run workflow") or with:
 #   gh workflow run runner-environment-probe.yml --ref main

@@ -15,7 +15,7 @@ product *does*, start with [README.md](README.md).
 | **Windows** | DevWS drives Windows Terminal, the scheduled-task service, Win32 window management and Windows integrity levels. There is no cross-platform build. |
 | **PowerShell 7+** | Required. The CLI and the test suite both require PowerShell 7; Windows PowerShell 5.1 is not supported. |
 | **An elevated shell for the full test suite** | The suite creates its protected-state fixtures through the production initializer, which expects an elevated session. It does not detect and skip on a non-elevated session, so run the suite from an **Administrator** PowerShell. |
-| **Windows Terminal and AutoHotkey v2** *(optional)* | A few tests exercise the real Windows Terminal package resolution and the real AutoHotkey host. When those are unavailable, the affected cases skip visibly rather than passing silently. |
+| **Windows Terminal and AutoHotkey v2** *(optional locally)* | A few tests exercise the real Windows Terminal package resolution and the real AutoHotkey host. When they are unavailable locally, the affected cases skip visibly rather than passing silently. Hosted CI provisions a pinned portable AutoHotkey so that case executes there. |
 
 You do **not** need to install DevWS to work on it.
 
@@ -87,6 +87,28 @@ afterwards. It must never touch your real installation, configuration or install
 The suite is expected to run in an elevated PowerShell. It creates its protected-state
 fixtures through the production initializer and asserts the elevated token path.
 
+### Hosted CI
+
+`.github/workflows/ci.yml` is the permanent gate. It runs on GitHub-hosted `windows-latest`
+for pull requests, pushes to `main` and manual dispatch, with `contents: read` only, no
+secrets and no self-hosted runners.
+
+The workflow provisions AutoHotkey v2 as a **pinned portable ZIP** (`v2.0.30`, verified by
+SHA-256) extracted under `RUNNER_TEMP`, and passes the resolved `AutoHotkey64.exe` through
+the supported repository-layout override (`DEVWS_AHK_PATH`). Nothing is installed
+system-wide and no installer is executed.
+
+Hosted Windows is a High-integrity Administrator whose UAC/token model does not provide the
+genuine same-user linked filtered Medium token that a normal UAC-enabled elevated workstation
+has. `Test-DevWSProtectedStateAnchorSafety` correctly fails closed there
+(`TokenSource=unavailable`). The hosted gate therefore accepts **exactly one** runtime skip:
+the real Medium-token protected-state integration case, and only when its reason states that
+a reliable Medium authority is unavailable. Any other skip, more than one skip, any test
+failure, or any filter exclusion fails the gate.
+
+That skip describes the runner, not the product. The protected-state check is unchanged and
+still refuses to assume safety when it cannot obtain a reliable Medium subject.
+
 ## 5. Reading the test result
 
 The suite reports six mutually exclusive numbers, and the terminology matters:
@@ -120,6 +142,12 @@ complete their assertions, so coverage is NOT complete.
 Use `-RequireFullCoverage` whenever you need a result you can call complete: with that
 switch, any runtime skip makes the run exit non-zero. Without it, a run with skips still
 exits zero, and the summary tells you coverage is incomplete.
+
+**Hosted CI is not a substitute for release acceptance.** Hosted runners validate the
+fail-closed hosted environment plus every portable test; they do not exercise the positive
+linked-Medium security path. Maintainer and release validation must still run
+`-RequireFullCoverage` on a normal UAC-enabled elevated Windows environment, where that path
+executes and zero skips are required.
 
 ## 6. Changing the suite
 
