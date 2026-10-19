@@ -9675,6 +9675,18 @@ function Find-DevWSReversiblyEncodedPrintableContent {
         $env:DEVWS_CONFIG = $target
 
         try {
+            # This case tests set selection/defaultSet semantics, not Task
+            # Scheduler integration. Without this shadow the reset path reads the
+            # host's real root task and only passes on a machine that has run
+            # install.ps1, which makes the case depend on incidental host state.
+            # TASK_STATE_READY (3) is a registered, non-running managed task, so
+            # the reset path continues through the worker stubs below. The
+            # shadow is scoped to this body and disappears with it.
+            function Get-DevWSRootScheduledTaskState {
+                param([string]$TaskName)
+                return 3
+            }
+
             function Start-DevWSWorkerRequest {
                 param([string]$Kind, [string]$TaskName, $Payload, [int]$TimeoutSeconds = 60)
                 $calls.Add([pscustomobject]@{ Kind = "worker-start"; Payload = $Payload })
@@ -15804,10 +15816,26 @@ public static class P2HDirHandle {
     Test-Case "anchor safety uses the real Medium-token access check" {
         $programData = [Environment]::GetFolderPath('CommonApplicationData')
 
-        # The real anchor on this machine must satisfy the invariant (read-only).
+        # The real anchor on this machine is inspected read-only with the
+        # production Medium-token subject. Production accepts either genuine
+        # Medium authority (the linked filtered token of an elevated caller, or
+        # a caller that is already Medium) and fails closed when neither can be
+        # obtained. A host in the last category cannot execute the integration
+        # coverage at all, so it must still prove the fail-closed contract and
+        # then report the missing execution as a visible runtime skip.
         $realAnchor = Test-DevWSProtectedStateAnchorSafety -Anchor $programData
-        Assert-Equal $true $realAnchor.Ok "the real ProgramData anchor satisfies the delete-child invariant"
-        Assert-Equal "linked-medium" $realAnchor.TokenSource "the elevated linked filtered Medium token path was exercised"
+
+        if ([string]$realAnchor.TokenSource -eq 'unavailable') {
+            Assert-Equal $false ([bool]$realAnchor.Ok) "an unavailable Medium authority must fail closed"
+            $anchorErrors = @($realAnchor.Errors) -join " "
+            Assert-Contains $anchorErrors "could not be obtained reliably" "the refusal names the unobtainable Medium token"
+            Assert-Contains $anchorErrors "refusing to assume the anchor is safe" "the refusal states it will not assume safety"
+            Skip-Test "a reliable Medium (filtered) token authority is unavailable on this host (TokenSource=unavailable); the real anchor access check cannot execute"
+        }
+
+        Assert-True (@('linked-medium', 'duplicate-medium') -contains [string]$realAnchor.TokenSource) `
+            "the checked subject is a Medium authority production recognizes"
+        Assert-Equal $true ([bool]$realAnchor.Ok) "the real ProgramData anchor satisfies the delete-child invariant"
 
         # A synthetic anchor granting the Medium authority dangerous rights is rejected.
         function New-P2HAnchor([string]$Name, [string]$Right) {
@@ -15828,6 +15856,10 @@ public static class P2HDirHandle {
         $writeDacResult = Test-DevWSProtectedStateAnchorSafety -Anchor $writeDacAnchor
         Assert-Equal $false $writeDacResult.Ok "a WRITE_DAC-granting anchor is rejected"
         Assert-Contains ($writeDacResult.Errors -join " ") "WRITE_DAC" "the failure names WRITE_DAC"
+    }
+
+    Test-Case "protected state fixture routing never bypasses the installed anchor" {
+        $programData = [Environment]::GetFolderPath('CommonApplicationData')
 
         # Fixture chains are never "installed": the repository seam cannot
         # bypass the production anchor check, and the installed shape is
@@ -16702,8 +16734,36 @@ $mutex.Dispose()
 
     # Protected fixtures must live under a SHORT base: the accepted support
     # contract bounds the protected SID root at 117 characters, and the
-    # standard deep test root cannot host a valid protected chain.
-    $script:P2CCwdFixtureRoot = Join-Path $env:TEMP 'devws-p2c'
+    # standard deep test root cannot host a valid protected chain. A user
+    # profile (%TEMP%) is NOT a portable length across Windows hosts, so the
+    # base is a unique disposable directory at the root of the system volume.
+    # That makes the exact-root-length cases a function of the product's
+    # pathname contract rather than of the length of the current Windows
+    # username. The GUID suffix keeps concurrent suite invocations from
+    # colliding, and the suite's finally block removes exactly this directory.
+    $script:P2CCwdFixtureRoot = $null
+
+    function Get-P2CCwdFixtureRoot {
+        if (-not [string]::IsNullOrWhiteSpace($script:P2CCwdFixtureRoot)) { return $script:P2CCwdFixtureRoot }
+
+        $systemDrive = [string]$env:SystemDrive
+
+        if ([string]::IsNullOrWhiteSpace($systemDrive) -or -not [System.IO.Path]::IsPathRooted($systemDrive)) {
+            throw "the protected-cwd fixture base requires a rooted system volume; SystemDrive is '$systemDrive'"
+        }
+
+        $root = $systemDrive.TrimEnd('\') + '\dwp2c-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+
+        try {
+            New-Item -ItemType Directory -Path $root -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            throw ("the protected-cwd fixture base '{0}' could not be created ({1}); these fixtures require an elevated test process and a writable system-volume root" -f $root, $_.Exception.Message)
+        }
+
+        $script:P2CCwdFixtureRoot = $root
+        return $root
+    }
 
     function New-P2CCwdFixture {
         param(
@@ -16713,16 +16773,30 @@ $mutex.Dispose()
 
         if ($Name.Length -gt 11) { throw "protected fixture name '$Name' is too long for the 117-character root contract" }
 
-        New-Item -ItemType Directory -Path $script:P2CCwdFixtureRoot -Force | Out-Null
-        $base = Join-Path $script:P2CCwdFixtureRoot $Name
+        $base = Join-Path (Get-P2CCwdFixtureRoot) $Name
+        $sidLength = (Get-DevWSCurrentUserSid).Length
+        $pad = 0
+
+        if ($ExactRootLength -gt 0) {
+            $pad = $ExactRootLength - (18 + $sidLength) - $base.Length - 1
+
+            if ($pad -lt 1) {
+                throw "fixture base path '$base' is too long for an exact root length of $ExactRootLength (18 + SID $sidLength leaves no padding for $($base.Length) base characters)"
+            }
+        }
+        else {
+            # Fail actionably instead of silently weakening the 117-character
+            # boundary assertions when a host cannot provide a short enough base.
+            $rootLength = $base.Length + 18 + $sidLength
+
+            if ($rootLength -gt 117) {
+                throw "the protected-cwd fixture base '$base' produces a $rootLength-character protected SID root; the production contract supports at most 117"
+            }
+        }
+
         New-Item -ItemType Directory -Path $base -Force | Out-Null
 
         if ($ExactRootLength -gt 0) {
-            $sidLength = (Get-DevWSCurrentUserSid).Length
-            $pad = $ExactRootLength - (18 + $sidLength) - $base.Length - 1
-
-            if ($pad -lt 1) { throw "fixture base path is too long for an exact root length of $ExactRootLength" }
-
             $base = Join-Path $base ('r' * $pad)
             New-Item -ItemType Directory -Path $base -Force | Out-Null
         }
@@ -34491,7 +34565,9 @@ exit 0
 finally {
     Remove-Item Env:\DEVWS_STATE_ROOT -ErrorAction SilentlyContinue
     Remove-Item Env:\DEVWS_PROTECTED_STATE_ROOT -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath (Join-Path $env:TEMP 'devws-p2c') -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($script:P2CCwdFixtureRoot)) {
+        Remove-Item -LiteralPath $script:P2CCwdFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 
     if (Test-Path -LiteralPath $TestRoot) {
         Remove-Item -LiteralPath $TestRoot -Recurse -Force -ErrorAction SilentlyContinue
