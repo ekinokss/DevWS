@@ -1249,6 +1249,40 @@ function Stop-TestFixtureProcess {
     }
 }
 
+function Wait-TestFixtureProcessesGone {
+    # Test-only bound for disposable fixture cleanup.
+    #
+    # A termination REQUEST (Stop-Process / Kill) is not proof that
+    # Win32_Process has already stopped reporting the process: the process table
+    # is eventually consistent, and a single immediate snapshot is a race on a
+    # loaded host. Poll the EXACT fixture predicate until it is observably empty
+    # or the deadline expires.
+    #
+    # This returns the observation; the caller still asserts Gone, so a genuine
+    # leak fails instead of being hidden, and no test is retried.
+    param(
+        [Parameter(Mandatory)][scriptblock]$Select,
+        [int]$TimeoutSeconds = 10,
+        [int]$PollMilliseconds = 150
+    )
+
+    $deadline = [datetime]::UtcNow.AddSeconds($TimeoutSeconds)
+
+    while ($true) {
+        $remaining = @(& $Select)
+
+        if ($remaining.Count -eq 0) {
+            return [pscustomobject]@{ Gone = $true; Remaining = @() }
+        }
+
+        if ([datetime]::UtcNow -ge $deadline) {
+            return [pscustomobject]@{ Gone = $false; Remaining = @($remaining) }
+        }
+
+        Start-Sleep -Milliseconds $PollMilliseconds
+    }
+}
+
 function Get-FileBase64 {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -1775,11 +1809,20 @@ function Stop-WorkerPipeFixtureProcess {
     }
 
     # Sweep any other fixture child of this case (e.g. the second concurrent
-    # caller's spawn) so no disposable process is left behind.
+    # caller's spawn) so no disposable process is left behind. The sweep must be
+    # synchronized here, at the owner: a later case's single process-table
+    # snapshot cannot distinguish a just-killed stray from a genuinely stranded
+    # worker. Only this case's uniquely script-marked children are matched.
     $strays = @(Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" | Where-Object { $_.CommandLine -like "*$($Case.Script)*" })
 
     foreach ($stray in $strays) {
         Stop-Process -Id $stray.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($strays.Count -gt 0) {
+        $null = Wait-TestFixtureProcessesGone -Select {
+            Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" | Where-Object { $_.CommandLine -like "*$($Case.Script)*" }
+        }
     }
 }
 
@@ -4889,8 +4932,10 @@ try {
 
         Assert-Equal 0 $stalledPipeline.Count "a timed-out invocation returns no object at all"
 
-        $orphans = @(Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" | Where-Object { $_.CommandLine -like "*$stallMarker*" })
-        Assert-Equal 0 @($orphans).Count "no process carrying the stalled child marker remains"
+        $orphanGone = Wait-TestFixtureProcessesGone -Select {
+            Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" | Where-Object { $_.CommandLine -like "*$stallMarker*" }
+        }
+        Assert-Equal $true $orphanGone.Gone "no process carrying the stalled child marker remains"
     }
 
     Test-Case "a descendant holding an inherited writer cannot delay the runner" {
@@ -4919,15 +4964,21 @@ try {
         }
         finally {
             # The grandchild is a fixture artifact: terminate it by its unique
-            # marker so the suite leaves no disposable process behind.
+            # marker so the suite leaves no disposable process behind. A kill
+            # request is not proof that Win32_Process already stopped reporting
+            # it, so the absence check is a bounded condition wait instead of one
+            # instantaneous snapshot.
             $holders = @(Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" | Where-Object { $_.CommandLine -like "*$marker*" })
 
             foreach ($holder in $holders) {
                 Stop-Process -Id $holder.ProcessId -Force -ErrorAction SilentlyContinue
             }
 
-            $remaining = @(Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" | Where-Object { $_.CommandLine -like "*$marker*" })
-            Assert-Equal 0 $remaining.Count "the inherited-writer fixture grandchild was cleaned up"
+            $gone = Wait-TestFixtureProcessesGone -Select {
+                Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" | Where-Object { $_.CommandLine -like "*$marker*" }
+            }
+
+            Assert-Equal $true $gone.Gone ("the inherited-writer fixture grandchild was cleaned up (remaining: " + (@($gone.Remaining | ForEach-Object { $_.ProcessId }) -join ',') + ")")
         }
     }
 
@@ -34934,8 +34985,10 @@ exit 0
         $sleepContext = New-P2EHealthStubContext -Name "timeout" -ChildBody "Start-Sleep -Seconds 300"
         $timeoutRun = Invoke-P2EHealthRun -Context $sleepContext -TempDir $tempDir -ListTimeoutSeconds 2
         Assert-Equal $false $timeoutRun.ById["ws-list"].Ok "a hung ws list fails the check"
-        $leftover = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -like ("*" + $sleepContext.InstallRoot + "*") })
-        Assert-Equal 0 $leftover.Count "the timed-out child is terminated"
+        $leftoverGone = Wait-TestFixtureProcessesGone -Select {
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -like ("*" + $sleepContext.InstallRoot + "*") }
+        }
+        Assert-Equal $true $leftoverGone.Gone "the timed-out child is terminated"
         Assert-Equal 0 @(Get-ChildItem -LiteralPath $tempDir -Recurse -File -ErrorAction SilentlyContinue).Count "timeout leaves no temporary files"
     }
 
@@ -35043,16 +35096,23 @@ exit 0
         finally {
             $holders = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -like "*$marker*" })
             foreach ($holder in $holders) { Stop-Process -Id $holder.ProcessId -Force -ErrorAction SilentlyContinue }
-            Start-Sleep -Milliseconds 200
-            $remaining = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -like "*$marker*" })
-            Assert-Equal 0 $remaining.Count "the inherited-writer fixture descendant was cleaned up"
+
+            # A fixed sleep followed by one snapshot is the same observation
+            # race: wait for the actual absence condition instead.
+            $gone = Wait-TestFixtureProcessesGone -Select {
+                Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -like "*$marker*" }
+            }
+
+            Assert-Equal $true $gone.Gone ("the inherited-writer fixture descendant was cleaned up (remaining: " + (@($gone.Remaining | ForEach-Object { $_.ProcessId }) -join ',') + ")")
         }
 
         # 7. Zero temporary files and zero residual fixture processes.
         $afterTemp = @(Get-ChildItem -LiteralPath $tempDir -Filter 'devws-*' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
         Assert-Equal @($beforeTemp).Count @($afterTemp).Count "the classification fixtures create no temporary files"
-        $residual = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -like "*$fixtureDir*" })
-        Assert-Equal 0 $residual.Count "no residual fixture processes remain"
+        $residualGone = Wait-TestFixtureProcessesGone -Select {
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $null -ne $_.CommandLine -and $_.CommandLine -like "*$fixtureDir*" }
+        }
+        Assert-Equal $true $residualGone.Gone "no residual fixture processes remain"
     }
 
     Test-Case "installed bootstrap produces no filesystem diagnostics" {
