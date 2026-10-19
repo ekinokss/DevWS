@@ -2650,6 +2650,18 @@ function Get-DevWSScheduledTaskSpecs {
     )
 }
 
+function Get-DevWSScheduledTaskActionArguments {
+    # Single owner of the managed worker action argument string. The task
+    # definition builder and the -RepairTasks ownership predicate must agree
+    # exactly, so both derive the string here rather than repeating a literal.
+    param(
+        [Parameter(Mandatory)]
+        $Spec
+    )
+
+    return ("-NoProfile -WindowStyle Hidden -File `"$($Spec.Worker)`"")
+}
+
 function New-DevWSScheduledTaskDefinition {
     param(
         [Parameter(Mandatory)]
@@ -2664,7 +2676,7 @@ function New-DevWSScheduledTaskDefinition {
 
     $action = New-ScheduledTaskAction `
         -Execute $powerShellPath `
-        -Argument ("-NoProfile -WindowStyle Hidden -File `"$($Spec.Worker)`"")
+        -Argument (Get-DevWSScheduledTaskActionArguments -Spec $Spec)
 
     $principal = New-ScheduledTaskPrincipal `
         -UserId $env:USERNAME `
@@ -2704,6 +2716,35 @@ function New-DevWSScheduledTaskDefinition {
         Settings  = $settings
         Triggers  = $triggers
     }
+}
+
+function Register-DevWSManagedScheduledTask {
+    # Single registration path for a DevWS-managed definition, shared by the
+    # installer and the -RepairTasks transaction so the two can never drift.
+    param(
+        [Parameter(Mandatory)]
+        $Definition
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Definition.TaskName)) {
+        throw "A DevWS-managed scheduled-task definition is missing its task name."
+    }
+
+    $registerArguments = @{
+        TaskName  = [string]$Definition.TaskName
+        Action    = $Definition.Action
+        Principal = $Definition.Principal
+        Settings  = $Definition.Settings
+        Force     = $true
+    }
+
+    # Register-ScheduledTask rejects an empty trigger collection; the four
+    # short-lived workers intentionally have no trigger (on-demand only).
+    if (@($Definition.Triggers).Count -gt 0) {
+        $registerArguments["Trigger"] = $Definition.Triggers
+    }
+
+    Register-ScheduledTask @registerArguments | Out-Null
 }
 
 function Install-DevWSScheduledTasks {
@@ -2759,21 +2800,7 @@ function Install-DevWSScheduledTasks {
 
         $definition = New-DevWSScheduledTaskDefinition -Spec $spec
 
-        $registerArguments = @{
-            TaskName  = $spec.TaskName
-            Action    = $definition.Action
-            Principal = $definition.Principal
-            Settings  = $definition.Settings
-            Force     = $true
-        }
-
-        # Register-ScheduledTask rejects an empty trigger collection; the four
-        # short-lived workers intentionally have no trigger (on-demand only).
-        if (@($definition.Triggers).Count -gt 0) {
-            $registerArguments["Trigger"] = $definition.Triggers
-        }
-
-        Register-ScheduledTask @registerArguments | Out-Null
+        Register-DevWSManagedScheduledTask -Definition $definition
 
         $results.Add([pscustomobject]@{
             TaskName = $spec.TaskName
@@ -2783,6 +2810,616 @@ function Install-DevWSScheduledTasks {
     }
 
     return $results.ToArray()
+}
+
+# ---------------------------------------------------------------------------
+# Managed-task PowerShell repair (install.ps1 -RepairTasks)
+# ---------------------------------------------------------------------------
+#
+# A packaged (MSIX / Microsoft Store) PowerShell installation lives in a
+# version-stamped directory. When the package updates, the directory recorded in
+# the five managed task actions disappears and elevated operations stop working.
+#
+# -RepairTasks narrows that recovery to the only state that went stale: the
+# interpreter binding in the managed task declarations and the recorded trusted
+# PowerShell path. It deliberately does NOT make interpreter resolution dynamic:
+# the tasks keep an absolute trusted pwsh.exe, and worker authentication keeps
+# deriving the expected executable and argv from the administrator-controlled
+# declaration (Get-DevWSWorkerKindExpectation).
+
+function Get-DevWSRootScheduledTaskXml {
+    # Exact root-folder definition read through the Task Scheduler COM service,
+    # the same authority the worker authentication path reads. The repair
+    # preflight and the authenticated-server expectation therefore cannot
+    # disagree about which task they are looking at, and a same-named task in a
+    # different folder is never mistaken for the managed one.
+    param(
+        [Parameter(Mandatory)]
+        [string]$TaskName
+    )
+
+    $service = $null
+    $folder  = $null
+    $task    = $null
+
+    try {
+        $service = New-Object -ComObject "Schedule.Service"
+        $service.Connect()
+        $folder = $service.GetFolder("\")
+        $task = $folder.GetTask($TaskName)
+
+        if ($null -eq $task) {
+            throw "Scheduled task '$TaskName' was not found in the root Task Scheduler folder."
+        }
+
+        return [string]$task.Xml
+    }
+    catch {
+        if ($_.Exception -is [System.IO.FileNotFoundException] -or $_.Exception.HResult -eq -2147024894) {
+            throw "Scheduled task '$TaskName' was not found in the root Task Scheduler folder; run install.ps1 to register the DevWS scheduled tasks."
+        }
+
+        throw
+    }
+    finally {
+        if ($null -ne $task)    { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($task) }
+        if ($null -ne $folder)  { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($folder) }
+        if ($null -ne $service) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($service) }
+    }
+}
+
+function Register-DevWSRootScheduledTaskXml {
+    # Re-registers a previously captured definition verbatim. This is the
+    # rollback primitive: Register-ScheduledTask -Xml restores the whole
+    # definition (action, principal, settings, triggers), so a rolled-back task
+    # is not a reconstructed approximation.
+    param(
+        [Parameter(Mandatory)]
+        [string]$TaskName,
+        [Parameter(Mandatory)]
+        [string]$Xml
+    )
+
+    Register-ScheduledTask -TaskName $TaskName -Xml $Xml -Force -ErrorAction Stop | Out-Null
+}
+
+function Get-DevWSScheduledTaskShapeAssessment {
+    # Pure ownership/definition predicate: does this task definition carry the
+    # exact DevWS-managed shape for the spec, apart from the executable path
+    # that -RepairTasks is allowed to change?
+    #
+    # The OLD executable is deliberately not required to exist - a stale package
+    # path is precisely the condition being repaired. It must still be an
+    # absolute pwsh.exe, because the managed declaration never contained
+    # anything else. Every other managed property is compared exactly, so a
+    # foreign same-name task can never be adopted.
+    param(
+        [Parameter(Mandatory)]
+        $Spec,
+        [Parameter(Mandatory)]
+        [string]$DefinitionXml
+    )
+
+    $problems = [System.Collections.Generic.List[string]]::new()
+
+    $document = [System.Xml.XmlDocument]::new()
+
+    try {
+        $document.LoadXml($DefinitionXml)
+    }
+    catch {
+        throw "The scheduled task definition for '$($Spec.TaskName)' is not valid XML: $($_.Exception.Message)"
+    }
+
+    $namespaces = [System.Xml.XmlNamespaceManager]::new($document.NameTable)
+    [void]$namespaces.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+
+    function Read-ShapeChild {
+        param($Node, [string]$Name)
+
+        if ($null -eq $Node) { return '' }
+
+        $child = $Node.SelectSingleNode("t:$Name", $namespaces)
+
+        if ($null -eq $child) { return '' }
+
+        return [string]$child.InnerText
+    }
+
+    $execute = ''
+
+    $actions = @($document.SelectNodes('//t:Actions/t:Exec', $namespaces))
+
+    if ($actions.Count -ne 1) {
+        $problems.Add("expected exactly one Exec action, found $($actions.Count)")
+    }
+    else {
+        $execute = Read-ShapeChild $actions[0] 'Command'
+        $arguments = Read-ShapeChild $actions[0] 'Arguments'
+        $expectedArguments = Get-DevWSScheduledTaskActionArguments -Spec $Spec
+
+        if ([string]::IsNullOrWhiteSpace($execute)) {
+            $problems.Add('the action has no executable')
+        }
+        elseif (-not [System.IO.Path]::IsPathRooted($execute)) {
+            $problems.Add("the action executable '$execute' is not an absolute path")
+        }
+        elseif ((Split-Path -Leaf $execute) -ine 'pwsh.exe') {
+            $problems.Add("the action executable '$execute' is not pwsh.exe")
+        }
+
+        if ($arguments -cne $expectedArguments) {
+            $problems.Add('the action arguments do not match the managed worker invocation')
+        }
+    }
+
+    $principals = @($document.SelectNodes('//t:Principals/t:Principal', $namespaces))
+
+    if ($principals.Count -ne 1) {
+        $problems.Add("expected exactly one principal, found $($principals.Count)")
+    }
+    else {
+        $principal = $principals[0]
+        $userId    = Read-ShapeChild $principal 'UserId'
+        $groupId   = Read-ShapeChild $principal 'GroupId'
+        $logonType = Read-ShapeChild $principal 'LogonType'
+        $runLevel  = Read-ShapeChild $principal 'RunLevel'
+        $currentSid = Get-DevWSCurrentUserSid
+
+        if (-not [string]::IsNullOrWhiteSpace($groupId)) {
+            $problems.Add("the principal is a group principal ('$groupId')")
+        }
+
+        # Task Scheduler serializes the account as a SID when it can resolve
+        # one; older/hand-authored definitions carry the account name. Both
+        # forms identify the installing user.
+        $principalUserOk = (
+            -not [string]::IsNullOrWhiteSpace($userId) -and
+            (
+                $userId.Equals($currentSid, [StringComparison]::OrdinalIgnoreCase) -or
+                ($userId -split '\\')[-1] -ieq $env:USERNAME
+            )
+        )
+
+        if ([string]::IsNullOrWhiteSpace($userId)) {
+            $problems.Add('the principal has no user id')
+        }
+        elseif (-not $principalUserOk) {
+            $problems.Add("the principal user '$userId' is not the current user")
+        }
+
+        # InteractiveToken is the serialized form of an Interactive logon; both
+        # spellings are the same managed semantics across Task Scheduler
+        # versions.
+        if ($logonType -notin @('InteractiveToken', 'Interactive')) {
+            $problems.Add("the principal logon type is '$logonType', expected an interactive logon")
+        }
+
+        if ($runLevel -notin @('HighestAvailable', 'Highest')) {
+            $problems.Add("the principal run level is '$runLevel', expected the highest available run level")
+        }
+    }
+
+    $settings = $document.SelectSingleNode('//t:Settings', $namespaces)
+
+    if ($null -eq $settings) {
+        $problems.Add('the task has no settings')
+    }
+    else {
+        $multipleInstances = Read-ShapeChild $settings 'MultipleInstancesPolicy'
+
+        if ($multipleInstances -ne 'IgnoreNew') {
+            $problems.Add("the multiple-instances policy is '$multipleInstances', expected 'IgnoreNew'")
+        }
+    }
+
+    $triggersNode = $document.SelectSingleNode('//t:Triggers', $namespaces)
+    $triggerNodes = @()
+
+    if ($null -ne $triggersNode) {
+        $triggerNodes = @($triggersNode.ChildNodes | Where-Object { $_.NodeType -eq 'Element' })
+    }
+
+    $isBroker = ([string]$Spec.TaskName -eq 'DevWorkspace-ElevatedBroker')
+
+    if ($isBroker) {
+        if ($triggerNodes.Count -ne 1) {
+            $problems.Add("expected exactly one broker logon trigger, found $($triggerNodes.Count)")
+        }
+        else {
+            $trigger = $triggerNodes[0]
+
+            if ($trigger.LocalName -ne 'LogonTrigger') {
+                $problems.Add("the broker trigger is '$($trigger.LocalName)', expected 'LogonTrigger'")
+            }
+
+            # An omitted <Enabled> means enabled; only an explicit false
+            # disables a trigger.
+            $triggerEnabled = Read-ShapeChild $trigger 'Enabled'
+
+            if (-not [string]::IsNullOrWhiteSpace($triggerEnabled) -and $triggerEnabled -ine 'true') {
+                $problems.Add('the broker logon trigger is not enabled')
+            }
+
+            $triggerUser = Read-ShapeChild $trigger 'UserId'
+
+            if ([string]::IsNullOrWhiteSpace($triggerUser)) {
+                $problems.Add('the broker logon trigger has no user id')
+            }
+            elseif (-not (
+                $triggerUser.Equals($currentSid, [StringComparison]::OrdinalIgnoreCase) -or
+                ($triggerUser -split '\\')[-1] -ieq $env:USERNAME
+            )) {
+                $problems.Add("the broker logon trigger user '$triggerUser' is not the current user")
+            }
+        }
+
+        if ((Read-ShapeChild $settings 'ExecutionTimeLimit') -ne 'PT0S') {
+            $problems.Add('the broker execution time limit is not disabled')
+        }
+
+        if ((Read-ShapeChild $settings 'DisallowStartIfOnBatteries') -ne 'false') {
+            $problems.Add('the broker is not allowed to start on battery')
+        }
+
+        if ((Read-ShapeChild $settings 'StopIfGoingOnBatteries') -ne 'false') {
+            $problems.Add('the broker stops when switching to battery')
+        }
+
+        $restartNode = $settings.SelectSingleNode('t:RestartOnFailure', $namespaces)
+
+        if ((Read-ShapeChild $restartNode 'Count') -ne '3') {
+            $problems.Add('the broker restart count is not the managed value')
+        }
+
+        if ((Read-ShapeChild $restartNode 'Interval') -ne 'PT1M') {
+            $problems.Add('the broker restart interval is not the managed value')
+        }
+    }
+    else {
+        if ($triggerNodes.Count -ne 0) {
+            $problems.Add("the on-demand worker has $($triggerNodes.Count) trigger(s), expected none")
+        }
+    }
+
+    return [pscustomobject]@{
+        TaskName = [string]$Spec.TaskName
+        Ok       = ($problems.Count -eq 0)
+        Execute  = $execute
+        Problems = $problems.ToArray()
+    }
+}
+
+function New-DevWSScheduledTaskStore {
+    # Production adapter over the Task Scheduler and install metadata. Tests
+    # inject an object with the same members so the transaction can be exercised
+    # without touching any real task.
+    return [pscustomobject]@{
+        GetTaskXml        = { param([string]$TaskName) Get-DevWSRootScheduledTaskXml -TaskName $TaskName }
+        GetTaskIsRunning  = { param([string]$TaskName) ((Get-DevWSRootScheduledTaskState -TaskName $TaskName) -eq 4) }
+        SetTaskDefinition = { param([string]$TaskName, $Definition) Register-DevWSManagedScheduledTask -Definition $Definition }
+        SetTaskXml        = { param([string]$TaskName, [string]$Xml) Register-DevWSRootScheduledTaskXml -TaskName $TaskName -Xml $Xml }
+        StopTask          = { param([string]$TaskName) Stop-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+        StartTask         = { param([string]$TaskName) Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+        SaveMetadata      = { param($Metadata, [string]$Path) Save-DevWSInstallMetadata -Metadata $Metadata -Path $Path }
+    }
+}
+
+function Get-DevWSTaskRepairPreflight {
+    # Proves this is a real installed instance before any task is touched, and
+    # that the repair will not have to create application, runtime or config
+    # state to succeed.
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$TaskSpecs,
+        [Parameter(Mandatory)]
+        $Metadata,
+        [Parameter(Mandatory)]
+        [string]$MetadataPath,
+        [Parameter(Mandatory)]
+        [string]$InstallRoot,
+        [Parameter(Mandatory)]
+        [string]$PrivilegedRoot
+    )
+
+    $errors = [System.Collections.Generic.List[string]]::new()
+
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+        $errors.Add('scheduled-task repair is Windows-only')
+    }
+
+    if ($TaskSpecs.Count -ne 5) {
+        $errors.Add("expected exactly five managed task specs, found $($TaskSpecs.Count)")
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $InstallRoot 'app\ws.ps1') -PathType Leaf)) {
+        $errors.Add("the DevWS application is not installed at '$InstallRoot'")
+    }
+
+    if (-not (Test-Path -LiteralPath $MetadataPath -PathType Leaf)) {
+        $errors.Add("the install metadata is missing at '$MetadataPath'")
+    }
+
+    $recordedRoot = ''
+
+    if ($null -ne $Metadata.PSObject.Properties['privileged'] -and $null -ne $Metadata.privileged.PSObject.Properties['root']) {
+        $recordedRoot = [string]$Metadata.privileged.root
+    }
+
+    if ([string]::IsNullOrWhiteSpace($recordedRoot)) {
+        $errors.Add('the install metadata has no recorded privileged root (a pre-Security-Phase-1 installation)')
+    }
+    elseif (-not $recordedRoot.Equals($PrivilegedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $errors.Add("the recorded privileged root '$recordedRoot' does not match the resolved privileged root '$PrivilegedRoot'")
+    }
+
+    foreach ($spec in $TaskSpecs) {
+        if (-not (Test-Path -LiteralPath ([string]$spec.Worker) -PathType Leaf)) {
+            $errors.Add("the protected worker script '$($spec.Worker)' is missing")
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok     = ($errors.Count -eq 0)
+        Errors = $errors.ToArray()
+    }
+}
+
+function Invoke-DevWSTaskPowerShellRepair {
+    # One logical, all-or-nothing operation over the five managed tasks.
+    #
+    # Order of work:
+    #   1. capture every task definition and prove the managed shape (no change)
+    #   2. build every replacement definition (no change)
+    #   3. stop the running managed broker through its exact task (no definition
+    #      change yet)
+    #   4. re-register the stale definitions, verifying each one
+    #   5. persist metadata only after every task verified
+    #   6. restart the broker only if it was running before the repair
+    #
+    # Any failure after step 4 restores every changed definition from its
+    # captured XML and restores the metadata file bytes.
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$TaskSpecs,
+        [Parameter(Mandatory)]
+        $Metadata,
+        [Parameter(Mandatory)]
+        [string]$MetadataPath,
+        $Store
+    )
+
+    if ($null -eq $Store) {
+        $Store = New-DevWSScheduledTaskStore
+    }
+
+    if ($TaskSpecs.Count -eq 0) {
+        throw 'Scheduled-task repair requires at least one managed task spec.'
+    }
+
+    $brokerTaskName = 'DevWorkspace-ElevatedBroker'
+    $targetPowerShell = [string]$TaskSpecs[0].PowerShellPath
+
+    if ([string]::IsNullOrWhiteSpace($targetPowerShell)) {
+        throw 'Scheduled-task repair requires an absolute trusted PowerShell path.'
+    }
+
+    foreach ($spec in $TaskSpecs) {
+        if (-not ([string]$spec.PowerShellPath).Equals($targetPowerShell, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Every repair spec must use the same newly verified trusted PowerShell executable.'
+        }
+    }
+
+    # Defence in depth: even a mis-called transaction must never write a task
+    # action that the privileged-executable policy would reject. Bare names,
+    # user-profile app-execution aliases and untrusted roots are refused here,
+    # not only at the installer entry point.
+    if (-not (Test-DevWSTrustedExecutablePath -Path $targetPowerShell)) {
+        throw "The repair target '$targetPowerShell' is not a trusted absolute pwsh.exe under an administrator-protected root; bare names, user-profile aliases and untrusted roots are refused."
+    }
+
+    # --- 1. Capture + assess (read-only) -----------------------------------
+    $snapshots   = @{}
+    $assessments = @{}
+    $missing     = [System.Collections.Generic.List[string]]::new()
+    $conflicts   = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($spec in $TaskSpecs) {
+        $name = [string]$spec.TaskName
+
+        try {
+            $xml = [string](& $Store.GetTaskXml $name)
+        }
+        catch {
+            $missing.Add("$name - $($_.Exception.Message)")
+            continue
+        }
+
+        $snapshots[$name] = $xml
+        $assessment = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml $xml
+        $assessments[$name] = $assessment
+
+        if (-not $assessment.Ok) {
+            $conflicts.Add("$name - $($assessment.Problems -join '; ')")
+        }
+    }
+
+    if ($missing.Count -gt 0) {
+        throw ("The installed DevWS scheduled task set is incomplete, so nothing was changed: " + ($missing -join ' | ') + ". -RepairTasks repairs stale PowerShell interpreter bindings only; run install.ps1 (normal mode) to restore a missing task.")
+    }
+
+    if ($conflicts.Count -gt 0) {
+        throw ("Ownership/definition conflict, so nothing was changed: " + ($conflicts -join ' | ') + ". A same-named task does not have the DevWS-managed shape apart from its interpreter path. Refusing to overwrite it; run install.ps1 (normal mode) or inspect the tasks manually.")
+    }
+
+    # --- 2. What actually needs to change ----------------------------------
+    $stale = @($TaskSpecs | Where-Object {
+        -not ([string]$assessments[[string]$_.TaskName].Execute).Equals($targetPowerShell, [StringComparison]::OrdinalIgnoreCase)
+    })
+
+    $recordedPath = ''
+
+    if ($null -ne $Metadata.PSObject.Properties['privileged'] -and $null -ne $Metadata.privileged.PSObject.Properties['powerShellPath']) {
+        $recordedPath = [string]$Metadata.privileged.powerShellPath
+    }
+
+    $metadataCurrent = $recordedPath.Equals($targetPowerShell, [StringComparison]::OrdinalIgnoreCase)
+
+    if ($stale.Count -eq 0 -and $metadataCurrent) {
+        # Explicit successful no-op: nothing is rewritten.
+        return [pscustomobject]@{
+            Status           = 'current'
+            ChangedTasks     = @()
+            PowerShellPath   = $targetPowerShell
+            PreviousPath     = $recordedPath
+            MetadataUpdated  = $false
+            BrokerWasRunning = $false
+            BrokerRestarted  = $false
+            Warnings         = @()
+        }
+    }
+
+    # --- 3. Build every replacement definition before the first mutation ----
+    $definitions = @{}
+
+    foreach ($spec in $TaskSpecs) {
+        $definitions[[string]$spec.TaskName] = New-DevWSScheduledTaskDefinition -Spec $spec
+    }
+
+    # --- 4. Mutate ----------------------------------------------------------
+    $brokerWasRunning = [bool](& $Store.GetTaskIsRunning $brokerTaskName)
+
+    if ($brokerWasRunning) {
+        try {
+            & $Store.StopTask $brokerTaskName | Out-Null
+        }
+        catch {
+            throw ("The running elevated broker could not be stopped, so no task definition was changed: " + $_.Exception.Message)
+        }
+    }
+
+    $originalMetadataBytes = $null
+
+    if (Test-Path -LiteralPath $MetadataPath -PathType Leaf) {
+        $originalMetadataBytes = [System.IO.File]::ReadAllBytes($MetadataPath)
+    }
+
+    $changed  = [System.Collections.Generic.List[string]]::new()
+    $warnings = [System.Collections.Generic.List[string]]::new()
+
+    try {
+        foreach ($spec in $stale) {
+            $name = [string]$spec.TaskName
+            $definition = $definitions[$name]
+
+            & $Store.SetTaskDefinition $name $definition | Out-Null
+            $changed.Add($name)
+
+            # Verify immediately: a registration that silently produced a
+            # different definition must roll back rather than be reported as a
+            # successful repair.
+            $verify = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml ([string](& $Store.GetTaskXml $name))
+
+            if (-not $verify.Ok) {
+                throw "the re-registered task '$name' does not have the managed shape ($($verify.Problems -join '; '))"
+            }
+
+            if (-not ([string]$verify.Execute).Equals($targetPowerShell, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "the re-registered task '$name' still does not execute the repaired PowerShell path"
+            }
+        }
+
+        if (-not $metadataCurrent) {
+            $Metadata.privileged.powerShellPath = $targetPowerShell
+            & $Store.SaveMetadata $Metadata $MetadataPath | Out-Null
+        }
+    }
+    catch {
+        $failure = $_
+        $rollbackErrors = [System.Collections.Generic.List[string]]::new()
+
+        for ($index = $changed.Count - 1; $index -ge 0; $index--) {
+            $name = $changed[$index]
+
+            try {
+                & $Store.SetTaskXml $name $snapshots[$name] | Out-Null
+            }
+            catch {
+                $rollbackErrors.Add("$name - $($_.Exception.Message)")
+            }
+        }
+
+        # Metadata was only written after every task verified; this restores the
+        # prior bytes defensively if that write nevertheless changed the file.
+        if ($null -ne $originalMetadataBytes) {
+            $currentBytes = $null
+
+            if (Test-Path -LiteralPath $MetadataPath -PathType Leaf) {
+                $currentBytes = [System.IO.File]::ReadAllBytes($MetadataPath)
+            }
+
+            $sameBytes = (
+                $null -ne $currentBytes -and
+                $currentBytes.Length -eq $originalMetadataBytes.Length -and
+                [System.Convert]::ToBase64String($currentBytes) -ceq [System.Convert]::ToBase64String($originalMetadataBytes)
+            )
+
+            if (-not $sameBytes) {
+                try {
+                    Write-DevWSBytesAtomic -Path $MetadataPath -Bytes $originalMetadataBytes
+                }
+                catch {
+                    $rollbackErrors.Add("metadata - $($_.Exception.Message)")
+                }
+            }
+        }
+
+        $Metadata.privileged.powerShellPath = $recordedPath
+
+        if ($brokerWasRunning) {
+            try {
+                & $Store.StartTask $brokerTaskName | Out-Null
+            }
+            catch {
+                $rollbackErrors.Add("broker restart - $($_.Exception.Message)")
+            }
+        }
+
+        $rollbackSummary = if ($rollbackErrors.Count -eq 0) {
+            'all changed task definitions and the metadata state were restored'
+        }
+        else {
+            'rollback incomplete: ' + ($rollbackErrors -join '; ')
+        }
+
+        throw ("Scheduled-task PowerShell repair failed: " + $failure.Exception.Message + " Rollback: " + $rollbackSummary + ".")
+    }
+
+    # --- 5. Restore the broker lifecycle ------------------------------------
+    $brokerRestarted = $false
+
+    if ($brokerWasRunning) {
+        try {
+            & $Store.StartTask $brokerTaskName | Out-Null
+            $brokerRestarted = $true
+        }
+        catch {
+            $warnings.Add("the elevated broker did not restart ($($_.Exception.Message)); it will start on demand or at logon")
+        }
+    }
+
+    return [pscustomobject]@{
+        Status           = 'repaired'
+        ChangedTasks     = @($changed)
+        PowerShellPath   = $targetPowerShell
+        PreviousPath     = $recordedPath
+        MetadataUpdated  = (-not $metadataCurrent)
+        BrokerWasRunning = $brokerWasRunning
+        BrokerRestarted  = $brokerRestarted
+        Warnings         = @($warnings)
+    }
 }
 
 # ---------------------------------------------------------------------------

@@ -14,11 +14,15 @@
 #   install.ps1 -ResetConfig      replace the canonical config with the default
 #   install.ps1 -ResetConfig -Force   skip the reset confirmation
 #   install.ps1 -HealthCheck      non-destructive health check only
+#   install.ps1 -RepairTasks      restore stale managed task PowerShell bindings
+#                                 (after a packaged PowerShell update) without
+#                                 reinstalling anything else
 
 param(
     [switch]$ResetConfig,
     [switch]$Force,
-    [switch]$HealthCheck
+    [switch]$HealthCheck,
+    [switch]$RepairTasks
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +53,74 @@ function Get-DevWSInstallerRerunCommand {
 }
 
 try {
+    if ($RepairTasks -and ($ResetConfig -or $Force -or $HealthCheck)) {
+        throw "install.ps1 -RepairTasks is a task-only repair mode and cannot be combined with -ResetConfig, -Force or -HealthCheck."
+    }
+
+    if ($RepairTasks) {
+        # --- Isolated task-only repair path ---------------------------------
+        # It never falls through into the nine-step installer: no application
+        # files, native runtime, privileged staging, protected state, config,
+        # PATH, shim, hotkey or AutoHotkey work happens here.
+        Write-DevWSInstallSection "DevWS scheduled-task PowerShell repair"
+
+        if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "src\ws.ps1") -PathType Leaf)) {
+            throw "install.ps1 must run from the DevWS repository root (src\ws.ps1 was not found next to it)."
+        }
+
+        if (-not (Test-DevWSAdministrator)) {
+            throw ("Repairing the DevWS scheduled tasks requires an Administrator PowerShell so the managed task actions can be rewritten. Rerun it elevated:" + [Environment]::NewLine + "  " + (Get-DevWSInstallerRerunCommand))
+        }
+
+        $trustedPowerShell = Resolve-DevWSTrustedPowerShellPath -VerifyRuntime
+        Write-Host "  trusted PowerShell: $trustedPowerShell"
+
+        $installRoot    = Get-DevWSInstallRoot
+        $privilegedRoot = Get-DevWSPrivilegedInstallRoot
+        $metadataPath   = Get-DevWSInstallMetadataPath
+        $metadata       = Read-DevWSInstallMetadata -Path $metadataPath
+        $specs          = @(Get-DevWSScheduledTaskSpecs `
+            -InstallRoot $installRoot `
+            -PrivilegedRoot $privilegedRoot `
+            -PowerShellPath $trustedPowerShell)
+
+        $preflight = Get-DevWSTaskRepairPreflight `
+            -TaskSpecs $specs `
+            -Metadata $metadata `
+            -MetadataPath $metadataPath `
+            -InstallRoot $installRoot `
+            -PrivilegedRoot $privilegedRoot
+
+        if (-not $preflight.Ok) {
+            throw ("DevWS is not installed sufficiently for a task-only repair:" + [Environment]::NewLine + "  " + (@($preflight.Errors) -join ([Environment]::NewLine + "  ")) + [Environment]::NewLine + "Run install.ps1 (normal mode) instead.")
+        }
+
+        $repair = Invoke-DevWSTaskPowerShellRepair `
+            -TaskSpecs $specs `
+            -Metadata $metadata `
+            -MetadataPath $metadataPath
+
+        if ($repair.Status -eq "current") {
+            Write-Host "  all five managed tasks and the recorded metadata already use this executable; nothing was changed."
+        }
+        else {
+            Write-Host ("  repaired {0} task(s): {1}" -f @($repair.ChangedTasks).Count, (@($repair.ChangedTasks) -join ", "))
+            Write-Host ("  recorded PowerShell path: {0}" -f $repair.PowerShellPath)
+            Write-Host ("  metadata: {0}" -f $(if ($repair.MetadataUpdated) { "updated" } else { "already current" }))
+            Write-Host ("  broker: {0}" -f $(if (-not $repair.BrokerWasRunning) { "was not running; left stopped (starts on demand or at logon)" } elseif ($repair.BrokerRestarted) { "was running; restarted" } else { "was running; restart deferred" }))
+        }
+
+        foreach ($warning in @($repair.Warnings)) {
+            Write-Host ("  warning: " + $warning) -ForegroundColor Yellow
+        }
+
+        Write-Host ""
+        Write-Host "Repair complete. Verify with: install.ps1 -HealthCheck" -ForegroundColor DarkGray
+        Write-Host ""
+
+        exit 0
+    }
+
     if ($HealthCheck) {
         Write-DevWSInstallSection "DevWS health check"
 

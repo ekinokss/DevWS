@@ -21,6 +21,7 @@ install.ps1                      # install or idempotently update
 install.ps1 -ResetConfig         # back up the current config, then install the starter
 install.ps1 -ResetConfig -Force  # same, skipping the reset confirmation
 install.ps1 -HealthCheck         # report status without changing anything
+install.ps1 -RepairTasks         # repair stale managed task PowerShell bindings only
 ```
 
 The installer **does not self-elevate**. If it is not running as an administrator it stops
@@ -28,6 +29,10 @@ before making any change and prints the exact command to re-run.
 
 `-HealthCheck` is non-destructive, is safe to run at any time, and does not require
 elevation. The same health implementation backs `ws doctor` and `ws health`.
+
+`-RepairTasks` is an isolated repair mode (see §6.1). It requires elevation, never falls
+through into the nine-step install/update flow, and cannot be combined with `-ResetConfig`,
+`-Force` or `-HealthCheck`.
 
 ## 2. Prerequisites
 
@@ -158,6 +163,39 @@ that backup rather than creating a chain.
 **Tasks DevWS does not own are never read, modified or removed.** In particular an external
 `AdminTerminal` task is left completely alone.
 
+### 6.1 Repairing the task interpreter after a PowerShell update
+
+Each action records an **absolute** trusted `pwsh.exe`. A packaged (Microsoft Store / MSIX)
+PowerShell installation lives in a version-stamped directory, so a package update can leave
+the tasks pointing at a path that no longer exists.
+
+`install.ps1 -RepairTasks`, run from an elevated PowerShell 7 shell, rewrites exactly those
+bindings:
+
+- it resolves and runtime-verifies the **currently running** PowerShell installation through
+  the existing trusted-executable policy;
+- it refuses unless the machine really is an installed DevWS instance: the installed app host,
+  all five protected worker scripts, and install metadata with a recorded privileged root
+  must be present;
+- it refuses if any of the five tasks is missing, or if a same-named task does not have the
+  complete DevWS-managed shape apart from the interpreter path (wrong worker, extra argument,
+  different principal, settings or triggers). Nothing is overwritten in that case;
+- it captures every task definition first, re-registers only the stale ones through the same
+  canonical definition builder the installer uses, verifies each result, and only then
+  updates `privileged.powerShellPath` in the install metadata;
+- on any failure it restores every changed definition from its captured XML and restores the
+  metadata bytes;
+- it restarts the broker only if the broker was running before the repair.
+
+It does **not** copy application files, rebuild the native assembly, stage the privileged
+runtime, create protected state, migrate configuration, or touch `PATH`, the legacy shim,
+hotkeys, AutoHotkey, Windows Terminal or `AdminTerminal`. It never runs any part of the
+uninstall path. When every task and the metadata already agree with the current interpreter,
+it reports a no-op and changes nothing.
+
+The task actions remain absolute. This is a repair command, not dynamic interpreter
+resolution, and it does not make package updates self-healing.
+
 ## 7. User PATH and the command shim
 
 - The installer ensures `%LOCALAPPDATA%\DevWS\bin` is on the **user** `PATH`, prepending it
@@ -217,6 +255,12 @@ in the Startup folder.
 
 The check only reads files, tasks and `PATH`, and runs the read-only `ws list`. It never
 launches a workspace, moves a window, resets a terminal or closes anything.
+
+Check 20 distinguishes a stale interpreter binding from other task damage. When the recorded
+interpreter is missing, or a task still has the complete managed shape but executes a
+different `pwsh.exe`, the message names `install.ps1 -RepairTasks`. Any other definition
+drift is reported as a general installer problem instead, so a foreign task is never
+presented as a routine package update.
 
 ## 10. Uninstall
 

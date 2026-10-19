@@ -626,6 +626,8 @@ function Invoke-DevWSHealthCheck {
                     $expected = [string]$Context.PrivilegedPowerShellPath
                 }
 
+                $recorded = $expected
+
                 if ([string]::IsNullOrWhiteSpace($expected)) {
                     # Legacy metadata (or a test context) without the recorded
                     # path: require the running trusted installation instead.
@@ -633,6 +635,12 @@ function Invoke-DevWSHealthCheck {
                 }
 
                 if (-not (Test-DevWSTrustedExecutablePath -Path $expected)) {
+                    if (-not [string]::IsNullOrWhiteSpace($recorded)) {
+                        # The recorded interpreter itself is gone or no longer a
+                        # trusted candidate. That is the package-update case.
+                        throw ("the recorded trusted PowerShell executable '$recorded' is missing or is no longer a trusted candidate (typical after a PowerShell package update); repair the managed task bindings with: install.ps1 -RepairTasks  (from an elevated PowerShell 7 shell)")
+                    }
+
                     return $false
                 }
 
@@ -652,9 +660,33 @@ function Invoke-DevWSHealthCheck {
                         return $false
                     }
 
-                    if (-not $execute.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
-                        return $false
+                    if ($execute.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+                        continue
                     }
+
+                    # The executable does not match. Only a task that still has
+                    # the complete DevWS-managed shape apart from that
+                    # executable is the repairable package-update condition; any
+                    # other drift stays a distinct installer problem and must
+                    # not be presented as a routine PowerShell update.
+                    $repairable = $false
+
+                    if ([string]$task.TaskPath -eq "\") {
+                        try {
+                            $xml = Export-ScheduledTask -TaskName $spec.TaskName -ErrorAction Stop
+                            $shape = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml $xml
+                            $repairable = [bool]$shape.Ok
+                        }
+                        catch {
+                            $repairable = $false
+                        }
+                    }
+
+                    if ($repairable) {
+                        throw ("the scheduled task '$($spec.TaskName)' still executes '$execute', not the recorded trusted PowerShell executable '$expected' (typical after a PowerShell package update); repair the managed task bindings with: install.ps1 -RepairTasks  (from an elevated PowerShell 7 shell)")
+                    }
+
+                    throw ("the scheduled task '$($spec.TaskName)' has an unexpected definition (execute '$execute', expected '$expected'); the DevWS-managed shape no longer matches, so run install.ps1 (normal mode) to repair the installation")
                 }
 
                 return $true

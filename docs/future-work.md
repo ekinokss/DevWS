@@ -16,32 +16,34 @@ These are behaviours a user can actually meet.
 ### 1.1 PowerShell package-update resilience
 
 DevWS scheduled tasks must launch an **absolute, trusted** PowerShell executable, so the
-installer resolves one and records its full path in all five managed task actions.
+installer resolves one and records its full path in all five managed task actions. That is a
+security property, not an implementation detail: a privileged worker is authenticated
+against the administrator-controlled task declaration, so the declaration must never resolve
+an interpreter through `PATH`, an alias, or a user-writable location.
 
-If PowerShell is installed as a **packaged (Microsoft Store / MSIX) application**, its
-executable lives in a **version-stamped** directory. When the package updates, that directory
-is replaced, and the recorded path no longer exists. The managed tasks then cannot start,
-which means elevated operations — terminal launches, capture, focus and reset — stop working
-until the installer is re-run to re-register the task actions.
+Consequence: the task actions do **not** transparently follow a PowerShell upgrade. If
+PowerShell is installed as a **packaged (Microsoft Store / MSIX) application**, its executable
+lives in a **version-stamped** directory. When the package updates, that directory is
+replaced and the recorded path no longer exists, so elevated operations — terminal launches,
+capture, focus and reset — stop working until the binding is repaired.
 
-Observed behaviour in that situation:
+DevWS detects that condition and narrows the recovery:
 
-- `ws doctor` / `ws health` reports the scheduled-task executable check as failing, so the
-  problem is visible rather than silent;
-- ordinary configuration-only commands continue to work;
-- the fix is to re-run `install.ps1` from an elevated PowerShell.
+- `ws doctor` / `ws health` reports the scheduled-task executable check as failing, with a
+  message that names the repair command when the fault is a stale interpreter;
+- `install.ps1 -RepairTasks`, run from an elevated PowerShell 7 shell, re-registers the five
+  managed task actions against the currently running trusted PowerShell and updates the
+  recorded `privileged.powerShellPath`; nothing else is reinstalled or reconfigured;
+- ordinary configuration-only commands continue to work while the tasks are stale.
 
-**This is not solved.** Addressing it requires an architecture decision, because every
-candidate solution changes how a high-integrity process obtains its interpreter — and that
-is exactly the kind of decision that must not be made casually. Candidate directions, none
-of which is chosen:
+Automatic transparent self-healing is **deliberately not implemented**. It would require a
+larger privileged indirection or bootstrapper design — a protected component that resolves a
+validated interpreter at task-run time — and that changes how a high-integrity process
+obtains its interpreter. That remains an open architectural question, not a small fix.
 
-- prefer a non-packaged PowerShell installation, and document that preference;
-- introduce a protected indirection that resolves a validated interpreter at task-run time;
-- add an explicit repair path that re-registers the managed task actions.
-
-Until one of those is designed and reviewed, treat a packaged PowerShell installation as a
-known operational fragility.
+Until such a design is reviewed, treat a packaged PowerShell installation as an operational
+fragility that needs an explicit repair after a package update. Prefer `-RepairTasks` over
+re-running the entire installer: it is the narrow operation.
 
 ### 1.2 `Alt+T` depends on an external task DevWS does not create
 

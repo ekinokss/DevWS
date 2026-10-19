@@ -91,6 +91,7 @@ $script:TestGroupCatalog = [ordered]@{
     'legacy-shim'         = 'Legacy shim'
     'hotkey-install'      = 'Hotkey installation'
     'task-specs'          = 'Scheduled task specs'
+    'task-repair'         = 'Scheduled-task PowerShell repair'
     'protected-state'     = 'Protected privileged-state foundation (Security Phase 2-A)'
     'protected-capture'   = 'Protected capture publications (Security Phase 2-B)'
     'protected-cwd'       = 'Protected cwd authority (Security Phase 2-C)'
@@ -14656,6 +14657,711 @@ foreach ($entry in $argv) { Write-Output ("ARG:" + $entry) }
             Assert-Equal "Highest" $definition.Principal.RunLevel "highest run level"
             Assert-Equal "IgnoreNew" $definition.Settings.MultipleInstances "single instance policy"
         }
+    }
+
+    Write-Host ""
+    Start-TestGroup -Name 'task-repair' -Title 'Scheduled-task PowerShell repair'
+
+    # Hermetic repair fixtures. No test in this group reads or writes a real
+    # scheduled task: the transaction takes an injected store, and every task
+    # definition is synthetic XML.
+
+    $script:TestTaskRepairSpecs = @{}
+    $script:TestTaskRepairStore = $null
+
+    function New-TestManagedTaskXml {
+        # Mirrors the XML Task Scheduler produced for the live managed tasks
+        # (SID principal, InteractiveToken logon, HighestAvailable run level,
+        # IgnoreNew, broker logon trigger and restart settings).
+        param(
+            [Parameter(Mandatory)]$Spec,
+            [Parameter(Mandatory)][string]$Execute,
+            [string]$Arguments = '',
+            [string]$LogonType = 'InteractiveToken',
+            [string]$RunLevel = 'HighestAvailable',
+            [string]$MultipleInstances = 'IgnoreNew',
+            [switch]$Broker
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Arguments)) {
+            $Arguments = Get-DevWSScheduledTaskActionArguments -Spec $Spec
+        }
+
+        $lines = @(
+            '<?xml version="1.0" encoding="UTF-16"?>'
+            '<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+            '  <RegistrationInfo>'
+            ('    <URI>\' + $Spec.TaskName + '</URI>')
+            '  </RegistrationInfo>'
+            '  <Principals>'
+            '    <Principal id="Author">'
+            ('      <UserId>' + (Get-DevWSCurrentUserSid) + '</UserId>')
+            ('      <LogonType>' + $LogonType + '</LogonType>')
+            ('      <RunLevel>' + $RunLevel + '</RunLevel>')
+            '    </Principal>'
+            '  </Principals>'
+            '  <Settings>'
+            ('    <DisallowStartIfOnBatteries>' + $(if ($Broker) { 'false' } else { 'true' }) + '</DisallowStartIfOnBatteries>')
+            ('    <StopIfGoingOnBatteries>' + $(if ($Broker) { 'false' } else { 'true' }) + '</StopIfGoingOnBatteries>')
+        )
+
+        if ($Broker) {
+            $lines += '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>'
+        }
+
+        $lines += ('    <MultipleInstancesPolicy>' + $MultipleInstances + '</MultipleInstancesPolicy>')
+
+        if ($Broker) {
+            $lines += @(
+                '    <RestartOnFailure>'
+                '      <Count>3</Count>'
+                '      <Interval>PT1M</Interval>'
+                '    </RestartOnFailure>'
+            )
+        }
+
+        $lines += '  </Settings>'
+
+        if ($Broker) {
+            $lines += @(
+                '  <Triggers>'
+                '    <LogonTrigger>'
+                ('      <UserId>' + $env:USERNAME + '</UserId>')
+                '    </LogonTrigger>'
+                '  </Triggers>'
+            )
+        }
+        else {
+            $lines += '  <Triggers />'
+        }
+
+        $lines += @(
+            '  <Actions Context="Author">'
+            '    <Exec>'
+            ('      <Command>' + $Execute + '</Command>')
+            ('      <Arguments>' + $Arguments + '</Arguments>')
+            '    </Exec>'
+            '  </Actions>'
+            '</Task>'
+        )
+
+        return ($lines -join "`n")
+    }
+
+    function New-TestTaskRepairStore {
+        # In-memory Task Scheduler + metadata adapter. The real adapter is
+        # New-DevWSScheduledTaskStore; this one never contacts Windows.
+        param(
+            [Parameter(Mandatory)][hashtable]$Tasks,
+            [bool]$BrokerRunning = $false,
+            [string]$FailRegistrationFor = '',
+            [switch]$FailMetadataSave,
+            [switch]$FailBrokerStart,
+            [switch]$FailBrokerStop
+        )
+
+        $copy = @{}
+        foreach ($key in $Tasks.Keys) { $copy[$key] = $Tasks[$key] }
+
+        $script:TestTaskRepairStore = [pscustomobject]@{
+            Tasks               = $copy
+            BrokerRunning       = $BrokerRunning
+            Registrations       = [System.Collections.Generic.List[string]]::new()
+            Restores            = [System.Collections.Generic.List[string]]::new()
+            Stops               = [System.Collections.Generic.List[string]]::new()
+            Starts              = [System.Collections.Generic.List[string]]::new()
+            MetadataWrites      = 0
+            FailRegistrationFor = $FailRegistrationFor
+            FailMetadataSave    = [bool]$FailMetadataSave
+            FailBrokerStart     = [bool]$FailBrokerStart
+            FailBrokerStop      = [bool]$FailBrokerStop
+        }
+
+        return [pscustomobject]@{
+            GetTaskXml = {
+                param([string]$TaskName)
+                $state = $script:TestTaskRepairStore
+
+                if (-not $state.Tasks.ContainsKey($TaskName)) {
+                    throw "Scheduled task '$TaskName' was not found in the root Task Scheduler folder; run install.ps1 to register the DevWS scheduled tasks."
+                }
+
+                [string]$state.Tasks[$TaskName]
+            }
+            GetTaskIsRunning = {
+                param([string]$TaskName)
+                [bool]$script:TestTaskRepairStore.BrokerRunning
+            }
+            SetTaskDefinition = {
+                param([string]$TaskName, $Definition)
+                $state = $script:TestTaskRepairStore
+
+                if ($state.FailRegistrationFor -eq $TaskName) {
+                    throw "simulated registration failure for '$TaskName'"
+                }
+
+                $state.Registrations.Add($TaskName)
+                $state.Tasks[$TaskName] = New-TestManagedTaskXml `
+                    -Spec $script:TestTaskRepairSpecs[$TaskName] `
+                    -Execute ([string]$Definition.Action.Execute) `
+                    -Broker:($TaskName -eq 'DevWorkspace-ElevatedBroker')
+            }
+            SetTaskXml = {
+                param([string]$TaskName, [string]$Xml)
+                $state = $script:TestTaskRepairStore
+                $state.Restores.Add($TaskName)
+                $state.Tasks[$TaskName] = $Xml
+            }
+            StopTask = {
+                param([string]$TaskName)
+                $state = $script:TestTaskRepairStore
+
+                if ($state.FailBrokerStop) { throw 'simulated stop failure' }
+
+                $state.Stops.Add($TaskName)
+                $state.BrokerRunning = $false
+            }
+            StartTask = {
+                param([string]$TaskName)
+                $state = $script:TestTaskRepairStore
+
+                if ($state.FailBrokerStart) { throw 'simulated start failure' }
+
+                $state.Starts.Add($TaskName)
+                $state.BrokerRunning = $true
+            }
+            SaveMetadata = {
+                param($Metadata, [string]$Path)
+                $state = $script:TestTaskRepairStore
+
+                if ($state.FailMetadataSave) { throw 'simulated metadata write failure' }
+
+                $state.MetadataWrites++
+                Save-DevWSInstallMetadata -Path $Path -Metadata $Metadata
+            }
+        }
+    }
+
+    function New-TestTaskRepairFixture {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [switch]$StaleMetadata
+        )
+
+        $fixture = New-InstallFixture ("task-repair-" + $Name)
+        $workerDir = Join-Path $fixture.Privileged 'workers'
+
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root 'app') -Force | Out-Null
+        New-Item -ItemType Directory -Path $workerDir -Force | Out-Null
+
+        Set-Content -LiteralPath (Join-Path $fixture.Root 'app\ws.ps1') -Value '# installed application host' -Encoding utf8
+
+        foreach ($workerName in @('elevated.ps1', 'elevated-capture.ps1', 'elevated-focus.ps1', 'elevated-reset.ps1', 'elevated-broker.ps1')) {
+            Set-Content -LiteralPath (Join-Path $workerDir $workerName) -Value '# protected worker' -Encoding utf8
+        }
+
+        $newPath = Resolve-DevWSTrustedPowerShellPath
+        $oldPath = 'C:\Program Files\WindowsApps\Microsoft.PowerShell_7.0.0.0_x64__8wekyb3d8bbwe\pwsh.exe'
+        $metadataPath = Join-Path $fixture.Root 'state\install-metadata.json'
+
+        $metadata = New-DevWSInstallMetadata
+        $metadata.installRoot = $fixture.Root
+        $metadata.privileged.root = $fixture.Privileged
+        $metadata.privileged.powerShellPath = $(if ($StaleMetadata) { $oldPath } else { $newPath })
+        Save-DevWSInstallMetadata -Path $metadataPath -Metadata $metadata
+
+        $newSpecs = @(Get-DevWSScheduledTaskSpecs -InstallRoot $fixture.Root -PrivilegedRoot $fixture.Privileged -PowerShellPath $newPath)
+        $oldSpecs = @(Get-DevWSScheduledTaskSpecs -InstallRoot $fixture.Root -PrivilegedRoot $fixture.Privileged -PowerShellPath $oldPath)
+
+        $script:TestTaskRepairSpecs = @{}
+
+        foreach ($spec in $newSpecs) {
+            $script:TestTaskRepairSpecs[$spec.TaskName] = $spec
+        }
+
+        $tasks = @{}
+
+        foreach ($spec in $oldSpecs) {
+            $tasks[$spec.TaskName] = New-TestManagedTaskXml `
+                -Spec $spec `
+                -Execute $oldPath `
+                -Broker:($spec.TaskName -eq 'DevWorkspace-ElevatedBroker')
+        }
+
+        return [pscustomobject]@{
+            Fixture      = $fixture
+            MetadataPath = $metadataPath
+            Metadata     = $metadata
+            NewPath      = $newPath
+            OldPath      = $oldPath
+            Specs        = $newSpecs
+            OldSpecs     = $oldSpecs
+            Tasks        = $tasks
+        }
+    }
+
+    Test-Case "install.ps1 -RepairTasks is an isolated task-only mode" {
+        $install = Get-SourceOf "install.ps1"
+
+        Assert-Contains $install '[switch]$RepairTasks' "the repair switch exists"
+        Assert-Contains $install 'install.ps1 -RepairTasks' "usage documents the repair mode"
+        Assert-Contains $install 'cannot be combined with -ResetConfig, -Force or -HealthCheck' "repair is mutually exclusive"
+
+        $start = $install.IndexOf('if ($RepairTasks) {')
+        $end   = $install.IndexOf('if ($HealthCheck) {')
+
+        Assert-True ($start -ge 0 -and $end -gt $start) "the repair branch precedes the health/install flow"
+
+        $branch = $install.Substring($start, $end - $start)
+
+        Assert-Contains $branch 'Test-DevWSAdministrator' "repair requires elevation"
+        Assert-Contains $branch 'Resolve-DevWSTrustedPowerShellPath -VerifyRuntime' "repair verifies the current PowerShell"
+        Assert-Contains $branch 'Get-DevWSTaskRepairPreflight' "repair proves the installed instance first"
+        Assert-Contains $branch 'Invoke-DevWSTaskPowerShellRepair' "repair runs the transaction"
+        Assert-Contains $branch 'exit 0' "repair does not fall through"
+
+        foreach ($forbidden in @(
+            'Install-DevWSApplicationFiles',
+            'Install-DevWSNativeRuntime',
+            'Install-DevWSPrivilegedFiles',
+            'Initialize-DevWSPrivilegedStateRoot',
+            'Initialize-DevWSWorkspaceConfig',
+            'Install-DevWSScheduledTasks',
+            'Set-DevWSUserPathText',
+            'Install-DevWSLegacyShim',
+            'Install-DevWSTerminalShortcut',
+            'Write-DevWSBindingsState',
+            'Start-DevWSInstalledHotkey'
+        )) {
+            Assert-NotContains $branch $forbidden "repair never performs $forbidden"
+        }
+
+        # The routing is also exercised: combining the modes must fail before
+        # any work, so this is safe against the live machine.
+        $output = & pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot "install.ps1") -RepairTasks -HealthCheck 2>&1 | Out-String
+        $code = $LASTEXITCODE
+
+        Assert-Equal 1 $code "repair refuses to combine with -HealthCheck"
+        Assert-Contains $output "cannot be combined" "the refusal is explicit"
+    }
+
+    Test-Case "the managed-shape predicate accepts only the DevWS action shape" {
+        $f = New-TestTaskRepairFixture "shape"
+        $spec = @($f.Specs | Where-Object { $_.TaskName -eq 'DevWorkspace-ElevatedHelper' })[0]
+
+        $stale = New-TestManagedTaskXml -Spec $spec -Execute 'C:\Program Files\Old\pwsh.exe'
+        $assessment = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml $stale
+
+        Assert-Equal $true $assessment.Ok "a missing but absolute pwsh.exe path is recognized"
+        Assert-Equal 'C:\Program Files\Old\pwsh.exe' $assessment.Execute "the observed executable is reported"
+
+        $notPwsh = New-TestManagedTaskXml -Spec $spec -Execute 'C:\Program Files\Old\notepad.exe'
+        $assessment = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml $notPwsh
+
+        Assert-Equal $false $assessment.Ok "a non-pwsh executable is refused"
+        Assert-Contains (@($assessment.Problems) -join ' ') "not pwsh.exe" "the problem names the executable"
+
+        $relative = New-TestManagedTaskXml -Spec $spec -Execute 'pwsh.exe'
+        $assessment = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml $relative
+
+        Assert-Equal $false $assessment.Ok "a bare executable is refused"
+        Assert-Contains (@($assessment.Problems) -join ' ') "not an absolute path" "the problem names absoluteness"
+    }
+
+    Test-Case "task repair is a no-op when every task and the metadata already agree" {
+        $f = New-TestTaskRepairFixture "noop"
+        $current = @{}
+
+        foreach ($spec in $f.Specs) {
+            $current[$spec.TaskName] = New-TestManagedTaskXml `
+                -Spec $spec `
+                -Execute $f.NewPath `
+                -Broker:($spec.TaskName -eq 'DevWorkspace-ElevatedBroker')
+        }
+
+        $store = New-TestTaskRepairStore -Tasks $current
+        $result = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store
+
+        Assert-Equal 'current' $result.Status "explicit no-op status"
+        Assert-Equal 0 @($result.ChangedTasks).Count "no task changed"
+        Assert-Equal 0 $script:TestTaskRepairStore.Registrations.Count "no registration"
+        Assert-Equal 0 $script:TestTaskRepairStore.Restores.Count "no rollback"
+        Assert-Equal 0 $script:TestTaskRepairStore.MetadataWrites "no metadata write"
+        Assert-Equal 0 $script:TestTaskRepairStore.Starts.Count "broker not started"
+    }
+
+    Test-Case "a stale packaged PowerShell path is repaired across all five managed tasks" {
+        $f = New-TestTaskRepairFixture "stale" -StaleMetadata
+        $store = New-TestTaskRepairStore -Tasks $f.Tasks
+
+        Assert-True (-not (Test-Path -LiteralPath $f.OldPath)) "the synthetic stale interpreter does not exist"
+
+        $result = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store
+
+        Assert-Equal 'repaired' $result.Status "repair status"
+        Assert-Equal 5 @($result.ChangedTasks).Count "all five tasks repaired"
+        Assert-Equal 5 $script:TestTaskRepairStore.Registrations.Count "all five registrations"
+        Assert-Equal 0 $script:TestTaskRepairStore.Restores.Count "no rollback"
+        Assert-Equal 1 $script:TestTaskRepairStore.MetadataWrites "metadata written once"
+        Assert-Equal $f.NewPath $f.Metadata.privileged.powerShellPath "metadata records the repaired path"
+
+        foreach ($spec in $f.Specs) {
+            $assessment = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml $script:TestTaskRepairStore.Tasks[$spec.TaskName]
+
+            Assert-Equal $true $assessment.Ok "repaired task keeps the managed shape: $($spec.TaskName)"
+            Assert-Equal $f.NewPath $assessment.Execute "repaired executable: $($spec.TaskName)"
+            Assert-Contains $script:TestTaskRepairStore.Tasks[$spec.TaskName] (Get-DevWSScheduledTaskActionArguments -Spec $spec) "worker arguments preserved: $($spec.TaskName)"
+        }
+    }
+
+    Test-Case "a mixed stale and current task set converges to one repaired path" {
+        $f = New-TestTaskRepairFixture "mixed" -StaleMetadata
+        $mixed = @{}
+        $index = 0
+
+        foreach ($spec in $f.Specs) {
+            $execute = $(if ($index -lt 3) { $f.OldPath } else { $f.NewPath })
+
+            $mixed[$spec.TaskName] = New-TestManagedTaskXml `
+                -Spec $spec `
+                -Execute $execute `
+                -Broker:($spec.TaskName -eq 'DevWorkspace-ElevatedBroker')
+
+            $index++
+        }
+
+        $store = New-TestTaskRepairStore -Tasks $mixed
+        $result = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store
+
+        Assert-Equal 'repaired' $result.Status "repair status"
+        Assert-Equal 3 @($result.ChangedTasks).Count "only the stale tasks are registered"
+        Assert-Equal 3 $script:TestTaskRepairStore.Registrations.Count "three registrations"
+
+        foreach ($spec in $f.Specs) {
+            $assessment = Get-DevWSScheduledTaskShapeAssessment -Spec $spec -DefinitionXml $script:TestTaskRepairStore.Tasks[$spec.TaskName]
+            Assert-Equal $f.NewPath $assessment.Execute "converged executable: $($spec.TaskName)"
+        }
+    }
+
+    Test-Case "a missing managed task refuses the repair before any modification" {
+        $f = New-TestTaskRepairFixture "missing" -StaleMetadata
+        $tasks = @{}
+
+        foreach ($key in $f.Tasks.Keys) {
+            if ($key -ne 'DevWorkspace-ElevatedFocus') { $tasks[$key] = $f.Tasks[$key] }
+        }
+
+        $store = New-TestTaskRepairStore -Tasks $tasks
+        $threw = $null
+
+        try { $null = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store }
+        catch { $threw = $_.Exception.Message }
+
+        Assert-True ($null -ne $threw) "repair refuses"
+        Assert-Contains $threw "incomplete" "the refusal names the incomplete task set"
+        Assert-Contains $threw "install.ps1" "the refusal points at the normal installer"
+        Assert-Equal 0 $script:TestTaskRepairStore.Registrations.Count "no registration"
+        Assert-Equal 0 $script:TestTaskRepairStore.Restores.Count "no rollback needed"
+        Assert-Equal 0 $script:TestTaskRepairStore.MetadataWrites "metadata untouched"
+    }
+
+    Test-Case "foreign same-name tasks are refused before any modification" {
+        $mutations = @(
+            @{ Name = 'wrong worker';    Apply = { param($xml, $spec) $xml -replace '<Arguments>[^<]+</Arguments>', '<Arguments>-NoProfile -WindowStyle Hidden -File "C:\evil\evil.ps1"</Arguments>' } },
+            @{ Name = 'extra argument';  Apply = { param($xml, $spec) $xml -replace '<Arguments>[^<]+</Arguments>', ('<Arguments>-NoProfile -WindowStyle Hidden -File "' + $spec.Worker + '" -Extra</Arguments>') } },
+            @{ Name = 'wrong run level'; Apply = { param($xml, $spec) $xml -replace '<RunLevel>HighestAvailable</RunLevel>', '<RunLevel>LeastPrivilege</RunLevel>' } }
+        )
+
+        foreach ($mutation in $mutations) {
+            $f = New-TestTaskRepairFixture ("foreign-" + ($mutation.Name -replace ' ', '-')) -StaleMetadata
+            $tasks = @{}
+
+            foreach ($key in $f.Tasks.Keys) { $tasks[$key] = $f.Tasks[$key] }
+
+            $spec = @($f.Specs | Where-Object { $_.TaskName -eq 'DevWorkspace-ElevatedHelper' })[0]
+            $tasks['DevWorkspace-ElevatedHelper'] = & $mutation.Apply $tasks['DevWorkspace-ElevatedHelper'] $spec
+
+            $store = New-TestTaskRepairStore -Tasks $tasks
+            $threw = $null
+
+            try { $null = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store }
+            catch { $threw = $_.Exception.Message }
+
+            Assert-True ($null -ne $threw) ("$($mutation.Name): repair refuses")
+            Assert-Contains $threw "Ownership/definition conflict" ("$($mutation.Name): conflict reported")
+            Assert-Equal 0 $script:TestTaskRepairStore.Registrations.Count ("$($mutation.Name): zero registrations")
+            Assert-Equal 0 $script:TestTaskRepairStore.MetadataWrites ("$($mutation.Name): metadata untouched")
+        }
+    }
+
+    Test-Case "task repair refuses untrusted or aliased PowerShell targets" {
+        $f = New-TestTaskRepairFixture "untrusted" -StaleMetadata
+
+        foreach ($candidate in @(
+            'pwsh.exe',
+            (Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Microsoft\WindowsApps\pwsh.exe'),
+            'C:\Temp\devws-untrusted\pwsh.exe'
+        )) {
+            $specs = @(Get-DevWSScheduledTaskSpecs -InstallRoot $f.Fixture.Root -PrivilegedRoot $f.Fixture.Privileged -PowerShellPath $candidate)
+            $store = New-TestTaskRepairStore -Tasks $f.Tasks
+            $threw = $null
+
+            try { $null = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store }
+            catch { $threw = $_.Exception.Message }
+
+            Assert-True ($null -ne $threw) "refused: $candidate"
+            Assert-Contains $threw "not a trusted absolute pwsh.exe" "the refusal names the trust policy for $candidate"
+            Assert-Equal 0 $script:TestTaskRepairStore.Registrations.Count "no registration for $candidate"
+        }
+    }
+
+    Test-Case "task repair preflight requires a sufficiently installed instance" {
+        $f = New-TestTaskRepairFixture "preflight"
+
+        $ok = Get-DevWSTaskRepairPreflight `
+            -TaskSpecs $f.Specs `
+            -Metadata $f.Metadata `
+            -MetadataPath $f.MetadataPath `
+            -InstallRoot $f.Fixture.Root `
+            -PrivilegedRoot $f.Fixture.Privileged
+
+        Assert-Equal $true $ok.Ok "a complete fixture passes"
+        Assert-Equal 0 @($ok.Errors).Count "no errors"
+
+        # Missing application host.
+        Rename-Item -LiteralPath (Join-Path $f.Fixture.Root 'app\ws.ps1') -NewName 'ws.ps1.off'
+
+        $result = Get-DevWSTaskRepairPreflight -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -InstallRoot $f.Fixture.Root -PrivilegedRoot $f.Fixture.Privileged
+        Assert-Equal $false $result.Ok "a missing application fails"
+        Assert-Contains (@($result.Errors) -join ' ') "not installed" "the error names the missing installation"
+
+        Rename-Item -LiteralPath (Join-Path $f.Fixture.Root 'app\ws.ps1.off') -NewName 'ws.ps1'
+
+        # Missing protected worker.
+        Rename-Item -LiteralPath (Join-Path $f.Fixture.Privileged 'workers\elevated-focus.ps1') -NewName 'elevated-focus.ps1.off'
+
+        $result = Get-DevWSTaskRepairPreflight -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -InstallRoot $f.Fixture.Root -PrivilegedRoot $f.Fixture.Privileged
+        Assert-Equal $false $result.Ok "a missing protected worker fails"
+        Assert-Contains (@($result.Errors) -join ' ') "worker script" "the error names the missing worker"
+
+        Rename-Item -LiteralPath (Join-Path $f.Fixture.Privileged 'workers\elevated-focus.ps1.off') -NewName 'elevated-focus.ps1'
+
+        # Missing metadata.
+        $savedMetadata = [System.IO.File]::ReadAllBytes($f.MetadataPath)
+        Remove-Item -LiteralPath $f.MetadataPath -Force
+
+        $result = Get-DevWSTaskRepairPreflight -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -InstallRoot $f.Fixture.Root -PrivilegedRoot $f.Fixture.Privileged
+        Assert-Equal $false $result.Ok "missing metadata fails"
+        Assert-Contains (@($result.Errors) -join ' ') "install metadata is missing" "the error names the metadata"
+
+        [System.IO.File]::WriteAllBytes($f.MetadataPath, $savedMetadata)
+
+        # Legacy metadata without the recorded privileged root.
+        $legacy = $f.Metadata
+        $legacy.privileged.root = ''
+
+        $result = Get-DevWSTaskRepairPreflight -TaskSpecs $f.Specs -Metadata $legacy -MetadataPath $f.MetadataPath -InstallRoot $f.Fixture.Root -PrivilegedRoot $f.Fixture.Privileged
+        Assert-Equal $false $result.Ok "legacy metadata fails"
+        Assert-Contains (@($result.Errors) -join ' ') "no recorded privileged root" "the error names the missing record"
+
+        $legacy.privileged.root = $f.Fixture.Privileged
+
+        # Recorded root that does not match the resolved root.
+        $mismatch = New-DevWSInstallMetadata
+        $mismatch.privileged.root = 'C:\Program Files\SomewhereElse\privileged'
+        $mismatch.privileged.powerShellPath = $f.NewPath
+
+        $result = Get-DevWSTaskRepairPreflight -TaskSpecs $f.Specs -Metadata $mismatch -MetadataPath $f.MetadataPath -InstallRoot $f.Fixture.Root -PrivilegedRoot $f.Fixture.Privileged
+        Assert-Equal $false $result.Ok "a mismatched privileged root fails"
+        Assert-Contains (@($result.Errors) -join ' ') "does not match the resolved privileged root" "the error names the mismatch"
+    }
+
+    Test-Case "a registration failure restores every changed task definition" {
+        $f = New-TestTaskRepairFixture "registration-failure" -StaleMetadata
+        $store = New-TestTaskRepairStore -Tasks $f.Tasks -BrokerRunning $true -FailRegistrationFor 'DevWorkspace-ElevatedReset'
+
+        $threw = $null
+
+        try { $null = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store }
+        catch { $threw = $_.Exception.Message }
+
+        Assert-True ($null -ne $threw) "repair fails"
+        Assert-Contains $threw "simulated registration failure for 'DevWorkspace-ElevatedReset'" "the original failure is reported"
+        Assert-Contains $threw "all changed task definitions" "the rollback result is reported"
+
+        Assert-Equal 3 $script:TestTaskRepairStore.Registrations.Count "three registrations before the failure"
+        Assert-Equal 3 $script:TestTaskRepairStore.Restores.Count "three tasks restored"
+        Assert-Equal 0 $script:TestTaskRepairStore.MetadataWrites "metadata never written"
+
+        foreach ($spec in $f.Specs) {
+            Assert-Equal $f.Tasks[$spec.TaskName] $script:TestTaskRepairStore.Tasks[$spec.TaskName] "task definition restored exactly: $($spec.TaskName)"
+        }
+
+        Assert-Equal 1 $script:TestTaskRepairStore.Starts.Count "the broker was restarted after rollback"
+        Assert-Equal $true $script:TestTaskRepairStore.BrokerRunning "the broker running state was restored"
+    }
+
+    Test-Case "a metadata persistence failure rolls the task definitions back" {
+        $f = New-TestTaskRepairFixture "metadata-failure" -StaleMetadata
+        $store = New-TestTaskRepairStore -Tasks $f.Tasks -FailMetadataSave
+
+        $before = [System.IO.File]::ReadAllBytes($f.MetadataPath)
+        $threw = $null
+
+        try { $null = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store }
+        catch { $threw = $_.Exception.Message }
+
+        Assert-True ($null -ne $threw) "repair fails"
+        Assert-Contains $threw "simulated metadata write failure" "the metadata failure is reported"
+        Assert-Equal 5 $script:TestTaskRepairStore.Registrations.Count "all five tasks registered first"
+        Assert-Equal 5 $script:TestTaskRepairStore.Restores.Count "all five tasks rolled back"
+
+        foreach ($spec in $f.Specs) {
+            Assert-Equal $f.Tasks[$spec.TaskName] $script:TestTaskRepairStore.Tasks[$spec.TaskName] "task restored: $($spec.TaskName)"
+        }
+
+        $after = [System.IO.File]::ReadAllBytes($f.MetadataPath)
+
+        Assert-Equal ([System.Convert]::ToBase64String($before)) ([System.Convert]::ToBase64String($after)) "metadata bytes unchanged"
+        Assert-Equal $f.OldPath $f.Metadata.privileged.powerShellPath "in-memory metadata restored"
+
+        $reread = Read-DevWSInstallMetadata -Path $f.MetadataPath
+        Assert-Equal $f.OldPath $reread.privileged.powerShellPath "metadata on disk still records the old path"
+    }
+
+    Test-Case "broker lifecycle follows the state observed before the repair" {
+        # Running before repair: stopped and restarted through exact task control.
+        $f = New-TestTaskRepairFixture "broker-running" -StaleMetadata
+        $store = New-TestTaskRepairStore -Tasks $f.Tasks -BrokerRunning $true
+
+        $result = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f.Specs -Metadata $f.Metadata -MetadataPath $f.MetadataPath -Store $store
+
+        Assert-Equal 1 $script:TestTaskRepairStore.Stops.Count "the managed broker was stopped"
+        Assert-Equal 1 $script:TestTaskRepairStore.Starts.Count "the managed broker was restarted"
+        Assert-Equal $true $result.BrokerWasRunning "reported as previously running"
+        Assert-Equal $true $result.BrokerRestarted "reported as restarted"
+
+        # Not running before repair: never manufactured.
+        $f2 = New-TestTaskRepairFixture "broker-stopped" -StaleMetadata
+        $store2 = New-TestTaskRepairStore -Tasks $f2.Tasks -BrokerRunning $false
+
+        $result2 = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f2.Specs -Metadata $f2.Metadata -MetadataPath $f2.MetadataPath -Store $store2
+
+        Assert-Equal 0 $script:TestTaskRepairStore.Stops.Count "no stop when the broker was not running"
+        Assert-Equal 0 $script:TestTaskRepairStore.Starts.Count "repair does not manufacture a running broker"
+        Assert-Equal $false $result2.BrokerWasRunning "reported as not previously running"
+
+        # A restart failure after a successful repair is surfaced, not rolled back.
+        $f3 = New-TestTaskRepairFixture "broker-start-fails" -StaleMetadata
+        $store3 = New-TestTaskRepairStore -Tasks $f3.Tasks -BrokerRunning $true -FailBrokerStart
+
+        $result3 = Invoke-DevWSTaskPowerShellRepair -TaskSpecs $f3.Specs -Metadata $f3.Metadata -MetadataPath $f3.MetadataPath -Store $store3
+
+        Assert-Equal 'repaired' $result3.Status "the repair itself still succeeds"
+        Assert-Equal 0 $script:TestTaskRepairStore.Restores.Count "a broker restart failure does not roll back the definitions"
+        Assert-Equal 1 @($result3.Warnings).Count "the restart failure is surfaced as a warning"
+    }
+
+    Test-Case "health points at -RepairTasks only for a repairable stale interpreter" {
+        $f = New-TestTaskRepairFixture "health"
+
+        $makeContext = {
+            param([string]$Recorded)
+
+            $context = [pscustomobject]@{
+                InstallRoot         = $f.Fixture.Root
+                StateRoot           = Join-Path $f.Fixture.Root 'state'
+                CanonicalPath       = Join-Path $f.Fixture.Root 'canonical.json'
+                StartupPath         = Join-Path $f.Fixture.Root 'Startup'
+                LegacyShimPath      = Join-Path $f.Fixture.Root 'local-bin\ws.cmd'
+                WindowsTerminalPath = Join-Path $f.Fixture.Root 'wt.exe'
+                AutoHotkeyPath      = Join-Path $f.Fixture.Root 'AutoHotkey64.exe'
+                MetadataPath        = $f.MetadataPath
+                PrivilegedRoot      = $f.Fixture.Privileged
+            }
+
+            $context | Add-Member -NotePropertyName 'PrivilegedPowerShellPath' -NotePropertyValue $Recorded
+
+            return $context
+        }
+
+        $taskObjects = @($f.Specs | ForEach-Object {
+            [pscustomobject]@{
+                TaskName  = $_.TaskName
+                TaskPath  = '\'
+                Actions   = @([pscustomobject]@{ Execute = $f.OldPath; Arguments = (Get-DevWSScheduledTaskActionArguments -Spec $_) })
+                Principal = [pscustomobject]@{ RunLevel = 'Highest' }
+                Settings  = [pscustomobject]@{ MultipleInstances = 'IgnoreNew' }
+                Triggers  = @()
+            }
+        })
+
+        $xmlByName = @{}
+
+        foreach ($spec in $f.OldSpecs) {
+            $xmlByName[$spec.TaskName] = New-TestManagedTaskXml `
+                -Spec $spec `
+                -Execute $f.OldPath `
+                -Broker:($spec.TaskName -eq 'DevWorkspace-ElevatedBroker')
+        }
+
+        function Get-ScheduledTask {
+            param([string]$TaskName, [string]$TaskPath, $ErrorAction)
+            return $taskObjects
+        }
+
+        function Export-ScheduledTask {
+            param([string]$TaskName, $ErrorAction)
+            return $xmlByName[$TaskName]
+        }
+
+        # A: the recorded interpreter itself is gone.
+        $summary = Invoke-DevWSHealthCheck -Context (& $makeContext $f.OldPath)
+        $result = @($summary.Results | Where-Object { $_.Id -eq 'task-executable' })[0]
+
+        Assert-Equal $false $result.Ok "a stale recorded interpreter fails"
+        Assert-Contains $result.Message "-RepairTasks" "the message names the repair command"
+
+        # B: tasks drift from a valid recorded interpreter, shape intact.
+        $summary = Invoke-DevWSHealthCheck -Context (& $makeContext $f.NewPath)
+        $result = @($summary.Results | Where-Object { $_.Id -eq 'task-executable' })[0]
+
+        Assert-Equal $false $result.Ok "task drift fails"
+        Assert-Contains $result.Message "-RepairTasks" "repairable drift suggests the repair"
+
+        # C: definition damage is NOT presented as a routine package update.
+        $xmlByName['DevWorkspace-ElevatedHelper'] = $xmlByName['DevWorkspace-ElevatedHelper'] -replace '<Arguments>[^<]+</Arguments>', '<Arguments>-NoProfile -WindowStyle Hidden -File "C:\evil\evil.ps1"</Arguments>'
+
+        $summary = Invoke-DevWSHealthCheck -Context (& $makeContext $f.NewPath)
+        $result = @($summary.Results | Where-Object { $_.Id -eq 'task-executable' })[0]
+
+        Assert-Equal $false $result.Ok "definition damage fails"
+        Assert-NotContains $result.Message "-RepairTasks" "definition damage is not a routine package update"
+        Assert-Contains $result.Message "install.ps1" "definition damage points at the installer"
+    }
+
+    Test-Case "the repair path preserves the absolute trusted-executable contract" {
+        $lib = Get-SourceOf "src\lib\devws-install.ps1"
+        $start = $lib.IndexOf('function Get-DevWSRootScheduledTaskXml')
+        $end   = $lib.IndexOf('# Uninstall decision model and execution')
+
+        Assert-True ($start -ge 0 -and $end -gt $start) "the repair region is located"
+
+        $region = $lib.Substring($start, $end - $start)
+
+        Assert-Contains $region 'Test-DevWSTrustedExecutablePath' "the repair target must satisfy the trusted-executable policy"
+        Assert-Contains $region 'New-DevWSScheduledTaskDefinition' "the repair builds definitions through the canonical owner"
+        Assert-Contains $region 'Get-DevWSScheduledTaskActionArguments' "the repair uses the canonical arguments"
+
+        foreach ($forbidden in @('Get-Command', '$env:PATH', 'Invoke-Expression', 'LOCALAPPDATA', 'WindowsApps')) {
+            Assert-NotContains $region $forbidden "the repair never resolves the interpreter through $forbidden"
+        }
+
+        # Worker authentication still derives its expectation from the
+        # administrator-controlled declaration; repair adds no dynamic path.
+        $protocol = Get-SourceOf "src\lib\devws-worker-protocol.ps1"
+        Assert-Contains $protocol 'Get-DevWSScheduledTaskDeclaration -TaskName $taskName' "worker authentication still reads the task declaration"
+        Assert-Contains $protocol 'Get-DevWSWorkerFixedArgumentPrefix' "worker authentication still checks the fixed argv prefix"
     }
 
     Write-Host ""
@@ -34423,8 +35129,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 61 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 61 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 62 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 62 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

@@ -76,6 +76,11 @@ configuration.
 - [ ] Each runs as the installing user, interactively, at the highest run level.
 - [ ] Each action uses an absolute trusted PowerShell path and a protected worker script.
 - [ ] Any unrelated task — in particular an external `AdminTerminal` task — is unchanged.
+- [ ] After a packaged PowerShell update, `install.ps1 -RepairTasks` rewrites all five task
+      actions to the new absolute interpreter while leaving every other managed property
+      intact, and `install.ps1 -HealthCheck` reports the executable check green again.
+- [ ] `install.ps1 -RepairTasks` refuses, and changes nothing, when one managed task is
+      missing or a same-named task has a foreign definition.
 
 **Needs elevation.**
 
