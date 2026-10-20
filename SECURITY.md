@@ -10,14 +10,18 @@ notes, see [docs/future-work.md](docs/future-work.md) §2.
 
 ## 1. Reporting a vulnerability
 
-**There is currently no dedicated private vulnerability-reporting channel configured for
-this project.** There is no security contact address, no bug bounty and no response-time
-commitment, and this document deliberately does not invent one.
+Please report suspected security vulnerabilities **privately**. Do not open a public issue for
+an undisclosed vulnerability, and do not include exploit details in a public discussion.
 
-The repository is private and pre-release. Until a private reporting channel is configured —
-which will happen before the repository becomes publicly visible — please report security
-concerns to the maintainer directly through the private repository rather than opening a
-public issue.
+The preferred channel is **GitHub private vulnerability reporting**: open the repository's
+**Security** tab and choose **Report a vulnerability**. That creates a private advisory visible
+to the maintainers without disclosing the report publicly.
+
+If the private reporting control is not available, contact the maintainer through GitHub and
+ask for a private channel. Do not post the details publicly while a private channel is being
+arranged.
+
+There is no bug bounty and no response-time commitment.
 
 When you report, include:
 
@@ -123,5 +127,7 @@ impact in [docs/future-work.md](docs/future-work.md) §2.5.
 
 ## 8. Supported versions
 
-DevWS is pre-release and has no published versions. Security fixes, when they happen, apply to
-the current state of the repository. No back-porting policy exists yet.
+DevWS is pre-1.0. Security fixes target the current `0.1.x` line on `main`; there is no
+long-term support branch and no back-porting policy. Because DevWS is distributed as source,
+there are no supported binary, package or installer artefacts. Users should run a current
+source checkout and re-run the installer after security-relevant updates.

@@ -3,6 +3,12 @@
 Automated coverage lives in `tests/run-tests.ps1` and is hermetic: it never launches a
 workspace, moves a real window, registers a task or writes to your configuration.
 
+The installer lifecycle — clean install, installed health, idempotent update, real
+`-RepairTasks`, default uninstall, reinstall and purge — was acceptance-tested on a disposable
+Windows 11 VM. The optional real-window lifecycle smoke was **not observed** in that
+environment. This checklist remains the manual procedure for desktop behaviour and for future
+changes.
+
 This document covers the behaviour that genuinely needs a real Windows desktop session:
 real Windows Terminal windows, real scheduled tasks, real elevation and real monitor
 topologies. Use it after changing installer behaviour, the lifecycle, or anything that

@@ -45,21 +45,7 @@ Until such a design is reviewed, treat a packaged PowerShell installation as an 
 fragility that needs an explicit repair after a package update. Prefer `-RepairTasks` over
 re-running the entire installer: it is the narrow operation.
 
-### 1.2 Retired pre-release `Alt+T` external-task integration
-
-Earlier pre-release builds mapped `Alt+T` to an external scheduled task named
-`AdminTerminal` that DevWS never created. That integration is **retired**: the built-in
-hotkey surface is `Alt+Shift+T` only, and `Alt+T` is ordinary binding space.
-
-DevWS does not read, create, modify or remove that external task, and no health check
-depends on it. A managed Startup script from an older build is recognised during update so
-the installer can replace it with the current core; a custom Startup script is still left
-untouched.
-
-There is no compatibility switch and no plan to restore the behaviour. A user who owns such
-a task independently can bind it outside DevWS.
-
-### 1.3 The native assembly is not byte-reproducible
+### 1.2 The native assembly is not byte-reproducible
 
 The native assembly is compiled from tracked C# sources with PowerShell's `Add-Type`.
 Compiling identical sources twice is **not** guaranteed to produce identical bytes.
@@ -81,7 +67,7 @@ with different line-ending settings can therefore materialise the C# sources dif
 This is harmless today because the assembly is not compared by hash, but it would need to be
 settled before any reproducible-binary claim.
 
-### 1.4 No monitor watcher, no automatic reflow, no tiling
+### 1.3 No monitor watcher, no automatic reflow, no tiling
 
 DevWS has no background monitor observer. Topology is sampled at the start of an operation
 that needs it, and nothing happens between operations.
@@ -91,18 +77,21 @@ an absolute rectangle per item, plus optional per-topology profiles. If your mon
 while DevWS is idle, the next explicit launch or reset observes the new arrangement — DevWS
 will not rearrange anything by itself.
 
-### 1.5 AutoHotkey remains a required dependency
+### 1.4 AutoHotkey remains a required dependency
 
 AutoHotkey v2 is required for global hotkeys and for two window operations. Most window work
-has already moved in-process, but the dependency has not been removed. See §3.
+has already moved in-process, but the dependency has not been removed. DevWS does not install,
+own or test the upstream AutoHotkey installer; the accepted contract is an installed
+machine-wide v2 instance under an administrator-protected Program Files root, validated by the
+trusted resolver. See §3.
 
-### 1.6 Managed terminals must be elevated
+### 1.5 Managed terminals must be elevated
 
 A managed terminal must be configured as elevated. A non-elevated managed terminal is
 rejected with an actionable error rather than silently accepted. This is a consequence of the
 privileged model: elevated windows cannot be managed by a normal-integrity process.
 
-### 1.7 Application-id launches cannot take arguments
+### 1.6 Application-id launches cannot take arguments
 
 An application launched by AppsFolder application id cannot carry launch arguments. Use an
 executable launch definition when arguments are required.
@@ -158,7 +147,7 @@ permissions have been changed from the installer's defaults.
 
 Installation validates the assembly's required surface, and loading trusts the file in the
 administrator-protected location. There is no signature or publisher check on the generated
-assembly. See §1.3 for the reproducibility angle.
+assembly. See §1.2 for the reproducibility angle.
 
 ### 2.5 Lower-priority hardening items
 

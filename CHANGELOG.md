@@ -5,49 +5,73 @@ All notable changes to DevWS are recorded here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions and
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**There is no released version yet.** DevWS is pre-release: no installer package, no release
-binary and no distribution channel exist. The section below records the state of the
-repository; it does not describe a release.
-
----
+> **Release preparation.** The intended first public source release is **0.1.0**. The material
+> below is the release-note source for that publication. It remains under `[Unreleased]` until
+> the maintainer creates the tag and a release exists. At publication, retitle this section
+> `## [0.1.0] - YYYY-MM-DD` and add a new empty `## [Unreleased]` above it.
 
 ## [Unreleased]
 
 ### Added
 
-- Public project documentation: a project overview, an architecture and security-model
-  reference, a complete command reference generated from the CLI's own command metadata, a
-  configuration schema and validation reference, an installer and uninstaller contract, the
-  workspace-set product model, a known-limitations and deferred-work register, and a manual
-  validation checklist.
-- Contributor guidance and a security policy.
-- A read-only environment probe for comparing a test environment with a validated one.
-- A neutral shared test fixture so behavioural tests no longer depend on the shipped default
-  configuration.
+- **Workspace sets** — independent, named workspace definitions with a configured default and
+  set-qualified commands, so several complete environments can coexist without a hidden
+  "active set".
+- **Managed terminals** — Windows Terminal windows and tabs created from configuration, with
+  per-tab working directories and startup commands, and a durable named-window identity used
+  for matching and adoption of live windows.
+- **Managed applications** — executable and AppsFolder launches with explicit `dedicated` or
+  `shared` instance modes, saved geometry, and refusal of ambiguous matches.
+- **Layout and topology** — all-or-nothing layout capture, deterministic restore, optional
+  per-monitor-topology layout profiles, and a universal fallback layout.
+- **Live-state saving** — geometry plus the reliable tracked working directory and active tab
+  of each managed terminal.
+- **Global hotkeys** — a managed AutoHotkey v2 Startup host, one built-in `Alt+Shift+T`
+  shortcut, and generated per-set launch bindings. `Alt+T` is ordinary binding space.
+- **Read-only inspection** — `ws list`, `ws status`, `ws show-layout`, `ws monitors`,
+  `ws detect-app`, `ws doctor` and `ws health`.
+- **Privileged operations without per-command UAC** — a small set of pre-authorised scheduled
+  tasks and a persistent broker, with the privileged runtime separated from the user-writable
+  CLI and configuration.
+- **Installer lifecycle** — install, idempotent update, stale-interpreter task repair,
+  health/doctor, default uninstall, reinstall and purge uninstall.
+- **Hermetic test suite and permanent hosted CI** — a canonical suite with explicit case
+  accounting, a strict zero-skip local gate, and a pinned, hash-verified AutoHotkey
+  provisioning step for hosted Windows.
+
+### Security
+
+- Administrator-protected privileged runtime and privileged state, with protected access
+  control, owner validation and reparse-point refusal.
+- Authenticated short-lived worker transport: the caller validates the connected worker's
+  kernel-reported process identity, image, user, session, integrity and exact task action
+  before transmitting anything.
+- Absolute trusted executable resolution for privileged PowerShell and machine-wide
+  AutoHotkey; no `PATH`, alias or user-writable lookup.
+- Fail-closed handling for ambiguous configuration, unsafe topologies, untrusted candidates
+  and unvalidated protected-state components.
 
 ### Changed
 
-- The shipped default configuration is now a **neutral starter** — one empty set, no items, no
-  bindings and no geometry — instead of a personal workspace. A fresh installation no longer
-  imposes any particular terminals, applications or screen geometry.
-- The test harness now reports six mutually exclusive case outcomes (discovered, selected,
-  passed, failed, runtime-skipped, filter-excluded) and enforces both partition equations. A
-  runtime skip is never counted as a pass.
-- Added a `-RequireFullCoverage` switch: with it, any runtime skip makes the run exit
-  non-zero, so an incomplete run cannot be mistaken for a complete one.
-- Configuration-dependent test expectations were re-derived for the neutral starter, and
-  several write-refusal cases now run against the real shipped default.
-
-### Removed
-
-- Personal identifiers, machine-specific identifiers and personal workspace content from
-  source comments, fixtures and the bundled configuration.
+- The bundled configuration is a neutral starter: one empty set, no bindings and no geometry.
+  A fresh installation does not impose a personal workspace.
+- A valid canonical configuration is preserved byte-for-byte on install and update. Supported
+  older configurations are migrated only with a backup, and invalid or unrecognised
+  configurations are left untouched.
+- Test results report six mutually exclusive outcomes and enforce both accounting partitions.
+  The strict release run treats any runtime skip as incomplete coverage.
+- Hosted CI accepts only the named linked-Medium protected-state integration skip that the
+  hosted token model cannot exercise; the strict local gate requires that case to execute.
 
 ### Notes
 
-- Historical v1 configuration migration is **not supported** by the public product. A v1
-  document is refused without modifying either the v1 file or the canonical configuration.
-- Existing valid v3 configurations are preserved byte-for-byte.
-- Bundled-template instance-mode inference can no longer supply a mode, because the neutral
-  starter defines no applications; see
-  [docs/configuration.md](docs/configuration.md) §12.
+- DevWS is Windows-only and distributed as source. There is no MSI, MSIX, setup executable,
+  package-manager package or committed binary bundle.
+- The generated native assembly is compiled at installation time. Its bytes are not
+  guaranteed to be reproducible, so DevWS does not publish or promise a binary digest.
+- Historical v1 configuration migration is not supported by the public product. A v1 document
+  is refused without modifying either the v1 file or the canonical configuration.
+- The disposable installer-lifecycle acceptance covered clean install, 25/25 installed health,
+  genuine linked-Medium protected-state validation, the exact five-task topology, idempotent
+  update, real `-RepairTasks`, default uninstall, reinstall and purge. The optional
+  real-window lifecycle smoke was not observed and is not claimed as passed.

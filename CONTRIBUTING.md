@@ -19,6 +19,10 @@ product *does*, start with [README.md](README.md).
 
 You do **not** need to install DevWS to work on it.
 
+A clean `-RequireFullCoverage` run needs both a genuine packaged **stable** Windows Terminal
+and an all-users AutoHotkey v2 installation. The repository-layout `DEVWS_AHK_PATH` override
+is a development/hosted-CI convenience only; installed High-integrity processes ignore it.
+
 ## 2. Repository layout
 
 ```text
@@ -83,6 +87,9 @@ The suite is **hermetic by construction**. It installs process-local fakes for t
 privileged-broker client surface, so ordinary tests never contact the live broker, its task
 or its mutex. It writes only into a temporary test root and restores the environment
 afterwards. It must never touch your real installation, configuration or installed tasks.
+
+Documentation-only changes still run the canonical suite; the public documentation set,
+cross-document links and source-referenced document paths are covered by it.
 
 The suite is expected to run in an elevated PowerShell. It creates its protected-state
 fixtures through the production initializer and asserts the elevated token path.

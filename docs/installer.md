@@ -43,8 +43,8 @@ actionable message and leaves the machine untouched.
 | --- | --- |
 | **Windows** | The process is running on Windows. |
 | **PowerShell 7+** | Major version 7 or newer. |
-| **Windows Terminal** | The genuine registered Microsoft package is resolved through the operating system's package APIs, its publisher identity is validated, and a non-reparse `WindowsTerminal.exe` under the protected package location is confirmed. A foreign, repackaged or unregistered build is refused. |
-| **AutoHotkey v2** | A machine-wide (all-users) installation whose recorded directory resolves to an existing `v2\AutoHotkey64.exe` under an administrator-protected Program Files root, with file metadata reporting major version 2. DevWS never installs it, and a current-user-only installation is rejected for installed operation. |
+| **Windows Terminal** | A genuine registered Microsoft **stable** package is resolved through the operating system's package APIs, its publisher identity is validated, and a non-reparse `WindowsTerminal.exe` under the protected package location is confirmed. A foreign, repackaged or unregistered build is refused. No minimum Windows Terminal version is claimed. |
+| **AutoHotkey v2** | A machine-wide (all-users) installation whose recorded directory resolves to an existing `v2\AutoHotkey64.exe` under an administrator-protected Program Files root, with file metadata reporting major version 2. DevWS never installs it, does not own or test the upstream AutoHotkey installer, and rejects a current-user-only installation for installed operation. The accepted contract is the installed machine-wide state. |
 | **Administrator** | Checked after the prerequisites and before any modification. |
 
 DevWS never installs third-party software for you, and there is no onboarding wizard.
@@ -219,8 +219,8 @@ DevWS manages exactly one Startup script, `TerminalShortcut.ahk`:
   never breaks the built-in shortcut.
 
 The installer regenerates the include from canonical configuration before installing the
-core script. Recognised historical content — including the pre-release core that carried a
-retired external-task binding — is upgraded in place; unknown content is left untouched and
+core script. Recognised historical content — including an older core that carried a retired
+external-task binding — is upgraded in place; unknown content is left untouched and
 reported. Backups are taken before replacing a legacy `.ws` hotkey, and no backup files are
 left in the Startup folder.
 
@@ -318,7 +318,13 @@ root, install and update timestamps, whether DevWS added the `PATH` entry, legac
 hotkey backup locations, task definition backups, and what happened to the configuration.
 It never contains the workspace configuration itself.
 
-## 13. Manual validation
+## 13. Acceptance and manual validation
+
+The installer lifecycle was acceptance-tested on a disposable Windows 11 VM: clean install,
+25/25 installed health, genuine linked-Medium protected-state validation, the exact five-task
+topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall, purge, and a
+final residue/ownership audit. The optional real-window lifecycle smoke was **not observed**
+in that environment and is not claimed as passed.
 
 Behaviour that cannot be covered by automated tests — real windows, real tasks, real
 monitor topologies — is listed in

@@ -1,5 +1,7 @@
 # DevWS
 
+[![CI](https://github.com/ekinokss/DevWS/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ekinokss/DevWS/actions/workflows/ci.yml)
+
 **A configuration-driven workspace orchestrator for Windows.**
 
 DevWS restores and manages a complete multi-window development environment — Windows
@@ -8,9 +10,10 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-release.** DevWS has no published release yet. The repository is a
-> source-first project: there is no installer package, no release binary and no
-> distribution channel. Everything below describes the current source.
+> **Status: source-first, pre-1.0.** DevWS has no tagged release yet. The repository is the
+> distribution: installation uses the tracked PowerShell installer. There is no installer
+> package, release binary, container image or package-manager distribution. The generated
+> native assembly is installation-time output and is not byte-reproducible.
 
 ---
 
@@ -60,14 +63,31 @@ workspace" state. Every change is the result of a command you ran.
 Win32 window management, Windows integrity levels and the Windows registry. It does not
 run on Linux or macOS, and it is not portable to them.
 
+## Project status and CI
+
+The permanent hosted gate is [`.github/workflows/ci.yml`](.github/workflows/ci.yml). It runs
+the canonical suite on GitHub-hosted `windows-latest` with read-only repository permissions.
+Hosted Windows cannot provide the genuine linked-Medium authority that one protected-state
+check requires, so the hosted gate accepts exactly one runtime skip: that named Medium-token
+integration case, and only when the runner reports the authority as unavailable. Any other
+skip, any failure and any filter exclusion fails the gate.
+
+The strict local release gate is stronger: it must pass with zero failures, zero runtime
+skips and zero filter exclusions on a UAC-enabled, elevated Windows environment, where the
+positive linked-Medium path executes.
+
+The installer lifecycle was acceptance-tested on a disposable Windows 11 VM: clean install,
+25/25 installed health, genuine linked-Medium protected-state validation, the exact five-task
+topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall and purge.
+
 ## Prerequisites
 
 | Requirement | Notes |
 | --- | --- |
 | **Windows** | DevWS is validated on Windows 11. No older Windows release is currently claimed as supported. |
 | **PowerShell 7+** | Required to run the CLI and the installer. Windows PowerShell 5.1 is not sufficient. |
-| **Windows Terminal** | The genuine Microsoft Store / packaged Windows Terminal. DevWS resolves it through the official package identity and refuses to launch an untrusted executable. |
-| **AutoHotkey v2** | Required for global hotkeys and for the window focus/close helpers. It must be installed **for all users** under an administrator-protected Program Files location; a current-user-only installation is not accepted for installed DevWS because elevated operations launch AutoHotkey from High-integrity workers. DevWS does not install it. |
+| **Windows Terminal** | A genuine packaged **stable** Windows Terminal installation. DevWS resolves it through the official package identity and refuses to launch an untrusted executable. No minimum Windows Terminal version is claimed. |
+| **AutoHotkey v2** | Required for global hotkeys and for the window focus/close helpers. It must be installed **for all users** under an administrator-protected Program Files location; a current-user-only installation is not accepted for installed DevWS because elevated operations launch AutoHotkey from High-integrity workers. DevWS does not install, own or test the upstream AutoHotkey installer; the accepted contract is the installed machine-wide v2 state. |
 | **Administrator rights for installation** | The installer creates or updates DevWS-managed scheduled tasks and writes to a protected location. Normal `ws` commands do **not** require elevation. |
 
 DevWS never installs third-party software for you. If a prerequisite is missing the
@@ -75,15 +95,22 @@ installer stops before making any change and tells you what is missing.
 
 ## Installing
 
-Installation is a single elevated PowerShell session run from the repository root:
+Start from a fresh clone or a source archive. From a clone:
+
+```powershell
+git clone https://github.com/ekinokss/DevWS.git
+cd DevWS
+```
+
+Then, in an **Administrator** PowerShell 7 session in the repository root:
 
 ```powershell
 pwsh
 .\install.ps1
 ```
 
-Run it from an **Administrator** PowerShell. The installer does not self-elevate; if it
-is not elevated it prints the exact command to re-run.
+The installer does not self-elevate; if it is not elevated it prints the exact command to
+re-run.
 
 The installer is idempotent and preserve-oriented. In particular it does **not** replace
 an existing valid configuration:
@@ -93,6 +120,24 @@ an existing valid configuration:
 - an unrecognised or invalid configuration is left untouched and reported.
 
 See [docs/installer.md](docs/installer.md) for the full contract.
+
+## Updating and repairing
+
+Re-run the installer from an elevated PowerShell 7 session to update idempotently:
+
+```powershell
+.\install.ps1
+```
+
+If a packaged PowerShell installation has updated and `ws doctor` or
+`install.ps1 -HealthCheck` reports that the managed tasks still point at a missing
+interpreter, repair only those bindings:
+
+```powershell
+.\install.ps1 -RepairTasks
+```
+
+This does not reinstall the application, configuration, PATH entry or hotkeys.
 
 ## First run: a neutral, empty workspace
 
@@ -247,6 +292,20 @@ from the user-writable CLI, configuration and state. The trust boundaries are de
 | `%ProgramFiles%\DevWS\privileged` | Administrator-protected privileged runtime |
 | `%ProgramData%\DevWS\privileged-state\<SID>` | Administrator-protected privileged state |
 
+## Uninstalling
+
+Uninstall removes the five managed tasks, the installed runtime, the DevWS-owned PATH entry
+and the DevWS-managed Startup hotkey, while preserving your canonical configuration, state,
+backups, the legacy `%USERPROFILE%\.ws` directory and unrelated integrations:
+
+```powershell
+.\uninstall.ps1
+```
+
+Add `-Purge` to remove the canonical configuration and disposable state/backups as well.
+Both forms require elevation, and `-Force` skips the confirmation prompt. See
+[docs/installer.md](docs/installer.md) §10.
+
 ## Documentation
 
 | Document | Contents |
@@ -261,7 +320,7 @@ from the user-writable CLI, configuration and state. The trust boundaries are de
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development environment, tests and contribution guidance |
 | [SECURITY.md](SECURITY.md) | Security model summary and how to report a problem |
 | [PROVENANCE.md](PROVENANCE.md) | Where this source came from and how the repository is maintained |
-| [CHANGELOG.md](CHANGELOG.md) | Changes, kept truthful and release-free until a release exists |
+| [CHANGELOG.md](CHANGELOG.md) | Versioned change history, prepared for the initial public source release |
 
 ## License
 
