@@ -44,7 +44,7 @@ actionable message and leaves the machine untouched.
 | **Windows** | The process is running on Windows. |
 | **PowerShell 7+** | Major version 7 or newer. |
 | **Windows Terminal** | The genuine registered Microsoft package is resolved through the operating system's package APIs, its publisher identity is validated, and a non-reparse `WindowsTerminal.exe` under the protected package location is confirmed. A foreign, repackaged or unregistered build is refused. |
-| **AutoHotkey v2** | Present at its installed location. |
+| **AutoHotkey v2** | A machine-wide (all-users) installation whose recorded directory resolves to an existing `v2\AutoHotkey64.exe` under an administrator-protected Program Files root, with file metadata reporting major version 2. DevWS never installs it, and a current-user-only installation is rejected for installed operation. |
 | **Administrator** | Checked after the prerequisites and before any modification. |
 
 DevWS never installs third-party software for you, and there is no onboarding wizard.

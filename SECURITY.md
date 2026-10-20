@@ -54,7 +54,11 @@ Three rules enforce the split:
 1. **A high-integrity DevWS process loads code only from the administrator-protected
    privileged root.** There is no fallback to a user-writable copy.
 2. **Executables are resolved absolutely and validated**, never through `PATH` and never from
-   a user-writable value.
+   a user-writable value. AutoHotkey follows the same rule for installed operation: it must
+   come from the machine-wide all-users installation under an administrator-protected
+   Program Files root, be an existing `AutoHotkey64.exe`, and report major version 2.
+   Current-user installations, aliases and the repository-only `DEVWS_AHK_PATH` override are
+   never used by an installed High-integrity process.
 3. **Privileged state is validated on every authoritative read** and is never silently
    repaired, re-owned or re-permissioned.
 

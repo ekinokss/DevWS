@@ -168,8 +168,10 @@ Recorded for completeness, each with bounded impact:
   administrator-protected roots this is mitigated by the directory permissions; in
   user-owned state the exposure is limited to the user's own data.
 - AutoHotkey helper invocations build an argument string by concatenation without escaping
-  embedded quote characters, and the AutoHotkey executable itself is checked for existence
-  rather than verified by hash.
+  embedded quote characters. The installed interpreter is resolved from the machine-wide
+  installer record (or the Program Files default) and validated for location, executable
+  name and major version 2, but DevWS does not own its bytes: there is no hash pin and no
+  publisher-signature check.
 - The exact-title locator accepts a matching window by title without a process check, so a
   same-user process could race a same-titled window. Impact is limited to that user's own
   windows.

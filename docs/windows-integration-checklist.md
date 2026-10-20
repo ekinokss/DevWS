@@ -45,6 +45,10 @@ If you have a legacy `%USERPROFILE%\.ws` directory, note its hash too — it mus
 - [ ] A non-elevated shell is told the exact command to re-run, and **nothing** is modified.
 - [ ] With a prerequisite missing, the installer aborts before any modification and names
       what is missing.
+- [ ] AutoHotkey is resolved from the machine-wide (all-users) installation under Program
+      Files, never from `PATH`, a user-profile installation or a literal hard-coded path.
+      A current-user-only installation makes the prerequisite fail with an explanatory
+      message rather than being accepted.
 
 **Needs elevation.**
 

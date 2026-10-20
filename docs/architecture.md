@@ -331,6 +331,14 @@ rectangle capture, restore, move and exact-title lookup — is now in-process in
 assembly. The helper scripts are strictly descendant-free, and their output is captured in
 memory rather than through temporary files.
 
+Because High-integrity workers invoke it, the installed interpreter is selected by a
+trusted machine-wide resolver: the all-users installer record under
+`HKLM\Software\AutoHotkey` (or the Program Files default when no record exists), validated
+as an existing `AutoHotkey64.exe` beneath an administrator-protected Program Files root with
+major version 2. Current-user installations, `PATH`, aliases and user-writable locations are
+never used. Repository development and hosted CI may point `DEVWS_AHK_PATH` at a disposable
+portable copy; installed layouts ignore that override.
+
 Replacing AutoHotkey entirely is a recognised future option, not a committed plan; see
 [future-work.md](future-work.md).
 

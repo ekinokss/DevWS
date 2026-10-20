@@ -67,7 +67,7 @@ run on Linux or macOS, and it is not portable to them.
 | **Windows** | DevWS is validated on Windows 11. No older Windows release is currently claimed as supported. |
 | **PowerShell 7+** | Required to run the CLI and the installer. Windows PowerShell 5.1 is not sufficient. |
 | **Windows Terminal** | The genuine Microsoft Store / packaged Windows Terminal. DevWS resolves it through the official package identity and refuses to launch an untrusted executable. |
-| **AutoHotkey v2** | Required for global hotkeys and for the window focus/close helpers. DevWS does not install it. |
+| **AutoHotkey v2** | Required for global hotkeys and for the window focus/close helpers. It must be installed **for all users** under an administrator-protected Program Files location; a current-user-only installation is not accepted for installed DevWS because elevated operations launch AutoHotkey from High-integrity workers. DevWS does not install it. |
 | **Administrator rights for installation** | The installer creates or updates DevWS-managed scheduled tasks and writes to a protected location. Normal `ws` commands do **not** require elevation. |
 
 DevWS never installs third-party software for you. If a prerequisite is missing the

@@ -78,6 +78,19 @@ function Get-DevWSHealthContext {
         $trustedWtError = $_.Exception.Message
     }
 
+    # AutoHotkey follows the same shape: the resolver is evaluated now, and a
+    # failure is carried into the dedicated check instead of aborting the whole
+    # health run.
+    $trustedAhkPath  = $null
+    $trustedAhkError = $null
+
+    try {
+        $trustedAhkPath = Get-DevWSAutoHotkeyPath
+    }
+    catch {
+        $trustedAhkError = $_.Exception.Message
+    }
+
     return [pscustomobject]@{
         InstallRoot          = Get-DevWSInstallRoot
         StateRoot            = Get-DevWSStateRoot
@@ -87,7 +100,8 @@ function Get-DevWSHealthContext {
         WindowsTerminalPath  = $(if ($null -ne $trustedWtPath) { $trustedWtPath } else { Get-DevWSWindowsTerminalPath })
         WindowsTerminalTrustRoots = $(if ((Get-DevWSPathsLayout) -eq "repository") { @() } else { @(Get-DevWSTrustedWindowsTerminalRoots) })
         WindowsTerminalTrustError = $trustedWtError
-        AutoHotkeyPath       = Get-DevWSAutoHotkeyPath
+        AutoHotkeyPath       = $(if ($null -ne $trustedAhkPath) { [string]$trustedAhkPath } else { '' })
+        AutoHotkeyTrustError = $trustedAhkError
         MetadataPath         = Get-DevWSInstallMetadataPath
         PrivilegedRoot       = Get-DevWSPrivilegedInstallRoot
         PrivilegedStateRoot  = $(if ((Get-DevWSPathsLayout) -eq "repository") { $null } else { (Get-DevWSPrivilegedStateRoot) })
@@ -339,6 +353,14 @@ function Invoke-DevWSHealthCheck {
             Id          = "autohotkey"
             Description = "AutoHotkey v2 executable"
             Test        = {
+                if ($null -ne $Context.PSObject.Properties["AutoHotkeyTrustError"] -and -not [string]::IsNullOrWhiteSpace([string]$Context.AutoHotkeyTrustError)) {
+                    throw ([string]$Context.AutoHotkeyTrustError)
+                }
+
+                if ([string]::IsNullOrWhiteSpace([string]$Context.AutoHotkeyPath)) {
+                    throw "AutoHotkey v2 could not be resolved."
+                }
+
                 return (Test-Path -LiteralPath $Context.AutoHotkeyPath -PathType Leaf)
             }
         },

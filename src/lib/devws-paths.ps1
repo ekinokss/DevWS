@@ -1907,12 +1907,272 @@ function Get-DevWSBindingsAhkPath {
     return (Join-Path (Get-DevWSStateRoot) "hotkeys\bindings.ahk")
 }
 
+function Get-DevWSTrustedAutoHotkeyRoots {
+    # Administrator-protected roots a machine-wide AutoHotkey installation may
+    # live under. System32 is deliberately excluded: AutoHotkey is never a
+    # system executable.
+    $roots = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($base in @([Environment]::GetFolderPath('ProgramFiles'), [Environment]::GetFolderPath('ProgramFilesX86'))) {
+        if (-not [string]::IsNullOrWhiteSpace($base)) {
+            $roots.Add($base) | Out-Null
+        }
+    }
+
+    return $roots.ToArray()
+}
+
+function Get-DevWSAutoHotkeyInstallRecord {
+    # Read-only discovery of the official installer's recorded directory.
+    #
+    # Machine (HKLM, native 64-bit view) is the only trust authority. The
+    # per-user record is read only to improve a failure message: an HKCU path is
+    # never returned as executable authority.
+    #
+    # Returns { Scope; Present; InstallDir; Error }. `Present` means the
+    # AutoHotkey key itself exists; a present record with an empty/malformed
+    # InstallDir is an explicit broken installation, not a missing one.
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('Machine', 'User')]
+        [string]$Scope
+    )
+
+    $hive = if ($Scope -eq 'Machine') {
+        [Microsoft.Win32.RegistryHive]::LocalMachine
+    }
+    else {
+        [Microsoft.Win32.RegistryHive]::CurrentUser
+    }
+
+    $base = $null
+
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, [Microsoft.Win32.RegistryView]::Registry64)
+        $key = $base.OpenSubKey('Software\AutoHotkey', $false)
+
+        if ($null -eq $key) {
+            return [pscustomobject]@{ Scope = $Scope; Present = $false; InstallDir = ''; Error = '' }
+        }
+
+        try {
+            $value = $key.GetValue('InstallDir', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+
+            if ($null -eq $value) {
+                return [pscustomobject]@{ Scope = $Scope; Present = $true; InstallDir = ''; Error = 'the record has no InstallDir value' }
+            }
+
+            if ($value -isnot [string]) {
+                return [pscustomobject]@{ Scope = $Scope; Present = $true; InstallDir = ''; Error = 'the InstallDir value is not a string' }
+            }
+
+            return [pscustomobject]@{ Scope = $Scope; Present = $true; InstallDir = ([string]$value).Trim(); Error = '' }
+        }
+        finally {
+            $key.Dispose()
+        }
+    }
+    catch {
+        return [pscustomobject]@{ Scope = $Scope; Present = $false; InstallDir = ''; Error = $_.Exception.Message }
+    }
+    finally {
+        if ($null -ne $base) { $base.Dispose() }
+    }
+}
+
+function Test-DevWSTrustedAutoHotkeyPath {
+    # Pure candidate assessment for the installed runtime interpreter.
+    #
+    # Accepted: an existing absolute `AutoHotkey64.exe` beneath an
+    # administrator-protected Program Files root whose file metadata reports
+    # major version 2. Token/user identity is never consulted; the root is the
+    # authority. No hash and no publisher check is performed (DevWS does not own
+    # AutoHotkey's bytes and supported versions update independently).
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Path,
+        [string[]]$TrustedRoots = @(Get-DevWSTrustedAutoHotkeyRoots),
+        [scriptblock]$GetVersionInfo = { param($CandidatePath) (Get-Item -LiteralPath $CandidatePath -ErrorAction Stop).VersionInfo }
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'the AutoHotkey executable path is empty'; Path = '' }
+    }
+
+    if (-not [System.IO.Path]::IsPathRooted($Path)) {
+        return [pscustomobject]@{ Ok = $false; Reason = "the AutoHotkey executable '$Path' is not an absolute path"; Path = $Path }
+    }
+
+    try {
+        $full = [System.IO.Path]::GetFullPath($Path)
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Reason = "the AutoHotkey executable path '$Path' could not be normalized"; Path = $Path }
+    }
+
+    if ((Split-Path -Leaf $full) -ine 'AutoHotkey64.exe') {
+        return [pscustomobject]@{ Ok = $false; Reason = "the AutoHotkey executable '$full' must be named AutoHotkey64.exe"; Path = $full }
+    }
+
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        return [pscustomobject]@{ Ok = $false; Reason = "the AutoHotkey executable '$full' does not exist"; Path = $full }
+    }
+
+    $matchedRoot = ''
+
+    foreach ($root in @($TrustedRoots)) {
+        if (-not [string]::IsNullOrWhiteSpace($root) -and (Test-DevWSPathUnderRoot -Path $full -Root $root)) {
+            $matchedRoot = $root
+            break
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($matchedRoot)) {
+        return [pscustomobject]@{ Ok = $false; Reason = "the AutoHotkey executable '$full' is outside the administrator-protected Program Files roots"; Path = $full }
+    }
+
+    # Best-effort reparse rejection from the executable up to its trusted root.
+    # This is attribute-based, not handle-based, so it cannot prove a
+    # TOCTOU-free result; it only refuses the ordinary junction/symlink shapes.
+    $current = $full
+
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+
+        if ($null -ne $item -and (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            return [pscustomobject]@{ Ok = $false; Reason = "the AutoHotkey executable '$full' is or is beneath a reparse point ('$current')"; Path = $full }
+        }
+
+        if ($current -ieq $matchedRoot) { break }
+
+        $parent = Split-Path -Parent $current
+
+        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $current) { break }
+
+        $current = $parent
+    }
+
+    try {
+        $versionInfo = & $GetVersionInfo $full
+    }
+    catch {
+        return [pscustomobject]@{ Ok = $false; Reason = "the version metadata of '$full' could not be read"; Path = $full }
+    }
+
+    $major = 0
+
+    try {
+        $major = [Math]::Max([int]$versionInfo.FileMajorPart, [int]$versionInfo.ProductMajorPart)
+    }
+    catch {
+        $major = 0
+    }
+
+    if ($major -ne 2) {
+        return [pscustomobject]@{ Ok = $false; Reason = "the AutoHotkey executable '$full' is not AutoHotkey v2 (reported major version $major)"; Path = $full }
+    }
+
+    return [pscustomobject]@{ Ok = $true; Reason = ''; Path = $full }
+}
+
+function Resolve-DevWSTrustedAutoHotkeyPath {
+    # Installed-layout AutoHotkey resolver.
+    #
+    # Discovery order:
+    #   1. an explicit machine-wide (HKLM) installation record;
+    #   2. otherwise the canonical all-users default derived from the Program
+    #      Files known folder.
+    #
+    # An explicit machine-wide record is NEVER silently reinterpreted: a stale,
+    # malformed or untrusted record fails with an actionable error instead of
+    # falling back. HKCU is diagnostic input only and can never redirect the
+    # result.
+    param(
+        $MachineRecord,
+        $UserRecord,
+        [string[]]$TrustedRoots = @(Get-DevWSTrustedAutoHotkeyRoots),
+        [string]$ProgramFilesRoot = '',
+        [scriptblock]$GetVersionInfo = { param($CandidatePath) (Get-Item -LiteralPath $CandidatePath -ErrorAction Stop).VersionInfo }
+    )
+
+    if ($null -eq $MachineRecord) {
+        $MachineRecord = Get-DevWSAutoHotkeyInstallRecord -Scope Machine
+    }
+
+    if ($null -ne $MachineRecord -and -not [string]::IsNullOrWhiteSpace([string]$MachineRecord.Error)) {
+        throw ("The machine-wide AutoHotkey registry record (HKLM\Software\AutoHotkey) could not be read: " + [string]$MachineRecord.Error + ". Repair the AutoHotkey for all users installation.")
+    }
+
+    if ($null -ne $MachineRecord -and [bool]$MachineRecord.Present) {
+        $installDir = [string]$MachineRecord.InstallDir
+
+        if ([string]::IsNullOrWhiteSpace($installDir)) {
+            throw "The machine-wide AutoHotkey registry record (HKLM\Software\AutoHotkey) is malformed: it has no usable InstallDir value. Reinstall AutoHotkey v2 for all users under Program Files."
+        }
+
+        if ($installDir.IndexOf('%') -ge 0) {
+            throw "The machine-wide AutoHotkey registry record (HKLM\Software\AutoHotkey) points at '$installDir'; environment-variable forms are not accepted. Reinstall AutoHotkey v2 for all users under Program Files."
+        }
+
+        if (-not [System.IO.Path]::IsPathRooted($installDir)) {
+            throw "The machine-wide AutoHotkey registry record (HKLM\Software\AutoHotkey) points at '$installDir', which is not an absolute path. Reinstall AutoHotkey v2 for all users under Program Files."
+        }
+
+        $candidate = Join-Path $installDir 'v2\AutoHotkey64.exe'
+        $assessment = Test-DevWSTrustedAutoHotkeyPath -Path $candidate -TrustedRoots $TrustedRoots -GetVersionInfo $GetVersionInfo
+
+        if (-not $assessment.Ok) {
+            throw ("The machine-wide AutoHotkey installation recorded at '$installDir' is not usable: " + $assessment.Reason + ". Reinstall AutoHotkey v2 for all users under an administrator-protected Program Files location, or repair the HKLM\Software\AutoHotkey record.")
+        }
+
+        return $assessment.Path
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ProgramFilesRoot)) {
+        $ProgramFilesRoot = [Environment]::GetFolderPath('ProgramFiles')
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ProgramFilesRoot)) {
+        throw "The Windows Program Files folder could not be resolved, so the machine-wide AutoHotkey installation cannot be located."
+    }
+
+    $fallback = Join-Path $ProgramFilesRoot 'AutoHotkey\v2\AutoHotkey64.exe'
+    $assessment = Test-DevWSTrustedAutoHotkeyPath -Path $fallback -TrustedRoots $TrustedRoots -GetVersionInfo $GetVersionInfo
+
+    if ($assessment.Ok) {
+        return $assessment.Path
+    }
+
+    # Diagnostic only: a current-user installation is never authority.
+    if ($null -eq $UserRecord) {
+        $UserRecord = Get-DevWSAutoHotkeyInstallRecord -Scope User
+    }
+
+    $userHint = ''
+
+    if ($null -ne $UserRecord -and [bool]$UserRecord.Present -and -not [string]::IsNullOrWhiteSpace([string]$UserRecord.InstallDir)) {
+        $userDir = [string]$UserRecord.InstallDir
+        $userCandidate = Join-Path $userDir 'v2\AutoHotkey64.exe'
+
+        if (Test-Path -LiteralPath $userCandidate -PathType Leaf) {
+            $userHint = " AutoHotkey v2 is installed only for the current user ('$userDir'). DevWS elevated window operations execute AutoHotkey from High-integrity workers, so installed DevWS requires an all-users AutoHotkey v2 installation under an administrator-protected Program Files location."
+        }
+    }
+
+    throw ("No trusted machine-wide AutoHotkey v2 installation was found: " + $assessment.Reason + "." + $userHint + " Install AutoHotkey v2 for all users under an administrator-protected Program Files location.")
+}
+
 function Get-DevWSAutoHotkeyPath {
+    # Canonical runtime entry point.
+    #
+    # The repository-only DEVWS_AHK_PATH override is honoured exactly where it
+    # always was (development and hosted CI); installed layouts ignore it and
+    # use the trusted machine-wide resolver, so a High-integrity worker can
+    # never be redirected to a user-controlled executable.
     if ((Test-DevWSPathsOverrideAllowed) -and -not [string]::IsNullOrWhiteSpace($env:DEVWS_AHK_PATH)) {
         return $env:DEVWS_AHK_PATH.Trim()
     }
 
-    return "C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe"
+    return Resolve-DevWSTrustedAutoHotkeyPath
 }
 
 function Get-DevWSWindowsTerminalPath {

@@ -12831,6 +12831,208 @@ public static class DevWSAppCandidateTestWindow
         }
     }
 
+    Test-Case "trusted AutoHotkey resolution accepts only machine-wide Program Files v2" {
+        $versionReader = {
+            param($CandidatePath)
+
+            if ($CandidatePath -like '*ahk-v1*') { return [pscustomobject]@{ FileMajorPart = 1; ProductMajorPart = 1 } }
+            return [pscustomobject]@{ FileMajorPart = 2; ProductMajorPart = 2 }
+        }
+
+        function New-AhkFixtureRoot([string]$Name) {
+            $pf = Join-Path $TestRoot ("ahk-trust-" + $Name + "\Program Files")
+            New-Item -ItemType Directory -Path $pf -Force | Out-Null
+            return $pf
+        }
+
+        function New-AhkStub([string]$Directory, [string]$Leaf = 'AutoHotkey64.exe') {
+            New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+            $path = Join-Path $Directory $Leaf
+            Set-Content -LiteralPath $path -Value "# AutoHotkey fixture stub" -NoNewline
+            return $path
+        }
+
+        function New-AhkRecord([string]$Scope, [AllowNull()][string]$InstallDir, [switch]$Present, [string]$ErrorText = '') {
+            return [pscustomobject]@{
+                Scope      = $Scope
+                Present    = [bool]$Present
+                InstallDir = [string]$InstallDir
+                Error      = $ErrorText
+            }
+        }
+
+        # 1. Standard all-users installation recorded in HKLM.
+        $pf = New-AhkFixtureRoot 'standard'
+        $standardDir = Join-Path $pf 'AutoHotkey'
+        $standardExe = New-AhkStub (Join-Path $standardDir 'v2')
+
+        $resolved = Resolve-DevWSTrustedAutoHotkeyPath `
+            -MachineRecord (New-AhkRecord 'Machine' $standardDir -Present) `
+            -UserRecord (New-AhkRecord 'User' $null) `
+            -TrustedRoots @($pf) `
+            -ProgramFilesRoot $pf `
+            -GetVersionInfo $versionReader
+
+        Assert-Equal $standardExe $resolved "a standard all-users installation is accepted"
+
+        # 2. Custom all-users installation that still lives under Program Files.
+        $pf2 = New-AhkFixtureRoot 'custom'
+        $customDir = Join-Path $pf2 'Dev Tools\AutoHotkey 2'
+        $customExe = New-AhkStub (Join-Path $customDir 'v2')
+
+        $resolved = Resolve-DevWSTrustedAutoHotkeyPath `
+            -MachineRecord (New-AhkRecord 'Machine' $customDir -Present) `
+            -UserRecord (New-AhkRecord 'User' $null) `
+            -TrustedRoots @($pf2) `
+            -ProgramFilesRoot $pf2 `
+            -GetVersionInfo $versionReader
+
+        Assert-Equal $customExe $resolved "a custom all-users installation under Program Files is accepted"
+
+        # 3. No registry record: the canonical default is derived from Program Files.
+        $pf3 = New-AhkFixtureRoot 'fallback'
+        $fallbackExe = New-AhkStub (Join-Path $pf3 'AutoHotkey\v2')
+
+        $resolved = Resolve-DevWSTrustedAutoHotkeyPath `
+            -MachineRecord (New-AhkRecord 'Machine' $null) `
+            -UserRecord (New-AhkRecord 'User' $null) `
+            -TrustedRoots @($pf3) `
+            -ProgramFilesRoot $pf3 `
+            -GetVersionInfo $versionReader
+
+        Assert-Equal $fallbackExe $resolved "the canonical default is derived from the Program Files known folder"
+
+        # 4. Current-user-only installation: never authority, actionable refusal.
+        $pf4 = New-AhkFixtureRoot 'useronly'
+        $userDir = Join-Path $TestRoot 'ahk-trust-useronly\LocalAppData\Programs\AutoHotkey'
+        $null = New-AhkStub (Join-Path $userDir 'v2')
+
+        $error = $null
+        try {
+            $null = Resolve-DevWSTrustedAutoHotkeyPath `
+                -MachineRecord (New-AhkRecord 'Machine' $null) `
+                -UserRecord (New-AhkRecord 'User' $userDir -Present) `
+                -TrustedRoots @($pf4) `
+                -ProgramFilesRoot $pf4 `
+                -GetVersionInfo $versionReader
+        }
+        catch { $error = $_.Exception.Message }
+
+        Assert-True ($null -ne $error) "a current-user-only installation is not trusted"
+        Assert-Contains $error "installed only for the current user" "the diagnostic explains the all-users requirement"
+        Assert-Contains $error "High-integrity" "the diagnostic names the privileged reason"
+        Assert-Contains $error "all-users AutoHotkey v2 installation" "the diagnostic prescribes the all-users installation"
+
+        # 5. HKLM wins over an arbitrary HKCU record.
+        $pf5 = New-AhkFixtureRoot 'both'
+        $machineDir = Join-Path $pf5 'AutoHotkey'
+        $machineExe = New-AhkStub (Join-Path $machineDir 'v2')
+        $otherUserDir = Join-Path $TestRoot 'ahk-trust-both\LocalAppData\Programs\AutoHotkey'
+        $null = New-AhkStub (Join-Path $otherUserDir 'v2')
+
+        $resolved = Resolve-DevWSTrustedAutoHotkeyPath `
+            -MachineRecord (New-AhkRecord 'Machine' $machineDir -Present) `
+            -UserRecord (New-AhkRecord 'User' $otherUserDir -Present) `
+            -TrustedRoots @($pf5) `
+            -ProgramFilesRoot $pf5 `
+            -GetVersionInfo $versionReader
+
+        Assert-Equal $machineExe $resolved "HKLM is authoritative and HKCU cannot redirect it"
+
+        # 6. Stale HKLM record: explicit failure, never a silent fallback.
+        $pf6 = New-AhkFixtureRoot 'stale'
+        $null = New-AhkStub (Join-Path $pf6 'AutoHotkey\v2')
+        $staleDir = Join-Path $pf6 'Removed AutoHotkey'
+
+        $error = $null
+        try {
+            $null = Resolve-DevWSTrustedAutoHotkeyPath `
+                -MachineRecord (New-AhkRecord 'Machine' $staleDir -Present) `
+                -UserRecord (New-AhkRecord 'User' $null) `
+                -TrustedRoots @($pf6) `
+                -ProgramFilesRoot $pf6 `
+                -GetVersionInfo $versionReader
+        }
+        catch { $error = $_.Exception.Message }
+
+        Assert-True ($null -ne $error) "a stale machine-wide record fails"
+        Assert-Contains $error $staleDir "the failure names the recorded directory"
+        Assert-Contains $error "not usable" "the failure is actionable"
+        Assert-Contains $error "does not exist" "the failure names the missing interpreter"
+
+        # 7. Machine-wide record outside Program Files.
+        $pf7 = New-AhkFixtureRoot 'outside'
+        $outsideDir = Join-Path $TestRoot 'ahk-trust-outside\User AutoHotkey'
+        $null = New-AhkStub (Join-Path $outsideDir 'v2')
+
+        $error = $null
+        try {
+            $null = Resolve-DevWSTrustedAutoHotkeyPath `
+                -MachineRecord (New-AhkRecord 'Machine' $outsideDir -Present) `
+                -UserRecord (New-AhkRecord 'User' $null) `
+                -TrustedRoots @($pf7) `
+                -ProgramFilesRoot $pf7 `
+                -GetVersionInfo $versionReader
+        }
+        catch { $error = $_.Exception.Message }
+
+        Assert-True ($null -ne $error) "a machine-wide record outside Program Files is refused"
+        Assert-Contains $error "outside the administrator-protected Program Files roots" "the refusal names the root policy"
+
+        # 8. Malformed and environment-variable records are explicit failures.
+        foreach ($malformed in @('', '%ProgramFiles%\AutoHotkey', 'AutoHotkey')) {
+            $error = $null
+            try {
+                $null = Resolve-DevWSTrustedAutoHotkeyPath `
+                    -MachineRecord (New-AhkRecord 'Machine' $malformed -Present) `
+                    -UserRecord (New-AhkRecord 'User' $null) `
+                    -TrustedRoots @($pf7) `
+                    -ProgramFilesRoot $pf7 `
+                    -GetVersionInfo $versionReader
+            }
+            catch { $error = $_.Exception.Message }
+
+            Assert-True ($null -ne $error) "malformed machine-wide record '$malformed' fails"
+            Assert-Contains $error "HKLM\Software\AutoHotkey" "the failure names the registry record"
+        }
+
+        # 9. v1 and a wrong leaf are rejected by the pure candidate assessment.
+        $v1Dir = Join-Path $pf7 'ahk-v1\v2'
+        $v1Exe = New-AhkStub $v1Dir
+        $v1 = Test-DevWSTrustedAutoHotkeyPath -Path $v1Exe -TrustedRoots @($pf7) -GetVersionInfo $versionReader
+        Assert-Equal $false $v1.Ok "AutoHotkey v1 is refused"
+        Assert-Contains $v1.Reason "not AutoHotkey v2" "the refusal names the version"
+
+        $wrongLeaf = New-AhkStub (Join-Path $pf7 'wrong') 'AutoHotkey.exe'
+        $wrong = Test-DevWSTrustedAutoHotkeyPath -Path $wrongLeaf -TrustedRoots @($pf7) -GetVersionInfo $versionReader
+        Assert-Equal $false $wrong.Ok "a different executable name is refused"
+        Assert-Contains $wrong.Reason "AutoHotkey64.exe" "the refusal names the required executable"
+
+        $bare = Test-DevWSTrustedAutoHotkeyPath -Path 'AutoHotkey64.exe' -TrustedRoots @($pf7) -GetVersionInfo $versionReader
+        Assert-Equal $false $bare.Ok "a bare executable name is refused"
+        Assert-Contains $bare.Reason "not an absolute path" "the refusal names absoluteness"
+
+        $outsideExe = New-AhkStub (Join-Path $TestRoot 'ahk-trust-outside\bin')
+        $outside = Test-DevWSTrustedAutoHotkeyPath -Path $outsideExe -TrustedRoots @($pf7) -GetVersionInfo $versionReader
+        Assert-Equal $false $outside.Ok "a user-writable location is refused"
+        Assert-Contains $outside.Reason "outside the administrator-protected Program Files roots" "the refusal names the root policy"
+
+        # 10. The canonical runtime entry point uses the resolver, never a literal.
+        $paths = Get-SourceOf "src\lib\devws-paths.ps1"
+        $start = $paths.IndexOf('function Resolve-DevWSTrustedAutoHotkeyPath')
+        $end   = $paths.IndexOf('function Get-DevWSWindowsTerminalPath')
+        Assert-True ($start -ge 0 -and $end -gt $start) "the AutoHotkey resolver region is located"
+
+        $region = $paths.Substring($start, $end - $start)
+        Assert-Contains $region 'Get-DevWSAutoHotkeyInstallRecord' "the resolver consumes the registry discovery adapter"
+        Assert-Contains $region 'Test-DevWSTrustedAutoHotkeyPath' "the resolver applies the candidate policy"
+        Assert-Contains $region "GetFolderPath('ProgramFiles')" "the fallback derives from the known folder"
+        Assert-NotContains $region 'C:\Program Files' "no literal Program Files path is used"
+        Assert-NotContains $region 'Get-Command' "no command discovery"
+        Assert-NotContains $region '$env:PATH' "no PATH lookup"
+        Assert-NotContains $region 'HKCU:\' "no user-hive authority"
+    }
+
     Write-Host ""
     Start-TestGroup -Name 'install-layout' -Title 'Install layout'
 
@@ -13161,7 +13363,7 @@ public static class DevWSAppCandidateTestWindow
             '"wtRecords=$(( @(Get-DevWSWindowsTerminalPackageRecords | ForEach-Object { $_.Name + "|" + $_.PackageFamilyName + "|" + $_.PublisherId }) -join ";"))"',
             '$env:PATH = "C:\hostile-path"',
             '"wtTrustedAfterPathPoison=$(try { Resolve-DevWSTrustedWindowsTerminalPath } catch { ''ERROR: '' + $_.Exception.Message })"',
-            '"ahk=$(Get-DevWSAutoHotkeyPath)"',
+            '"ahk=$(try { Get-DevWSAutoHotkeyPath } catch { ''ERROR: '' + $_.Exception.Message })"',
             '"startup=$(Get-DevWSStartupPath)"'
         )
 
@@ -13200,7 +13402,17 @@ public static class DevWSAppCandidateTestWindow
         Assert-Contains $output "bootstrap=$privileged\helpers\cwd-shell-bootstrap.ps1" "bootstrap routed privileged"
         Assert-Contains $output "userRoot=$([Environment]::GetFolderPath('LocalApplicationData'))\DevWS" "user root derives from the registry LocalAppData"
         Assert-Contains $output "wt=$([Environment]::GetFolderPath('LocalApplicationData'))\Microsoft\WindowsApps\wt.exe" "WT alias derives from the registry LocalAppData"
-        Assert-Contains $output "ahk=C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe" "AHK path uses the fixed default"
+        $expectedAhk = $null
+        try { $expectedAhk = Resolve-DevWSTrustedAutoHotkeyPath } catch { $expectedAhk = $null }
+
+        if ($null -ne $expectedAhk) {
+            Assert-Contains $output ("ahk=" + $expectedAhk) "installed resolution uses the machine-wide trusted resolver"
+        }
+        else {
+            Assert-Contains $output "ahk=ERROR: " "installed resolution fails closed when no machine-wide installation exists"
+        }
+
+        Assert-NotContains $output "hostile-ahk" "the installed layout never honors the AutoHotkey override"
         Assert-NotContains $output "hostile" "no hostile override is honored"
 
         # The installed launch path must never trust the alias pathname: the
@@ -13794,13 +14006,35 @@ foreach ($entry in $argv) { Write-Output ("ARG:" + $entry) }
         $savedAhk = $env:DEVWS_AHK_PATH
 
         try {
+            # Repository layout: the development/CI override is honoured verbatim.
+            $overridePath = Join-Path $TestRoot "portable-ahk\AutoHotkey64.exe"
+            $env:DEVWS_AHK_PATH = $overridePath
+
+            Assert-Equal $overridePath (Get-DevWSAutoHotkeyPath) "the repository override is honored"
+            Assert-True ([System.IO.Path]::IsPathRooted($overridePath)) "the override route stays absolute"
+
+            # Without an override the path comes from the trusted machine-wide
+            # resolver, never a literal, PATH list or alias.
             Remove-Item Env:\DEVWS_AHK_PATH -ErrorAction SilentlyContinue
 
-            $ahk = Get-DevWSAutoHotkeyPath
-            Assert-Equal "C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe" $ahk "AutoHotkey resolves to the fixed absolute default"
-            Assert-True ([System.IO.Path]::IsPathRooted($ahk)) "AutoHotkey path is absolute"
-            Assert-True (Test-DevWSPathUnderRoot -Path $ahk -Root ([Environment]::GetFolderPath('ProgramFiles'))) "AutoHotkey lives under Program Files"
-            Assert-NotContains $ahk ";" "no PATH list can leak into the AutoHotkey path"
+            $machine = $null
+            try { $machine = Resolve-DevWSTrustedAutoHotkeyPath } catch { $machine = $null }
+
+            if ($null -ne $machine) {
+                Assert-Equal $machine (Get-DevWSAutoHotkeyPath) "AutoHotkey resolves through the trusted machine-wide resolver"
+                Assert-True ([System.IO.Path]::IsPathRooted($machine)) "AutoHotkey path is absolute"
+                Assert-True (
+                    (Test-DevWSPathUnderRoot -Path $machine -Root ([Environment]::GetFolderPath('ProgramFiles'))) -or
+                    (Test-DevWSPathUnderRoot -Path $machine -Root ([Environment]::GetFolderPath('ProgramFilesX86')))
+                ) "AutoHotkey lives under an administrator-protected Program Files root"
+                Assert-Equal "AutoHotkey64.exe" (Split-Path -Leaf $machine) "the v2 x64 interpreter is selected"
+                Assert-NotContains $machine ";" "no PATH list can leak into the AutoHotkey path"
+            }
+            else {
+                $threw = $null
+                try { $null = Get-DevWSAutoHotkeyPath } catch { $threw = $_.Exception.Message }
+                Assert-Contains $threw "No trusted machine-wide AutoHotkey v2 installation" "an absent machine installation fails closed with an actionable message"
+            }
 
             $ahkSource = Get-SourceOf "src\lib\devws-ahk.ps1"
             $ahkSourceCode = (@($ahkSource -split "`r?`n") | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
@@ -22364,9 +22598,10 @@ Write-Output "REPLACEMENT-LOADED"
     }
 
     Test-Case "generated hotkey content parses in the installed AutoHotkey v2" {
-        $ahk = Get-DevWSAutoHotkeyPath
+        $ahk = $null
+        try { $ahk = Get-DevWSAutoHotkeyPath } catch { $ahk = $null }
 
-        if (-not (Test-Path -LiteralPath $ahk -PathType Leaf)) {
+        if ([string]::IsNullOrWhiteSpace([string]$ahk) -or -not (Test-Path -LiteralPath $ahk -PathType Leaf)) {
             return
         }
 
@@ -22560,6 +22795,55 @@ Write-Output "REPLACEMENT-LOADED"
         Assert-NotContains $healthSource 'Get-ScheduledTask -TaskName' "health never queries a task by name"
     }
 
+    Test-Case "health reports AutoHotkey resolver failure without aborting the run" {
+        $fixture = New-InstallFixture "health-ahk-trust"
+        $startup = Join-Path $fixture.Root "Startup"
+        $stateRoot = Join-Path $fixture.Root "state"
+        New-Item -ItemType Directory -Path $startup, $stateRoot -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "app") -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $fixture.Root "app\ws.ps1") -Value "# fixture" -NoNewline
+
+        $available = Join-Path $fixture.Root "AutoHotkey64.exe"
+        Set-Content -LiteralPath $available -Value "# stub" -NoNewline
+
+        $newContext = {
+            param([string]$Path, [string]$ErrorText)
+
+            $context = [pscustomobject]@{
+                InstallRoot         = $fixture.Root
+                StateRoot           = $stateRoot
+                CanonicalPath       = Join-Path $fixture.Root "canonical.json"
+                StartupPath         = $startup
+                LegacyShimPath      = Join-Path $fixture.Root "local-bin\ws.cmd"
+                WindowsTerminalPath = Join-Path $fixture.Root "wt.exe"
+                AutoHotkeyPath      = $Path
+                MetadataPath        = Join-Path $stateRoot "install-metadata.json"
+                PrivilegedRoot      = $fixture.Privileged
+            }
+
+            $context | Add-Member -NotePropertyName "AutoHotkeyTrustError" -NotePropertyValue $ErrorText
+
+            return $context
+        }
+
+        $resolverError = "No trusted machine-wide AutoHotkey v2 installation was found: the AutoHotkey executable is outside the administrator-protected Program Files roots."
+
+        $summary = Invoke-DevWSHealthCheck -Context (& $newContext '' $resolverError)
+        $byId = @{}
+        foreach ($result in @($summary.Results)) { $byId[$result.Id] = $result }
+
+        Assert-Equal 25 @($summary.Results).Count "the whole health run still completes"
+        Assert-Equal $false $byId["autohotkey"].Ok "the AutoHotkey check fails"
+        Assert-Contains $byId["autohotkey"].Message "machine-wide AutoHotkey v2 installation" "the reason is actionable"
+
+        $summary = Invoke-DevWSHealthCheck -Context (& $newContext $available '')
+        $byId = @{}
+        foreach ($result in @($summary.Results)) { $byId[$result.Id] = $result }
+
+        Assert-Equal $true $byId["autohotkey"].Ok "a resolved existing interpreter passes"
+        Assert-Equal "ok" $byId["autohotkey"].Message "the passing check is reported normally"
+    }
+
     Test-Case "health reads scheduled task state once and shares it across task checks" {
         $fixture = New-InstallFixture "health-task-snapshot"
 
@@ -22704,6 +22988,38 @@ Write-Output "REPLACEMENT-LOADED"
             Assert-True ($null -ne $result.PSObject.Properties["Ok"]) "every result has an Ok field"
             Assert-True ($null -ne $result.PSObject.Properties["Message"]) "every result has a Message field"
         }
+    }
+
+    Test-Case "installer AutoHotkey prerequisite mirrors the trusted resolver" {
+        $pf = Join-Path $TestRoot "ahk-prereq\Program Files"
+        New-Item -ItemType Directory -Path (Join-Path $pf "AutoHotkey\v2") -Force | Out-Null
+        $exe = Join-Path $pf "AutoHotkey\v2\AutoHotkey64.exe"
+        Set-Content -LiteralPath $exe -Value "# AutoHotkey fixture stub" -NoNewline
+
+        # Injected path: the historical test/dev contract is existence-only.
+        $byName = @{}
+        foreach ($result in @(Get-DevWSPrerequisiteResults -AutoHotkeyPath $exe)) { $byName[$result.Name] = $result }
+
+        Assert-Equal $true $byName["AutoHotkey v2"].Ok "an explicit existing path satisfies the injected prerequisite"
+        Assert-Equal $exe $byName["AutoHotkey v2"].Message "the injected path is reported verbatim"
+
+        $byName = @{}
+        foreach ($result in @(Get-DevWSPrerequisiteResults -AutoHotkeyPath (Join-Path $pf "missing.exe"))) { $byName[$result.Name] = $result }
+
+        Assert-Equal $false $byName["AutoHotkey v2"].Ok "a missing injected path fails"
+
+        # Production path: exactly the trusted resolver's outcome.
+        $expectedOk = $false
+        $expectedMessage = ''
+
+        try { $expectedMessage = Resolve-DevWSTrustedAutoHotkeyPath; $expectedOk = $true }
+        catch { $expectedMessage = $_.Exception.Message; $expectedOk = $false }
+
+        $byName = @{}
+        foreach ($result in @(Get-DevWSPrerequisiteResults)) { $byName[$result.Name] = $result }
+
+        Assert-Equal $expectedOk $byName["AutoHotkey v2"].Ok "the production prerequisite mirrors the resolver"
+        Assert-Equal $expectedMessage $byName["AutoHotkey v2"].Message "the prerequisite reports the resolved path or its actionable reason"
     }
 
     Test-Case "prerequisite code never assigns to the automatic IsWindows variable" {

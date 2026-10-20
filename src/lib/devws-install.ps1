@@ -871,10 +871,6 @@ function Get-DevWSPrerequisiteResults {
         $WindowsTerminalPath = Get-DevWSWindowsTerminalPath
     }
 
-    if ([string]::IsNullOrWhiteSpace($AutoHotkeyPath)) {
-        $AutoHotkeyPath = Get-DevWSAutoHotkeyPath
-    }
-
     $results = [System.Collections.Generic.List[object]]::new()
 
     $runningOnWindows = $null
@@ -929,10 +925,29 @@ function Get-DevWSPrerequisiteResults {
         Message = $wtMessage
     })
 
+    # AutoHotkey is resolved through the same trusted machine-wide policy the
+    # installed runtime uses. An explicit caller-supplied path is a test/dev
+    # override with existence-only semantics; the production path uses the
+    # resolver and reports its actionable failure text.
+    if ($PSBoundParameters.ContainsKey("AutoHotkeyPath")) {
+        $ahkOk = (Test-Path -LiteralPath $AutoHotkeyPath -PathType Leaf)
+        $ahkMessage = $AutoHotkeyPath
+    }
+    else {
+        try {
+            $ahkMessage = Resolve-DevWSTrustedAutoHotkeyPath
+            $ahkOk = $true
+        }
+        catch {
+            $ahkOk = $false
+            $ahkMessage = $_.Exception.Message
+        }
+    }
+
     $results.Add([pscustomobject]@{
         Name    = "AutoHotkey v2"
-        Ok      = (Test-Path -LiteralPath $AutoHotkeyPath -PathType Leaf)
-        Message = $AutoHotkeyPath
+        Ok      = $ahkOk
+        Message = $ahkMessage
     })
 
     return $results.ToArray()
