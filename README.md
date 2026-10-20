@@ -10,10 +10,10 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: source-first, pre-1.0.** DevWS has no tagged release yet. The repository is the
-> distribution: installation uses the tracked PowerShell installer. There is no installer
-> package, release binary, container image or package-manager distribution. The generated
-> native assembly is installation-time output and is not byte-reproducible.
+> **Status: source-first, pre-1.0.** The current source release is **v0.1.0**. The repository
+> is the distribution: installation uses the tracked PowerShell installer. There is no
+> installer package, release binary, container image or package-manager distribution. The
+> generated native assembly is installation-time output and is not byte-reproducible.
 
 ---
 

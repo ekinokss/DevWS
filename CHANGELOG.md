@@ -5,12 +5,9 @@ All notable changes to DevWS are recorded here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions and
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> **Release preparation.** The intended first public source release is **0.1.0**. The material
-> below is the release-note source for that publication. It remains under `[Unreleased]` until
-> the maintainer creates the tag and a release exists. At publication, retitle this section
-> `## [0.1.0] - YYYY-MM-DD` and add a new empty `## [Unreleased]` above it.
-
 ## [Unreleased]
+
+## [0.1.0] - 2026-10-21
 
 ### Added
 
