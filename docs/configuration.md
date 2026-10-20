@@ -309,11 +309,12 @@ Additional set launch hotkeys, stored in canonical configuration:
 
 Objects must contain exactly these two properties. Unknown properties are rejected.
 
-**Reserved hotkeys.** `Alt+T` and `Alt+Shift+T` are permanently reserved and may not be
-bound:
+**Reserved hotkeys.** `Alt+Shift+T` is permanently reserved and may not be bound; it
+launches the default set. `Alt+T` is **not** reserved and behaves like any other binding:
 
-- `Alt+T` is reserved for the external `AdminTerminal` shortcut;
-- `Alt+Shift+T` is reserved for launching the default set.
+```json
+{ "hotkey": "alt+t", "setId": "main" }
+```
 
 One hotkey may target only one set. The generated AutoHotkey include is derived state — it
 is regenerated from configuration and is never the source of truth.

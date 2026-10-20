@@ -351,8 +351,8 @@ single-instance policy, and with an action built from an absolute trusted PowerS
 and a protected worker script. The broker additionally starts at logon, has no execution
 time limit, is battery-safe and restarts on failure.
 
-DevWS never reads, modifies or removes scheduled tasks it does not own. In particular an
-external `AdminTerminal` task is left completely alone.
+DevWS never reads, modifies or removes scheduled tasks it does not own, and it has no
+dependency on any external scheduled task.
 
 ## 15. Security boundaries at a glance
 

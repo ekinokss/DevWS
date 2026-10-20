@@ -1,9 +1,6 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
-; Alt + T -> elevated Terminal
-!t::Run('schtasks /run /tn "AdminTerminal"', , "Hide")
-
 ; Alt + Shift + T -> warm DevWS coordinator launch (local IPC)
 !+t::DevWSLaunchWorkspace()
 

@@ -160,8 +160,8 @@ managed broker task so the new code takes effect; it never kills processes by na
 The previous task definitions are exported to the backup directory once. Reinstalls reuse
 that backup rather than creating a chain.
 
-**Tasks DevWS does not own are never read, modified or removed.** In particular an external
-`AdminTerminal` task is left completely alone.
+**Tasks DevWS does not own are never read, modified or removed.** DevWS has no dependency
+on any external scheduled task.
 
 ### 6.1 Repairing the task interpreter after a PowerShell update
 
@@ -189,9 +189,9 @@ bindings:
 
 It does **not** copy application files, rebuild the native assembly, stage the privileged
 runtime, create protected state, migrate configuration, or touch `PATH`, the legacy shim,
-hotkeys, AutoHotkey, Windows Terminal or `AdminTerminal`. It never runs any part of the
-uninstall path. When every task and the metadata already agree with the current interpreter,
-it reports a no-op and changes nothing.
+hotkeys, AutoHotkey or Windows Terminal. It never runs any part of the uninstall path. When
+every task and the metadata already agree with the current interpreter, it reports a no-op
+and changes nothing.
 
 The task actions remain absolute. This is a repair command, not dynamic interpreter
 resolution, and it does not make package updates self-healing.
@@ -211,17 +211,18 @@ resolution, and it does not make package updates self-healing.
 
 DevWS manages exactly one Startup script, `TerminalShortcut.ahk`:
 
-- `Alt+T` keeps running the external `AdminTerminal` task, which DevWS does not create;
 - `Alt+Shift+T` sends a launch request to the warm coordinator over a current-user-only
   local pipe, and falls back to a hidden CLI launch if the coordinator is unavailable;
+- `Alt+T` has no built-in action; it is ordinary binding space for configured sets;
 - the same script starts the coordinator once at login;
 - a generated include file carries additional per-set hotkeys, and a missing generated file
-  never breaks the two built-in shortcuts.
+  never breaks the built-in shortcut.
 
 The installer regenerates the include from canonical configuration before installing the
-core script. Recognised historical content is upgraded in place; unknown content is left
-untouched and reported. Backups are taken before replacement, and no backup files are left
-in the Startup folder.
+core script. Recognised historical content — including the pre-release core that carried a
+retired external-task binding — is upgraded in place; unknown content is left untouched and
+reported. Backups are taken before replacing a legacy `.ws` hotkey, and no backup files are
+left in the Startup folder.
 
 ## 9. Health check
 
@@ -249,7 +250,7 @@ in the Startup folder.
 20. Scheduled tasks use the absolute trusted PowerShell executable
 21. `TerminalShortcut.ahk` exists
 22. `TerminalShortcut` `Alt+Shift+T` targets installed DevWS
-23. `TerminalShortcut` `Alt+T` keeps the `AdminTerminal` hotkey
+23. `TerminalShortcut` has no retired external scheduled-task binding
 24. Generated set launch bindings match canonical config
 25. Installed `ws list` runs read-only
 

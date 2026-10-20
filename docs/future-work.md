@@ -45,17 +45,19 @@ Until such a design is reviewed, treat a packaged PowerShell installation as an 
 fragility that needs an explicit repair after a package update. Prefer `-RepairTasks` over
 re-running the entire installer: it is the narrow operation.
 
-### 1.2 `Alt+T` depends on an external task DevWS does not create
+### 1.2 Retired pre-release `Alt+T` external-task integration
 
-The managed hotkey script maps `Alt+T` to an external scheduled task named `AdminTerminal`.
+Earlier pre-release builds mapped `Alt+T` to an external scheduled task named
+`AdminTerminal` that DevWS never created. That integration is **retired**: the built-in
+hotkey surface is `Alt+Shift+T` only, and `Alt+T` is ordinary binding space.
 
-DevWS **never creates, modifies or removes** that task. It is not a DevWS feature, and the
-installer does not verify that it exists — the health check only confirms that the hotkey
-still points at it.
+DevWS does not read, create, modify or remove that external task, and no health check
+depends on it. A managed Startup script from an older build is recognised during update so
+the installer can replace it with the current core; a custom Startup script is still left
+untouched.
 
-Consequence: on a machine that does not already have an `AdminTerminal` task, `Alt+T`
-silently does nothing useful, and the health check still passes. Treat it as a legacy
-integration assumption rather than an installed capability.
+There is no compatibility switch and no plan to restore the behaviour. A user who owns such
+a task independently can bind it outside DevWS.
 
 ### 1.3 The native assembly is not byte-reproducible
 

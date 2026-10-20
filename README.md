@@ -205,26 +205,27 @@ with no profiles has no monitor dependency at all.
 
 ## Hotkeys
 
-DevWS manages one AutoHotkey v2 script in your Startup folder. Two shortcuts are built in
+DevWS manages one AutoHotkey v2 script in your Startup folder. One shortcut is built in
 and permanently reserved:
 
 | Hotkey | Behaviour |
 | --- | --- |
 | `Alt+Shift+T` | Launches or restores the default set. |
-| `Alt+T` | Runs an **external** scheduled task named `AdminTerminal`, which DevWS does not create. See the note below. |
+
+`Alt+T` has **no built-in DevWS behaviour**. It is ordinary binding space and can be
+assigned to a workspace set like any other hotkey:
 
 Additional per-set launch hotkeys are configured and generated:
 
 ```powershell
 ws bind secondary alt+shift+y
+ws bind main alt+t
 ws bindings
 ws sync-hotkeys
 ```
 
-`Alt+T` is a legacy integration assumption: DevWS preserves and never modifies that task,
-but on a machine that does not already have an `AdminTerminal` task, `Alt+T` will not do
-anything useful. This is documented as a known limitation in
-[docs/future-work.md](docs/future-work.md).
+DevWS does not depend on, create, modify or remove any external scheduled task in order
+to provide a hotkey.
 
 ## Privileged operations
 

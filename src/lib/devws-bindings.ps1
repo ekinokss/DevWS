@@ -6,9 +6,10 @@
 # regenerated from config; never edit it by hand.
 #
 # One managed Startup script (TerminalShortcut.ahk) remains the only
-# persistent AutoHotkey process. It already owns Alt+T (AdminTerminal) and
-# Alt+Shift+T (bare `ws launch`); this library only produces the optional
-# generated include that adds explicit-set launch hotkeys.
+# persistent AutoHotkey process. It owns Alt+Shift+T (bare `ws launch`); all
+# other hotkeys, including Alt+T, are ordinary binding space. This library
+# only produces the optional generated include that adds explicit-set launch
+# hotkeys.
 
 function ConvertTo-DevWSBindingHotkey {
     param(
@@ -92,7 +93,7 @@ function Test-DevWSReservedBindingHotkey {
 
     $canonical = ConvertTo-DevWSBindingHotkey -Hotkey $Hotkey
 
-    return ($canonical -eq "alt+t" -or $canonical -eq "alt+shift+t")
+    return ($canonical -eq "alt+shift+t")
 }
 
 function Get-DevWSReservedBindingHotkeyReason {
@@ -102,10 +103,6 @@ function Get-DevWSReservedBindingHotkeyReason {
     )
 
     $canonical = ConvertTo-DevWSBindingHotkey -Hotkey $Hotkey
-
-    if ($canonical -eq "alt+t") {
-        return "Alt+T is permanently reserved for the AdminTerminal elevated terminal shortcut."
-    }
 
     if ($canonical -eq "alt+shift+t") {
         return "Alt+Shift+T is permanently reserved for the bare 'ws launch' shortcut that follows defaultSet."

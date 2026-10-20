@@ -75,7 +75,7 @@ configuration.
 - [ ] Exactly five `DevWorkspace-*` tasks exist.
 - [ ] Each runs as the installing user, interactively, at the highest run level.
 - [ ] Each action uses an absolute trusted PowerShell path and a protected worker script.
-- [ ] Any unrelated task — in particular an external `AdminTerminal` task — is unchanged.
+- [ ] No task outside the five DevWS-managed tasks is read, created, modified or removed.
 - [ ] After a packaged PowerShell update, `install.ps1 -RepairTasks` rewrites all five task
       actions to the new absolute interpreter while leaving every other managed property
       intact, and `install.ps1 -HealthCheck` reports the executable check green again.
@@ -98,8 +98,7 @@ configuration.
 
 - [ ] `TerminalShortcut.ahk` exists in the Startup folder.
 - [ ] `Alt+Shift+T` launches or restores the default set.
-- [ ] `Alt+T` still points at the external `AdminTerminal` task (see
-      [future-work.md](future-work.md) §1.2 — this is an external dependency).
+- [ ] `Alt+T` has no built-in action and can be bound to a set with `ws bind`.
 - [ ] An additional binding created with `ws bind` actually fires, and `ws unbind` removes
       it.
 - [ ] No backup files are left in the Startup folder.

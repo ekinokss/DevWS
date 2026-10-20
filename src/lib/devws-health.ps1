@@ -726,8 +726,8 @@ function Invoke-DevWSHealthCheck {
             }
         },
         @{
-            Id          = "hotkey-alt-t"
-            Description = "TerminalShortcut Alt+T keeps the AdminTerminal hotkey"
+            Id          = "hotkey-legacy-external"
+            Description = "TerminalShortcut has no retired external scheduled-task binding"
             Test        = {
                 $hotkeyPath = Join-Path $Context.StartupPath "TerminalShortcut.ahk"
 
@@ -737,10 +737,13 @@ function Invoke-DevWSHealthCheck {
 
                 $content = Get-Content -LiteralPath $hotkeyPath -Raw
 
-                return (
-                    $content.IndexOf("!t::", [StringComparison]::Ordinal) -ge 0 -and
-                    $content.IndexOf("AdminTerminal", [StringComparison]::OrdinalIgnoreCase) -ge 0
-                )
+                if (-not (Test-DevWSManagedHotkeyContent -Content $content -InstallRoot $Context.InstallRoot)) {
+                    return $false
+                }
+
+                # The current managed core must not carry the retired external
+                # scheduled-task binding: Alt+T is ordinary binding space now.
+                return (-not (Test-DevWSHistoricalManagedHotkeyContent -Content $content -InstallRoot $Context.InstallRoot))
             }
         },
         @{

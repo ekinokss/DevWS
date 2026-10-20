@@ -2720,15 +2720,17 @@ try {
     }
 
     Test-Case "reserved hotkeys are detected after normalization" {
-        foreach ($reserved in @("alt+t", "T+ALT", "shift+alt+t", "ALT+SHIFT+T")) {
+        foreach ($reserved in @("alt+shift+t", "shift+alt+t", "ALT+SHIFT+T")) {
             Assert-Equal $true (Test-DevWSReservedBindingHotkey -Hotkey $reserved) "reserved '$reserved'"
         }
 
+        Assert-Equal $false (Test-DevWSReservedBindingHotkey -Hotkey "alt+t") "alt+t is ordinary binding space"
+        Assert-Equal $false (Test-DevWSReservedBindingHotkey -Hotkey "T+ALT") "the retired Alt+T reservation is gone"
         Assert-Equal $false (Test-DevWSReservedBindingHotkey -Hotkey "ctrl+alt+t") "ctrl+alt+t is not reserved"
         Assert-Equal $false (Test-DevWSReservedBindingHotkey -Hotkey "alt+shift+y") "alt+shift+y is not reserved"
 
-        Assert-Contains (Get-DevWSReservedBindingHotkeyReason -Hotkey "T+ALT") "AdminTerminal" "Alt+T reason names AdminTerminal"
         Assert-Contains (Get-DevWSReservedBindingHotkeyReason -Hotkey "shift+alt+t") "defaultSet" "Alt+Shift+T reason names defaultSet"
+        Assert-Equal "" (Get-DevWSReservedBindingHotkeyReason -Hotkey "alt+t") "Alt+T has no reservation reason"
     }
 
     Test-Case "binding hotkeys translate deterministically to AutoHotkey v2" {
@@ -2798,7 +2800,7 @@ try {
             ))
         } "duplicates" "duplicate canonical hotkeys rejected"
 
-        foreach ($reserved in @("alt+t", "alt+shift+t")) {
+        foreach ($reserved in @("alt+shift+t")) {
             Assert-Throws {
                 Assert-DevWSConfig -Config (ConvertTo-TestConfig -Sets @((New-TestSet -Id "main")) -Bindings @([ordered]@{ hotkey = $reserved; setId = "main" }))
             } "reserved" "reserved '$reserved' rejected"
@@ -2811,10 +2813,15 @@ try {
 
         Assert-DevWSConfig -Config $preModeConfig -Source "test" -AllowMissingInstanceMode
 
+        # alt+t is ordinary binding space for the relaxed recognizer too.
+        Assert-DevWSConfig -Config (ConvertTo-TestConfig -Sets @(
+            (New-TestSet -Id "main" -Windows @((New-AppDefinition -Id "firefox")))
+        ) -Bindings @([ordered]@{ hotkey = "alt+t"; setId = "main" })) -Source "test" -AllowMissingInstanceMode
+
         Assert-Throws {
             Assert-DevWSConfig -Config (ConvertTo-TestConfig -Sets @(
                 (New-TestSet -Id "main" -Windows @((New-AppDefinition -Id "firefox")))
-            ) -Bindings @([ordered]@{ hotkey = "alt+t"; setId = "main" })) -Source "test" -AllowMissingInstanceMode
+            ) -Bindings @([ordered]@{ hotkey = "alt+shift+t"; setId = "main" })) -Source "test" -AllowMissingInstanceMode
         } "reserved" "relaxed recognizer rejects reserved bindings"
     }
 
@@ -13043,7 +13050,9 @@ public static class DevWSAppCandidateTestWindow
             -BindingsPath $bindingsPath
 
         Assert-Equal ($hotkeyTemplate -replace "`r`n", "`n").Trim() ($hotkeyGenerated -replace "`r`n", "`n").Trim() "hotkey template matches generated default"
-        Assert-Contains $hotkeyGenerated '!t::Run(''schtasks /run /tn "AdminTerminal"' "Alt+T preserved"
+        Assert-NotContains $hotkeyGenerated "AdminTerminal" "no retired external task binding"
+        Assert-NotContains $hotkeyGenerated "!t::" "no built-in Alt+T handler"
+        Assert-NotContains $hotkeyGenerated "schtasks /run" "no external scheduled-task invocation"
         Assert-Contains $hotkeyGenerated 'EnvGet("LOCALAPPDATA")' "paths resolve LOCALAPPDATA"
         Assert-Contains $hotkeyGenerated '\DevWS\app\ws.ps1' "fallback targets the installed app"
         Assert-Contains $hotkeyGenerated '\DevWS\app\coordinator.ps1' "coordinator start targets the installed host"
@@ -14646,6 +14655,88 @@ foreach ($entry in $argv) { Write-Output ("ARG:" + $entry) }
         $result3 = Install-DevWSTerminalShortcut -HotkeyPath $hotkeyPath -Content $content -InstallRoot $fixture.Root -BackupRoot $fixture.Backups -Metadata $metadata
         Assert-Equal "unknown" $result3.Status "unknown hotkey left alone"
         Assert-Equal $customBefore (Get-FileBase64 -Path $hotkeyPath) "unknown hotkey untouched"
+    }
+
+    Test-Case "current managed hotkey core carries no retired external binding" {
+        $fixture = New-InstallFixture "hotkey-current"
+        $bindingsPath = Join-Path $fixture.State "hotkeys\bindings.ahk"
+
+        $content = New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath $bindingsPath
+
+        Assert-Contains $content '!+t::DevWSLaunchWorkspace()' "Alt+Shift+T is the managed launcher"
+        Assert-True (Test-DevWSManagedHotkeyIncludeContract -Content $content -BindingsPath $bindingsPath) "the generated include is part of the core"
+        Assert-NotContains $content "AdminTerminal" "no external task name"
+        Assert-NotContains $content "!t::" "no built-in Alt+T handler"
+        Assert-NotContains $content "schtasks" "no external scheduled-task invocation"
+        Assert-Equal 0 @($content -split "`r?`n" | Where-Object { $_ -match '^!t::' }).Count "no Alt+T declaration line"
+
+        Assert-Equal $true (Test-DevWSManagedHotkeyContent -Content $content -InstallRoot $fixture.Root) "current content is DevWS-managed"
+        Assert-Equal $false (Test-DevWSHistoricalManagedHotkeyContent -Content $content -InstallRoot $fixture.Root) "current content is not the historical shape"
+
+        $template = Get-Content -LiteralPath (Join-Path $RepoRoot "src\hotkeys\TerminalShortcut.ahk") -Raw
+        Assert-NotContains $template "AdminTerminal" "the shipped template has no external dependency"
+        Assert-NotContains $template "schtasks" "the shipped template runs no scheduled task"
+        Assert-Contains $template '!+t::DevWSLaunchWorkspace()' "the shipped template keeps the default-set launcher"
+    }
+
+    Test-Case "historical managed hotkey core is recognized and upgraded in place" {
+        $fixture = New-InstallFixture "hotkey-historical"
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "Startup") -Force | Out-Null
+        $hotkeyPath = Join-Path $fixture.Root "Startup\TerminalShortcut.ahk"
+        $bindingsPath = Join-Path $fixture.State "hotkeys\bindings.ahk"
+
+        $current = New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath $bindingsPath
+
+        # Reconstruct the exact previous managed core: the current structure
+        # plus the retired Alt+T external binding.
+        $historical = $current.Replace(
+            "; Alt + Shift + T -> warm DevWS coordinator launch (local IPC)",
+            "; Alt + T -> elevated Terminal`r`n!t::Run('schtasks /run /tn `"AdminTerminal`"', , `"Hide`")`r`n`r`n; Alt + Shift + T -> warm DevWS coordinator launch (local IPC)"
+        )
+
+        Assert-Contains $historical "AdminTerminal" "the fixture carries the retired binding"
+        Assert-Equal $true (Test-DevWSManagedHotkeyContent -Content $historical -InstallRoot $fixture.Root) "the historical core is recognized as DevWS-managed"
+        Assert-Equal $true (Test-DevWSHistoricalManagedHotkeyContent -Content $historical -InstallRoot $fixture.Root) "the historical shape is named explicitly"
+
+        Set-Content -LiteralPath $hotkeyPath -Value $historical -NoNewline
+        $metadata = New-DevWSInstallMetadata
+
+        $result = Install-DevWSTerminalShortcut -HotkeyPath $hotkeyPath -Content $current -InstallRoot $fixture.Root -BackupRoot $fixture.Backups -Metadata $metadata
+
+        Assert-Equal "updated" $result.Status "the historical managed core is upgraded, not treated as foreign"
+        Assert-Equal $null $result.Backup "a DevWS format change does not create a new backup"
+        Assert-Equal $current (Get-Content -LiteralPath $hotkeyPath -Raw) "the current core is installed"
+        Assert-NotContains (Get-Content -LiteralPath $hotkeyPath -Raw) "AdminTerminal" "the retired binding is gone after the upgrade"
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $fixture.Backups -File -ErrorAction SilentlyContinue).Count "no backup directory content is created"
+    }
+
+    Test-Case "custom Startup hotkey files are never adopted" {
+        $fixture = New-InstallFixture "hotkey-foreign"
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "Startup") -Force | Out-Null
+        $hotkeyPath = Join-Path $fixture.Root "Startup\TerminalShortcut.ahk"
+        $bindingsPath = Join-Path $fixture.State "hotkeys\bindings.ahk"
+        $current = New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath $bindingsPath
+
+        $foreign = @(
+            @{ Name = 'custom Alt+T';        Body = "!t::Run('calc.exe')`r`n" },
+            @{ Name = 'name in a comment';   Body = "; AdminTerminal is mentioned here`r`n!x::Run('custom.exe')`r`n" },
+            @{ Name = 'custom Alt+Shift+T';  Body = "!+t::Run('custom.exe')`r`n" },
+            @{ Name = 'arbitrary schtasks';  Body = "!x::Run('schtasks /run /tn `"AdminTerminal`"')`r`n" },
+            @{ Name = 'retired line only';   Body = "!t::Run('schtasks /run /tn `"AdminTerminal`"', , `"Hide`")`r`n" }
+        )
+
+        foreach ($case in $foreign) {
+            Set-Content -LiteralPath $hotkeyPath -Value $case.Body -NoNewline
+            $before = Get-FileBase64 -Path $hotkeyPath
+
+            Assert-Equal $false (Test-DevWSManagedHotkeyContent -Content $case.Body -InstallRoot $fixture.Root) ("$($case.Name): not DevWS-managed")
+            Assert-Equal $false (Test-DevWSHistoricalManagedHotkeyContent -Content $case.Body -InstallRoot $fixture.Root) ("$($case.Name): not the historical managed shape")
+
+            $result = Install-DevWSTerminalShortcut -HotkeyPath $hotkeyPath -Content $current -InstallRoot $fixture.Root -BackupRoot $fixture.Backups -Metadata (New-DevWSInstallMetadata)
+
+            Assert-Equal "unknown" $result.Status ("$($case.Name): left untouched")
+            Assert-Equal $before (Get-FileBase64 -Path $hotkeyPath) ("$($case.Name): bytes unchanged")
+        }
     }
 
     Write-Host ""
@@ -18403,6 +18494,45 @@ $mutex.Dispose()
         Assert-True (-not (Test-Path -LiteralPath $hotkeyPath)) "managed hotkey file removed"
     }
 
+    Test-Case "uninstall recognizes historical managed hotkey content and preserves custom files" {
+        $fixture = New-InstallFixture "uninstall-hotkey-legacy"
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "Startup") -Force | Out-Null
+        $hotkeyPath = Join-Path $fixture.Root "Startup\TerminalShortcut.ahk"
+        $bindingsPath = Join-Path $fixture.State "hotkeys\bindings.ahk"
+
+        $current = New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath $bindingsPath
+        $historical = $current.Replace(
+            "; Alt + Shift + T -> warm DevWS coordinator launch (local IPC)",
+            "; Alt + T -> elevated Terminal`r`n!t::Run('schtasks /run /tn `"AdminTerminal`"', , `"Hide`")`r`n`r`n; Alt + Shift + T -> warm DevWS coordinator launch (local IPC)"
+        )
+
+        Set-Content -LiteralPath $hotkeyPath -Value $historical -NoNewline
+
+        $metadata = New-DevWSInstallMetadata
+        $metadata.hotkey.managed = $true
+        $metadata.hotkey.backup = ""
+
+        $plan = Get-DevWSUninstallPlan -InstallRoot $fixture.Root -CanonicalPath (Join-Path $fixture.Root "canonical.json") -LegacyShimPath (Join-Path $fixture.Root "local-bin\ws.cmd") -HotkeyPath $hotkeyPath -Metadata $metadata
+
+        Assert-Equal $true $plan.RemoveHotkey "the historical managed hotkey is still DevWS-owned"
+        [void](Invoke-DevWSUninstall -Plan $plan -SkipTasks)
+        Assert-True (-not (Test-Path -LiteralPath $hotkeyPath)) "the historical managed hotkey is removed"
+
+        # A custom file is never adopted, removed or overwritten.
+        $custom = "!t::Run('calc.exe')`r`n"
+        Set-Content -LiteralPath $hotkeyPath -Value $custom -NoNewline
+
+        $metadata2 = New-DevWSInstallMetadata
+        $metadata2.hotkey.managed = $true
+        $metadata2.hotkey.backup = ""
+
+        $plan2 = Get-DevWSUninstallPlan -InstallRoot $fixture.Root -CanonicalPath (Join-Path $fixture.Root "canonical.json") -LegacyShimPath (Join-Path $fixture.Root "local-bin\ws.cmd") -HotkeyPath $hotkeyPath -Metadata $metadata2
+
+        Assert-Equal $false $plan2.RemoveHotkey "a custom hotkey is not DevWS-owned"
+        [void](Invoke-DevWSUninstall -Plan $plan2 -SkipTasks)
+        Assert-Equal $custom (Get-Content -LiteralPath $hotkeyPath -Raw) "the custom hotkey is preserved"
+    }
+
     Write-Host ""
     Start-TestGroup -Name 'bindings' -Title 'Phase 8 set launch bindings'
 
@@ -18420,7 +18550,11 @@ $mutex.Dispose()
         Assert-Contains $duplicate "secondary" "duplicate rejection names the current target"
         Assert-Equal 1 @($config.bindings).Count "duplicate bind leaves bindings unchanged"
 
-        foreach ($reserved in @("alt+t", "SHIFT+ALT+T")) {
+        $altT = Add-DevWSBinding -Config $config -SetId "main" -Hotkey "alt+t"
+        Assert-Equal "alt+t" $altT.hotkey "Alt+T is ordinary binding space"
+        $null = Remove-DevWSBinding -Config $config -Hotkey "alt+t"
+
+        foreach ($reserved in @("SHIFT+ALT+T")) {
             $message = Get-ThrownMessage { Add-DevWSBinding -Config $config -SetId "main" -Hotkey $reserved }
             Assert-Contains $message "reserved" "reserved bind '$reserved' rejected"
         }
@@ -18537,7 +18671,7 @@ $mutex.Dispose()
 
             $before = Get-FileBase64 -Path $target
 
-            $message = Get-ThrownMessage { Invoke-DevWSBind -SetReference "secondary" -Hotkey "alt+t" }
+            $message = Get-ThrownMessage { Invoke-DevWSBind -SetReference "secondary" -Hotkey "alt+shift+t" }
             Assert-Contains $message "reserved" "reserved bind rejected"
             Assert-Equal $before (Get-FileBase64 -Path $target) "reserved bind leaves config bytes unchanged"
             Assert-Equal 0 $script:syncAttempts "no sync before a successful save"
@@ -18689,7 +18823,6 @@ $mutex.Dispose()
         Assert-True ($reversed.IndexOf("launch research") -lt $reversed.IndexOf("launch secondary")) "reversed input reverses handlers"
 
         Assert-NotContains $content "#SingleInstance" "generated include never owns #SingleInstance"
-        Assert-NotContains $content "!t::" "generated include never owns Alt+T"
         Assert-NotContains $content "!+t::" "generated include never owns Alt+Shift+T"
         Assert-NotContains $content "AdminTerminal" "generated include never runs scheduled tasks"
         Assert-NotContains $content "schtasks" "generated include never runs scheduled tasks"
@@ -18728,6 +18861,23 @@ $mutex.Dispose()
         $contentB = Get-DevWSBindingsContentFromConfig -Config $geometryConfig -AppScriptPath $appScript
 
         Assert-Equal $contentA $contentB "geometry-only changes never alter generated content"
+    }
+
+    Test-Case "alt+t is an ordinary configurable set binding" {
+        $appScript = "C:\Apps\DevWS\app\ws.ps1"
+        $content = New-DevWSBindingsAhkContent `
+            -Bindings @([pscustomobject]@{ hotkey = "alt+t"; setId = "secondary" }) `
+            -AppScriptPath $appScript
+
+        $expected = '!t::Run(''pwsh.exe -NoLogo -NoProfile -WindowStyle Hidden -File "' + $appScript + '" launch secondary'', , "Hide")'
+
+        Assert-Contains $content $expected "Alt+T renders as the normal set-launch handler"
+        Assert-NotContains $content "AdminTerminal" "the retired external target is gone"
+        Assert-NotContains $content "schtasks" "no scheduled task is invoked"
+
+        Assert-Equal "alt+t" (ConvertTo-DevWSBindingHotkey -Hotkey "T+ALT") "Alt+T canonicalizes normally"
+        Assert-Equal $false (Test-DevWSReservedBindingHotkey -Hotkey "alt+t") "Alt+T is not reserved"
+        Assert-Equal $true (Test-DevWSReservedBindingHotkey -Hotkey "alt+shift+t") "Alt+Shift+T stays reserved"
     }
 
     Test-Case "sync reconciles derived state atomically, reloads explicitly, and never touches canonical config" {
@@ -18788,7 +18938,7 @@ $mutex.Dispose()
         Assert-Contains $message "not recognized" "unrecognized core fails safely"
         Assert-Equal $customBefore (Get-FileBase64 -Path $corePath) "unrecognized core is never overwritten"
 
-        $noInclude = "!t::Run('schtasks /run /tn `"AdminTerminal`"', , `"Hide`")`r`n!+t::Run('pwsh.exe -NoLogo -NoProfile -WindowStyle Hidden -File `"$(Join-Path $fixture.Root 'app\ws.ps1')`" launch', , `"Hide`")`r`n"
+        $noInclude = (New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath $bindingsPath) -replace '(?m)^#Include .*\r?\n?', ''
         Set-Content -LiteralPath $corePath -Value $noInclude -NoNewline
         $noIncludeBefore = Get-FileBase64 -Path $corePath
         $message = Get-ThrownMessage { Sync-DevWSBindings -Config $config -InstallRoot $fixture.Root -StateRoot $fixture.State -StartupPath $startup }
@@ -22163,7 +22313,8 @@ Write-Output "REPLACEMENT-LOADED"
         Assert-Equal "installed" $installed.Status "core script installed"
         Assert-True (Test-DevWSManagedHotkeyContent -Content (Get-Content -LiteralPath $corePath -Raw) -InstallRoot $fixture.Root) "core stays DevWS-managed"
         Assert-True (Test-DevWSManagedHotkeyIncludeContract -Content (Get-Content -LiteralPath $corePath -Raw) -BindingsPath $bindingsPath) "core includes the generated file"
-        Assert-Contains (Get-Content -LiteralPath $corePath -Raw) "AdminTerminal" "Alt+T contract intact"
+        Assert-NotContains (Get-Content -LiteralPath $corePath -Raw) "AdminTerminal" "no retired external binding"
+        Assert-NotContains (Get-Content -LiteralPath $corePath -Raw) '!t::' "no built-in Alt+T handler"
         Assert-Contains (Get-Content -LiteralPath $corePath -Raw) '!+t::' "Alt+Shift+T contract intact"
         Assert-Contains (Get-Content -LiteralPath $corePath -Raw) ' launch''' "Alt+Shift+T stays the bare default-set launch"
 
@@ -22336,7 +22487,7 @@ Write-Output "REPLACEMENT-LOADED"
             "privileged-runtime", "privileged-native", "bin-shim",
             "state-directory", "canonical-config", "canonical-config-valid",
             "user-path", "scheduled-tasks", "task-workers", "task-runlevel", "task-executable",
-            "hotkey-file", "hotkey-target", "hotkey-alt-t", "hotkey-bindings", "ws-list"
+            "hotkey-file", "hotkey-target", "hotkey-legacy-external", "hotkey-bindings", "ws-list"
         )) {
             Assert-True $byId.ContainsKey($id) "health result includes $id"
         }
@@ -22351,10 +22502,62 @@ Write-Output "REPLACEMENT-LOADED"
         Assert-Equal $true $byId["canonical-config-valid"].Ok "canonical config valid"
         Assert-Equal $true $byId["ws-list"].Ok "installed ws list runs read-only"
         Assert-Equal $true $byId["hotkey-target"].Ok "installed hotkey target recognized"
-        Assert-Equal $true $byId["hotkey-alt-t"].Ok "Alt+T retained"
+        Assert-Equal $true $byId["hotkey-legacy-external"].Ok "no retired external binding"
         Assert-Equal $true $byId["hotkey-bindings"].Ok "generated bindings in sync"
         Assert-Equal $false $byId["task-workers"].Ok "fixture workers cannot match live tasks"
         Assert-Equal $false $byId["user-path"].Ok "fixture bin is not on the real user PATH"
+    }
+
+    Test-Case "health rejects the retired external hotkey binding without querying the task" {
+        $fixture = New-InstallFixture "health-legacy-hotkey"
+        $startup = Join-Path $fixture.Root "Startup"
+        $stateRoot = Join-Path $fixture.Root "state"
+        New-Item -ItemType Directory -Path $startup, $stateRoot -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "app") -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $fixture.Root "app\ws.ps1") -Value "# fixture" -NoNewline
+
+        $bindingsPath = Join-Path $stateRoot "hotkeys\bindings.ahk"
+        $hotkeyPath = Join-Path $startup "TerminalShortcut.ahk"
+
+        $context = [pscustomobject]@{
+            InstallRoot         = $fixture.Root
+            StateRoot           = $stateRoot
+            CanonicalPath       = Join-Path $fixture.Root "canonical.json"
+            StartupPath         = $startup
+            LegacyShimPath      = Join-Path $fixture.Root "local-bin\ws.cmd"
+            WindowsTerminalPath = Join-Path $fixture.Root "wt.exe"
+            AutoHotkeyPath      = Join-Path $fixture.Root "AutoHotkey64.exe"
+            MetadataPath        = Join-Path $stateRoot "install-metadata.json"
+            PrivilegedRoot      = $fixture.Privileged
+        }
+
+        $current = New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath $bindingsPath
+        Set-Content -LiteralPath $hotkeyPath -Value $current -NoNewline
+
+        $summary = Invoke-DevWSHealthCheck -Context $context
+        $byId = @{}
+        foreach ($result in @($summary.Results)) { $byId[$result.Id] = $result }
+
+        Assert-True $byId.ContainsKey("hotkey-legacy-external") "the retired-binding invariant is explicit"
+        Assert-Equal $true $byId["hotkey-legacy-external"].Ok "the current core passes"
+
+        $historical = $current.Replace(
+            "; Alt + Shift + T -> warm DevWS coordinator launch (local IPC)",
+            "; Alt + T -> elevated Terminal`r`n!t::Run('schtasks /run /tn `"AdminTerminal`"', , `"Hide`")`r`n`r`n; Alt + Shift + T -> warm DevWS coordinator launch (local IPC)"
+        )
+        Set-Content -LiteralPath $hotkeyPath -Value $historical -NoNewline
+
+        $summary = Invoke-DevWSHealthCheck -Context $context
+        $byId = @{}
+        foreach ($result in @($summary.Results)) { $byId[$result.Id] = $result }
+
+        Assert-Equal $false $byId["hotkey-legacy-external"].Ok "the historical core is reported as stale"
+        Assert-Equal $true $byId["hotkey-target"].Ok "the historical core is still a recognized managed target"
+
+        # No health code path names or queries the retired external task.
+        $healthSource = Get-SourceOf "src\lib\devws-health.ps1"
+        Assert-NotContains $healthSource "AdminTerminal" "health never references the external task"
+        Assert-NotContains $healthSource 'Get-ScheduledTask -TaskName' "health never queries a task by name"
     }
 
     Test-Case "health reads scheduled task state once and shares it across task checks" {
@@ -29088,8 +29291,8 @@ Start-Sleep -Seconds 6
             -BindingsPath (Join-Path $env:LOCALAPPDATA "DevWS\state\hotkeys\bindings.ahk")
 
         Assert-Contains $hotkey $prefix "coordinator start path contract"
-        Assert-Equal 1 @($hotkey -split "`r?`n" | Where-Object { $_ -like "!t::*" }).Count "exactly one Alt+T handler remains"
-        Assert-Contains $hotkey '!t::Run(''schtasks /run /tn "AdminTerminal"'', , "Hide")' "Alt+T handler byte-stable"
+        Assert-Equal 0 @($hotkey -split "`r?`n" | Where-Object { $_ -like "!t::*" }).Count "no built-in Alt+T handler remains"
+        Assert-NotContains $hotkey 'schtasks /run /tn "AdminTerminal"' "the retired external binding is gone"
     }
 
     Write-Host ""
