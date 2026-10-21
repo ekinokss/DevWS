@@ -15,6 +15,11 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preserves configuration and state. Package mode does not self-elevate, never resets or
   purges, and rejects destructive or alternate-mode combinations before mutation. No setup
   executable or WinGet package is included in this phase.
+- **Thin setup bootstrapper source** — an unreleased Native AOT Windows x64 bootstrapper under
+  `packaging/` that resolves trusted PowerShell, requests elevation, stages the embedded
+  DevWS source payload in protected ProgramData storage, extracts it safely and invokes
+  `install.ps1 -PackageMode`. It is source-only: no setup binary is published, no WinGet
+  manifest exists, and no uninstall/repair/ARP lifecycle is provided yet.
 
 ## [0.1.0] - 2026-10-21
 

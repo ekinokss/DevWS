@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>DevWS.Setup.Checks</AssemblyName>
+    <RootNamespace>DevWS.Setup.Checks</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\bootstrapper\ArchitecturePolicy.cs" Link="ArchitecturePolicy.cs" />
+    <Compile Include="..\bootstrapper\NativeMethods.cs" Link="NativeMethods.cs" />
+    <Compile Include="..\bootstrapper\PathSafety.cs" Link="PathSafety.cs" />
+    <Compile Include="..\bootstrapper\PayloadArchive.cs" Link="PayloadArchive.cs" />
+    <Compile Include="..\bootstrapper\PowerShellResolver.cs" Link="PowerShellResolver.cs" />
+    <Compile Include="..\bootstrapper\ProtectedStaging.cs" Link="ProtectedStaging.cs" />
+  </ItemGroup>
+</Project>

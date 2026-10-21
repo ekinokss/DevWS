@@ -1,0 +1,46 @@
+name: Bootstrapper CI
+
+# Source-only Phase-2 validation for the thin setup bootstrapper. This workflow
+# builds Native AOT and runs fixture-payload acceptance; it does not upload or
+# publish the executable.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrapper:
+    name: Native AOT bootstrapper on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1  # v5
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build fixture bootstrapper and run acceptance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & pwsh -NoLogo -NoProfile -File packaging/test-bootstrapper.ps1
+          if ($LASTEXITCODE -ne 0) { throw "bootstrapper acceptance exited $LASTEXITCODE" }
+
+      - name: Verify the repository stayed clean
+        shell: pwsh
+        run: |
+          $status = @(git status --porcelain=v1)
+          if ($status.Count -gt 0) {
+              $status | ForEach-Object { Write-Output $_ }
+              throw 'bootstrapper validation left repository changes'
+          }
+          Write-Output 'repository clean'

@@ -122,6 +122,7 @@ $script:TestGroupCatalog = [ordered]@{
     'layout-profiles'     = 'Topology layout profiles (Pass 5C)'
     'lifecycle-layouts'   = 'Lifecycle profile placement (Pass 5D)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
+    'packaging'           = 'Packaging / setup bootstrapper'
     'test-harness'        = 'Test harness'
 }
 
@@ -35810,6 +35811,105 @@ exit 0
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'packaging' -Title 'Packaging / setup bootstrapper'
+
+    Test-Case "setup bootstrapper source is present and platform-locked" {
+        foreach ($relative in @(
+            'packaging\bootstrapper\DevWS.Setup.csproj',
+            'packaging\bootstrapper\Program.cs',
+            'packaging\build-setup.ps1',
+            'packaging\test-bootstrapper.ps1',
+            'packaging\README.md',
+            '.github\workflows\bootstrapper-ci.yml'
+        )) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $RepoRoot $relative) -PathType Leaf) "$relative exists"
+        }
+
+        $project = Get-SourceOf "packaging\bootstrapper\DevWS.Setup.csproj"
+        Assert-Contains $project '<TargetFramework>net10.0-windows</TargetFramework>' "the bootstrapper targets net10.0-windows"
+        Assert-Contains $project '<RuntimeIdentifier>win-x64</RuntimeIdentifier>' "the bootstrapper is win-x64 only"
+        Assert-Contains $project '<PublishAot>true</PublishAot>' "Native AOT is enabled"
+        Assert-Contains $project '<SelfContained>true</SelfContained>' "the executable is self-contained"
+        Assert-Contains $project '<AssemblyName>DevWS-Setup</AssemblyName>' "the executable name is fixed"
+        Assert-NotContains $project '<PackageReference' "the bootstrapper has no third-party package references"
+
+        $build = Get-SourceOf "packaging\build-setup.ps1"
+        Assert-Contains $build 'git -C $RepoRoot archive --format=zip --output=$payloadFile HEAD -- install.ps1 uninstall.ps1 LICENSE src config' "the payload is generated from tracked source"
+        Assert-Contains $build "'-p:PublishAot=true'" "the build publishes Native AOT"
+        Assert-Contains $build 'Get-FileHash -LiteralPath $artifact -Algorithm SHA256' "the artifact hash is reported"
+        Assert-Contains $build 'source commit' "the source commit is reported"
+        Assert-Contains $build 'The production setup build requires a clean committed worktree' "production builds require exact source identity"
+
+        $readme = Get-SourceOf "README.md"
+        Assert-NotContains $readme "DevWS-Setup.exe" "the public README does not claim a published setup executable"
+
+        $packagingFiles = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'packaging') -Recurse -File -Force)
+        foreach ($file in $packagingFiles) {
+            Assert-True ($file.Extension -notin @('.exe', '.zip', '.pdb', '.dbg')) "no generated binary/archive is present: $($file.FullName)"
+        }
+        Assert-True (@($packagingFiles | Where-Object { $_.FullName -match '(?i)[\\/](bin|obj)[\\/]' }).Count -eq 0) "packaging contains no bin/obj directories"
+
+        $trackedPackaging = @(& git -C $RepoRoot ls-files -- packaging)
+        Assert-True (@($trackedPackaging | Where-Object { $_ -match '(?i)\.(exe|zip|pdb|dbg)$|/(bin|obj)/' }).Count -eq 0) "no generated artifact is tracked"
+        Assert-True (@($trackedPackaging | Where-Object { $_ -match '(?i)winget|\.ya?ml$' }).Count -eq 0) "no WinGet manifest exists under packaging"
+    }
+
+    Test-Case "setup bootstrapper executes only the package-mode contract" {
+        $program = Get-SourceOf "packaging\bootstrapper\Program.cs"
+        $process = Get-SourceOf "packaging\bootstrapper\ProcessRunner.cs"
+
+        Assert-Contains $process 'startInfo.ArgumentList.Add("-PackageMode");' "the installer receives -PackageMode"
+        Assert-Contains $process 'startInfo.ArgumentList.Add("-NoLogo");' "the installer uses a direct argv"
+        Assert-Contains $process 'WorkingDirectory = workingDirectory' "the installer working directory is explicit"
+        foreach ($forbidden in @('"-Force"', '"-ResetConfig"', '"-Purge"')) {
+            Assert-NotContains $process $forbidden "the bootstrapper never passes $forbidden"
+            Assert-NotContains $program $forbidden "the bootstrapper entry point never passes $forbidden"
+        }
+        Assert-NotContains $process 'cmd.exe' "the bootstrapper never invokes cmd.exe"
+        Assert-NotContains $process 'powershell.exe' "the bootstrapper never invokes Windows PowerShell"
+        Assert-Contains $program 'Elevation.ElevatedArgument' "elevation uses the fixed internal marker"
+        Assert-Contains $program 'ArchitecturePolicy.EnsureSupported' "the executable fails closed off Windows x64"
+    }
+
+    Test-Case "trusted PowerShell and protected staging policy are explicit" {
+        $resolver = Get-SourceOf "packaging\bootstrapper\PowerShellResolver.cs"
+        Assert-Contains $resolver 'Microsoft.PowerShell_8wekyb3d8bbwe' "the official MSIX family is fixed"
+        Assert-Contains $resolver 'GetPackagesByPackageFamily' "MSIX discovery uses package APIs"
+        Assert-Contains $resolver 'GetPackagePathByFullName' "MSIX discovery uses the registered package path"
+        Assert-Contains $resolver 'PowerShell", "7", "pwsh.exe' "the machine-wide candidate is exact"
+        Assert-Contains $resolver 'WindowsApps' "the MSIX root is the protected WindowsApps root"
+        Assert-Contains $resolver 'FileMajorPart >= 7' "PowerShell major version is checked"
+        Assert-Contains $resolver 'ProductMajorPart >= 7' "PowerShell product version is checked"
+        Assert-NotContains $resolver 'Environment.GetEnvironmentVariable("PATH")' "PowerShell is never resolved through PATH"
+        Assert-NotContains $resolver 'where.exe' "PowerShell is never resolved through where.exe"
+
+        $staging = Get-SourceOf "packaging\bootstrapper\ProtectedStaging.cs"
+        Assert-Contains $staging 'SpecialFolder.CommonApplicationData' "staging uses the OS ProgramData root"
+        Assert-Contains $staging 'setup-staging' "staging uses the dedicated setup area"
+        Assert-Contains $staging 'CreateDirectoryW' "staging directories are created with security attributes"
+        Assert-Contains $staging 'SetAccessRuleProtection' "staging DACLs are protected"
+        Assert-Contains $staging 'ReparsePoint' "staging refuses reparse points"
+        Assert-NotContains $staging 'GetTempPath' "staging never uses a user temp root"
+        Assert-NotContains $staging 'LocalApplicationData' "staging never uses LOCALAPPDATA"
+
+        $payload = Get-SourceOf "packaging\bootstrapper\PayloadArchive.cs"
+        Assert-Contains $payload 'GetFullPath' "archive destinations are normalized"
+        Assert-Contains $payload 'duplicate normalized targets' "duplicate archive targets are refused"
+        Assert-Contains $payload 'ReparsePoint' "archive reparse entries are refused"
+        Assert-Contains $payload 'escapes the staging root' "archive traversal is refused"
+
+        $workflow = Get-SourceOf ".github\workflows\bootstrapper-ci.yml"
+        Assert-Contains $workflow 'workflow_dispatch:' "bootstrapper validation is manually dispatched"
+        Assert-Contains $workflow 'contents: read' "the workflow is read-only"
+        Assert-Contains $workflow 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' "checkout is SHA-pinned"
+        Assert-Contains $workflow 'actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1' "setup-dotnet is SHA-pinned"
+        Assert-Contains $workflow 'packaging/test-bootstrapper.ps1' "the workflow runs fixture acceptance"
+        Assert-NotContains $workflow 'upload-artifact' "the workflow publishes no artifact"
+        Assert-NotContains $workflow 'secrets.' "the workflow uses no repository secret"
+        Assert-NotContains $workflow 'self-hosted' "the workflow stays hosted"
+    }
+
+    Write-Host ""
     Start-TestGroup -Name 'test-harness' -Title 'Test harness'
 
     Test-Case "suite broker isolation is installed and never connects to the production broker pipe" {
@@ -35823,8 +35923,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 62 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 62 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 63 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 63 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

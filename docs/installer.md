@@ -60,6 +60,18 @@ package**; this contract only fixes the arguments, non-interactive behavior and 
 future wrapper will use. Exit code `0` means the requested package-mode operation completed;
 any nonzero exit means it did not.
 
+### Unreleased setup bootstrapper source
+
+The v0.2 integration branch contains the source for a thin Windows x64 setup bootstrapper at
+`packaging/bootstrapper`. It embeds the DevWS installation payload and invokes
+`install.ps1 -PackageMode`; it does not replace the PowerShell installer's semantics. It does
+not install prerequisites, provide an uninstall/repair/Add-Remove-Programs lifecycle, or ship
+a WinGet package. The current build is x64-only.
+
+This is **source only** at this phase. No setup executable is published or downloadable, and
+the public README's v0.1.0 source-only distribution statement remains unchanged. See
+[`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
+
 ## 2. Prerequisites
 
 All prerequisites are checked **before anything is modified**. A failure aborts with an
