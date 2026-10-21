@@ -7,6 +7,15 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Package-mode installer contract** — `install.ps1 -PackageMode` performs the ordinary
+  non-interactive install/update path for a future package/bootstrap layer, while
+  `uninstall.ps1 -PackageMode` performs the ordinary default uninstall non-interactively and
+  preserves configuration and state. Package mode does not self-elevate, never resets or
+  purges, and rejects destructive or alternate-mode combinations before mutation. No setup
+  executable or WinGet package is included in this phase.
+
 ## [0.1.0] - 2026-10-21
 
 ### Added

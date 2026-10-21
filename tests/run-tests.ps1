@@ -18767,6 +18767,60 @@ $mutex.Dispose()
         Assert-Equal $custom (Get-Content -LiteralPath $hotkeyPath -Raw) "the custom hotkey is preserved"
     }
 
+    Test-Case "uninstall.ps1 -PackageMode is the non-interactive default uninstall contract" {
+        $uninstall = Get-SourceOf "uninstall.ps1"
+
+        Assert-Contains $uninstall '[switch]$PackageMode' "the package-mode switch exists"
+        Assert-Contains $uninstall 'uninstall.ps1 -PackageMode' "usage documents package mode"
+
+        $guard = 'if ($PackageMode -and ($Purge -or $Force)) {'
+        Assert-Contains $uninstall $guard "package mode rejects purge and force"
+
+        $guardIndex = $uninstall.IndexOf($guard, [StringComparison]::Ordinal)
+        $adminIndex = $uninstall.IndexOf('Test-DevWSAdministrator', [StringComparison]::Ordinal)
+        $planIndex = $uninstall.IndexOf('$plan = Get-DevWSUninstallPlan', [StringComparison]::Ordinal)
+        $executeIndex = $uninstall.IndexOf('Invoke-DevWSUninstall', [StringComparison]::Ordinal)
+
+        Assert-True ($guardIndex -ge 0) "package-mode guard located"
+        Assert-True ($guardIndex -lt $adminIndex) "package-mode guard runs before elevation"
+        Assert-True ($guardIndex -lt $planIndex) "package-mode guard runs before planning"
+        Assert-True ($guardIndex -lt $executeIndex) "package-mode guard runs before execution"
+
+        $promptCondition = 'if (-not $Force -and -not $PackageMode) {'
+        Assert-Contains $uninstall $promptCondition "the confirmation prompt excludes package mode"
+
+        $promptIndex = $uninstall.IndexOf($promptCondition, [StringComparison]::Ordinal)
+        $readHostIndex = $uninstall.IndexOf('Read-Host', $promptIndex, [StringComparison]::Ordinal)
+        $promptEnd = $uninstall.IndexOf('$actions = @(Invoke-DevWSUninstall', $promptIndex, [StringComparison]::Ordinal)
+
+        Assert-True ($promptIndex -ge 0) "the prompt condition is located"
+        Assert-True ($readHostIndex -gt $promptIndex -and $readHostIndex -lt $promptEnd) "Read-Host remains only inside the non-package prompt"
+        Assert-Equal 1 ([regex]::Matches($uninstall, 'Read-Host')).Count "ordinary uninstall keeps exactly one confirmation prompt"
+        Assert-Contains $uninstall '-Purge:$Purge' "package mode does not replace the explicit purge decision"
+
+        $fixture = New-InstallFixture "uninstall-package-contract"
+        $canonical = Join-Path $fixture.Root "canonical.json"
+        Set-Content -LiteralPath $canonical -Value "{}" -NoNewline
+        $metadata = New-DevWSInstallMetadata
+        $plan = Get-DevWSUninstallPlan -InstallRoot $fixture.Root -CanonicalPath $canonical -LegacyShimPath (Join-Path $fixture.Root "local-bin\ws.cmd") -HotkeyPath (Join-Path $fixture.Root "Startup\TerminalShortcut.ahk") -Metadata $metadata
+
+        Assert-Equal $false $plan.RemoveCanonicalConfig "default package uninstall preserves canonical config"
+        Assert-Equal $false $plan.RemoveState "default package uninstall preserves disposable state"
+        Assert-Equal $true $plan.PreserveV1 "default package uninstall preserves v1"
+    }
+
+    Test-Case "uninstall.ps1 -PackageMode rejects purge and force before mutation" {
+        foreach ($extra in @('-Purge', '-Force')) {
+            $output = & pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot "uninstall.ps1") -PackageMode $extra 2>&1 | Out-String
+            $code = $LASTEXITCODE
+
+            Assert-Equal 1 $code "uninstall package mode refuses $extra"
+            Assert-Contains $output "cannot be combined" "the $extra refusal is explicit"
+            Assert-NotContains $output "DevWS uninstall plan" "the $extra refusal precedes planning"
+            Assert-NotContains $output "must run from an Administrator" "the $extra refusal precedes elevation"
+        }
+    }
+
     Write-Host ""
     Start-TestGroup -Name 'bindings' -Title 'Phase 8 set launch bindings'
 
@@ -23073,6 +23127,51 @@ Write-Output "REPLACEMENT-LOADED"
         Assert-True ($code -eq 0 -or $code -eq 1) "health check exits 0 or 1 (got $code)"
         Assert-Contains $output "Health check" "health summary printed"
         Assert-NotContains $output "ParserError" "installer script parses and runs"
+    }
+
+    Test-Case "install.ps1 -PackageMode is the non-interactive ordinary install contract" {
+        $install = Get-SourceOf "install.ps1"
+
+        Assert-Contains $install '[switch]$PackageMode' "the package-mode switch exists"
+        Assert-Contains $install 'install.ps1 -PackageMode' "usage documents package mode"
+
+        $guard = 'if ($PackageMode -and ($ResetConfig -or $Force -or $HealthCheck -or $RepairTasks)) {'
+        Assert-Contains $install $guard "package mode rejects every forbidden combination"
+
+        $guardIndex = $install.IndexOf($guard, [StringComparison]::Ordinal)
+        $prerequisiteIndex = $install.IndexOf('Get-DevWSPrerequisiteResults', [StringComparison]::Ordinal)
+        $mutationIndex = $install.IndexOf('Install-DevWSApplicationFiles', [StringComparison]::Ordinal)
+        $healthBranchIndex = $install.IndexOf('if ($HealthCheck) {', [StringComparison]::Ordinal)
+        $repairBranchIndex = $install.IndexOf('if ($RepairTasks) {', [StringComparison]::Ordinal)
+
+        Assert-True ($guardIndex -ge 0) "package-mode guard located"
+        Assert-True ($guardIndex -lt $prerequisiteIndex) "package-mode guard runs before prerequisite checks"
+        Assert-True ($guardIndex -lt $mutationIndex) "package-mode guard runs before install mutation"
+        Assert-True ($guardIndex -lt $healthBranchIndex) "package-mode guard runs before the health-only branch"
+        Assert-True ($guardIndex -lt $repairBranchIndex) "package-mode guard runs before the repair-only branch"
+
+        $resetCondition = 'if ($ResetConfig -and -not $Force) {'
+        $resetIndex = $install.IndexOf($resetCondition, [StringComparison]::Ordinal)
+        $readHostIndex = $install.IndexOf('Read-Host', $resetIndex, [StringComparison]::Ordinal)
+        $resetEnd = $install.IndexOf('# --- 1. Application files', $resetIndex, [StringComparison]::Ordinal)
+
+        Assert-True ($resetIndex -ge 0) "ordinary reset confirmation is preserved"
+        Assert-True ($readHostIndex -gt $resetIndex -and $readHostIndex -lt $resetEnd) "the only install prompt is inside the reset branch"
+        Assert-Equal 1 ([regex]::Matches($install, 'Read-Host')).Count "the installer has exactly one interactive decision"
+        Assert-NotContains $install 'Invoke-DevWSPackageInstall' "package mode does not duplicate the installer flow"
+    }
+
+    Test-Case "install.ps1 -PackageMode rejects destructive and alternate modes before mutation" {
+        foreach ($extra in @('-ResetConfig', '-Force', '-HealthCheck', '-RepairTasks')) {
+            $output = & pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot "install.ps1") -PackageMode $extra 2>&1 | Out-String
+            $code = $LASTEXITCODE
+
+            Assert-Equal 1 $code "install package mode refuses $extra"
+            Assert-Contains $output "cannot be combined" "the $extra refusal is explicit"
+            Assert-NotContains $output "Prerequisites:" "the $extra refusal precedes prerequisite checks"
+            Assert-NotContains $output "1/9 Application files" "the $extra refusal precedes installer mutation"
+            Assert-NotContains $output "must run from an Administrator" "the $extra refusal precedes elevation"
+        }
     }
 
     Write-Host ""

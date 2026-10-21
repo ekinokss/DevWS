@@ -22,6 +22,7 @@ install.ps1 -ResetConfig         # back up the current config, then install the 
 install.ps1 -ResetConfig -Force  # same, skipping the reset confirmation
 install.ps1 -HealthCheck         # report status without changing anything
 install.ps1 -RepairTasks         # repair stale managed task PowerShell bindings only
+install.ps1 -PackageMode         # non-interactive ordinary install/update for a future package layer
 ```
 
 The installer **does not self-elevate**. If it is not running as an administrator it stops
@@ -33,6 +34,31 @@ elevation. The same health implementation backs `ws doctor` and `ws health`.
 `-RepairTasks` is an isolated repair mode (see §6.1). It requires elevation, never falls
 through into the nine-step install/update flow, and cannot be combined with `-ResetConfig`,
 `-Force` or `-HealthCheck`.
+
+### Package integration contract
+
+`install.ps1 -PackageMode` is the stable non-interactive contract for a future external
+package/bootstrap layer. It performs the ordinary install/idempotent-update path: prerequisite
+validation, elevation, configuration preservation/migration, the existing nine-step installer
+and the mandatory health check. It has no separate installation implementation and never
+resets a valid configuration.
+
+`uninstall.ps1 -PackageMode` is the corresponding non-interactive default uninstall contract.
+It performs the ordinary uninstall without the confirmation prompt and preserves the canonical
+workspace configuration, disposable state/backups, `%USERPROFILE%\.ws` and unrelated resources
+exactly as a default uninstall does. It never implies `-Purge` or `-Force`.
+
+Package mode does **not** self-elevate and does **not** install prerequisites. The invoking
+package/bootstrap layer must run it from an elevated PowerShell and is responsible for any
+prerequisite acquisition outside DevWS. Package mode cannot reset or purge: the installer
+rejects `-PackageMode` with `-ResetConfig`, `-Force`, `-HealthCheck` or `-RepairTasks`, and the
+uninstaller rejects it with `-Purge` or `-Force`, before any machine mutation.
+
+Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
+unchanged. At this phase there is **no `DevWS-Setup.exe`, no WinGet manifest and no WinGet
+package**; this contract only fixes the arguments, non-interactive behavior and exit status a
+future wrapper will use. Exit code `0` means the requested package-mode operation completed;
+any nonzero exit means it did not.
 
 ## 2. Prerequisites
 
@@ -266,9 +292,10 @@ presented as a routine package update.
 ## 10. Uninstall
 
 ```powershell
-uninstall.ps1          # remove DevWS files, tasks and integrations; keep configuration
-uninstall.ps1 -Purge   # also remove canonical configuration, state and backups
-uninstall.ps1 -Force   # skip the confirmation prompt
+uninstall.ps1              # remove DevWS files, tasks and integrations; keep configuration
+uninstall.ps1 -Purge       # also remove canonical configuration, state and backups
+uninstall.ps1 -Force       # skip the confirmation prompt
+uninstall.ps1 -PackageMode # non-interactive default uninstall for a future package layer
 ```
 
 Uninstall requires elevation, because it removes scheduled tasks and files under the

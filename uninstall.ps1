@@ -16,10 +16,13 @@
 #   uninstall.ps1              remove DevWS, preserve the workspace config
 #   uninstall.ps1 -Purge       also remove canonical config, state, and backups
 #   uninstall.ps1 -Force       skip the confirmation prompt
+#   uninstall.ps1 -PackageMode non-interactive default uninstall for a future
+#                              package/bootstrap layer; always preserves config
 
 param(
     [switch]$Purge,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$PackageMode
 )
 
 $ErrorActionPreference = "Stop"
@@ -36,6 +39,10 @@ foreach ($libName in @(
 }
 
 try {
+    if ($PackageMode -and ($Purge -or $Force)) {
+        throw "uninstall.ps1 -PackageMode is the non-interactive default uninstall contract and cannot be combined with -Purge or -Force."
+    }
+
     if (-not (Test-DevWSAdministrator)) {
         throw ("The uninstaller must run from an Administrator PowerShell so it can remove the five managed DevWS scheduled tasks. Rerun it elevated:" + [Environment]::NewLine + "  Start-Process pwsh -Verb RunAs -ArgumentList '-NoLogo','-NoProfile','-File','`"" + $PSCommandPath + "`"'")
     }
@@ -121,7 +128,7 @@ try {
     Write-Host "  v1 rollback dir:   $(Join-Path $HOME '.ws') (always preserved)"
     Write-Host ""
 
-    if (-not $Force) {
+    if (-not $Force -and -not $PackageMode) {
         $answer = Read-Host "Continue? [y/N]"
 
         if ($answer -notmatch '^(?i:y|yes)$') {

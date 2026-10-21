@@ -17,12 +17,15 @@
 #   install.ps1 -RepairTasks      restore stale managed task PowerShell bindings
 #                                 (after a packaged PowerShell update) without
 #                                 reinstalling anything else
+#   install.ps1 -PackageMode      non-interactive ordinary install/update for a
+#                                 future package/bootstrap layer; no reset
 
 param(
     [switch]$ResetConfig,
     [switch]$Force,
     [switch]$HealthCheck,
-    [switch]$RepairTasks
+    [switch]$RepairTasks,
+    [switch]$PackageMode
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,6 +56,10 @@ function Get-DevWSInstallerRerunCommand {
 }
 
 try {
+    if ($PackageMode -and ($ResetConfig -or $Force -or $HealthCheck -or $RepairTasks)) {
+        throw "install.ps1 -PackageMode is the non-interactive ordinary install/update contract and cannot be combined with -ResetConfig, -Force, -HealthCheck or -RepairTasks."
+    }
+
     if ($RepairTasks -and ($ResetConfig -or $Force -or $HealthCheck)) {
         throw "install.ps1 -RepairTasks is a task-only repair mode and cannot be combined with -ResetConfig, -Force or -HealthCheck."
     }
