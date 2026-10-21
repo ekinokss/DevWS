@@ -1,18 +1,50 @@
-# DevWS Setup Bootstrapper (Phase 2 source)
+# DevWS Setup Bootstrapper (Phase 3 source)
 
-This directory contains the **unreleased** source for the thin Windows x64 setup
-bootstrapper. It is not a published DevWS release artifact.
+This directory contains the **unreleased** source for the Windows x64 setup lifecycle. It is
+not a published DevWS release artifact.
 
 The bootstrapper embeds the tracked DevWS installation payload and invokes the accepted
-Phase-1 contract:
+Phase-1 contracts:
 
 ```text
 pwsh -NoLogo -NoProfile -NonInteractive -File <protected staging>\install.ps1 -PackageMode
+pwsh -NoLogo -NoProfile -NonInteractive -File <protected staging>\uninstall.ps1 -PackageMode
 ```
 
 It does not implement installation semantics. Configuration migration, privileged runtime
 staging, scheduled tasks, PATH, hotkeys, native runtime generation, health checking and
 rollback remain owned by the existing PowerShell installer.
+
+## Package identity and lifecycle
+
+| Property | Value |
+| --- | --- |
+| Product ID / ARP key | `ekinokss.DevWS` |
+| Display name | `DevWS` |
+| Publisher | `ekinokss` |
+| Current source version | `0.2.0` |
+| ARP hive/view | `HKCU` 64-bit uninstall view |
+| Persisted setup | `%ProgramFiles%\DevWS\setup\<current-user-SID>\DevWS-Setup.exe` |
+
+The product identity and version are source-controlled in `product.json` and embedded into
+the executable at build time. The PowerShell runtime and configuration remain per-user;
+HKLM is not used for this package identity.
+
+Running the setup without arguments installs, upgrades, or idempotently reinstalls/repairs
+the same version. A newer installed version causes a downgrade refusal before
+`install.ps1` is invoked. `--uninstall` runs the ordinary default package-mode uninstall,
+preserves user configuration/state and removes the ARP registration. The persisted setup is
+administrator-owned, grants the target user read/execute only, and is atomically replaced
+after a successful installer run.
+
+Post-exit self-removal uses a short-lived protected-stage PowerShell helper; it derives the
+exact per-SID lifecycle path from fixed roots, waits for the setup parent to exit, refuses
+reparse paths, removes only the lifecycle directory and staging, and does not require a
+reboot. Registry values are discovery/ARP state only and are never used as execution
+authority.
+
+There is no MSI/MSIX, no Windows Installer product code, no service, no scheduled task, no
+self-update, no network acquisition, and no WinGet package in this phase.
 
 ## Requirements
 
@@ -56,16 +88,19 @@ pwsh -NoLogo -NoProfile -File packaging\build-setup.ps1 -DotNetPath C:\path\to\d
 
 ## Fixture acceptance
 
-Run from an elevated PowerShell 7 (the fixture exercises the real protected staging path):
+Run from an elevated PowerShell 7 (the fixture exercises the real protected staging and
+per-user package lifecycle paths, under build-time-only fixture identities):
 
 ```powershell
 pwsh -NoLogo -NoProfile -File packaging\test-bootstrapper.ps1
 ```
 
-The test builds a disposable Native AOT executable with a harmless fixture `install.ps1`.
-It proves package-mode argv, protected ProgramData staging, working directory, trusted
-PowerShell use, exit-code propagation and cleanup. It never invokes the real installer.
-It also runs the pure archive/trust/reparse checks.
+The test builds disposable Native AOT executables for fixture versions `0.2.0` and `0.2.1`.
+It proves fresh install, same-version reinstall, upgrade, downgrade refusal, install and
+uninstall failure preservation, ARP registration, protected SID-qualified setup persistence,
+ACL semantics, successful self-removing uninstall, user-data preservation and final residue
+cleanup. It also runs the pure archive/trust/version/ARP checks. It never invokes the real
+DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycle paths.
 
 ## Current scope
 

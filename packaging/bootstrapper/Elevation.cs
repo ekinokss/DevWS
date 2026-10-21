@@ -7,6 +7,8 @@ namespace DevWS.Setup;
 internal static class Elevation
 {
     internal const string ElevatedArgument = "--elevated";
+    internal const string OperationArgument = "--operation";
+    internal const string CallerSidArgument = "--caller-sid";
 
     internal static bool IsElevated()
     {
@@ -14,7 +16,7 @@ internal static class Elevation
         return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
     }
 
-    internal static int RelaunchElevated()
+    internal static int RelaunchElevated(SetupOperation operation, string callerSid)
     {
         var executable = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(executable) || !Path.IsPathFullyQualified(executable))
@@ -22,13 +24,19 @@ internal static class Elevation
             throw new SetupException("Could not resolve the absolute path of DevWS-Setup.exe for elevation.");
         }
 
+        if (!UserIdentity.TryParseSid(callerSid, out _))
+        {
+            throw new SetupException("The caller SID is malformed; refusing to request elevation.");
+        }
+
+        var operationText = operation == SetupOperation.Install ? "install" : "uninstall";
         var startInfo = new ProcessStartInfo
         {
             FileName = executable,
             WorkingDirectory = Path.GetDirectoryName(executable) ?? Environment.CurrentDirectory,
             UseShellExecute = true,
             Verb = "runas",
-            Arguments = ElevatedArgument
+            Arguments = $"{ElevatedArgument} {OperationArgument} {operationText} {CallerSidArgument} {callerSid}"
         };
 
         try

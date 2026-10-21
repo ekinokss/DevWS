@@ -17,14 +17,25 @@
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>
     <StripSymbols>true</StripSymbols>
-    <Version>0.2.0</Version>
+    <Version Condition="'$(DevWSProductVersion)' != ''">$(DevWSProductVersion)</Version>
   </PropertyGroup>
 
   <ItemGroup Condition="'$(DevWSPayloadZip)' != ''">
     <EmbeddedResource Include="$(DevWSPayloadZip)" LogicalName="DevWS.Setup.Payload.zip" />
   </ItemGroup>
 
-  <ItemGroup Condition="'$(DevWSSourceSha)' != ''">
-    <AssemblyMetadata Include="DevWSSourceSha" Value="$(DevWSSourceSha)" />
+  <ItemGroup>
+    <EmbeddedResource Include="PackageCleanup.ps1" LogicalName="DevWS.Setup.Cleanup.ps1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="DevWSSourceSha" Value="$(DevWSSourceSha)" Condition="'$(DevWSSourceSha)' != ''" />
+    <AssemblyMetadata Include="DevWSProductId" Value="$(DevWSProductId)" Condition="'$(DevWSProductId)' != ''" />
+    <AssemblyMetadata Include="DevWSDisplayName" Value="$(DevWSDisplayName)" Condition="'$(DevWSDisplayName)' != ''" />
+    <AssemblyMetadata Include="DevWSPublisher" Value="$(DevWSPublisher)" Condition="'$(DevWSPublisher)' != ''" />
+    <AssemblyMetadata Include="DevWSProductVersion" Value="$(DevWSProductVersion)" Condition="'$(DevWSProductVersion)' != ''" />
+    <AssemblyMetadata Include="DevWSProgramFilesRootLeaf" Value="$(DevWSProgramFilesRootLeaf)" Condition="'$(DevWSProgramFilesRootLeaf)' != ''" />
+    <AssemblyMetadata Include="DevWSInstallRootLeaf" Value="$(DevWSInstallRootLeaf)" Condition="'$(DevWSInstallRootLeaf)' != ''" />
+    <AssemblyMetadata Include="DevWSURLInfoAbout" Value="$(DevWSURLInfoAbout)" Condition="'$(DevWSURLInfoAbout)' != ''" />
   </ItemGroup>
 </Project>

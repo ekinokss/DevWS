@@ -18,8 +18,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Thin setup bootstrapper source** — an unreleased Native AOT Windows x64 bootstrapper under
   `packaging/` that resolves trusted PowerShell, requests elevation, stages the embedded
   DevWS source payload in protected ProgramData storage, extracts it safely and invokes
-  `install.ps1 -PackageMode`. It is source-only: no setup binary is published, no WinGet
-  manifest exists, and no uninstall/repair/ARP lifecycle is provided yet.
+  `install.ps1 -PackageMode`. It is source-only: no setup binary is published and no WinGet
+  manifest exists.
+- **Windows package lifecycle source** — per-user `ekinokss.DevWS` ARP registration, a
+  protected SID-qualified persisted setup executable, numeric version policy (fresh,
+  same-version repair, upgrade and downgrade refusal), setup-driven package uninstall, and
+  protected post-exit self-removal. The existing PowerShell install/uninstall engines and
+  user-data preservation semantics are unchanged.
 
 ## [0.1.0] - 2026-10-21
 

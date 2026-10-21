@@ -72,6 +72,27 @@ This is **source only** at this phase. No setup executable is published or downl
 the public README's v0.1.0 source-only distribution statement remains unchanged. See
 [`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
 
+### Unreleased v0.2 package lifecycle
+
+The unreleased setup source now models a per-user Windows package lifecycle. Its stable
+identity is `ekinokss.DevWS`, display name `DevWS`, publisher `ekinokss`, and current version
+`0.2.0`. Discovery state is written to the 64-bit current-user uninstall key; no HKLM
+registration or Windows Installer product code is used.
+
+A successful install persists the setup executable at
+`%ProgramFiles%\DevWS\setup\<current-user-SID>\DevWS-Setup.exe` with an administrator-owned
+protected ACL. The target user can read and execute it but cannot write, replace, rename,
+delete, change permissions or take ownership. The same version reruns the idempotent
+PowerShell install for repair. Upgrades are allowed; downgrades are refused before the
+PowerShell installer is called. The ARP entry is discovery state only and is never trusted
+as executable authority.
+
+`--uninstall` runs the ordinary package-mode uninstall, removes the ARP entry, then uses a
+protected post-exit helper to remove the per-SID setup directory without a reboot. Package
+uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` and unrelated
+resources exactly as the frozen Phase-1 contract requires. There is no self-update, network
+acquisition, prerequisite installation, published setup binary or WinGet package yet.
+
 ## 2. Prerequisites
 
 All prerequisites are checked **before anything is modified**. A failure aborts with an

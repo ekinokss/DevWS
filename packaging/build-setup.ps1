@@ -4,13 +4,19 @@ param(
     [string]$DotNetPath = 'dotnet',
     [string]$OutputDir = '',
     [string]$PayloadZip = '',
-    [switch]$Fixture
+    [switch]$Fixture,
+    [string]$ProductVersion = '',
+    [string]$ProductId = '',
+    [string]$DisplayName = '',
+    [string]$ProgramFilesRootLeaf = '',
+    [string]$InstallRootLeaf = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $ProjectPath = Join-Path $PSScriptRoot 'bootstrapper\DevWS.Setup.csproj'
+$ProductPath = Join-Path $PSScriptRoot 'product.json'
 
 function Assert-Condition([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -38,6 +44,40 @@ if ($Fixture -and -not $isFixture) {
 if (-not $isFixture -and $sourceStatus.Count -gt 0) {
     throw "The production setup build requires a clean committed worktree. Dirty paths: $($sourceStatus -join '; ')"
 }
+
+Assert-Condition (Test-Path -LiteralPath $ProductPath -PathType Leaf) "Product identity not found: $ProductPath"
+$product = Get-Content -LiteralPath $ProductPath -Raw | ConvertFrom-Json
+
+if ($isFixture) {
+    foreach ($item in @(
+        @{ Name = 'ProductVersion'; Value = $ProductVersion },
+        @{ Name = 'ProductId'; Value = $ProductId },
+        @{ Name = 'DisplayName'; Value = $DisplayName },
+        @{ Name = 'ProgramFilesRootLeaf'; Value = $ProgramFilesRootLeaf },
+        @{ Name = 'InstallRootLeaf'; Value = $InstallRootLeaf }
+    )) {
+        Assert-Condition (-not [string]::IsNullOrWhiteSpace($item.Value)) "Fixture builds require -$($item.Name)."
+    }
+    Assert-Condition ($ProductId -ne [string]$product.productId) 'Fixture ProductId must differ from the production product id.'
+    Assert-Condition ($ProgramFilesRootLeaf -ne [string]$product.programFilesRootLeaf) 'Fixture Program Files root must differ from production.'
+    Assert-Condition ($InstallRootLeaf -ne [string]$product.installRootLeaf) 'Fixture install root must differ from production.'
+}
+else {
+    foreach ($item in @($ProductVersion, $ProductId, $DisplayName, $ProgramFilesRootLeaf, $InstallRootLeaf)) {
+        Assert-Condition ([string]::IsNullOrWhiteSpace($item)) 'Product identity overrides are accepted only with -Fixture.'
+    }
+
+    $ProductVersion = [string]$product.version
+    $ProductId = [string]$product.productId
+    $DisplayName = [string]$product.displayName
+    $ProgramFilesRootLeaf = [string]$product.programFilesRootLeaf
+    $InstallRootLeaf = [string]$product.installRootLeaf
+}
+
+Assert-Condition ($ProductVersion -match '^\d+\.\d+\.\d+$') "Product version '$ProductVersion' is not major.minor.patch."
+Assert-Condition ($ProductId -match '^[A-Za-z0-9._-]+$') "Product id '$ProductId' contains unsupported characters."
+Assert-Condition ($ProgramFilesRootLeaf -notmatch '[\\/]' -and $ProgramFilesRootLeaf -notin @('.', '..')) 'ProgramFilesRootLeaf is not a safe leaf.'
+Assert-Condition ($InstallRootLeaf -notmatch '[\\/]' -and $InstallRootLeaf -notin @('.', '..')) 'InstallRootLeaf is not a safe leaf.'
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path ([IO.Path]::GetTempPath()) ('devws-setup-artifact-' + [DateTime]::UtcNow.ToString('yyyyMMddHHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -100,6 +140,14 @@ try {
         '-p:SelfContained=true',
         "-p:DevWSPayloadZip=$payloadFile",
         "-p:DevWSSourceSha=$sourceIdentity",
+        "-p:DevWSProductId=$ProductId",
+        "-p:DevWSDisplayName=$DisplayName",
+        "-p:DevWSPublisher=$($product.publisher)",
+        "-p:DevWSProductVersion=$ProductVersion",
+        "-p:DevWSProgramFilesRootLeaf=$ProgramFilesRootLeaf",
+        "-p:DevWSInstallRootLeaf=$InstallRootLeaf",
+        "-p:DevWSURLInfoAbout=$($product.urlInfoAbout)",
+        "-p:Version=$ProductVersion",
         "-p:BaseIntermediateOutputPath=$objRoot",
         "-p:BaseOutputPath=$binRoot"
     )
@@ -121,6 +169,10 @@ try {
 
     Write-Output "[setup-build] source commit: $sourceSha"
     Write-Output "[setup-build] source identity embedded: $sourceIdentity"
+    Write-Output "[setup-build] product id: $ProductId"
+    Write-Output "[setup-build] product version: $ProductVersion"
+    Write-Output "[setup-build] display name: $DisplayName"
+    Write-Output "[setup-build] Program Files root leaf: $ProgramFilesRootLeaf"
     Write-Output "[setup-build] build mode: $(if ($isFixture) { 'fixture payload' } else { 'production payload' })"
     Write-Output "[setup-build] .NET SDK: $sdkVersion"
     Write-Output "[setup-build] host architecture: win-x64"

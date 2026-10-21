@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
+using Microsoft.Win32;
 
 namespace DevWS.Setup.Checks;
 
@@ -19,6 +20,107 @@ internal static class Program
             Check(!ArchitecturePolicy.IsSupported(true, Architecture.X86));
             Check(!ArchitecturePolicy.IsSupported(true, Architecture.Arm64));
             Check(!ArchitecturePolicy.IsSupported(false, Architecture.X64));
+        });
+
+        Run("version policy is numeric and fail-closed", () =>
+        {
+            Check(PackageVersion.TryParse("0.2.0", out var v020));
+            Check(PackageVersion.TryParse("0.2.1", out var v021));
+            Check(!PackageVersion.TryParse("0.2", out _));
+            Check(!PackageVersion.TryParse("0.2.x", out _));
+            Check(!PackageVersion.TryParse("0.2.0-beta", out _));
+            Check(v020.CompareTo(v021) < 0);
+            Check(VersionPolicy.Decide(null, v020) == PackageVersionDecision.FreshInstall);
+            Check(VersionPolicy.Decide(v020, v020) == PackageVersionDecision.Reinstall);
+            Check(VersionPolicy.Decide(v020, v021) == PackageVersionDecision.Upgrade);
+            Check(VersionPolicy.Decide(v021, v020) == PackageVersionDecision.Downgrade);
+        });
+
+        Run("production/fixture identity paths and SID rules are exact", () =>
+        {
+            var sid = UserIdentity.CurrentSid();
+            Check(UserIdentity.TryParseSid(sid.Value, out var parsed));
+            Check(parsed is not null && parsed.Equals(sid));
+            Check(!UserIdentity.TryParseSid("not-a-sid", out _));
+
+            var fixture = FixtureIdentity();
+            Check(fixture.ArpKeyPath == @"Software\Microsoft\Windows\CurrentVersion\Uninstall\" + fixture.ProductId);
+            Check(fixture.PersistedSetupPath(sid.Value).EndsWith(@"\setup\" + sid.Value + @"\DevWS-Setup.exe", StringComparison.OrdinalIgnoreCase));
+            Check(fixture.InstallLocation.EndsWith(fixture.InstallRootLeaf, StringComparison.OrdinalIgnoreCase));
+
+            var otherSid = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null).Value;
+            var rejected = false;
+            try { UserIdentity.RequireSameElevatedSid(otherSid); }
+            catch (SetupException) { rejected = true; }
+            Check(rejected, "cross-user elevation SID mismatch was accepted");
+        });
+
+        Run("ARP registration fixture round-trips and is removable", () =>
+        {
+            var identity = FixtureIdentity();
+            var sid = UserIdentity.CurrentSid().Value;
+            try
+            {
+                Check(!PackageRegistration.Read(identity, sid).Exists);
+                PackageRegistration.Write(identity, sid, "test-source", identity.ParsedVersion);
+                var read = PackageRegistration.Read(identity, sid);
+                Check(read.Exists);
+                Check(read.Version == identity.ParsedVersion);
+                PackageRegistration.ValidatePersistedRegistration(identity, sid, identity.ParsedVersion, "test-source");
+            }
+            finally
+            {
+                PackageRegistration.Remove(identity);
+            }
+            Check(!PackageRegistration.Read(identity, sid).Exists, "fixture ARP key remained after removal");
+        });
+
+        Run("malformed package registration is refused", () =>
+        {
+            var identity = FixtureIdentity();
+            var sid = UserIdentity.CurrentSid().Value;
+            try
+            {
+                PackageRegistration.Write(identity, sid, "test-source", identity.ParsedVersion);
+                using (var baseKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64))
+                using (var key = baseKey.OpenSubKey(identity.ArpKeyPath, writable: true))
+                {
+                    Check(key is not null);
+                    key!.SetValue("DisplayVersion", "not-a-version", RegistryValueKind.String);
+                }
+
+                var rejected = false;
+                try { PackageRegistration.Read(identity, sid); }
+                catch (SetupException) { rejected = true; }
+                Check(rejected, "malformed ARP version was accepted");
+            }
+            finally
+            {
+                PackageRegistration.Remove(identity);
+            }
+        });
+
+        Run("package ACL policy grants user read but no write/delete", () =>
+        {
+            var root = NewTempDirectory();
+            var packageRoot = Path.Combine(root, "pkg");
+            var sid = UserIdentity.CurrentSid();
+            try
+            {
+                PackageSecurity.CreateDirectoryAtomic(packageRoot, null);
+                var readOnlyDir = Path.Combine(packageRoot, "setup");
+                PackageSecurity.CreateDirectoryAtomic(readOnlyDir, sid);
+                PackageSecurity.ValidateDirectory(readOnlyDir, root, sid, requireReaderAccess: true);
+
+                var file = Path.Combine(readOnlyDir, "install-marker.txt");
+                File.WriteAllText(file, "fixture");
+                PackageSecurity.ApplyFileSecurity(file, sid);
+                PackageSecurity.ValidateFile(file, root, sid);
+            }
+            finally
+            {
+                TryDelete(root);
+            }
         });
 
         Run("PowerShell trust root rejects user-writable and missing candidates", () =>
@@ -102,6 +204,38 @@ internal static class Program
             }
         });
 
+        Run("stable self-image handle prevents replacement and copies exact bytes", () =>
+        {
+            var root = NewTempDirectory();
+            var sourcePath = Path.Combine(root, "source.exe");
+            var copyPath = Path.Combine(root, "copy.exe");
+            var bytes = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+            File.WriteAllBytes(sourcePath, bytes);
+            try
+            {
+                using var image = SelfImage.Open(sourcePath);
+                Check(image.Length == bytes.Length);
+                Check(image.Hash == Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)));
+
+                var writeRejected = false;
+                try
+                {
+                    using var writer = new FileStream(sourcePath, FileMode.Open, FileAccess.Write, FileShare.ReadWrite);
+                    writer.WriteByte(0);
+                }
+                catch (IOException) { writeRejected = true; }
+                catch (UnauthorizedAccessException) { writeRejected = true; }
+                Check(writeRejected, "the held source could be replaced");
+
+                image.CopyTo(copyPath);
+                Check(File.ReadAllBytes(copyPath).SequenceEqual(bytes));
+            }
+            finally
+            {
+                TryDelete(root);
+            }
+        });
+
         Run("protected staging is created and cleaned under ProgramData", () =>
         {
             var stagingRoot = Path.Combine(
@@ -175,6 +309,19 @@ internal static class Program
         {
             TryDelete(root);
         }
+    }
+
+    private static ProductIdentity FixtureIdentity()
+    {
+        var suffix = Guid.NewGuid().ToString("N").Substring(0, 8);
+        return new ProductIdentity(
+            "ekinokss.DevWS.Fixture.Checks." + suffix,
+            "DevWS Setup Fixture Checks " + suffix,
+            "ekinokss",
+            "0.2.0",
+            "DevWS-Setup-Fixture-Checks-" + suffix,
+            "DevWS-Setup-Fixture-Checks-" + suffix,
+            "https://github.com/ekinokss/DevWS");
     }
 
     private static ZipArchive Zip(params string[] namesAndContents)

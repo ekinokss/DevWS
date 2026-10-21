@@ -11,10 +11,18 @@
 
   <ItemGroup>
     <Compile Include="..\bootstrapper\ArchitecturePolicy.cs" Link="ArchitecturePolicy.cs" />
+    <Compile Include="..\bootstrapper\BuildInfo.cs" Link="BuildInfo.cs" />
+    <Compile Include="..\bootstrapper\InstalledSetup.cs" Link="InstalledSetup.cs" />
     <Compile Include="..\bootstrapper\NativeMethods.cs" Link="NativeMethods.cs" />
+    <Compile Include="..\bootstrapper\PackageRegistration.cs" Link="PackageRegistration.cs" />
+    <Compile Include="..\bootstrapper\PackageSecurity.cs" Link="PackageSecurity.cs" />
     <Compile Include="..\bootstrapper\PathSafety.cs" Link="PathSafety.cs" />
     <Compile Include="..\bootstrapper\PayloadArchive.cs" Link="PayloadArchive.cs" />
     <Compile Include="..\bootstrapper\PowerShellResolver.cs" Link="PowerShellResolver.cs" />
+    <Compile Include="..\bootstrapper\ProductIdentity.cs" Link="ProductIdentity.cs" />
     <Compile Include="..\bootstrapper\ProtectedStaging.cs" Link="ProtectedStaging.cs" />
+    <Compile Include="..\bootstrapper\SelfImage.cs" Link="SelfImage.cs" />
+    <Compile Include="..\bootstrapper\UserIdentity.cs" Link="UserIdentity.cs" />
+    <Compile Include="..\bootstrapper\VersionPolicy.cs" Link="VersionPolicy.cs" />
   </ItemGroup>
 </Project>

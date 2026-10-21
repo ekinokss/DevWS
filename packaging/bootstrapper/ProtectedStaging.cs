@@ -8,6 +8,7 @@ internal sealed class StagingSession : IDisposable
 {
     private readonly List<string> _createdDirectories;
     private bool _disposed;
+    private bool _handedOffToCleanup;
 
     internal StagingSession(string root, List<string> createdDirectories)
     {
@@ -18,6 +19,11 @@ internal sealed class StagingSession : IDisposable
     internal string Root { get; }
     internal string InstallScript => Path.Combine(Root, "install.ps1");
 
+    internal void HandoffToCleanup()
+    {
+        _handedOffToCleanup = true;
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -25,6 +31,11 @@ internal sealed class StagingSession : IDisposable
             return;
         }
         _disposed = true;
+
+        if (_handedOffToCleanup)
+        {
+            return;
+        }
 
         try
         {

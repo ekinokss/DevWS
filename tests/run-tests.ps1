@@ -35815,8 +35815,16 @@ exit 0
 
     Test-Case "setup bootstrapper source is present and platform-locked" {
         foreach ($relative in @(
+            'packaging\product.json',
             'packaging\bootstrapper\DevWS.Setup.csproj',
             'packaging\bootstrapper\Program.cs',
+            'packaging\bootstrapper\ProductIdentity.cs',
+            'packaging\bootstrapper\VersionPolicy.cs',
+            'packaging\bootstrapper\PackageRegistration.cs',
+            'packaging\bootstrapper\InstalledSetup.cs',
+            'packaging\bootstrapper\SelfImage.cs',
+            'packaging\bootstrapper\PackageCleanup.cs',
+            'packaging\bootstrapper\PackageCleanup.ps1',
             'packaging\build-setup.ps1',
             'packaging\test-bootstrapper.ps1',
             'packaging\README.md',
@@ -35833,12 +35841,21 @@ exit 0
         Assert-Contains $project '<AssemblyName>DevWS-Setup</AssemblyName>' "the executable name is fixed"
         Assert-NotContains $project '<PackageReference' "the bootstrapper has no third-party package references"
 
+        $product = Get-SourceOf "packaging\product.json"
+        Assert-Contains $product '"productId": "ekinokss.DevWS"' "the production product id is fixed"
+        Assert-Contains $product '"displayName": "DevWS"' "the production display name is fixed"
+        Assert-Contains $product '"publisher": "ekinokss"' "the production publisher is fixed"
+        Assert-Contains $product '"version": "0.2.0"' "the production version is 0.2.0"
+        Assert-Contains $product '"programFilesRootLeaf": "DevWS"' "the production Program Files root is fixed"
+
         $build = Get-SourceOf "packaging\build-setup.ps1"
         Assert-Contains $build 'git -C $RepoRoot archive --format=zip --output=$payloadFile HEAD -- install.ps1 uninstall.ps1 LICENSE src config' "the payload is generated from tracked source"
         Assert-Contains $build "'-p:PublishAot=true'" "the build publishes Native AOT"
         Assert-Contains $build 'Get-FileHash -LiteralPath $artifact -Algorithm SHA256' "the artifact hash is reported"
         Assert-Contains $build 'source commit' "the source commit is reported"
         Assert-Contains $build 'The production setup build requires a clean committed worktree' "production builds require exact source identity"
+        Assert-Contains $build 'product.json' "the build reads the source-controlled product identity"
+        Assert-Contains $build 'A custom PayloadZip is accepted only with the explicit -Fixture switch' "fixture identity overrides are not a production path"
 
         $readme = Get-SourceOf "README.md"
         Assert-NotContains $readme "DevWS-Setup.exe" "the public README does not claim a published setup executable"
@@ -35861,6 +35878,8 @@ exit 0
         Assert-Contains $process 'startInfo.ArgumentList.Add("-PackageMode");' "the installer receives -PackageMode"
         Assert-Contains $process 'startInfo.ArgumentList.Add("-NoLogo");' "the installer uses a direct argv"
         Assert-Contains $process 'WorkingDirectory = workingDirectory' "the installer working directory is explicit"
+        Assert-Equal 2 ([regex]::Matches($process, 'ArgumentList\.Add\("-PackageMode"\)')).Count "install and uninstall both use -PackageMode"
+        Assert-Contains $process 'RunUninstaller' "the uninstall path has an explicit argv builder"
         foreach ($forbidden in @('"-Force"', '"-ResetConfig"', '"-Purge"')) {
             Assert-NotContains $process $forbidden "the bootstrapper never passes $forbidden"
             Assert-NotContains $program $forbidden "the bootstrapper entry point never passes $forbidden"
@@ -35868,7 +35887,63 @@ exit 0
         Assert-NotContains $process 'cmd.exe' "the bootstrapper never invokes cmd.exe"
         Assert-NotContains $process 'powershell.exe' "the bootstrapper never invokes Windows PowerShell"
         Assert-Contains $program 'Elevation.ElevatedArgument' "elevation uses the fixed internal marker"
+        Assert-Contains $program '--uninstall' "the user-facing uninstall operation exists"
+        Assert-Contains $program '--version' "the informational version operation exists"
         Assert-Contains $program 'ArchitecturePolicy.EnsureSupported' "the executable fails closed off Windows x64"
+        Assert-NotContains $program '--purge' "purge is not exposed through the setup"
+    }
+
+    Test-Case "package lifecycle identity, ARP, persistence and cleanup contracts are explicit" {
+        $identity = Get-SourceOf "packaging\bootstrapper\ProductIdentity.cs"
+        Assert-Contains $identity 'ArpKeyPath' "the ARP key is derived from product identity"
+        Assert-Contains $identity 'PersistedSetupDirectory' "the persisted setup directory is SID-qualified"
+        Assert-Contains $identity 'SpecialFolder.ProgramFiles' "persisted lifecycle authority lives under Program Files"
+        Assert-Contains $identity 'SpecialFolder.LocalApplicationData' "the discovery install location is per-user"
+
+        $registration = Get-SourceOf "packaging\bootstrapper\PackageRegistration.cs"
+        Assert-Contains $registration 'RegistryHive.CurrentUser' "ARP registration uses HKCU"
+        Assert-Contains $registration 'RegistryView.Registry64' "ARP registration explicitly uses the 64-bit view"
+        Assert-Contains $registration 'UninstallString' "ARP uninstall discovery is written"
+        Assert-Contains $registration 'QuietUninstallString' "ARP quiet uninstall discovery is written"
+        Assert-Contains $registration 'NoModify' "ARP modification is disabled"
+        Assert-Contains $registration 'NoRepair' "ARP repair is disabled"
+        Assert-Contains $registration 'DevWSSourceSha' "ARP source identity is recorded"
+        Assert-NotContains $registration 'RegistryHive.LocalMachine' "ARP never uses HKLM"
+
+        $version = Get-SourceOf "packaging\bootstrapper\VersionPolicy.cs"
+        Assert-Contains $version 'CompareTo' "version comparison is deterministic"
+        Assert-Contains $version 'Downgrade' "downgrade policy exists"
+        Assert-Contains $version 'Reinstall' "same-version reinstall policy exists"
+        Assert-Contains $version 'Upgrade' "upgrade policy exists"
+
+        $selfImage = Get-SourceOf "packaging\bootstrapper\SelfImage.cs"
+        Assert-Contains $selfImage 'FileShare.Read' "the running image is held without write/delete sharing"
+        Assert-Contains $selfImage 'SHA256' "the stable source image is hashed"
+
+        $installed = Get-SourceOf "packaging\bootstrapper\InstalledSetup.cs"
+        Assert-Contains $installed 'SpecialFolder.ProgramFiles' "persistence derives an OS Program Files root"
+        Assert-Contains $installed 'File.Replace' "persisted setup replacement is atomic"
+        Assert-Contains $installed 'DevWS-Setup.new.' "candidate setup files stay in the protected directory"
+        Assert-NotContains $installed 'GetTempPath' "persistence never stages through TEMP"
+        Assert-NotContains $installed 'LocalApplicationData' "persistence never uses LOCALAPPDATA"
+
+        $cleanup = Get-SourceOf "packaging\bootstrapper\PackageCleanup.ps1"
+        Assert-Contains $cleanup 'ParentPid' "self-removal waits for the setup parent"
+        Assert-Contains $cleanup 'setup-staging' "cleanup validates protected staging"
+        Assert-Contains $cleanup 'Remove-PackageTree' "cleanup refuses reparse traversal"
+        Assert-Contains $cleanup 'RootLeaf' "cleanup derives the lifecycle root from fixed identity"
+
+        foreach ($relative in @(
+            'packaging\bootstrapper\Program.cs',
+            'packaging\bootstrapper\PackageRegistration.cs',
+            'packaging\bootstrapper\InstalledSetup.cs',
+            'packaging\bootstrapper\PackageCleanup.cs'
+        )) {
+            $source = Get-SourceOf $relative
+            foreach ($networkNeedle in @('HttpClient', 'WebClient', 'WebRequest')) {
+                Assert-NotContains $source $networkNeedle "$relative performs no network acquisition"
+            }
+        }
     }
 
     Test-Case "trusted PowerShell and protected staging policy are explicit" {

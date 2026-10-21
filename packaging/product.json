@@ -1,0 +1,9 @@
+{
+  "productId": "ekinokss.DevWS",
+  "displayName": "DevWS",
+  "publisher": "ekinokss",
+  "version": "0.2.0",
+  "programFilesRootLeaf": "DevWS",
+  "installRootLeaf": "DevWS",
+  "urlInfoAbout": "https://github.com/ekinokss/DevWS"
+}
