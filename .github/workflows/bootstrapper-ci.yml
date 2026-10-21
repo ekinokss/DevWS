@@ -6,6 +6,8 @@ name: Bootstrapper CI
 
 on:
   workflow_dispatch:
+  push:
+    branches: [v0.2/winget-distribution]
 
 permissions:
   contents: read
