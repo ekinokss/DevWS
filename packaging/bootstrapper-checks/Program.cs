@@ -204,6 +204,57 @@ internal static class Program
             }
         });
 
+        Run("inherited dangerous ACL is rejected on child", () =>
+        {
+            var fixture = CreateAclFixture(dangerous: true, inheritOnly: false);
+            try
+            {
+                var childAcl = new DirectoryInfo(fixture.Child).GetAccessControl(
+                    AccessControlSections.Access);
+                var inheritedDangerous = childAcl.GetAccessRules(true, true, typeof(SecurityIdentifier))
+                    .Cast<FileSystemAccessRule>()
+                    .First(rule => rule.IdentityReference.Equals(UserIdentity.CurrentSid()) &&
+                        (rule.FileSystemRights & FileSystemRights.DeleteSubdirectoriesAndFiles) != 0);
+                Check(inheritedDangerous.IsInherited, "dangerous child ACE was not inherited");
+                Check(!inheritedDangerous.PropagationFlags.HasFlag(PropagationFlags.InheritOnly));
+
+                var rejected = false;
+                try { PackageSecurity.ValidateDirectory(fixture.Child, fixture.Root, UserIdentity.CurrentSid(), requireReaderAccess: true); }
+                catch (SetupException) { rejected = true; }
+                Check(rejected, "inherited dangerous authority was accepted");
+            }
+            finally
+            {
+                TryDelete(fixture.Root);
+            }
+        });
+
+        Run("safe inherited read/execute is accepted", () =>
+        {
+            var fixture = CreateAclFixture(dangerous: false, inheritOnly: false);
+            try
+            {
+                PackageSecurity.ValidateDirectory(fixture.Child, fixture.Root, UserIdentity.CurrentSid(), requireReaderAccess: true);
+            }
+            finally
+            {
+                TryDelete(fixture.Root);
+            }
+        });
+
+        Run("inherit-only dangerous ACE is not current-object authority", () =>
+        {
+            var fixture = CreateAclFixture(dangerous: true, inheritOnly: true);
+            try
+            {
+                PackageSecurity.ValidateDirectory(fixture.Parent, fixture.Root, UserIdentity.CurrentSid(), requireReaderAccess: true);
+            }
+            finally
+            {
+                TryDelete(fixture.Root);
+            }
+        });
+
         Run("stable self-image handle prevents replacement and copies exact bytes", () =>
         {
             var root = NewTempDirectory();
@@ -309,6 +360,58 @@ internal static class Program
         {
             TryDelete(root);
         }
+    }
+
+    private static (string Root, string Parent, string Child) CreateAclFixture(
+        bool dangerous,
+        bool inheritOnly)
+    {
+        var root = NewTempDirectory();
+        var parent = Path.Combine(root, "parent");
+        Directory.CreateDirectory(parent);
+
+        var user = UserIdentity.CurrentSid();
+        const InheritanceFlags inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        var security = new DirectorySecurity();
+        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+        security.SetOwner(PackageSecurity.Administrators);
+        security.AddAccessRule(new FileSystemAccessRule(
+            PackageSecurity.Administrators,
+            FileSystemRights.FullControl,
+            inheritance,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            PackageSecurity.LocalSystem,
+            FileSystemRights.FullControl,
+            inheritance,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        security.AddAccessRule(new FileSystemAccessRule(
+            user,
+            FileSystemRights.ReadAndExecute,
+            inheritance,
+            PropagationFlags.None,
+            AccessControlType.Allow));
+        if (dangerous)
+        {
+            security.AddAccessRule(new FileSystemAccessRule(
+                user,
+                FileSystemRights.DeleteSubdirectoriesAndFiles,
+                inheritance,
+                inheritOnly ? PropagationFlags.InheritOnly : PropagationFlags.None,
+                AccessControlType.Allow));
+        }
+        new DirectoryInfo(parent).SetAccessControl(security);
+
+        var child = Path.Combine(parent, "child");
+        Directory.CreateDirectory(child);
+        var childSecurity = new DirectoryInfo(child).GetAccessControl(
+            AccessControlSections.Access | AccessControlSections.Owner);
+        childSecurity.SetOwner(PackageSecurity.Administrators);
+        new DirectoryInfo(child).SetAccessControl(childSecurity);
+
+        return (root, parent, child);
     }
 
     private static ProductIdentity FixtureIdentity()

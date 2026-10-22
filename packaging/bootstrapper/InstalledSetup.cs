@@ -30,9 +30,9 @@ internal static class InstalledSetup
 
         try
         {
-            EnsureDirectory(identity.ProgramFilesRoot, programFilesRoot, userSid, requireReaderAccess: false, includeInheritedRules: false, createdDirectories);
-            EnsureDirectory(identity.SetupRoot, programFilesRoot, userSid, requireReaderAccess: true, includeInheritedRules: true, createdDirectories);
-            EnsureDirectory(identity.PersistedSetupDirectory(sid), programFilesRoot, userSid, requireReaderAccess: true, includeInheritedRules: true, createdDirectories);
+            EnsureDirectory(identity.ProgramFilesRoot, programFilesRoot, userSid, requireReaderAccess: false, createdDirectories);
+            EnsureDirectory(identity.SetupRoot, programFilesRoot, userSid, requireReaderAccess: true, createdDirectories);
+            EnsureDirectory(identity.PersistedSetupDirectory(sid), programFilesRoot, userSid, requireReaderAccess: true, createdDirectories);
 
             targetExisted = File.Exists(targetPath);
             if (targetExisted)
@@ -158,18 +158,17 @@ internal static class InstalledSetup
         string stopAt,
         SecurityIdentifier reader,
         bool requireReaderAccess,
-        bool includeInheritedRules,
         List<string> createdDirectories)
     {
         if (Directory.Exists(path))
         {
-            PackageSecurity.ValidateDirectory(path, stopAt, reader, requireReaderAccess, includeInheritedRules);
+            PackageSecurity.ValidateDirectory(path, stopAt, reader, requireReaderAccess);
             return;
         }
 
         PackageSecurity.CreateDirectoryAtomic(path, requireReaderAccess ? reader : null);
         createdDirectories.Add(path);
-        PackageSecurity.ValidateDirectory(path, stopAt, reader, requireReaderAccess, includeInheritedRules);
+        PackageSecurity.ValidateDirectory(path, stopAt, reader, requireReaderAccess);
     }
 
     private static void ValidateCandidate(

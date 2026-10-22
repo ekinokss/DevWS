@@ -35958,6 +35958,12 @@ exit 0
         Assert-NotContains $resolver 'Environment.GetEnvironmentVariable("PATH")' "PowerShell is never resolved through PATH"
         Assert-NotContains $resolver 'where.exe' "PowerShell is never resolved through where.exe"
 
+        $security = Get-SourceOf "packaging\bootstrapper\PackageSecurity.cs"
+        Assert-Contains $security 'PropagationFlags.InheritOnly' "inherit-only ACEs are excluded from current-object authority"
+        Assert-Contains $security 'TrustedInstaller' "the protected OS TrustedInstaller principal is trusted"
+        Assert-NotContains $security 'includeInheritedRules' "inherited ACEs are evaluated effectively, not skipped"
+        Assert-NotContains (Get-SourceOf "packaging\bootstrapper\InstalledSetup.cs") 'includeInheritedRules' "the parent validation has no inherited-rule escape hatch"
+
         $staging = Get-SourceOf "packaging\bootstrapper\ProtectedStaging.cs"
         Assert-Contains $staging 'SpecialFolder.CommonApplicationData' "staging uses the OS ProgramData root"
         Assert-Contains $staging 'setup-staging' "staging uses the dedicated setup area"

@@ -10,6 +10,8 @@ internal static class PackageSecurity
         new(WellKnownSidType.BuiltinAdministratorsSid, null);
     internal static readonly SecurityIdentifier LocalSystem =
         new(WellKnownSidType.LocalSystemSid, null);
+    internal static readonly SecurityIdentifier TrustedInstaller =
+        new("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464");
 
     internal const FileSystemRights DangerousRights =
         FileSystemRights.WriteData |
@@ -87,8 +89,7 @@ internal static class PackageSecurity
         string path,
         string stopAt,
         SecurityIdentifier? reader,
-        bool requireReaderAccess,
-        bool includeInheritedRules = true)
+        bool requireReaderAccess)
     {
         if (!Directory.Exists(path))
         {
@@ -108,7 +109,7 @@ internal static class PackageSecurity
             throw new SetupException($"Could not read package directory security '{path}': {error.Message}", error);
         }
 
-        ValidateSecurity(security, path, reader, requireReaderAccess, includeInheritedRules);
+        ValidateSecurity(security, path, reader, requireReaderAccess);
     }
 
     internal static void ApplyFileSecurity(string path, SecurityIdentifier reader)
@@ -163,15 +164,14 @@ internal static class PackageSecurity
             throw new SetupException($"Could not read persisted setup security '{path}': {error.Message}", error);
         }
 
-        ValidateSecurity(security, path, reader, requireReaderAccess: true, includeInheritedRules: true);
+        ValidateSecurity(security, path, reader, requireReaderAccess: true);
     }
 
     private static void ValidateSecurity(
         FileSystemSecurity security,
         string path,
         SecurityIdentifier? reader,
-        bool requireReaderAccess,
-        bool includeInheritedRules)
+        bool requireReaderAccess)
     {
         var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
         if (!IsTrustedSid(owner))
@@ -184,8 +184,12 @@ internal static class PackageSecurity
         {
             if (rule.AccessControlType != AccessControlType.Allow ||
                 rule.IdentityReference is not SecurityIdentifier sid ||
-                (!includeInheritedRules && rule.IsInherited))
+                (rule.PropagationFlags & PropagationFlags.InheritOnly) != 0)
             {
+                // InheritOnly ACEs do not apply to the current object; they only
+                // constrain descendants. Do not treat them as current-object
+                // authority (and do not treat inherited status by itself as a
+                // reason to ignore an ACE that does apply here).
                 continue;
             }
 
@@ -215,5 +219,6 @@ internal static class PackageSecurity
     }
 
     internal static bool IsTrustedSid(SecurityIdentifier? sid) =>
-        sid is not null && (sid.Equals(Administrators) || sid.Equals(LocalSystem));
+        sid is not null &&
+        (sid.Equals(Administrators) || sid.Equals(LocalSystem) || sid.Equals(TrustedInstaller));
 }
