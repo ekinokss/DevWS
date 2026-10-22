@@ -2,7 +2,12 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$BundleDir,
-    [string]$ExpectedSourceSha = ''
+    [string]$ExpectedSourceSha = '',
+    # Test-only path for the release-license regression. It still requires the
+    # exact inventory, provenance and checksums, but skips executable surfaces
+    # so the regression does not need a Native AOT build. The release workflow
+    # never passes this switch.
+    [switch]$LicenseCheckOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,6 +19,60 @@ $ChecksummedFiles = @('DevWS-Setup.exe', 'LICENSE', 'provenance.json')
 
 function Assert-Condition([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
+}
+
+function Test-ByteArrayEqual([byte[]]$Left, [byte[]]$Right) {
+    if ($Left.Length -ne $Right.Length) { return $false }
+    for ($index = 0; $index -lt $Left.Length; $index++) {
+        if ($Left[$index] -ne $Right[$index]) { return $false }
+    }
+    return $true
+}
+
+function Get-BytesSha256([byte[]]$Bytes) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [Convert]::ToHexString($sha.ComputeHash($Bytes)).ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-CommittedGitBlob([string]$Commit, [string]$Path) {
+    # git archive can apply checkout EOL conversion. Plumbing cat-file returns the
+    # exact bytes of the committed blob and never reads the materialized worktree.
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in @('-C', $RepoRoot, 'cat-file', 'blob', "$Commit`:$Path")) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    if ($null -eq $process) { throw "Could not start git while reading committed '$Path'." }
+    try {
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $memory = [System.IO.MemoryStream]::new()
+        try {
+            $process.StandardOutput.BaseStream.CopyTo($memory)
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) {
+                throw "Expected source commit '$Commit' cannot supply '$Path': $($stderr.Trim())"
+            }
+            return ,$memory.ToArray()
+        }
+        finally {
+            $memory.Dispose()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
 }
 
 if ([string]::IsNullOrWhiteSpace($ExpectedSourceSha)) {
@@ -93,6 +152,20 @@ foreach ($name in $ChecksummedFiles) {
 }
 Assert-Condition ($recorded['DevWS-Setup.exe'] -eq ([string]$provenance.artifact.sha256)) 'SHA256SUMS.txt EXE digest does not equal provenance.artifact.sha256.'
 Assert-Condition ((Get-Item -LiteralPath (Join-Path $bundle 'DevWS-Setup.exe')).Length -eq [long]$provenance.artifact.sizeBytes) 'provenance.artifact.sizeBytes does not match DevWS-Setup.exe.'
+
+$bundleLicenseBytes = [IO.File]::ReadAllBytes((Join-Path $bundle 'LICENSE'))
+$committedLicenseBytes = Get-CommittedGitBlob -Commit $ExpectedSourceSha -Path 'LICENSE'
+$bundleLicenseHash = Get-BytesSha256 $bundleLicenseBytes
+$committedLicenseHash = Get-BytesSha256 $committedLicenseBytes
+if (-not (Test-ByteArrayEqual $bundleLicenseBytes $committedLicenseBytes)) {
+    throw "Release bundle LICENSE does not match the LICENSE committed at $ExpectedSourceSha (bundle: $($bundleLicenseBytes.Length) bytes, $bundleLicenseHash; committed: $($committedLicenseBytes.Length) bytes, $committedLicenseHash)."
+}
+Write-Output "[verify] committed LICENSE SHA-256: $committedLicenseHash"
+
+if ($LicenseCheckOnly) {
+    Write-Output '[verify] PASS (license-check-only; executable surfaces were not invoked)'
+    return
+}
 
 $exePath = Join-Path $bundle 'DevWS-Setup.exe'
 $versionOutput = (& $exePath --version 2>&1 | Out-String).Trim()

@@ -55,22 +55,27 @@ rejects `-PackageMode` with `-ResetConfig`, `-Force`, `-HealthCheck` or `-Repair
 uninstaller rejects it with `-Purge` or `-Force`, before any machine mutation.
 
 Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
-unchanged. At this phase there is **no `DevWS-Setup.exe`, no WinGet manifest and no WinGet
-package**; this contract only fixes the arguments, non-interactive behavior and exit status a
-future wrapper will use. Exit code `0` means the requested package-mode operation completed;
-any nonzero exit means it did not.
+unchanged. The unreleased v0.2 source and its manual Actions release candidate contain a
+`DevWS-Setup.exe` build. No v0.2 setup asset is publicly released, and no WinGet manifest or
+WinGet package exists. This contract fixes the arguments, non-interactive behavior and exit
+status the setup wrapper uses. Exit code `0` means the requested package-mode operation
+completed; any nonzero exit means it did not.
 
 ### Unreleased setup bootstrapper source
 
 The v0.2 integration branch contains the source for a thin Windows x64 setup bootstrapper at
 `packaging/bootstrapper`. It embeds the DevWS installation payload and invokes
 `install.ps1 -PackageMode`; it does not replace the PowerShell installer's semantics. It does
-not install prerequisites, provide an uninstall/repair/Add-Remove-Programs lifecycle, or ship
-a WinGet package. The current build is x64-only.
+not install prerequisites or ship a WinGet package. The unreleased source does provide
+install, same-version reinstall/repair, upgrade, downgrade refusal, HKCU Add/Remove Programs
+registration, setup-driven package uninstall, and a protected persisted setup; see the
+lifecycle section below. The current build is x64-only.
 
-This is **source only** at this phase. No setup executable is published or downloadable, and
-the public README's v0.1.0 source-only distribution statement remains unchanged. See
-[`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
+The setup binary exists only in the unreleased source build and a retained Actions
+release-candidate artifact. No setup executable is published or downloadable as a v0.2
+release asset. The public README's v0.1.0 source-only distribution statement remains
+unchanged. See [`packaging/README.md`](../packaging/README.md) for build and fixture-test
+instructions.
 
 ### Unreleased v0.2 package lifecycle
 
@@ -90,8 +95,9 @@ as executable authority.
 `--uninstall` runs the ordinary package-mode uninstall, removes the ARP entry, then uses a
 protected post-exit helper to remove the per-SID setup directory without a reboot. Package
 uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` and unrelated
-resources exactly as the frozen Phase-1 contract requires. There is no self-update, network
-acquisition, prerequisite installation, published setup binary or WinGet package yet.
+resources exactly as the frozen Phase-1 contract requires. No v0.2 setup binary is publicly
+released and no WinGet package exists. Self-update, prerequisite acquisition, and
+MSI/MSIX/Windows Installer identity are not implemented.
 
 ### Unreleased release-candidate artifact pipeline
 
@@ -107,6 +113,34 @@ Normal feature-branch pushes run only fixture lifecycle validation. The candidat
 and no Native AOT reproducibility is claimed. This is not a published release: there is still
 no v0.2 tag, GitHub Release, release asset, public setup download, Windows Installer identity,
 attestation or WinGet package.
+
+### Release state
+
+**EXISTS IN UNRELEASED v0.2 SOURCE / ACTIONS CANDIDATE:**
+
+- `DevWS-Setup.exe` build
+- install
+- same-version reinstall/repair
+- upgrade
+- downgrade refusal
+- HKCU Add/Remove Programs registration
+- setup-driven package uninstall
+- protected persisted setup
+- release-candidate Actions artifact pipeline
+
+**NOT PUBLICLY RELEASED YET:**
+
+- downloadable v0.2 GitHub Release setup asset
+- v0.2 tag/release
+- WinGet package
+
+**NOT IMPLEMENTED:**
+
+- self-update
+- prerequisite acquisition
+- MSI/MSIX or Windows Installer identity
+
+The currently published v0.1.0 remains source-only.
 
 ## 2. Prerequisites
 

@@ -35963,6 +35963,9 @@ exit 0
         Assert-Contains $builder 'DevWS-Setup.exe' "the release builder includes the setup executable"
         Assert-Contains $builder 'LICENSE' "the release builder includes the canonical license"
         Assert-Contains $builder 'ExpectedSourceSha' "verification is bound to the source SHA"
+        Assert-Contains $builder 'cat-file' "the release builder reads committed Git blobs"
+        Assert-Contains $builder 'Get-CommittedGitBlob' "the release builder has an explicit commit-object path"
+        Assert-NotContains $builder "Join-Path `$RepoRoot 'LICENSE'" "the release builder never copies the materialized LICENSE"
         Assert-NotContains $builder '-Fixture' "the release builder cannot use fixture identity overrides"
         Assert-Contains $builder 'requires a clean worktree' "the release builder rejects dirty source"
 
@@ -35971,6 +35974,9 @@ exit 0
         Assert-Contains $verifier 'provenance.json' "the verifier validates provenance"
         Assert-Contains $verifier '--version' "the verifier uses the informational version surface"
         Assert-Contains $verifier '--help' "the verifier uses the informational help surface"
+        Assert-Contains $verifier 'cat-file' "the verifier reads the expected committed Git blob"
+        Assert-Contains $verifier 'Test-ByteArrayEqual' "the verifier compares LICENSE bytes exactly"
+        Assert-Contains $verifier 'LicenseCheckOnly' "the focused license regression path exists"
         Assert-Contains $verifier 'devws-base' "the verifier rejects historical private-repo markers"
         Assert-Contains $verifier 'USERPROFILE' "the verifier rejects local profile paths"
         Assert-Contains $verifier 'Authenticode' "the verifier reports unsigned status"
@@ -35978,7 +35984,16 @@ exit 0
         $packagingReadme = Get-SourceOf "packaging\README.md"
         Assert-Contains $packagingReadme 'same-version reinstall/repair' "the Phase-3 scope correction is documented"
         Assert-Contains $packagingReadme 'Release-candidate bundle' "the release-candidate pipeline is documented"
+        Assert-Contains $packagingReadme 'git cat-file' "the commit-derived LICENSE provenance is documented"
         Assert-NotContains $packagingReadme 'No setup uninstall, repair, upgrade, Add/Remove Programs registration' "the stale Phase-2 scope claim is gone"
+
+        $installerDoc = Get-SourceOf "docs\installer.md"
+        Assert-NotContains $installerDoc 'At this phase there is **no `DevWS-Setup.exe`' "the stale no-setup claim is gone"
+        Assert-NotContains $installerDoc 'provide an uninstall/repair/Add-Remove-Programs lifecycle' "the stale no-lifecycle claim is gone"
+        Assert-Contains $installerDoc 'EXISTS IN UNRELEASED v0.2 SOURCE / ACTIONS CANDIDATE' "the unreleased setup lifecycle is documented"
+        Assert-Contains $installerDoc 'NOT PUBLICLY RELEASED YET' "the public-release boundary is documented"
+        Assert-Contains $installerDoc 'NOT IMPLEMENTED' "the unimplemented installer scope is documented"
+        Assert-Contains $installerDoc 'currently published v0.1.0 remains source-only' "the public release truth is preserved"
 
         $workflow = Get-SourceOf ".github\workflows\bootstrapper-ci.yml"
         Assert-Contains $workflow 'release-candidate:' "the workflow contains a production release-candidate job"
@@ -35999,6 +36014,131 @@ exit 0
         Assert-NotContains $workflow 'softprops/action-gh-release' "no release action exists"
         Assert-NotContains $workflow 'actions/create-release' "no release creation action exists"
         Assert-NotContains $workflow 'git push --tags' "the workflow cannot push tags"
+        Assert-NotContains $workflow 'LicenseCheckOnly' "the release workflow never uses the focused test bypass"
+    }
+
+    Test-Case "release LICENSE is bound to the committed Git blob, not checkout EOL" {
+        function Get-TestCommittedGitBlob([string]$Repository, [string]$Commit, [string]$Path) {
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = 'git'
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $startInfo.CreateNoWindow = $true
+            foreach ($argument in @('-C', $Repository, 'cat-file', 'blob', "$Commit`:$Path")) {
+                $startInfo.ArgumentList.Add($argument)
+            }
+
+            $process = [System.Diagnostics.Process]::Start($startInfo)
+            if ($null -eq $process) { throw "Could not start git while reading committed '$Path'." }
+            try {
+                $stderrTask = $process.StandardError.ReadToEndAsync()
+                $memory = [System.IO.MemoryStream]::new()
+                try {
+                    $process.StandardOutput.BaseStream.CopyTo($memory)
+                    $stderr = $stderrTask.GetAwaiter().GetResult()
+                    $process.WaitForExit()
+                    if ($process.ExitCode -ne 0) {
+                        throw "Cannot read committed '$Path': $($stderr.Trim())"
+                    }
+                    return ,$memory.ToArray()
+                }
+                finally {
+                    $memory.Dispose()
+                }
+            }
+            finally {
+                $process.Dispose()
+            }
+        }
+
+        function Test-TestBytesEqual([byte[]]$Left, [byte[]]$Right) {
+            if ($Left.Length -ne $Right.Length) { return $false }
+            for ($index = 0; $index -lt $Left.Length; $index++) {
+                if ($Left[$index] -ne $Right[$index]) { return $false }
+            }
+            return $true
+        }
+
+        function Get-TestBytesSha256([byte[]]$Bytes) {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                return [Convert]::ToHexString($sha.ComputeHash($Bytes)).ToLowerInvariant()
+            }
+            finally {
+                $sha.Dispose()
+            }
+        }
+
+        function Write-TestReleaseBundle([string]$Directory, [byte[]]$LicenseBytes, [string]$SourceSha, $Product) {
+            New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+            $exePath = Join-Path $Directory 'DevWS-Setup.exe'
+            [IO.File]::WriteAllBytes($exePath, [Text.Encoding]::ASCII.GetBytes('test setup executable'))
+            [IO.File]::WriteAllBytes((Join-Path $Directory 'LICENSE'), $LicenseBytes)
+
+            $exeBytes = [IO.File]::ReadAllBytes($exePath)
+            $provenance = [ordered]@{
+                schemaVersion = 1
+                productId = [string]$Product.productId
+                displayName = [string]$Product.displayName
+                publisher = [string]$Product.publisher
+                version = [string]$Product.version
+                architecture = 'x64'
+                runtimeIdentifier = 'win-x64'
+                sourceRepository = [string]$Product.urlInfoAbout
+                sourceCommit = $SourceSha
+                artifact = [ordered]@{
+                    file = 'DevWS-Setup.exe'
+                    sha256 = (Get-TestBytesSha256 $exeBytes)
+                    sizeBytes = $exeBytes.Length
+                }
+                build = [ordered]@{
+                    configuration = 'Release'
+                    nativeAot = $true
+                    selfContained = $true
+                    dotnetSdk = '10.0.0'
+                }
+            }
+            [IO.File]::WriteAllText((Join-Path $Directory 'provenance.json'), ($provenance | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+
+            $sumLines = foreach ($name in @('DevWS-Setup.exe', 'LICENSE', 'provenance.json')) {
+                $hash = (Get-FileHash -LiteralPath (Join-Path $Directory $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+                "$hash  $name"
+            }
+            [IO.File]::WriteAllText((Join-Path $Directory 'SHA256SUMS.txt'), (($sumLines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+        }
+
+        $sourceSha = (& git -C $RepoRoot rev-parse HEAD 2>&1 | Out-String).Trim()
+        Assert-True ($sourceSha -match '^[0-9a-f]{40}$') "current source SHA is valid"
+        $canonical = Get-TestCommittedGitBlob -Repository $RepoRoot -Commit $sourceSha -Path 'LICENSE'
+        $committedSize = [int](& git -C $RepoRoot cat-file -s "$sourceSha`:LICENSE")
+        Assert-Equal $committedSize $canonical.Length "canonical LICENSE bytes come from the committed Git object"
+
+        $canonicalText = [Text.Encoding]::UTF8.GetString($canonical)
+        $alteredText = $canonicalText.Replace("`r`n", "`n").Replace("`n", "`r`n")
+        $altered = [Text.UTF8Encoding]::new($false).GetBytes($alteredText)
+        Assert-True (-not (Test-TestBytesEqual $canonical $altered)) "the line-ending-altered LICENSE differs"
+        Assert-True ($canonical.Length -ne $altered.Length) "the altered LICENSE has a different byte length"
+
+        $product = Get-Content -LiteralPath (Join-Path $RepoRoot 'packaging\product.json') -Raw | ConvertFrom-Json
+        $canonicalBundle = Join-Path $TestRoot 'release-license-canonical'
+        $alteredBundle = Join-Path $TestRoot 'release-license-altered'
+        Write-TestReleaseBundle -Directory $canonicalBundle -LicenseBytes $canonical -SourceSha $sourceSha -Product $product
+        Write-TestReleaseBundle -Directory $alteredBundle -LicenseBytes $altered -SourceSha $sourceSha -Product $product
+
+        $alteredHash = Get-TestBytesSha256 $altered
+        $alteredSums = Get-Content -LiteralPath (Join-Path $alteredBundle 'SHA256SUMS.txt') -Raw
+        Assert-Contains $alteredSums "$alteredHash  LICENSE" "altered LICENSE checksums were recomputed"
+
+        $canonicalOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $canonicalBundle -ExpectedSourceSha $sourceSha -LicenseCheckOnly 2>&1 | Out-String)
+        $canonicalExit = $LASTEXITCODE
+        Assert-Equal 0 $canonicalExit "canonical commit-derived LICENSE passes: $canonicalOutput"
+        Assert-Contains $canonicalOutput 'license-check-only' "the focused license path executed"
+
+        $alteredOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $alteredBundle -ExpectedSourceSha $sourceSha -LicenseCheckOnly 2>&1 | Out-String)
+        $alteredExit = $LASTEXITCODE
+        Assert-True ($alteredExit -ne 0) "altered LICENSE must fail even with recomputed checksums: $alteredOutput"
+        Assert-Contains $alteredOutput 'LICENSE does not match' "the verifier names the committed-LICENSE mismatch"
     }
 
     Test-Case "trusted PowerShell and protected staging policy are explicit" {

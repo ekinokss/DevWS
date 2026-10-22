@@ -16,6 +16,42 @@ function Assert-Condition([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
+function Get-CommittedGitBlob([string]$Commit, [string]$Path) {
+    # git archive can apply checkout EOL conversion. Plumbing cat-file returns the
+    # exact bytes of the committed blob and never reads the materialized worktree.
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = 'git'
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    foreach ($argument in @('-C', $RepoRoot, 'cat-file', 'blob', "$Commit`:$Path")) {
+        $startInfo.ArgumentList.Add($argument)
+    }
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    if ($null -eq $process) { throw "Could not start git while reading committed '$Path'." }
+    try {
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $memory = [System.IO.MemoryStream]::new()
+        try {
+            $process.StandardOutput.BaseStream.CopyTo($memory)
+            $stderr = $stderrTask.GetAwaiter().GetResult()
+            $process.WaitForExit()
+            if ($process.ExitCode -ne 0) {
+                throw "Expected source commit '$Commit' cannot supply '$Path': $($stderr.Trim())"
+            }
+            return ,$memory.ToArray()
+        }
+        finally {
+            $memory.Dispose()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 Assert-Condition ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) 'build-release.ps1 requires Windows.'
 Assert-Condition ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::X64) 'build-release.ps1 requires an x64 build host.'
 Assert-Condition (Test-Path -LiteralPath $BuildSetup -PathType Leaf) "Setup build entry point not found: $BuildSetup"
@@ -78,7 +114,8 @@ try {
     Assert-Condition ($versionOutput -match [regex]::Escape($sourceSha)) 'The setup executable source SHA does not match git HEAD.'
 
     Copy-Item -LiteralPath $setupExe -Destination (Join-Path $bundleTemp 'DevWS-Setup.exe') -Force
-    Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination (Join-Path $bundleTemp 'LICENSE') -Force
+    $licenseBytes = Get-CommittedGitBlob -Commit $sourceSha -Path 'LICENSE'
+    [IO.File]::WriteAllBytes((Join-Path $bundleTemp 'LICENSE'), $licenseBytes)
 
     $provenance = [ordered]@{
         schemaVersion = 1

@@ -110,6 +110,11 @@ repository, exact source commit, EXE size/SHA-256, and SDK/toolchain values. It 
 machine/user path or timestamp. `SHA256SUMS.txt` covers exactly the EXE, LICENSE and
 provenance file, in that order.
 
+The bundled `LICENSE` is read from the exact `HEAD` Git blob with `git cat-file`, not copied
+from the materialized checkout. `verify-release.ps1` compares the bundle bytes with the
+`LICENSE` blob at the expected source commit, so checkout EOL settings cannot change release
+source bytes.
+
 The verified bundle is retained only as a GitHub Actions artifact on a manually dispatched
 run of the bootstrapper workflow. Ordinary feature-branch pushes run the fixture lifecycle
 only and do not upload a production candidate. No GitHub Release, tag, WinGet manifest,
