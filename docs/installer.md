@@ -93,6 +93,21 @@ uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` 
 resources exactly as the frozen Phase-1 contract requires. There is no self-update, network
 acquisition, prerequisite installation, published setup binary or WinGet package yet.
 
+### Unreleased release-candidate artifact pipeline
+
+The v0.2 branch uses `packaging/build-release.ps1` to wrap `build-setup.ps1` and assemble a
+commit-bound release candidate containing exactly `DevWS-Setup.exe`, `LICENSE`,
+`provenance.json` and `SHA256SUMS.txt`. `packaging/verify-release.ps1` independently verifies
+the bundle, source SHA, version, checksums, provenance and privacy/path hygiene, and runs only
+the non-mutating `--version` and `--help` surfaces.
+
+A manually dispatched bootstrapper workflow validates and retains this candidate as an Actions
+artifact for 30 days, then downloads and re-verifies the exact artifact in a separate job.
+Normal feature-branch pushes run only fixture lifecycle validation. The candidate is unsigned
+and no Native AOT reproducibility is claimed. This is not a published release: there is still
+no v0.2 tag, GitHub Release, release asset, public setup download, Windows Installer identity,
+attestation or WinGet package.
+
 ## 2. Prerequisites
 
 All prerequisites are checked **before anything is modified**. A failure aborts with an

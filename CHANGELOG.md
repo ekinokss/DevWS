@@ -25,6 +25,12 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same-version repair, upgrade and downgrade refusal), setup-driven package uninstall, and
   protected post-exit self-removal. The existing PowerShell install/uninstall engines and
   user-data preservation semantics are unchanged.
+- **Release-candidate artifact pipeline (unreleased)** — commit-bound setup builds produce a
+  four-file candidate (`DevWS-Setup.exe`, `LICENSE`, `provenance.json`, `SHA256SUMS.txt`) with
+  independent verification and privacy/path checks. Manual bootstrapper runs retain the
+  verified candidate as a 30-day GitHub Actions artifact and re-verify the downloaded copy.
+  No v0.2 tag, GitHub Release, release asset, public setup download, attestation or WinGet
+  package is produced.
 
 ## [0.1.0] - 2026-10-21
 

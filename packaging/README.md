@@ -1,4 +1,4 @@
-# DevWS Setup Bootstrapper (Phase 3 source)
+# DevWS Setup Bootstrapper and Release Candidate (Phase 4 source)
 
 This directory contains the **unreleased** source for the Windows x64 setup lifecycle. It is
 not a published DevWS release artifact.
@@ -86,6 +86,38 @@ For a local toolchain outside `PATH`:
 pwsh -NoLogo -NoProfile -File packaging\build-setup.ps1 -DotNetPath C:\path\to\dotnet.exe
 ```
 
+## Release-candidate bundle
+
+The release candidate is assembled by wrapping the accepted setup build, not by rebuilding
+the payload independently:
+
+```powershell
+pwsh -NoLogo -NoProfile -File packaging\build-release.ps1 -OutputDir C:\path\outside\repo
+pwsh -NoLogo -NoProfile -File packaging\verify-release.ps1 -BundleDir C:\path\outside\repo -ExpectedSourceSha <sha>
+```
+
+The bundle contains exactly:
+
+```text
+DevWS-Setup.exe
+LICENSE
+provenance.json
+SHA256SUMS.txt
+```
+
+`provenance.json` records the canonical product identity/version, x64/`win-x64`, source
+repository, exact source commit, EXE size/SHA-256, and SDK/toolchain values. It contains no
+machine/user path or timestamp. `SHA256SUMS.txt` covers exactly the EXE, LICENSE and
+provenance file, in that order.
+
+The verified bundle is retained only as a GitHub Actions artifact on a manually dispatched
+run of the bootstrapper workflow. Ordinary feature-branch pushes run the fixture lifecycle
+only and do not upload a production candidate. No GitHub Release, tag, WinGet manifest,
+attestation or binary publication is produced by this pipeline.
+
+The candidate is unsigned for Phase 4; Authenticode status is reported by the verifier and
+must not be treated as signed. Native AOT output is not claimed to be byte-reproducible.
+
 ## Fixture acceptance
 
 Run from an elevated PowerShell 7 (the fixture exercises the real protected staging and
@@ -105,13 +137,14 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
 ## Current scope
 
 - Windows x64 only; x86 and ARM64 are not supported.
-- No setup uninstall, repair, upgrade, Add/Remove Programs registration, product codes,
-  version comparison or self-update.
-- No network acquisition.
-- No prerequisite installation.
-- No published EXE or WinGet package.
-- The public `v0.1.0` source-only distribution statement remains true until an artifact is
-  actually published.
+- Supports install, same-version reinstall/repair, upgrade, downgrade refusal, HKCU
+  Add/Remove Programs registration, and setup-driven package uninstall with user-data
+  preservation.
+- No self-update.
+- No network acquisition or prerequisite installation.
+- No MSI/MSIX, Windows Installer product codes, published setup release or WinGet package.
+- The release-candidate Actions artifact is not a public release. The public `v0.1.0`
+  source-only distribution statement remains true until an artifact is actually published.
 
 ## Security boundaries
 

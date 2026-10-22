@@ -35946,6 +35946,61 @@ exit 0
         }
     }
 
+    Test-Case "release-candidate pipeline is commit-bound and dispatch-only" {
+        foreach ($relative in @(
+            'packaging\build-release.ps1',
+            'packaging\verify-release.ps1',
+            'packaging\product.json'
+        )) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $RepoRoot $relative) -PathType Leaf) "$relative exists"
+        }
+
+        $builder = Get-SourceOf "packaging\build-release.ps1"
+        Assert-Contains $builder 'build-setup.ps1' "the release builder wraps the accepted setup build"
+        Assert-Contains $builder 'verify-release.ps1' "the release builder independently verifies the bundle"
+        Assert-Contains $builder 'provenance.json' "the release builder writes provenance"
+        Assert-Contains $builder 'SHA256SUMS.txt' "the release builder writes checksums"
+        Assert-Contains $builder 'DevWS-Setup.exe' "the release builder includes the setup executable"
+        Assert-Contains $builder 'LICENSE' "the release builder includes the canonical license"
+        Assert-Contains $builder 'ExpectedSourceSha' "verification is bound to the source SHA"
+        Assert-NotContains $builder '-Fixture' "the release builder cannot use fixture identity overrides"
+        Assert-Contains $builder 'requires a clean worktree' "the release builder rejects dirty source"
+
+        $verifier = Get-SourceOf "packaging\verify-release.ps1"
+        Assert-Contains $verifier 'SHA256SUMS.txt' "the verifier parses checksums"
+        Assert-Contains $verifier 'provenance.json' "the verifier validates provenance"
+        Assert-Contains $verifier '--version' "the verifier uses the informational version surface"
+        Assert-Contains $verifier '--help' "the verifier uses the informational help surface"
+        Assert-Contains $verifier 'devws-base' "the verifier rejects historical private-repo markers"
+        Assert-Contains $verifier 'USERPROFILE' "the verifier rejects local profile paths"
+        Assert-Contains $verifier 'Authenticode' "the verifier reports unsigned status"
+
+        $packagingReadme = Get-SourceOf "packaging\README.md"
+        Assert-Contains $packagingReadme 'same-version reinstall/repair' "the Phase-3 scope correction is documented"
+        Assert-Contains $packagingReadme 'Release-candidate bundle' "the release-candidate pipeline is documented"
+        Assert-NotContains $packagingReadme 'No setup uninstall, repair, upgrade, Add/Remove Programs registration' "the stale Phase-2 scope claim is gone"
+
+        $workflow = Get-SourceOf ".github\workflows\bootstrapper-ci.yml"
+        Assert-Contains $workflow 'release-candidate:' "the workflow contains a production release-candidate job"
+        Assert-Contains $workflow 'if: ${{ github.event_name == ''workflow_dispatch'' }}' "release jobs are dispatch-only"
+        Assert-Contains $workflow 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9' "upload-artifact is SHA-pinned"
+        Assert-Contains $workflow 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' "download-artifact is SHA-pinned"
+        Assert-Contains $workflow 'retention-days: 30' "artifact retention is bounded"
+        Assert-Contains $workflow 'if-no-files-found: error' "missing release files fail the upload"
+        Assert-Contains $workflow 'overwrite: false' "artifact overwrite is disabled"
+        Assert-Contains $workflow 'devws-$($product.version)-win-x64-$sha' "artifact name includes version, architecture and SHA"
+        Assert-Contains $workflow 'permissions:' "workflow permissions are explicit"
+        Assert-Contains $workflow 'contents: read' "workflow remains read-only"
+        Assert-NotContains $workflow 'contents: write' "workflow cannot write repository content"
+        Assert-NotContains $workflow 'id-token: write' "workflow cannot request an OIDC identity token"
+        Assert-NotContains $workflow 'attestations: write' "workflow cannot write attestations"
+        Assert-NotContains $workflow 'actions/attest' "no attestation action exists"
+        Assert-NotContains $workflow 'gh release' "no GitHub Release command exists"
+        Assert-NotContains $workflow 'softprops/action-gh-release' "no release action exists"
+        Assert-NotContains $workflow 'actions/create-release' "no release creation action exists"
+        Assert-NotContains $workflow 'git push --tags' "the workflow cannot push tags"
+    }
+
     Test-Case "trusted PowerShell and protected staging policy are explicit" {
         $resolver = Get-SourceOf "packaging\bootstrapper\PowerShellResolver.cs"
         Assert-Contains $resolver 'Microsoft.PowerShell_8wekyb3d8bbwe' "the official MSIX family is fixed"
@@ -35985,7 +36040,6 @@ exit 0
         Assert-Contains $workflow 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' "checkout is SHA-pinned"
         Assert-Contains $workflow 'actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1' "setup-dotnet is SHA-pinned"
         Assert-Contains $workflow 'packaging/test-bootstrapper.ps1' "the workflow runs fixture acceptance"
-        Assert-NotContains $workflow 'upload-artifact' "the workflow publishes no artifact"
         Assert-NotContains $workflow 'secrets.' "the workflow uses no repository secret"
         Assert-NotContains $workflow 'self-hosted' "the workflow stays hosted"
     }
