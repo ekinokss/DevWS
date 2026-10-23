@@ -102,17 +102,8 @@ internal static class ProtectedStaging
         new(WellKnownSidType.BuiltinAdministratorsSid, null);
     private static readonly SecurityIdentifier LocalSystem =
         new(WellKnownSidType.LocalSystemSid, null);
-
-    private const FileSystemRights DangerousRights =
-        FileSystemRights.WriteData |
-        FileSystemRights.AppendData |
-        FileSystemRights.WriteExtendedAttributes |
-        FileSystemRights.WriteAttributes |
-        FileSystemRights.Delete |
-        FileSystemRights.DeleteSubdirectoriesAndFiles |
-        FileSystemRights.ChangePermissions |
-        FileSystemRights.TakeOwnership |
-        FileSystemRights.Write;
+    private static readonly SecurityIdentifier Users =
+        new(WellKnownSidType.BuiltinUsersSid, null);
 
     internal static StagingSession Create()
     {
@@ -122,20 +113,30 @@ internal static class ProtectedStaging
             throw new SetupException("The Windows ProgramData root could not be resolved as an absolute path.");
         }
 
+        return CreateForRoot(commonData);
+    }
+
+    internal static StagingSession CreateForRoot(string commonData)
+    {
+        if (string.IsNullOrWhiteSpace(commonData) || !Path.IsPathFullyQualified(commonData))
+        {
+            throw new SetupException("The protected staging root is not an absolute path.");
+        }
+
         PathSafety.EnsureNoReparseChain(commonData, commonData);
 
         var created = new List<string>();
         try
         {
             var devwsRoot = Path.Combine(commonData, "DevWS");
-            EnsureProtectedDirectory(devwsRoot, commonData, created);
+            EnsureBaseDirectory(devwsRoot, commonData, created);
 
             var stagingRoot = Path.Combine(devwsRoot, "setup-staging");
-            EnsureProtectedDirectory(stagingRoot, commonData, created);
+            EnsureStagingDirectory(stagingRoot, commonData, created);
 
             var runRoot = Path.Combine(stagingRoot, Guid.NewGuid().ToString("N"));
-            CreateDirectoryAtomic(runRoot, created);
-            PathSafety.EnsureNoReparseChain(runRoot, commonData);
+            CreateDirectoryAtomic(runRoot, BuildStagingSecurity(), created, "protected staging run");
+            ValidateStagingDirectory(runRoot, commonData);
 
             return new StagingSession(runRoot, created);
         }
@@ -161,21 +162,36 @@ internal static class ProtectedStaging
         }
     }
 
-    private static void EnsureProtectedDirectory(string path, string commonData, List<string> created)
+    private static void EnsureBaseDirectory(string path, string commonData, List<string> created)
     {
         if (Directory.Exists(path))
         {
-            ValidateExistingDirectory(path, commonData);
+            ValidateBaseDirectory(path, commonData);
             return;
         }
 
-        CreateDirectoryAtomic(path, created);
-        ValidateExistingDirectory(path, commonData);
+        CreateDirectoryAtomic(path, BuildBaseSecurity(), created, "protected state base");
+        ValidateBaseDirectory(path, commonData);
     }
 
-    private static void CreateDirectoryAtomic(string path, List<string> created)
+    private static void EnsureStagingDirectory(string path, string commonData, List<string> created)
     {
-        var security = BuildSecurity();
+        if (Directory.Exists(path))
+        {
+            ValidateStagingDirectory(path, commonData);
+            return;
+        }
+
+        CreateDirectoryAtomic(path, BuildStagingSecurity(), created, "protected staging root");
+        ValidateStagingDirectory(path, commonData);
+    }
+
+    private static void CreateDirectoryAtomic(
+        string path,
+        DirectorySecurity security,
+        List<string> created,
+        string description)
+    {
         var descriptor = security.GetSecurityDescriptorBinaryForm();
         var descriptorHandle = GCHandle.Alloc(descriptor, GCHandleType.Pinned);
         try
@@ -192,9 +208,9 @@ internal static class ProtectedStaging
                 var error = Marshal.GetLastWin32Error();
                 if (error == NativeMethods.ErrorAlreadyExists)
                 {
-                    throw new SetupException($"Staging directory already exists and will not be reused: '{path}'.");
+                    throw new SetupException($"Protected directory already exists and will not be reused: '{path}'.");
                 }
-                throw new SetupException($"Could not create protected staging directory '{path}' (Win32 error {error}).");
+                throw new SetupException($"Could not create {description} directory '{path}' (Win32 error {error}).");
             }
 
             created.Add(path);
@@ -205,7 +221,13 @@ internal static class ProtectedStaging
         }
     }
 
-    private static DirectorySecurity BuildSecurity()
+    internal static DirectorySecurity BuildBaseSecurity()
+        => BuildDirectorySecurity(Users);
+
+    internal static DirectorySecurity BuildStagingSecurity()
+        => BuildDirectorySecurity(null);
+
+    private static DirectorySecurity BuildDirectorySecurity(SecurityIdentifier? reader)
     {
         var security = new DirectorySecurity();
         security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
@@ -225,52 +247,172 @@ internal static class ProtectedStaging
             PropagationFlags.None,
             AccessControlType.Allow));
 
+        if (reader is not null)
+        {
+            security.AddAccessRule(new FileSystemAccessRule(
+                reader,
+                FileSystemRights.ReadAndExecute,
+                inheritance,
+                PropagationFlags.None,
+                AccessControlType.Allow));
+        }
+
         return security;
     }
 
-    internal static void ValidateExistingDirectory(string path, string commonData)
+    internal static void ValidateBaseDirectory(string path, string commonData)
+        => ValidateDirectory(path, commonData, DirectoryPolicy.Base);
+
+    internal static void ValidateStagingDirectory(string path, string commonData)
+        => ValidateDirectory(path, commonData, DirectoryPolicy.Staging);
+
+    private static void ValidateDirectory(string path, string commonData, DirectoryPolicy policy)
     {
         if (!Directory.Exists(path))
         {
-            throw new SetupException($"Expected protected staging directory is missing: '{path}'.");
+            throw new SetupException($"Expected protected directory is missing: '{path}'.");
         }
 
         PathSafety.EnsureNoReparseChain(path, commonData);
 
-        var info = new DirectoryInfo(path);
         DirectorySecurity security;
         try
         {
-            security = info.GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
+            security = new DirectoryInfo(path).GetAccessControl(
+                AccessControlSections.Access | AccessControlSections.Owner);
         }
         catch (Exception error)
         {
-            throw new SetupException($"Could not read the staging directory security descriptor '{path}': {error.Message}", error);
+            throw new SetupException($"Could not read protected directory security '{path}': {error.Message}", error);
         }
 
+        var errors = new List<string>();
         var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
-        if (!IsTrustedSid(owner))
+
+        if (policy == DirectoryPolicy.Base)
         {
-            throw new SetupException($"Staging directory '{path}' is not owned by Administrators or SYSTEM.");
+            if (owner is null || !owner.Equals(Administrators))
+            {
+                errors.Add($"owner is '{owner?.Value ?? "unresolved"}'; expected BUILTIN\\Administrators ({Administrators.Value})");
+            }
         }
+        else if (!IsTrustedSid(owner))
+        {
+            errors.Add($"owner is '{owner?.Value ?? "unresolved"}'; expected BUILTIN\\Administrators or SYSTEM");
+        }
+
+        if (!security.AreAccessRulesProtected)
+        {
+            errors.Add("the DACL is not protected: inherited ACEs are still present");
+        }
+
+        var expected = new Dictionary<string, FileSystemRights>(StringComparer.Ordinal)
+        {
+            [LocalSystem.Value] = FileSystemRights.FullControl,
+            [Administrators.Value] = FileSystemRights.FullControl
+        };
+        if (policy == DirectoryPolicy.Base)
+        {
+            expected[Users.Value] = FileSystemRights.ReadAndExecute;
+        }
+
+        const InheritanceFlags requiredInheritance =
+            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+        var rights = new Dictionary<string, FileSystemRights>(StringComparer.Ordinal);
 
         foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
         {
-            if (rule.AccessControlType != AccessControlType.Allow ||
-                rule.IdentityReference is not SecurityIdentifier sid ||
-                IsTrustedSid(sid))
+            if (rule.AccessControlType != AccessControlType.Allow)
             {
+                errors.Add($"unexpected DENY access rule for '{rule.IdentityReference}'");
                 continue;
             }
 
-            if ((rule.FileSystemRights & DangerousRights) != 0)
+            if (rule.IsInherited)
             {
-                throw new SetupException(
-                    $"Staging directory '{path}' grants write/delete authority to untrusted identity '{sid}'.");
+                errors.Add($"an access rule for '{rule.IdentityReference}' is inherited; only explicit ACEs apply");
+                continue;
             }
+
+            if (rule.InheritanceFlags != requiredInheritance)
+            {
+                errors.Add($"an access rule for '{rule.IdentityReference}' must have exactly ContainerInherit|ObjectInherit inheritance (got '{rule.InheritanceFlags}')");
+                continue;
+            }
+
+            if (rule.PropagationFlags != PropagationFlags.None)
+            {
+                errors.Add($"an access rule for '{rule.IdentityReference}' must not use propagation flags (got '{rule.PropagationFlags}')");
+                continue;
+            }
+
+            if (rule.IdentityReference is not SecurityIdentifier sid)
+            {
+                errors.Add($"an access rule identity '{rule.IdentityReference}' could not be resolved to a SID");
+                continue;
+            }
+
+            if (!expected.ContainsKey(sid.Value))
+            {
+                errors.Add($"unexpected access rule for '{sid.Value}' (rights '{rule.FileSystemRights}')");
+                continue;
+            }
+
+            if (!rights.ContainsKey(sid.Value))
+            {
+                rights[sid.Value] = 0;
+            }
+            rights[sid.Value] |= rule.FileSystemRights;
+        }
+
+        foreach (var expectedRule in expected)
+        {
+            if (!rights.TryGetValue(expectedRule.Key, out var granted))
+            {
+                var expectedLabel = expectedRule.Key == Users.Value
+                    ? "BUILTIN\\Users"
+                    : expectedRule.Key == LocalSystem.Value
+                        ? "SYSTEM"
+                        : "BUILTIN\\Administrators";
+                errors.Add($"missing access rule for {expectedLabel} ({expectedRule.Key})");
+                continue;
+            }
+
+            if (expectedRule.Key == Users.Value && policy == DirectoryPolicy.Base)
+            {
+                var allowedReader = FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize;
+                if (((int)granted & ~(int)allowedReader) != 0)
+                {
+                    errors.Add($"BUILTIN\\Users grants unexpected write-capable rights: {granted}");
+                }
+                if ((granted & FileSystemRights.ReadAndExecute) != FileSystemRights.ReadAndExecute)
+                {
+                    errors.Add("BUILTIN\\Users is missing part of the required read+execute/list access");
+                }
+            }
+            else if ((granted & FileSystemRights.FullControl) != FileSystemRights.FullControl)
+            {
+                errors.Add($"'{(expectedRule.Key == LocalSystem.Value ? "SYSTEM" : "BUILTIN\\Administrators")}' does not have FullControl");
+            }
+        }
+
+        if (errors.Count > 0)
+        {
+            var label = policy == DirectoryPolicy.Base
+                ? "Protected state base"
+                : "Protected staging directory";
+            throw new SetupException(
+                $"{label} '{path}' has unexpected security. Refusing to repair it automatically; remove or repair it explicitly from an administrator shell and rerun setup." +
+                Environment.NewLine + "  - " + string.Join(Environment.NewLine + "  - ", errors));
         }
     }
 
     private static bool IsTrustedSid(SecurityIdentifier? sid)
         => sid is not null && (sid.Equals(Administrators) || sid.Equals(LocalSystem));
+
+    private enum DirectoryPolicy
+    {
+        Base,
+        Staging
+    }
 }

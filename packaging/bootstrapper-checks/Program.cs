@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Win32;
 
 namespace DevWS.Setup.Checks;
@@ -12,8 +13,19 @@ internal static class Program
     private static int _passed;
     private static readonly List<string> Failures = new();
 
-    private static int Main()
+    private static int Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == "--emit-acl-json")
+        {
+            return EmitAclJson(args[1]);
+        }
+
+        if (args.Length != 0)
+        {
+            Console.Error.WriteLine("Usage: DevWS.Setup.Checks [--emit-acl-json <common-data-root>]");
+            return 2;
+        }
+
         Run("x64 Windows is the only supported architecture", () =>
         {
             Check(ArchitecturePolicy.IsSupported(true, Architecture.X64));
@@ -287,35 +299,146 @@ internal static class Program
             }
         });
 
-        Run("protected staging is created and cleaned under ProgramData", () =>
+        Run("fresh staging uses a canonical base and restricted staging subtree", () =>
         {
-            var stagingRoot = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
-                "DevWS",
-                "setup-staging");
-            using var session = ProtectedStaging.Create();
+            var commonData = NewTempDirectory();
             try
             {
-                Check(Directory.Exists(session.Root));
-                Check(session.Root.StartsWith(stagingRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
-                Check(!session.Root.StartsWith(Path.GetTempPath(), StringComparison.OrdinalIgnoreCase));
+                var basePath = Path.Combine(commonData, "DevWS");
+                var stagingPath = Path.Combine(basePath, "setup-staging");
 
-                var security = new DirectoryInfo(session.Root)
-                    .GetAccessControl(AccessControlSections.Access | AccessControlSections.Owner);
-                foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(System.Security.Principal.SecurityIdentifier)))
+                using (var session = ProtectedStaging.CreateForRoot(commonData))
                 {
-                    if (rule.AccessControlType != AccessControlType.Allow) continue;
-                    var sid = (System.Security.Principal.SecurityIdentifier)rule.IdentityReference;
-                    var trusted = sid.IsWellKnown(System.Security.Principal.WellKnownSidType.BuiltinAdministratorsSid)
-                        || sid.IsWellKnown(System.Security.Principal.WellKnownSidType.LocalSystemSid);
-                    Check(trusted, $"unexpected staging ACL identity {sid}");
+                    Check(Directory.Exists(session.Root));
+                    Check(session.Root.StartsWith(stagingPath + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+
+                    ProtectedStaging.ValidateBaseDirectory(basePath, commonData);
+                    ProtectedStaging.ValidateStagingDirectory(stagingPath, commonData);
+                    ProtectedStaging.ValidateStagingDirectory(session.Root, commonData);
+
+                    var baseSecurity = GetDirectorySecurity(basePath);
+                    var usersRule = baseSecurity.GetAccessRules(true, true, typeof(SecurityIdentifier))
+                        .Cast<FileSystemAccessRule>()
+                        .FirstOrDefault(rule => rule.AccessControlType == AccessControlType.Allow &&
+                            rule.IdentityReference is SecurityIdentifier sid &&
+                            sid.IsWellKnown(WellKnownSidType.BuiltinUsersSid));
+                    Check(usersRule is not null, "fresh base directory does not grant BUILTIN\\Users read access");
+                    Check((usersRule!.FileSystemRights & FileSystemRights.ReadAndExecute) == FileSystemRights.ReadAndExecute,
+                        "fresh base directory does not grant BUILTIN\\Users read+execute");
+
+                    AssertRestrictedAcl(stagingPath);
+                    AssertRestrictedAcl(session.Root);
+                }
+
+                Check(!Directory.Exists(stagingPath), "staging root was not removed after disposal");
+            }
+            finally
+            {
+                TryDelete(commonData);
+            }
+        });
+
+        Run("legacy staging-only base ACL is rejected by the canonical base validator", () =>
+        {
+            var commonData = NewTempDirectory();
+            try
+            {
+                var basePath = Path.Combine(commonData, "DevWS");
+                PackageSecurity.CreateDirectoryAtomic(basePath, null);
+
+                var rejected = false;
+                try { ProtectedStaging.ValidateBaseDirectory(basePath, commonData); }
+                catch (SetupException error) { rejected = error.Message.Contains("BUILTIN\\Users", StringComparison.Ordinal); }
+                Check(rejected, "an Administrators/SYSTEM-only base ACL was accepted");
+            }
+            finally
+            {
+                TryDelete(commonData);
+            }
+        });
+
+        Run("pre-existing canonical base directory is accepted without ACL modification", () =>
+        {
+            var commonData = NewTempDirectory();
+            try
+            {
+                var basePath = Path.Combine(commonData, "DevWS");
+                PackageSecurity.CreateDirectoryAtomic(
+                    basePath,
+                    new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null));
+                var before = GetDirectorySddl(basePath);
+
+                using (var session = ProtectedStaging.CreateForRoot(commonData))
+                {
+                    Check(Directory.Exists(session.Root));
+                    Check(GetDirectorySddl(basePath) == before, "the pre-existing base ACL was modified");
+                    ProtectedStaging.ValidateBaseDirectory(basePath, commonData);
                 }
             }
             finally
             {
-                var root = session.Root;
-                session.Dispose();
-                Check(!Directory.Exists(root), "staging run directory was not removed");
+                TryDelete(commonData);
+            }
+        });
+
+        Run("pre-existing dangerous base ACL is rejected and left unchanged", () =>
+        {
+            var commonData = NewTempDirectory();
+            try
+            {
+                var basePath = Path.Combine(commonData, "DevWS");
+                PackageSecurity.CreateDirectoryAtomic(
+                    basePath,
+                    new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null));
+                var security = GetDirectorySecurity(basePath);
+                security.AddAccessRule(new FileSystemAccessRule(
+                    new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+                    FileSystemRights.DeleteSubdirectoriesAndFiles,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+                    PropagationFlags.None,
+                    AccessControlType.Allow));
+                new DirectoryInfo(basePath).SetAccessControl(security);
+
+                var before = GetDirectorySddl(basePath);
+                var rejected = false;
+                try { using var session = ProtectedStaging.CreateForRoot(commonData); }
+                catch (SetupException) { rejected = true; }
+
+                Check(rejected, "dangerous pre-existing base authority was accepted");
+                Check(GetDirectorySddl(basePath) == before, "a rejected base ACL was modified");
+                Check(!Directory.Exists(Path.Combine(basePath, "setup-staging")),
+                    "staging was created before the unsafe base was rejected");
+            }
+            finally
+            {
+                TryDelete(commonData);
+            }
+        });
+
+        Run("staging subtree with an untrusted reader ACE is rejected", () =>
+        {
+            var commonData = NewTempDirectory();
+            try
+            {
+                var basePath = Path.Combine(commonData, "DevWS");
+                var stagingPath = Path.Combine(basePath, "setup-staging");
+                PackageSecurity.CreateDirectoryAtomic(
+                    basePath,
+                    new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null));
+                PackageSecurity.CreateDirectoryAtomic(
+                    stagingPath,
+                    new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null));
+
+                var rejected = false;
+                try { using var session = ProtectedStaging.CreateForRoot(commonData); }
+                catch (SetupException) { rejected = true; }
+                Check(rejected, "an untrusted reader ACE on setup-staging was accepted");
+                Check(!Directory.EnumerateDirectories(stagingPath).Any(),
+                    "a staging run directory was created despite the untrusted reader ACE");
+            }
+            finally
+            {
+                TryDelete(commonData);
             }
         });
 
@@ -412,6 +535,54 @@ internal static class Program
         new DirectoryInfo(child).SetAccessControl(childSecurity);
 
         return (root, parent, child);
+    }
+
+    private static DirectorySecurity GetDirectorySecurity(string path)
+        => new DirectoryInfo(path).GetAccessControl(
+            AccessControlSections.Access | AccessControlSections.Owner);
+
+    private static string GetDirectorySddl(string path)
+        => GetDirectorySecurity(path).GetSecurityDescriptorSddlForm(
+            AccessControlSections.Access | AccessControlSections.Owner);
+
+    private static void AssertRestrictedAcl(string path)
+    {
+        var security = GetDirectorySecurity(path);
+        Check(security.AreAccessRulesProtected, $"staging ACL is not protected: {path}");
+
+        var owner = security.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        Check(owner is not null &&
+            (owner.Equals(PackageSecurity.Administrators) || owner.Equals(PackageSecurity.LocalSystem)),
+            $"staging owner is not Administrators or SYSTEM: {owner?.Value ?? "unresolved"}");
+
+        foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+        {
+            if (rule.AccessControlType != AccessControlType.Allow)
+            {
+                continue;
+            }
+
+            var sid = rule.IdentityReference as SecurityIdentifier;
+            Check(sid is not null &&
+                (sid.Equals(PackageSecurity.Administrators) || sid.Equals(PackageSecurity.LocalSystem)),
+                $"unexpected staging ACL identity: {rule.IdentityReference}");
+        }
+    }
+
+    private static int EmitAclJson(string commonData)
+    {
+        Directory.CreateDirectory(commonData);
+        using var session = ProtectedStaging.CreateForRoot(commonData);
+        var basePath = Path.Combine(commonData, "DevWS");
+        var stagingPath = Path.Combine(basePath, "setup-staging");
+        var payload = new
+        {
+            baseSddl = GetDirectorySddl(basePath),
+            stagingSddl = GetDirectorySddl(stagingPath),
+            runSddl = GetDirectorySddl(session.Root)
+        };
+        Console.WriteLine("DEVWS_ACL_CONTRACT_JSON:" + JsonSerializer.Serialize(payload));
+        return 0;
     }
 
     private static ProductIdentity FixtureIdentity()

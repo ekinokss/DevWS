@@ -160,8 +160,11 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
   `Microsoft.PowerShell_8wekyb3d8bbwe` MSIX package under `Program Files\WindowsApps`.
 - Candidates must be non-reparse normal files with PowerShell major version >= 7 and must
   pass a runtime smoke check with the same absolute executable.
-- Payload staging is created under `%ProgramData%\DevWS\setup-staging\<run-guid>` with a
-  protected ACL applied at directory creation. Existing insecure ancestors fail closed.
+- Payload staging is created under `%ProgramData%\DevWS\setup-staging\<run-guid>`. The
+  shared `%ProgramData%\DevWS` base follows the installer's canonical protected-state base
+  ACL (SYSTEM/Administrators full control and BUILTIN\Users read/execute only); the
+  `setup-staging` subtree and each run directory remain restricted to SYSTEM and
+  Administrators. Existing insecure ancestors fail closed without automatic repair.
 - Archive entries are validated before extraction for traversal, drive/UNC paths,
   duplicate normalized targets, file/directory conflicts and reparse/symlink semantics.
 - Cleanup never follows reparse points and leaves a cleanup warning without converting a

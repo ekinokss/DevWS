@@ -216,6 +216,11 @@ try {
     & $DotNetPath run --project $ChecksProject -c Release
     Assert-Condition ($LASTEXITCODE -eq 0) 'Bootstrapper source checks failed.'
 
+    Write-Output '[test] Verifying bootstrapper/installer ACL contract...'
+    & pwsh -NoLogo -NoProfile -File (Join-Path $PSScriptRoot 'test-staging-acl-contract.ps1') `
+        -DotNetPath $DotNetPath -ChecksProject $ChecksProject
+    Assert-Condition ($LASTEXITCODE -eq 0) 'Bootstrapper/installer ACL contract test failed.'
+
     $env:DEVWS_SETUP_FIXTURE_INSTALL_LOG = $FixtureInstallLog
     $env:DEVWS_SETUP_FIXTURE_UNINSTALL_LOG = $FixtureUninstallLog
     $env:DEVWS_SETUP_FIXTURE_MARKER = $FixtureMarker
@@ -362,6 +367,12 @@ finally {
     if (Test-Path -LiteralPath $StagingParent) {
         $remaining = @(Get-ChildItem -LiteralPath $StagingParent -Force -ErrorAction SilentlyContinue)
         if ($remaining.Count -eq 0) { Remove-Item -LiteralPath $StagingParent -Force -ErrorAction SilentlyContinue }
+    }
+
+    $devwsBase = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'DevWS'
+    if (Test-Path -LiteralPath $devwsBase) {
+        $remainingBase = @(Get-ChildItem -LiteralPath $devwsBase -Force -ErrorAction SilentlyContinue)
+        if ($remainingBase.Count -eq 0) { Remove-Item -LiteralPath $devwsBase -Force -ErrorAction SilentlyContinue }
     }
 
     foreach ($directory in @(
