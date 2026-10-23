@@ -22,7 +22,14 @@ $FixtureLocal = Join-Path $env:LOCALAPPDATA $RootLeaf
 $FixtureSetupDirectory = Join-Path $FixtureRoot ('setup\' + $Sid)
 $PersistedSetup = Join-Path $FixtureSetupDirectory 'DevWS-Setup.exe'
 $ArpRelativePath = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' + $ProductId
+$DevWSBase = Join-Path $env:ProgramData 'DevWS'
 $StagingParent = Join-Path $env:ProgramData 'DevWS\setup-staging'
+# Conservative defaults: if the fixture fails before observing the shared
+# roots, cleanup must preserve them rather than infer ownership.
+$DevWSBaseBefore = $true
+$StagingParentBefore = $true
+$DevWSBaseObserved = $false
+$StagingParentObserved = $false
 $ProductionArpRelativePath = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\ekinokss.DevWS'
 $ProductionLifecycle = Join-Path $env:ProgramFiles ('DevWS\setup\' + $Sid)
 $ProductionArpBefore = $null
@@ -83,6 +90,48 @@ function Remove-FixtureArp {
 function Get-LogLines([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
     return @(Get-Content -LiteralPath $Path -Encoding UTF8 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_ | ConvertFrom-Json })
+}
+function Remove-FixtureOwnedEmptyDirectory([string]$Path, [bool]$Preexisted) {
+    # Shared roots are removed only when this fixture observed their absence
+    # before the run and they are still empty at cleanup. A pre-existing empty
+    # root belongs to the environment and is never touched.
+    if ($Preexisted -or -not (Test-Path -LiteralPath $Path)) { return }
+    $remaining = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    if ($remaining.Count -eq 0) {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+function Test-FixtureCleanupOwnership([string]$Root) {
+    New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    $preexisting = Join-Path $Root 'pre-existing-empty-base'
+    $fixtureOwned = Join-Path $Root 'fixture-owned-empty-base'
+    $fixtureNonEmpty = Join-Path $Root 'fixture-owned-nonempty-base'
+    New-Item -ItemType Directory -Path $preexisting -Force | Out-Null
+    New-Item -ItemType Directory -Path $fixtureOwned -Force | Out-Null
+    New-Item -ItemType Directory -Path $fixtureNonEmpty -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $fixtureNonEmpty 'marker.txt') -Value 'fixture-owned' -Encoding Ascii
+
+    $beforeItem = Get-Item -LiteralPath $preexisting -Force
+    $beforeAcl = Get-Acl -LiteralPath $preexisting
+    $beforeCreation = $beforeItem.CreationTimeUtc
+    $beforeWrite = $beforeItem.LastWriteTimeUtc
+    Remove-FixtureOwnedEmptyDirectory -Path $preexisting -Preexisted $true
+    $afterItem = Get-Item -LiteralPath $preexisting -Force
+    $afterAcl = Get-Acl -LiteralPath $preexisting
+    Assert-Condition (Test-Path -LiteralPath $preexisting) 'pre-existing empty base was removed by cleanup'
+    Assert-Condition ($afterAcl.Owner -eq $beforeAcl.Owner) 'pre-existing empty base owner changed'
+    Assert-Condition ($afterAcl.Sddl -eq $beforeAcl.Sddl) 'pre-existing empty base ACL changed'
+    Assert-Condition ($afterItem.CreationTimeUtc -eq $beforeCreation) 'pre-existing empty base creation time changed'
+    Assert-Condition ($afterItem.LastWriteTimeUtc -eq $beforeWrite) 'pre-existing empty base metadata changed'
+
+    Remove-FixtureOwnedEmptyDirectory -Path $fixtureOwned -Preexisted $false
+    Assert-Condition (-not (Test-Path -LiteralPath $fixtureOwned)) 'fixture-owned empty base was not removed'
+
+    Remove-FixtureOwnedEmptyDirectory -Path $fixtureNonEmpty -Preexisted $false
+    Assert-Condition (Test-Path -LiteralPath $fixtureNonEmpty) 'fixture-owned non-empty base was removed'
+
+    Write-Output 'PASS: cleanup preserves a pre-existing empty shared base and its metadata'
+    Write-Output 'PASS: cleanup removes only fixture-created empty directories'
 }
 function Assert-ProtectedPath([string]$Path, [bool]$IsFile) {
     Assert-Condition (Test-Path -LiteralPath $Path) "Protected package path is missing: $Path"
@@ -203,9 +252,13 @@ try {
     Assert-Condition ($ProductId -ne 'ekinokss.DevWS') 'Fixture product identity collided with production.'
     $ProductionArpBefore = Test-KeyExists $ProductionArpRelativePath
     $ProductionLifecycleBefore = Test-Path -LiteralPath $ProductionLifecycle
+    $DevWSBaseBefore = Test-Path -LiteralPath $DevWSBase
     $StagingParentBefore = Test-Path -LiteralPath $StagingParent
+    $DevWSBaseObserved = $true
+    $StagingParentObserved = $true
 
     New-Item -ItemType Directory -Path $TestRoot -Force | Out-Null
+    Test-FixtureCleanupOwnership -Root (Join-Path $TestRoot 'cleanup-ownership')
     $FixtureZip = Write-FixturePayload
     $exe020 = Build-Fixture '0.2.0' 'fixture-020'
     $exe021 = Build-Fixture '0.2.1' 'fixture-021'
@@ -364,16 +417,8 @@ finally {
     Remove-FixtureArp
     if (Test-Path -LiteralPath $FixtureRoot) { Remove-Item -LiteralPath $FixtureRoot -Recurse -Force -ErrorAction SilentlyContinue }
     if (Test-Path -LiteralPath $FixtureLocal) { Remove-Item -LiteralPath $FixtureLocal -Recurse -Force -ErrorAction SilentlyContinue }
-    if (Test-Path -LiteralPath $StagingParent) {
-        $remaining = @(Get-ChildItem -LiteralPath $StagingParent -Force -ErrorAction SilentlyContinue)
-        if ($remaining.Count -eq 0) { Remove-Item -LiteralPath $StagingParent -Force -ErrorAction SilentlyContinue }
-    }
-
-    $devwsBase = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'DevWS'
-    if (Test-Path -LiteralPath $devwsBase) {
-        $remainingBase = @(Get-ChildItem -LiteralPath $devwsBase -Force -ErrorAction SilentlyContinue)
-        if ($remainingBase.Count -eq 0) { Remove-Item -LiteralPath $devwsBase -Force -ErrorAction SilentlyContinue }
-    }
+    Remove-FixtureOwnedEmptyDirectory -Path $StagingParent -Preexisted $StagingParentBefore
+    Remove-FixtureOwnedEmptyDirectory -Path $DevWSBase -Preexisted $DevWSBaseBefore
 
     foreach ($directory in @(
         (Join-Path $PSScriptRoot 'bootstrapper-checks\bin'),
@@ -392,4 +437,11 @@ finally {
     elseif ($KeepArtifacts) {
         Write-Output "[test] artifacts retained at $TestRoot"
     }
+}
+
+if ($DevWSBaseObserved -and $DevWSBaseBefore -and -not (Test-Path -LiteralPath $DevWSBase)) {
+    throw 'pre-existing shared DevWS base was removed during fixture cleanup'
+}
+if ($StagingParentObserved -and $StagingParentBefore -and -not (Test-Path -LiteralPath $StagingParent)) {
+    throw 'pre-existing staging parent was removed during fixture cleanup'
 }
