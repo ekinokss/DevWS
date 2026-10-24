@@ -18673,6 +18673,8 @@ $mutex.Dispose()
         Assert-Equal $true $plan.PreserveV1 "v1 rollback directory preserved"
         Assert-Equal 5 @($plan.TaskNames).Count "five tasks are removed"
         Assert-True (@($plan.TaskNames) -contains "DevWorkspace-ElevatedBroker") "the persistent broker task is removed"
+        Assert-Equal $null $plan.CoordinatorPipeName "fixture plan never targets the production coordinator pipe"
+        Assert-Equal $false $plan.StopManagedHotkeyProcess "fixture plan never stops a production hotkey process"
 
         foreach ($name in @("AppPath", "HelpersPath", "WorkersPath", "BinPath", "StatePath")) {
             $target = $plan.$name
@@ -18766,6 +18768,118 @@ $mutex.Dispose()
         Assert-Equal $false $plan2.RemoveHotkey "a custom hotkey is not DevWS-owned"
         [void](Invoke-DevWSUninstall -Plan $plan2 -SkipTasks)
         Assert-Equal $custom (Get-Content -LiteralPath $hotkeyPath -Raw) "the custom hotkey is preserved"
+    }
+
+    Test-Case "managed AutoHotkey process stops by exact path while unrelated AutoHotkey is preserved" {
+        $ahk = $null
+
+        try { $ahk = Get-DevWSAutoHotkeyPath } catch { $ahk = $null }
+
+        if ([string]::IsNullOrWhiteSpace($ahk) -or -not (Test-Path -LiteralPath $ahk -PathType Leaf)) {
+            Skip-Test "AutoHotkey v2 is unavailable on this host"
+        }
+
+        $fixture = New-InstallFixture "uninstall-ahk-lifecycle"
+        $managedDir = Join-Path $fixture.Root "managed"
+        $unrelatedDir = Join-Path $fixture.Root "unrelated"
+        New-Item -ItemType Directory -Path $managedDir, $unrelatedDir -Force | Out-Null
+
+        $managedScript = Join-Path $managedDir "TerminalShortcut.ahk"
+        $unrelatedScript = Join-Path $unrelatedDir "Unrelated.ahk"
+        $scriptBody = "#Requires AutoHotkey v2.0`r`n#SingleInstance Force`r`n!+t::return`r`n"
+        Set-Content -LiteralPath $managedScript -Value $scriptBody -Encoding Ascii
+        Set-Content -LiteralPath $unrelatedScript -Value $scriptBody -Encoding Ascii
+
+        $managed = $null
+        $unrelated = $null
+
+        try {
+            $managed = Start-Process -FilePath $ahk -ArgumentList @($managedScript) -PassThru -WindowStyle Hidden
+            $unrelated = Start-Process -FilePath $ahk -ArgumentList @($unrelatedScript) -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+
+            Assert-True (-not $managed.HasExited) "managed AutoHotkey fixture is running"
+            Assert-True (-not $unrelated.HasExited) "unrelated AutoHotkey fixture is running"
+
+            $result = Stop-DevWSManagedHotkeyProcesses -HotkeyPath $managedScript -TimeoutMilliseconds 10000
+            Assert-Equal "stopped" $result.State "managed AutoHotkey process is stopped"
+            Assert-Equal $true ($managed.WaitForExit(15000)) "managed AutoHotkey process exited"
+            Assert-Equal $false $unrelated.HasExited "unrelated AutoHotkey process is preserved"
+
+            $again = Stop-DevWSManagedHotkeyProcesses -HotkeyPath $managedScript -TimeoutMilliseconds 1000
+            Assert-Equal "absent" $again.State "repeated managed AutoHotkey cleanup is a no-op"
+        }
+        finally {
+            Stop-TestFixtureProcess $managed
+            Stop-TestFixtureProcess $unrelated
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Test-Case "uninstall stops managed processes before runtime removal and repeated uninstall is safe" {
+        $fixture = New-InstallFixture "uninstall-process-order"
+        $null = Install-DevWSApplicationFiles -RepoRoot $RepoRoot -InstallRoot $fixture.Root
+
+        $canonical = Join-Path $fixture.Root "canonical.json"
+        Set-Content -LiteralPath $canonical -Value "{}" -NoNewline
+
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "Startup") -Force | Out-Null
+        $hotkeyPath = Join-Path $fixture.Root "Startup\TerminalShortcut.ahk"
+        Set-Content -LiteralPath $hotkeyPath -Value (New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath (Join-Path $fixture.State "hotkeys\bindings.ahk")) -NoNewline
+
+        $metadata = New-DevWSInstallMetadata
+        $metadata.hotkey.managed = $true
+        $metadata.hotkey.backup = ""
+
+        $plan = Get-DevWSUninstallPlan -InstallRoot $fixture.Root -CanonicalPath $canonical -LegacyShimPath (Join-Path $fixture.Root "local-bin\ws.cmd") -HotkeyPath $hotkeyPath -Metadata $metadata
+        $plan.RemoveHotkey = $true
+        $plan.RestoreHotkey = $false
+        $plan.CoordinatorPipeName = "DevWS.Test.Uninstall.Coordinator"
+        $plan.StopManagedHotkeyProcess = $true
+
+        $script:uninstallProcessOrder = [System.Collections.Generic.List[string]]::new()
+
+        function Stop-DevWSManagedHotkeyProcesses {
+            param([string]$HotkeyPath)
+            $script:uninstallProcessOrder.Add("hotkey") | Out-Null
+            return [pscustomobject]@{ State = "stopped"; Pids = @(111); Error = $null }
+        }
+
+        function Stop-DevWSCoordinator {
+            param([string]$PipeName, [string]$InstallRoot)
+            $script:uninstallProcessOrder.Add("coordinator") | Out-Null
+            return [pscustomobject]@{ State = "stopped"; Pid = 222; Pids = @(222); Error = $null }
+        }
+
+        try {
+            [void](Invoke-DevWSUninstall -Plan $plan -SkipTasks)
+
+            Assert-Equal "hotkey,coordinator" ($script:uninstallProcessOrder -join ",") "managed hotkey is stopped before the coordinator"
+            Assert-True (-not (Test-Path -LiteralPath $fixture.App)) "runtime files are removed after process cleanup"
+            Assert-True (-not (Test-Path -LiteralPath $hotkeyPath)) "managed hotkey file is removed after process cleanup"
+
+            $script:uninstallProcessOrder.Clear()
+            $plan.RemoveHotkey = $false
+            $plan.RestoreHotkey = $false
+
+            function Stop-DevWSManagedHotkeyProcesses {
+                param([string]$HotkeyPath)
+                $script:uninstallProcessOrder.Add("hotkey") | Out-Null
+                return [pscustomobject]@{ State = "absent"; Pids = @(); Error = $null }
+            }
+
+            function Stop-DevWSCoordinator {
+                param([string]$PipeName, [string]$InstallRoot)
+                $script:uninstallProcessOrder.Add("coordinator") | Out-Null
+                return [pscustomobject]@{ State = "absent"; Pid = $null; Pids = @(); Error = $null }
+            }
+
+            [void](Invoke-DevWSUninstall -Plan $plan -SkipTasks)
+            Assert-Equal "hotkey,coordinator" ($script:uninstallProcessOrder -join ",") "repeated uninstall remains a safe process no-op"
+        }
+        finally {
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     Test-Case "uninstall.ps1 -PackageMode is the non-interactive default uninstall contract" {
@@ -23001,6 +23115,7 @@ Write-Output "REPLACEMENT-LOADED"
         Assert-Contains $uninstall "Get-DevWSUninstallPlan" "uninstaller plans"
         Assert-Contains $uninstall "Invoke-DevWSUninstall" "uninstaller executes"
         Assert-Contains $uninstall "workspace config preserved" "uninstaller reports config preservation"
+        Assert-Contains $uninstall 'devws-coordinator.ps1' "uninstaller loads the coordinator protocol helper"
 
         $lib = Get-SourceOf "src\lib\devws-install.ps1"
         $start = $lib.IndexOf("function Invoke-DevWSUninstall")
@@ -23009,6 +23124,10 @@ Write-Output "REPLACEMENT-LOADED"
         $region = $lib.Substring($start)
         Assert-NotContains $region "\.ws\" "uninstall executor never targets the v1 directory"
         Assert-NotContains $region "Startup" "uninstall executor never enumerates Startup"
+        Assert-Contains $region "Stop-DevWSManagedHotkeyProcesses" "uninstall stops the managed hotkey process"
+        Assert-Contains $region "Stop-DevWSCoordinator" "uninstall stops the warm coordinator"
+        Assert-True ($region.IndexOf("Stop-DevWSManagedHotkeyProcesses") -lt $region.IndexOf("if (`$Plan.RestoreHotkey)")) "hotkey process stop precedes hotkey file restore"
+        Assert-True ($region.IndexOf("Stop-DevWSCoordinator") -lt $region.IndexOf("foreach (`$directory in @(`$Plan.AppPath")) "coordinator stop precedes runtime file removal"
     }
 
     Test-Case "installer records the config action and backup in metadata" {
@@ -29299,10 +29418,14 @@ Start-Sleep -Seconds 6
             $unknownSingle = $unknown.First | ConvertFrom-Json
             Assert-Equal $false ([bool]$unknownSingle.ok) "unknown set rejected before acceptance"
 
-            $shutdown = (Invoke-Stage1Pipe $pipe '{"version":1,"command":"shutdown"}').First | ConvertFrom-Json
-            Assert-Equal $true ([bool]$shutdown.ok) "shutdown acknowledged"
+            $stop = Stop-DevWSCoordinator -PipeName $pipe -InstallRoot $fixture.Root -ConnectTimeoutMilliseconds 1000 -ResponseTimeoutMilliseconds 3000 -ExitTimeoutMilliseconds 15000
+            Assert-Equal "stopped" $stop.State "coordinator shutdown helper reports stopped"
+            Assert-Equal $coordinator.Id ([int]$stop.Pid) "shutdown response identifies the coordinator process"
             Assert-Equal $true ($coordinator.WaitForExit(15000)) "shutdown stops the coordinator"
             $coordinator = $null
+
+            $stopAgain = Stop-DevWSCoordinator -PipeName $pipe -InstallRoot $fixture.Root -ConnectTimeoutMilliseconds 300 -ResponseTimeoutMilliseconds 500 -ExitTimeoutMilliseconds 1000
+            Assert-Equal "absent" $stopAgain.State "repeated coordinator shutdown is a no-op"
 
             # Stale-deployed-code detection: a changed managed file makes the
             # running coordinator refuse and exit so fresh code can start.
@@ -29340,6 +29463,44 @@ Start-Sleep -Seconds 6
             if ($null -ne $stale -and -not $stale.HasExited) { Stop-Process -Id $stale.Id -Force -ErrorAction SilentlyContinue }
 
             if ($null -ne $savedConfig) { $env:DEVWS_CONFIG = $savedConfig } else { Remove-Item Env:\DEVWS_CONFIG -ErrorAction SilentlyContinue }
+        }
+    }
+
+    Test-Case "coordinator shutdown falls back only to verified exact identity and preserves unrelated PowerShell" {
+        $fixture = New-InstallFixture "stage1-coordinator-fallback"
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "app") -Force | Out-Null
+        $coordinatorPath = Join-Path $fixture.Root "app\coordinator.ps1"
+        Set-Content -LiteralPath $coordinatorPath -Value "# disposable coordinator-shaped fixture" -NoNewline
+        $sleeperPath = Join-Path $fixture.Root "sleeper.ps1"
+        Set-Content -LiteralPath $sleeperPath -Value "Start-Sleep -Seconds 120" -NoNewline
+
+        $pipe = "DevWS.Stage1.Fallback." + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        $fake = $null
+        $unrelated = $null
+
+        try {
+            $fake = Start-Process -FilePath "pwsh" -ArgumentList @(
+                '-NoProfile', '-File', $sleeperPath, $coordinatorPath
+            ) -PassThru -WindowStyle Hidden
+            $unrelated = Start-Process -FilePath "pwsh" -ArgumentList @(
+                '-NoProfile', '-Command', 'Start-Sleep -Seconds 120'
+            ) -PassThru -WindowStyle Hidden
+
+            Start-Sleep -Seconds 2
+            Assert-True (-not $fake.HasExited) "coordinator-shaped fixture process is running"
+            Assert-True (-not $unrelated.HasExited) "unrelated PowerShell fixture is running"
+
+            $result = Stop-DevWSCoordinator -PipeName $pipe -InstallRoot $fixture.Root `
+                -ConnectTimeoutMilliseconds 300 -ResponseTimeoutMilliseconds 500 -ExitTimeoutMilliseconds 10000
+
+            Assert-Equal "stopped-fallback" $result.State "verified exact-identity fallback stops the unresponsive coordinator"
+            Assert-Equal $true ($fake.WaitForExit(15000)) "coordinator-shaped fixture process exited"
+            Assert-Equal $false $unrelated.HasExited "unrelated PowerShell process is preserved"
+        }
+        finally {
+            Stop-TestFixtureProcess $fake
+            Stop-TestFixtureProcess $unrelated
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 

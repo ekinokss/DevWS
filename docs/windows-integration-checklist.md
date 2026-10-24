@@ -211,9 +211,13 @@ configuration.
 ## 17. Uninstall
 
 - [ ] `uninstall.ps1` removes the tasks, the installed files and DevWS-owned integrations.
+- [ ] A running warm coordinator is asked to shut down through its current-user-only pipe and its exact process exits before runtime files are removed.
+- [ ] The AutoHotkey process running the managed `TerminalShortcut.ahk` is stopped by exact path and owner SID; unrelated PowerShell and AutoHotkey processes remain.
+- [ ] A missing or already-exited coordinator/hotkey process is a safe no-op; an unresponsive or ownership-unverifiable known process makes uninstall fail before mutation.
 - [ ] It preserves the canonical configuration, disposable state and the legacy
       `%USERPROFILE%\.ws` directory.
 - [ ] It restores pre-install shim and hotkey backups when they exist.
+- [ ] Repeated uninstall remains safe when the coordinator/hotkey process is absent.
 - [ ] `-Purge` additionally removes the canonical configuration and state.
 - [ ] Even `-Purge` never removes `%USERPROFILE%\.ws`.
 

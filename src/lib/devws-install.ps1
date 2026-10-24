@@ -3607,6 +3607,11 @@ function Get-DevWSUninstallPlan {
         }
     }
 
+    # Process lifecycle targets are enabled only for the real installed layout.
+    # Fixture plans must never contact the production coordinator pipe or stop a
+    # real AutoHotkey process.
+    $isRealInstall = [string]::Equals($InstallRoot, (Get-DevWSInstallRoot), [StringComparison]::OrdinalIgnoreCase)
+
     return [pscustomobject]@{
         InstallRoot            = $InstallRoot
         AppPath                = Join-Path $InstallRoot "app"
@@ -3621,6 +3626,8 @@ function Get-DevWSUninstallPlan {
         ProtectedStateBasePath = $(if ($null -ne $protectedStatePath) { Split-Path -Parent $protectedStatePath } else { $null })
         RemoveProtectedState   = $removeProtectedState
         TaskNames              = @(Get-DevWSScheduledTaskNames)
+        CoordinatorPipeName    = $(if ($isRealInstall) { Get-DevWSCoordinatorPipeName } else { $null })
+        StopManagedHotkeyProcess = ($isRealInstall -and ($restoreHotkey -or $removeHotkey))
         RemoveApplicationFiles = $true
         RemoveState            = [bool]$Purge
         RemoveCanonicalConfig  = [bool]$Purge
@@ -3784,14 +3791,202 @@ function Remove-DevWSProtectedStateRootSafe {
     }
 }
 
+function Get-DevWSManagedHotkeyProcessRecords {
+    # Exact managed-hotkey process inventory for the current user. A candidate
+    # is an AutoHotkey v2 process whose command line carries the exact managed
+    # TerminalShortcut.ahk path; the owner SID must match the invoking user.
+    # Unverified candidates are returned with Verified=false so uninstall can
+    # fail closed instead of silently leaving a DevWS-owned hotkey process.
+    param(
+        [Parameter(Mandatory)]
+        [string]$HotkeyPath,
+        [string]$UserSid = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserSid)) {
+        $UserSid = Get-DevWSCurrentUserSid
+    }
+
+    $escapedPath = [regex]::Escape($HotkeyPath)
+    $pattern     = '(?i)(?:^|[\s"])' + $escapedPath + '(?:[\s"]|$)'
+    $records     = [System.Collections.Generic.List[object]]::new()
+    $processes   = @(
+        @(Get-CimInstance Win32_Process -Filter "Name = 'AutoHotkey64.exe'" -ErrorAction Stop) +
+        @(Get-CimInstance Win32_Process -Filter "Name = 'AutoHotkey.exe'" -ErrorAction Stop)
+    )
+
+    foreach ($process in $processes) {
+        $commandLine = [string]$process.CommandLine
+
+        if ([string]::IsNullOrWhiteSpace($commandLine) -or $commandLine -notmatch $pattern) {
+            continue
+        }
+
+        $ownerSid = $null
+        $verified = $false
+
+        try {
+            $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+
+            if ($null -ne $owner -and [int]$owner.ReturnValue -eq 0 -and
+                -not [string]::IsNullOrWhiteSpace([string]$owner.Sid)) {
+                $ownerSid = [string]$owner.Sid
+                $verified = [string]::Equals($ownerSid, $UserSid, [StringComparison]::OrdinalIgnoreCase)
+            }
+        }
+        catch {
+            # Leave Verified=false; the caller must not act on an unverified
+            # process identity.
+        }
+
+        $records.Add([pscustomobject]@{
+            Pid          = [int]$process.ProcessId
+            CommandLine  = $commandLine
+            CreationTime = $process.CreationDate
+            OwnerSid     = $ownerSid
+            Verified     = $verified
+        })
+    }
+
+    return @($records)
+}
+
+function Wait-DevWSManagedHotkeyProcessesGone {
+    param(
+        [Parameter(Mandatory)]
+        [string]$HotkeyPath,
+        [int]$TimeoutMilliseconds = 5000
+    )
+
+    $deadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+
+    while ($true) {
+        $records = @(Get-DevWSManagedHotkeyProcessRecords -HotkeyPath $HotkeyPath)
+
+        if ($records.Count -eq 0) {
+            return $true
+        }
+
+        if ([datetime]::UtcNow -ge $deadline) {
+            return $false
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+function Stop-DevWSManagedHotkeyProcesses {
+    # Stops only an ownership-verified AutoHotkey process that is running the
+    # exact managed hotkey path. Missing/already-exited is a no-op; unverified
+    # candidates and stop failures are returned as explicit failures.
+    param(
+        [Parameter(Mandatory)]
+        [string]$HotkeyPath,
+        [string]$UserSid = "",
+        [int]$TimeoutMilliseconds = 5000
+    )
+
+    $records    = @(Get-DevWSManagedHotkeyProcessRecords -HotkeyPath $HotkeyPath -UserSid $UserSid)
+    $unverified = @($records | Where-Object { -not [bool]$_.Verified })
+    $verified   = @($records | Where-Object { [bool]$_.Verified })
+    $pids       = @($records | ForEach-Object { $_.Pid })
+
+    if ($unverified.Count -gt 0) {
+        return [pscustomobject]@{
+            State  = "unverified"
+            Pids   = $pids
+            Error  = "a managed-hotkey process could not be ownership-verified"
+        }
+    }
+
+    if ($verified.Count -eq 0) {
+        return [pscustomobject]@{
+            State  = "absent"
+            Pids   = @()
+            Error  = $null
+        }
+    }
+
+    $stopErrors = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($record in $verified) {
+        try {
+            Stop-Process -Id $record.Pid -Force -ErrorAction Stop
+        }
+        catch {
+            $stopErrors.Add("PID $($record.Pid): $($_.Exception.Message)") | Out-Null
+        }
+    }
+
+    $gone = Wait-DevWSManagedHotkeyProcessesGone -HotkeyPath $HotkeyPath -TimeoutMilliseconds $TimeoutMilliseconds
+
+    if ($gone) {
+        return [pscustomobject]@{
+            State  = "stopped"
+            Pids   = $pids
+            Error  = if ($stopErrors.Count -gt 0) { ($stopErrors -join "; ") } else { $null }
+        }
+    }
+
+    return [pscustomobject]@{
+        State  = "failed"
+        Pids   = $pids
+        Error  = if ($stopErrors.Count -gt 0) { ($stopErrors -join "; ") } else { "a DevWS-managed AutoHotkey process remains running" }
+    }
+}
+
 function Invoke-DevWSUninstall {
     param(
         [Parameter(Mandatory)]
         $Plan,
-        [switch]$SkipTasks
+        [switch]$SkipTasks,
+        [string]$CoordinatorPipeName = ""
     )
 
     $actions = [System.Collections.Generic.List[string]]::new()
+
+    # Stop the DevWS-owned user-session processes before removing any runtime
+    # file they are executing. The managed hotkey launcher goes first so it
+    # cannot restart the coordinator while the coordinator is being stopped.
+    if ([bool]$Plan.StopManagedHotkeyProcess) {
+        $hotkeyStop = Stop-DevWSManagedHotkeyProcesses -HotkeyPath ([string]$Plan.HotkeyPath)
+
+        if ($hotkeyStop.State -eq "stopped") {
+            $actions.Add("Stopped DevWS-managed AutoHotkey process(es): $((@($hotkeyStop.Pids) -join ', ')).")
+        }
+        elseif ($hotkeyStop.State -eq "absent") {
+            $actions.Add("No DevWS-managed AutoHotkey process was running.")
+        }
+        else {
+            throw "The DevWS-managed AutoHotkey process could not be stopped safely ($($hotkeyStop.State): $($hotkeyStop.Error)); uninstall aborted before removing runtime files."
+        }
+    }
+
+    $effectiveCoordinatorPipe = if (-not [string]::IsNullOrWhiteSpace($CoordinatorPipeName)) {
+        $CoordinatorPipeName
+    }
+    else {
+        [string]$Plan.CoordinatorPipeName
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($effectiveCoordinatorPipe)) {
+        $coordinatorStop = Stop-DevWSCoordinator -PipeName $effectiveCoordinatorPipe -InstallRoot ([string]$Plan.InstallRoot)
+
+        if ($coordinatorStop.State -eq "stopped") {
+            $coordinatorPid = if ($null -ne $coordinatorStop.Pid) { [string]$coordinatorStop.Pid } else { (@($coordinatorStop.Pids) -join ', ') }
+            $actions.Add("Stopped the DevWS coordinator (PID $coordinatorPid).")
+        }
+        elseif ($coordinatorStop.State -eq "stopped-fallback") {
+            $coordinatorPid = if ($null -ne $coordinatorStop.Pid) { [string]$coordinatorStop.Pid } else { (@($coordinatorStop.Pids) -join ', ') }
+            $actions.Add("Stopped the DevWS coordinator by verified process identity (PID $coordinatorPid).")
+        }
+        elseif ($coordinatorStop.State -eq "absent") {
+            $actions.Add("The DevWS coordinator was not running.")
+        }
+        else {
+            throw "The DevWS coordinator could not be stopped safely ($($coordinatorStop.State): $($coordinatorStop.Error)); uninstall aborted before removing runtime files."
+        }
+    }
 
     if (-not $SkipTasks) {
         foreach ($taskName in @($Plan.TaskNames)) {

@@ -33,6 +33,7 @@ $LibDir   = Join-Path $RepoRoot "src\lib"
 foreach ($libName in @(
     "devws-paths.ps1",
     "devws-config.ps1",
+    "devws-coordinator.ps1",
     "devws-install.ps1"
 )) {
     . (Join-Path $LibDir $libName)

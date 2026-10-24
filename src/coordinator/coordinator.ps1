@@ -266,6 +266,7 @@ try {
                     version = 1
                     ok      = $true
                     command = "shutdown"
+                    pid     = $PID
                 } | ConvertTo-Json -Compress))
                 $writer.Flush()
                 $quit = $true

@@ -301,6 +301,329 @@ function Get-DevWSCoordinatorStatus {
     }
 }
 
+function Get-DevWSCoordinatorProcessRecords {
+    # Exact coordinator process inventory for the current user. A candidate is
+    # a pwsh process whose command line carries the exact installed
+    # app\coordinator.ps1 path; the owner SID must match the invoking user.
+    # Unverified candidates are returned with Verified=false so the uninstall
+    # path can fail closed instead of silently leaving a known coordinator.
+    param(
+        [string]$InstallRoot = "",
+        [string]$UserSid = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $InstallRoot = Get-DevWSInstallRoot
+    }
+
+    if ([string]::IsNullOrWhiteSpace($UserSid)) {
+        $UserSid = Get-DevWSCurrentUserSid
+    }
+
+    $coordinatorPath = Join-Path $InstallRoot "app\coordinator.ps1"
+    $escapedPath     = [regex]::Escape($coordinatorPath)
+    $pattern         = '(?i)(?:^|[\s"])' + $escapedPath + '(?:[\s"]|$)'
+    $records         = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" -ErrorAction Stop)) {
+        $commandLine = [string]$process.CommandLine
+
+        if ([string]::IsNullOrWhiteSpace($commandLine) -or $commandLine -notmatch $pattern) {
+            continue
+        }
+
+        $ownerSid = $null
+        $verified = $false
+
+        try {
+            $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+
+            if ($null -ne $owner -and [int]$owner.ReturnValue -eq 0 -and
+                -not [string]::IsNullOrWhiteSpace([string]$owner.Sid)) {
+                $ownerSid = [string]$owner.Sid
+                $verified = [string]::Equals($ownerSid, $UserSid, [StringComparison]::OrdinalIgnoreCase)
+            }
+        }
+        catch {
+            # Leave Verified=false; the caller must not act on an unverified
+            # process identity.
+        }
+
+        $records.Add([pscustomobject]@{
+            Pid          = [int]$process.ProcessId
+            CommandLine  = $commandLine
+            CreationTime = $process.CreationDate
+            OwnerSid     = $ownerSid
+            Verified     = $verified
+        })
+    }
+
+    return @($records)
+}
+
+function Wait-DevWSCoordinatorProcessesGone {
+    param(
+        [string]$InstallRoot = "",
+        [int]$TimeoutMilliseconds = 5000
+    )
+
+    $deadline = [datetime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+
+    while ($true) {
+        $records = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $InstallRoot)
+
+        if ($records.Count -eq 0) {
+            return $true
+        }
+
+        if ([datetime]::UtcNow -ge $deadline) {
+            return $false
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+}
+
+function Invoke-DevWSCoordinatorShutdown {
+    # Bounded graceful shutdown through the existing current-user-only pipe.
+    # Returns a structured state; it never kills a process itself.
+    param(
+        [string]$PipeName = (Get-DevWSCoordinatorPipeName),
+        [string]$InstallRoot = "",
+        [int]$ConnectTimeoutMilliseconds = 1500,
+        [int]$ResponseTimeoutMilliseconds = 3000,
+        [int]$ExitTimeoutMilliseconds = 5000
+    )
+
+    if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $InstallRoot = Get-DevWSInstallRoot
+    }
+
+    $known = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $InstallRoot)
+    $knownPids = @($known | ForEach-Object { $_.Pid })
+    $client = $null
+
+    try {
+        $client = [System.IO.Pipes.NamedPipeClientStream]::new('.', $PipeName, [System.IO.Pipes.PipeDirection]::InOut)
+        $client.Connect($ConnectTimeoutMilliseconds)
+    }
+    catch {
+        $connectError = $_.Exception.Message
+        if ($null -ne $client) { $client.Dispose() }
+
+        if ($known.Count -eq 0) {
+            return [pscustomobject]@{
+                State  = "absent"
+                Pid    = $null
+                Pids   = @()
+                Error  = $connectError
+                Detail = "no coordinator pipe and no exact coordinator process"
+            }
+        }
+
+        return [pscustomobject]@{
+            State  = "unavailable"
+            Pid    = $null
+            Pids   = $knownPids
+            Error  = $connectError
+            Detail = "an exact coordinator process exists but the current-user pipe could not be contacted"
+        }
+    }
+
+    $writer = $null
+    $reader = $null
+
+    try {
+        $encoding = [System.Text.UTF8Encoding]::new($false)
+        $writer = [System.IO.StreamWriter]::new($client, $encoding, 4096, $true)
+        $writer.AutoFlush = $true
+        $reader = [System.IO.StreamReader]::new($client, $encoding, $false, 4096, $true)
+
+        $writer.WriteLine('{"version":1,"command":"shutdown"}')
+        $writer.Flush()
+
+        $readTask = $reader.ReadLineAsync()
+
+        if (-not $readTask.Wait($ResponseTimeoutMilliseconds)) {
+            return [pscustomobject]@{
+                State  = "unresponsive"
+                Pid    = $null
+                Pids   = $knownPids
+                Error  = "coordinator did not answer within $ResponseTimeoutMilliseconds ms"
+                Detail = "shutdown request sent but no bounded response was received"
+            }
+        }
+
+        $line = [string]$readTask.Result
+
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            return [pscustomobject]@{
+                State  = "unresponsive"
+                Pid    = $null
+                Pids   = $knownPids
+                Error  = "coordinator returned an empty shutdown response"
+                Detail = "shutdown response was empty"
+            }
+        }
+
+        $parsed = $null
+
+        try {
+            $parsed = $line | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            return [pscustomobject]@{
+                State  = "unresponsive"
+                Pid    = $null
+                Pids   = $knownPids
+                Error  = "coordinator returned a malformed shutdown response"
+                Detail = $line
+            }
+        }
+
+        $isAck = ($parsed -is [System.Management.Automation.PSCustomObject]) -and
+            [int]$parsed.version -eq (Get-DevWSCoordinatorProtocolVersion) -and
+            [bool]$parsed.ok -eq $true -and
+            [string]$parsed.command -eq "shutdown"
+        $isStaleExit = ($parsed -is [System.Management.Automation.PSCustomObject]) -and
+            [int]$parsed.version -eq (Get-DevWSCoordinatorProtocolVersion) -and
+            [bool]$parsed.ok -eq $false -and
+            [string]$parsed.error -eq "restart-required"
+
+        if (-not $isAck -and -not $isStaleExit) {
+            return [pscustomobject]@{
+                State  = "unresponsive"
+                Pid    = $null
+                Pids   = $knownPids
+                Error  = "coordinator did not acknowledge shutdown"
+                Detail = $line
+            }
+        }
+
+        $responsePid = $null
+
+        if ($null -ne $parsed.PSObject.Properties["pid"]) {
+            try { $responsePid = [int]$parsed.pid } catch { $responsePid = $null }
+        }
+
+        $gone = Wait-DevWSCoordinatorProcessesGone -InstallRoot $InstallRoot -TimeoutMilliseconds $ExitTimeoutMilliseconds
+
+        if ($gone) {
+            return [pscustomobject]@{
+                State  = "stopped"
+                Pid    = $responsePid
+                Pids   = $knownPids
+                Error  = $null
+                Detail = if ($isStaleExit) { "stale coordinator exited after restart-required" } else { "shutdown acknowledged and exact process exited" }
+            }
+        }
+
+        return [pscustomobject]@{
+            State  = "still-running"
+            Pid    = $responsePid
+            Pids   = $knownPids
+            Error  = "coordinator acknowledged shutdown but the exact process is still running"
+            Detail = "bounded exit wait expired"
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            State  = "unresponsive"
+            Pid    = $null
+            Pids   = $knownPids
+            Error  = $_.Exception.Message
+            Detail = "shutdown exchange failed"
+        }
+    }
+    finally {
+        try { if ($reader) { $reader.Dispose() } } catch { }
+        try { if ($writer) { $writer.Dispose() } } catch { }
+        try { if ($client) { $client.Dispose() } } catch { }
+    }
+}
+
+function Stop-DevWSCoordinator {
+    # Graceful shutdown first. A bounded, exact-identity fallback is allowed
+    # only for processes that carry the installed coordinator path and whose
+    # owner SID matches the invoking user. An unverified candidate fails closed.
+    param(
+        [string]$PipeName = (Get-DevWSCoordinatorPipeName),
+        [string]$InstallRoot = "",
+        [int]$ConnectTimeoutMilliseconds = 1500,
+        [int]$ResponseTimeoutMilliseconds = 3000,
+        [int]$ExitTimeoutMilliseconds = 5000
+    )
+
+    $graceful = Invoke-DevWSCoordinatorShutdown `
+        -PipeName $PipeName `
+        -InstallRoot $InstallRoot `
+        -ConnectTimeoutMilliseconds $ConnectTimeoutMilliseconds `
+        -ResponseTimeoutMilliseconds $ResponseTimeoutMilliseconds `
+        -ExitTimeoutMilliseconds $ExitTimeoutMilliseconds
+
+    if ($graceful.State -in @("stopped", "absent")) {
+        return $graceful
+    }
+
+    $records = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $InstallRoot)
+    $unverified = @($records | Where-Object { -not [bool]$_.Verified })
+    $verified   = @($records | Where-Object { [bool]$_.Verified })
+    $pids       = @(
+        (@($graceful.Pids) + @($records | ForEach-Object { $_.Pid })) | Sort-Object -Unique
+    )
+
+    if ($unverified.Count -gt 0) {
+        return [pscustomobject]@{
+            State  = "unverified"
+            Pid    = $null
+            Pids   = $pids
+            Error  = "a coordinator-path process could not be ownership-verified"
+            Detail = $graceful.Detail
+        }
+    }
+
+    if ($verified.Count -eq 0) {
+        return [pscustomobject]@{
+            State  = "stopped"
+            Pid    = $graceful.Pid
+            Pids   = $pids
+            Error  = $null
+            Detail = "exact coordinator process exited before fallback"
+        }
+    }
+
+    $stopErrors = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($record in $verified) {
+        try {
+            Stop-Process -Id $record.Pid -Force -ErrorAction Stop
+        }
+        catch {
+            $stopErrors.Add("PID $($record.Pid): $($_.Exception.Message)") | Out-Null
+        }
+    }
+
+    $gone = Wait-DevWSCoordinatorProcessesGone -InstallRoot $InstallRoot -TimeoutMilliseconds $ExitTimeoutMilliseconds
+
+    if ($gone) {
+        return [pscustomobject]@{
+            State  = "stopped-fallback"
+            Pid    = $graceful.Pid
+            Pids   = $pids
+            Error  = if ($stopErrors.Count -gt 0) { ($stopErrors -join "; ") } else { $null }
+            Detail = "verified exact coordinator process stopped after graceful shutdown did not complete"
+        }
+    }
+
+    return [pscustomobject]@{
+        State  = "failed"
+        Pid    = $graceful.Pid
+        Pids   = $pids
+        Error  = if ($stopErrors.Count -gt 0) { ($stopErrors -join "; ") } else { $graceful.Error }
+        Detail = "a known DevWS coordinator remains running"
+    }
+}
+
 function Invoke-DevWSCoordinatorLaunch {
     # Execute one validated launch request through the same canonical
     # transaction the cold CLI uses. -LayoutPlan is the frozen lifecycle

@@ -383,6 +383,28 @@ uninstall.ps1 -PackageMode # non-interactive default uninstall for a future pack
 Uninstall requires elevation, because it removes scheduled tasks and files under the
 program-files root.
 
+Before removing the installed runtime or its integrations, uninstall stops the
+DevWS-owned user-session processes:
+
+- the warm coordinator is asked to shut down through its existing
+  current-user-only named pipe, and the exact coordinator process is waited on
+  with a bounded exit deadline;
+- the AutoHotkey process running the exact managed
+  `TerminalShortcut.ahk` path is stopped only after its command line and
+  current-user SID are verified;
+- unrelated PowerShell and AutoHotkey processes are never selected by image
+  name alone;
+- a missing or already-exited process is a safe no-op;
+- an unresponsive, stale, inaccessible, or ownership-unverifiable known
+  coordinator/hotkey process makes uninstall fail closed before any task,
+  file, PATH, configuration, or state mutation.
+
+The managed hotkey launcher is stopped before the coordinator so it cannot
+restart the coordinator during removal. The five scheduled tasks (including
+the managed broker), the managed hotkey file, PATH entry, runtime files, and
+privileged state are then handled in the existing order. Repeated uninstall
+remains safe.
+
 **Removed:**
 
 - the five DevWorkspace tasks, stopping the managed broker task first when it is running;
@@ -398,6 +420,7 @@ program-files root.
 - `%USERPROFILE%\.ws` (the legacy v1 directory) — under every option, including `-Purge`;
 - the canonical configuration and disposable state, unless `-Purge` is used;
 - unrelated Startup scripts and scheduled tasks;
+- unrelated PowerShell and AutoHotkey processes;
 - Windows Terminal settings;
 - your PowerShell profile;
 - another user's protected state directory.
