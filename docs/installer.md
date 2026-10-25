@@ -386,18 +386,27 @@ program-files root.
 Before removing the installed runtime or its integrations, uninstall stops the
 DevWS-owned user-session processes:
 
-- the warm coordinator is asked to shut down through its existing
-  current-user-only named pipe, and the exact coordinator process is waited on
-  with a bounded exit deadline;
-- the AutoHotkey process running the exact managed
-  `TerminalShortcut.ahk` path is stopped only after its command line and
-  current-user SID are verified;
+- a candidate is selected only when the script the host actually executes is
+  the exact installed target: the PowerShell `-File` script operand (or its
+  first positional script), or AutoHotkey's script operand. The coordinator or
+  `TerminalShortcut.ahk` path appearing only as an unrelated argument,
+  `-Command` text, or script parameter is never a target;
+- the process image, actual command line, owner SID, and exact kernel creation
+  time are read through a process handle. Termination uses that same verified
+  handle, so a PID that exited and was reused can never redirect cleanup to a
+  replacement process;
+- the warm coordinator is contacted only when at least one verified
+  coordinator process exists. The named-pipe server PID must match a verified
+  coordinator before any shutdown frame is sent, and the shutdown
+  acknowledgement PID must match that server;
+- an unrelated same-user pipe server that happens to use the expected pipe
+  name is never sent a shutdown command;
 - unrelated PowerShell and AutoHotkey processes are never selected by image
   name alone;
 - a missing or already-exited process is a safe no-op;
-- an unresponsive, stale, inaccessible, or ownership-unverifiable known
-  coordinator/hotkey process makes uninstall fail closed before any task,
-  file, PATH, configuration, or state mutation.
+- an unresponsive, stale, inaccessible, ownership-unverifiable, or
+  identity-changed known coordinator/hotkey process makes uninstall fail
+  closed before any task, file, PATH, configuration, or state mutation.
 
 The managed hotkey launcher is stopped before the coordinator so it cannot
 restart the coordinator during removal. The five scheduled tasks (including

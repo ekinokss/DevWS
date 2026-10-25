@@ -212,8 +212,11 @@ configuration.
 
 - [ ] `uninstall.ps1` removes the tasks, the installed files and DevWS-owned integrations.
 - [ ] A running warm coordinator is asked to shut down through its current-user-only pipe and its exact process exits before runtime files are removed.
-- [ ] The AutoHotkey process running the managed `TerminalShortcut.ahk` is stopped by exact path and owner SID; unrelated PowerShell and AutoHotkey processes remain.
-- [ ] A missing or already-exited coordinator/hotkey process is a safe no-op; an unresponsive or ownership-unverifiable known process makes uninstall fail before mutation.
+- [ ] A `pwsh` process running another script with the coordinator path as an argument, or a `-Command` containing the path only as data, is not treated as the coordinator and survives.
+- [ ] The AutoHotkey process running the managed `TerminalShortcut.ahk` is stopped by exact executed-script path and owner SID; an AutoHotkey process running another script with `TerminalShortcut.ahk` as an argument survives.
+- [ ] The coordinator pipe is contacted only when a verified coordinator process exists; an unrelated same-user pipe server using the expected name receives no shutdown frame and survives.
+- [ ] A reused PID is never terminated; identity is bound to a retained process handle and exact creation time.
+- [ ] A missing or already-exited coordinator/hotkey process is a safe no-op; an unresponsive, ownership-unverifiable, or identity-changed known process makes uninstall fail before mutation.
 - [ ] It preserves the canonical configuration, disposable state and the legacy
       `%USERPROFILE%\.ws` directory.
 - [ ] It restores pre-install shim and hotkey backups when they exist.

@@ -303,10 +303,11 @@ function Get-DevWSCoordinatorStatus {
 
 function Get-DevWSCoordinatorProcessRecords {
     # Exact coordinator process inventory for the current user. A candidate is
-    # a pwsh process whose command line carries the exact installed
-    # app\coordinator.ps1 path; the owner SID must match the invoking user.
-    # Unverified candidates are returned with Verified=false so the uninstall
-    # path can fail closed instead of silently leaving a known coordinator.
+    # a pwsh process whose actual executed script is the installed
+    # app\coordinator.ps1; a coordinator path appearing only as an argument or
+    # command text is not a candidate. The owner SID must match the invoking
+    # user, and the record carries the exact kernel creation time used later for
+    # handle-bound termination.
     param(
         [string]$InstallRoot = "",
         [string]$UserSid = ""
@@ -316,49 +317,45 @@ function Get-DevWSCoordinatorProcessRecords {
         $InstallRoot = Get-DevWSInstallRoot
     }
 
-    if ([string]::IsNullOrWhiteSpace($UserSid)) {
-        $UserSid = Get-DevWSCurrentUserSid
+    if ($null -eq (Get-Command Get-DevWSExecutedScriptProcessRecords -ErrorAction SilentlyContinue)) {
+        throw 'The executed-script process inventory is unavailable; load devws-install.ps1 before the coordinator lifecycle helpers.'
     }
 
     $coordinatorPath = Join-Path $InstallRoot "app\coordinator.ps1"
-    $escapedPath     = [regex]::Escape($coordinatorPath)
-    $pattern         = '(?i)(?:^|[\s"])' + $escapedPath + '(?:[\s"]|$)'
-    $records         = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe'" -ErrorAction Stop)) {
-        $commandLine = [string]$process.CommandLine
+    return @(Get-DevWSExecutedScriptProcessRecords `
+        -ImageNames @('pwsh.exe') `
+        -Kind 'PowerShell' `
+        -ExpectedScriptPath $coordinatorPath `
+        -UserSid $UserSid)
+}
 
-        if ([string]::IsNullOrWhiteSpace($commandLine) -or $commandLine -notmatch $pattern) {
-            continue
+function Get-DevWSCoordinatorPipeServerProcessId {
+    # Kernel-reported server PID from the connected pipe handle. No request
+    # bytes have been sent when this is called.
+    param([Parameter(Mandatory)]$Client)
+
+    Initialize-DevWSProcessIdentityNative
+
+    try {
+        $handle = $Client.SafePipeHandle
+
+        if ($null -eq $handle -or $handle.IsInvalid) {
+            return $null
         }
 
-        $ownerSid = $null
-        $verified = $false
+        [uint32]$serverPid = 0
 
-        try {
-            $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
-
-            if ($null -ne $owner -and [int]$owner.ReturnValue -eq 0 -and
-                -not [string]::IsNullOrWhiteSpace([string]$owner.Sid)) {
-                $ownerSid = [string]$owner.Sid
-                $verified = [string]::Equals($ownerSid, $UserSid, [StringComparison]::OrdinalIgnoreCase)
-            }
+        if ([DevWSProcessIdentityNative]::GetNamedPipeServerProcessId($handle.DangerousGetHandle(), [ref]$serverPid) -and $serverPid -ne 0) {
+            return [int]$serverPid
         }
-        catch {
-            # Leave Verified=false; the caller must not act on an unverified
-            # process identity.
-        }
-
-        $records.Add([pscustomobject]@{
-            Pid          = [int]$process.ProcessId
-            CommandLine  = $commandLine
-            CreationTime = $process.CreationDate
-            OwnerSid     = $ownerSid
-            Verified     = $verified
-        })
+    }
+    catch {
+        # Treat an unreadable server identity as unverifiable; never send a
+        # shutdown request to an unidentified server.
     }
 
-    return @($records)
+    return $null
 }
 
 function Wait-DevWSCoordinatorProcessesGone {
@@ -400,7 +397,32 @@ function Invoke-DevWSCoordinatorShutdown {
     }
 
     $known = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $InstallRoot)
-    $knownPids = @($known | ForEach-Object { $_.Pid })
+    $unverified = @($known | Where-Object { -not [bool]$_.Verified })
+    $verified   = @($known | Where-Object { [bool]$_.Verified })
+    $knownPids  = @($known | ForEach-Object { $_.Pid })
+
+    if ($unverified.Count -gt 0) {
+        return [pscustomobject]@{
+            State  = "unverified"
+            Pid    = $null
+            Pids   = $knownPids
+            Error  = "a coordinator process could not be ownership-verified"
+            Detail = (@($unverified | ForEach-Object { "PID $($_.Pid): $($_.IdentityError)" }) -join "; ")
+        }
+    }
+
+    if ($verified.Count -eq 0) {
+        # No verified coordinator process: do not contact the pipe at all. A
+        # same-user process merely owning the expected pipe name is unrelated.
+        return [pscustomobject]@{
+            State  = "absent"
+            Pid    = $null
+            Pids   = @()
+            Error  = $null
+            Detail = "no verified DevWS coordinator process is running"
+        }
+    }
+
     $client = $null
 
     try {
@@ -411,13 +433,15 @@ function Invoke-DevWSCoordinatorShutdown {
         $connectError = $_.Exception.Message
         if ($null -ne $client) { $client.Dispose() }
 
-        if ($known.Count -eq 0) {
+        $after = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $InstallRoot)
+
+        if ($after.Count -eq 0) {
             return [pscustomobject]@{
-                State  = "absent"
+                State  = "stopped"
                 Pid    = $null
-                Pids   = @()
-                Error  = $connectError
-                Detail = "no coordinator pipe and no exact coordinator process"
+                Pids   = $knownPids
+                Error  = $null
+                Detail = "verified coordinator exited before the pipe could be contacted"
             }
         }
 
@@ -426,7 +450,7 @@ function Invoke-DevWSCoordinatorShutdown {
             Pid    = $null
             Pids   = $knownPids
             Error  = $connectError
-            Detail = "an exact coordinator process exists but the current-user pipe could not be contacted"
+            Detail = "a verified coordinator process exists but the current-user pipe could not be contacted"
         }
     }
 
@@ -434,6 +458,51 @@ function Invoke-DevWSCoordinatorShutdown {
     $reader = $null
 
     try {
+        # Bind the pipe server to a verified coordinator process BEFORE sending
+        # any request. The kernel-reported server PID must be one of the
+        # verified records and its handle identity must still match; otherwise
+        # the connection is closed without writing a shutdown frame.
+        $serverPid = Get-DevWSCoordinatorPipeServerProcessId -Client $client
+
+        if ($null -eq $serverPid) {
+            return [pscustomobject]@{
+                State  = "unverified-pipe-server"
+                Pid    = $null
+                Pids   = $knownPids
+                Error  = "the named-pipe server process id is unavailable"
+                Detail = "no shutdown was sent"
+            }
+        }
+
+        $serverRecord = @($verified | Where-Object { [int]$_.Pid -eq [int]$serverPid })[0]
+
+        if ($null -eq $serverRecord) {
+            return [pscustomobject]@{
+                State  = "unverified-pipe-server"
+                Pid    = [int]$serverPid
+                Pids   = $knownPids
+                Error  = "the named-pipe server is not a verified coordinator process"
+                Detail = "no shutdown was sent"
+            }
+        }
+
+        $serverCheck = Invoke-DevWSProcessIdentityAction `
+            -Record $serverRecord `
+            -ImageNames @('pwsh.exe') `
+            -Kind 'PowerShell' `
+            -ExpectedScriptPath (Join-Path $InstallRoot "app\coordinator.ps1") `
+            -UserSid (Get-DevWSCurrentUserSid)
+
+        if ($serverCheck.State -ne "verified") {
+            return [pscustomobject]@{
+                State  = "unverified-pipe-server"
+                Pid    = [int]$serverPid
+                Pids   = $knownPids
+                Error  = "the named-pipe server identity is not current ($($serverCheck.State): $($serverCheck.Error))"
+                Detail = "no shutdown was sent"
+            }
+        }
+
         $encoding = [System.Text.UTF8Encoding]::new($false)
         $writer = [System.IO.StreamWriter]::new($client, $encoding, 4096, $true)
         $writer.AutoFlush = $true
@@ -506,21 +575,31 @@ function Invoke-DevWSCoordinatorShutdown {
             try { $responsePid = [int]$parsed.pid } catch { $responsePid = $null }
         }
 
+        if ($isAck -and ($null -eq $responsePid -or [int]$responsePid -ne [int]$serverPid)) {
+            return [pscustomobject]@{
+                State  = "unresponsive"
+                Pid    = $responsePid
+                Pids   = $knownPids
+                Error  = "the shutdown acknowledgement is not bound to the verified pipe server PID"
+                Detail = $line
+            }
+        }
+
         $gone = Wait-DevWSCoordinatorProcessesGone -InstallRoot $InstallRoot -TimeoutMilliseconds $ExitTimeoutMilliseconds
 
         if ($gone) {
             return [pscustomobject]@{
                 State  = "stopped"
-                Pid    = $responsePid
+                Pid    = [int]$serverPid
                 Pids   = $knownPids
                 Error  = $null
-                Detail = if ($isStaleExit) { "stale coordinator exited after restart-required" } else { "shutdown acknowledged and exact process exited" }
+                Detail = if ($isStaleExit) { "stale coordinator exited after restart-required" } else { "shutdown acknowledged by the verified pipe server and exact process exited" }
             }
         }
 
         return [pscustomobject]@{
             State  = "still-running"
-            Pid    = $responsePid
+            Pid    = [int]$serverPid
             Pids   = $knownPids
             Error  = "coordinator acknowledged shutdown but the exact process is still running"
             Detail = "bounded exit wait expired"
@@ -543,9 +622,10 @@ function Invoke-DevWSCoordinatorShutdown {
 }
 
 function Stop-DevWSCoordinator {
-    # Graceful shutdown first. A bounded, exact-identity fallback is allowed
-    # only for processes that carry the installed coordinator path and whose
-    # owner SID matches the invoking user. An unverified candidate fails closed.
+    # Graceful shutdown first. A bounded fallback may terminate only processes
+    # whose actual executed script is the installed coordinator, whose image
+    # and owner SID match, and whose exact creation time still matches the
+    # enumerated record. Termination uses the verified handle, never a bare PID.
     param(
         [string]$PipeName = (Get-DevWSCoordinatorPipeName),
         [string]$InstallRoot = "",
@@ -577,7 +657,7 @@ function Stop-DevWSCoordinator {
             State  = "unverified"
             Pid    = $null
             Pids   = $pids
-            Error  = "a coordinator-path process could not be ownership-verified"
+            Error  = (@($unverified | ForEach-Object { "PID $($_.Pid): $($_.IdentityError)" }) -join "; ")
             Detail = $graceful.Detail
         }
     }
@@ -585,39 +665,53 @@ function Stop-DevWSCoordinator {
     if ($verified.Count -eq 0) {
         return [pscustomobject]@{
             State  = "stopped"
-            Pid    = $graceful.Pid
+            Pid    = $null
             Pids   = $pids
             Error  = $null
-            Detail = "exact coordinator process exited before fallback"
+            Detail = "verified coordinator process exited before fallback"
         }
     }
 
+    $userSid = Get-DevWSCurrentUserSid
+    $target  = Join-Path $InstallRoot "app\coordinator.ps1"
     $stopErrors = [System.Collections.Generic.List[string]]::new()
+    $stoppedPids = [System.Collections.Generic.List[int]]::new()
 
     foreach ($record in $verified) {
-        try {
-            Stop-Process -Id $record.Pid -Force -ErrorAction Stop
+        $action = Invoke-DevWSProcessIdentityAction `
+            -Record $record `
+            -ImageNames @('pwsh.exe') `
+            -Kind 'PowerShell' `
+            -ExpectedScriptPath $target `
+            -UserSid $userSid `
+            -Terminate `
+            -TimeoutMilliseconds $ExitTimeoutMilliseconds
+
+        if ($action.State -eq "stopped") {
+            $stoppedPids.Add([int]$record.Pid) | Out-Null
         }
-        catch {
-            $stopErrors.Add("PID $($record.Pid): $($_.Exception.Message)") | Out-Null
+        elseif ($action.State -ne "gone") {
+            $stopErrors.Add("PID $($record.Pid): $($action.State) ($($action.Error))") | Out-Null
         }
     }
 
     $gone = Wait-DevWSCoordinatorProcessesGone -InstallRoot $InstallRoot -TimeoutMilliseconds $ExitTimeoutMilliseconds
 
     if ($gone) {
+        $fallbackPid = if ($stoppedPids.Count -gt 0) { $stoppedPids[0] } else { [int]$verified[0].Pid }
+
         return [pscustomobject]@{
             State  = "stopped-fallback"
-            Pid    = $graceful.Pid
+            Pid    = $fallbackPid
             Pids   = $pids
             Error  = if ($stopErrors.Count -gt 0) { ($stopErrors -join "; ") } else { $null }
-            Detail = "verified exact coordinator process stopped after graceful shutdown did not complete"
+            Detail = "handle-verified exact coordinator process stopped after graceful shutdown did not complete"
         }
     }
 
     return [pscustomobject]@{
         State  = "failed"
-        Pid    = $graceful.Pid
+        Pid    = $null
         Pids   = $pids
         Error  = if ($stopErrors.Count -gt 0) { ($stopErrors -join "; ") } else { $graceful.Error }
         Detail = "a known DevWS coordinator remains running"

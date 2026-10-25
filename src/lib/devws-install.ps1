@@ -3791,64 +3791,540 @@ function Remove-DevWSProtectedStateRootSafe {
     }
 }
 
+function Initialize-DevWSProcessIdentityNative {
+    # The process identity interop lives in the tracked native runtime
+    # (src\native\devws-worker-pipe-identity.cs). Load it lazily: normal CLI
+    # startup never calls this, and uninstall fails closed if the native
+    # surface is unavailable.
+    if ($null -ne ('DevWSProcessIdentityNative' -as [type])) {
+        return
+    }
+
+    Initialize-DevWSNativeRuntime
+
+    if ($null -eq ('DevWSProcessIdentityNative' -as [type])) {
+        throw 'The native process identity surface is unavailable; uninstall cannot verify DevWS process ownership.'
+    }
+}
+function Split-DevWSProcessCommandLine {
+    # CommandLineToArgvW is the Windows argv parser; never a regex over the raw
+    # command line. A null result means the command line is unparseable.
+    param([AllowNull()][string]$CommandLine)
+
+    Initialize-DevWSProcessIdentityNative
+
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) {
+        return $null
+    }
+
+    $argv = [DevWSProcessIdentityNative]::SplitCommandLine($CommandLine)
+
+    if ($null -eq $argv) {
+        return $null
+    }
+
+    return ,$argv
+}
+
+function ConvertTo-DevWSProcessPathIdentity {
+    # Absolute-path normalization for exact script identity. Relative paths are
+    # never accepted because the process working directory is not part of the
+    # verified identity.
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $null
+    }
+
+    $candidate = $Path.Trim()
+
+    if ($candidate.Length -ge 2 -and $candidate[0] -eq '"' -and $candidate[$candidate.Length - 1] -eq '"') {
+        $candidate = $candidate.Substring(1, $candidate.Length - 2)
+    }
+
+    if (-not [System.IO.Path]::IsPathRooted($candidate)) {
+        return $null
+    }
+
+    try {
+        return [System.IO.Path]::GetFullPath($candidate)
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-DevWSExecutedScript {
+    # Determine the script operand the host actually executes, not a path that
+    # merely appears elsewhere in the command line.
+    #
+    # PowerShell: the exact -File target (including its accepted prefix
+    # spellings) or the first positional script token. -Command and
+    # -EncodedCommand execute text and never a file. Value-taking host switches
+    # are skipped so their values cannot be mistaken for the script.
+    #
+    # AutoHotkey: the first non-switch operand, after documented no-value
+    # switches (and the value-taking /iLib and /include switches) are skipped.
+    #
+    # Certain=$false means the execution mode could not be proven. The caller
+    # must not treat such a process as a verified target; if the expected path
+    # appears as a token, the caller fails closed without terminating it.
+    param(
+        [Parameter(Mandatory)][string]$CommandLine,
+        [Parameter(Mandatory)][ValidateSet('PowerShell', 'AutoHotkey')][string]$Kind
+    )
+
+    $argv = Split-DevWSProcessCommandLine -CommandLine $CommandLine
+
+    if ($null -eq $argv -or @($argv).Count -lt 1) {
+        return [pscustomobject]@{ Certain = $false; ScriptPath = $null; Tokens = @(); Reason = 'command-line-unparsable' }
+    }
+
+    $tokens = [System.Collections.Generic.List[string]]::new()
+
+    for ($index = 1; $index -lt @($argv).Count; $index++) {
+        $tokens.Add([string]$argv[$index]) | Out-Null
+    }
+
+    if ($tokens.Count -eq 0) {
+        return [pscustomobject]@{ Certain = $true; ScriptPath = $null; Tokens = @(); Reason = 'no-arguments' }
+    }
+
+    $index = 0
+
+    while ($index -lt $tokens.Count) {
+        $token = [string]$tokens[$index]
+
+        if ([string]::IsNullOrEmpty($token)) {
+            $index++
+            continue
+        }
+
+        if ($Kind -eq 'PowerShell') {
+            if ($token[0] -ne '-') {
+                return [pscustomobject]@{ Certain = $true; ScriptPath = $token; Tokens = @($tokens); Reason = 'positional-script' }
+            }
+
+            $lower = $token.ToLowerInvariant()
+
+            if ($lower.Length -ge 2 -and '-file'.StartsWith($lower, [StringComparison]::Ordinal)) {
+                if ($index + 1 -ge $tokens.Count) {
+                    return [pscustomobject]@{ Certain = $false; ScriptPath = $null; Tokens = @($tokens); Reason = 'file-switch-without-script' }
+                }
+
+                return [pscustomobject]@{ Certain = $true; ScriptPath = [string]$tokens[$index + 1]; Tokens = @($tokens); Reason = 'file-switch' }
+            }
+
+            if ($lower.Length -ge 2 -and '-command'.StartsWith($lower, [StringComparison]::Ordinal)) {
+                return [pscustomobject]@{ Certain = $true; ScriptPath = $null; Tokens = @($tokens); Reason = 'command-text' }
+            }
+
+            if ($lower.Length -ge 2 -and '-encodedcommand'.StartsWith($lower, [StringComparison]::Ordinal)) {
+                return [pscustomobject]@{ Certain = $true; ScriptPath = $null; Tokens = @($tokens); Reason = 'encoded-command-text' }
+            }
+
+            if ($lower -in @('-windowstyle', '-executionpolicy', '-workingdirectory', '-configurationname', '-inputformat', '-outputformat', '-settingsfile', '-custompipename', '-version')) {
+                $index += 2
+                continue
+            }
+
+            if ($lower -match '^-(windowstyle|executionpolicy|workingdirectory|configurationname|inputformat|outputformat|settingsfile|custompipename|version):') {
+                $index++
+                continue
+            }
+
+            if ($lower -in @('-nologo', '-noprofile', '-noninteractive', '-noexit', '-login', '-interactive', '-sta', '-mta', '-noprofileloadtime', '-sshservermode')) {
+                $index++
+                continue
+            }
+
+            return [pscustomobject]@{ Certain = $false; ScriptPath = $null; Tokens = @($tokens); Reason = "unrecognized PowerShell switch '$token'" }
+        }
+
+        if ($token[0] -ne '/') {
+            return [pscustomobject]@{ Certain = $true; ScriptPath = $token; Tokens = @($tokens); Reason = 'script-filename' }
+        }
+
+        $lower = $token.ToLowerInvariant()
+
+        if ($lower -eq '/script') {
+            $index++
+            continue
+        }
+
+        if ($lower -match '^/cp\d+$') {
+            $index++
+            continue
+        }
+
+        if ($lower -in @('/f', '/force', '/restart', '/errorstdout', '/debug', '/validate')) {
+            $index++
+            continue
+        }
+
+        if ($lower -match '^/errorstdout=' -or $lower -match '^/debug=') {
+            $index++
+            continue
+        }
+
+        if ($lower -in @('/ilib', '/include')) {
+            $index += 2
+            continue
+        }
+
+        return [pscustomobject]@{ Certain = $false; ScriptPath = $null; Tokens = @($tokens); Reason = "unrecognized AutoHotkey switch '$token'" }
+    }
+
+    return [pscustomobject]@{ Certain = $true; ScriptPath = $null; Tokens = @($tokens); Reason = 'no-script-operand' }
+}
+
+function Get-DevWSExecutedScriptTargetMatch {
+    param(
+        [AllowNull()]$Parsed,
+        [Parameter(Mandatory)][string]$ExpectedPath
+    )
+
+    if ($null -eq $Parsed) {
+        return [pscustomobject]@{ Matches = $false; Uncertain = $false }
+    }
+
+    if ([bool]$Parsed.Certain) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Parsed.ScriptPath)) {
+            $actual = ConvertTo-DevWSProcessPathIdentity -Path ([string]$Parsed.ScriptPath)
+
+            if ($null -ne $actual -and [string]::Equals($actual, $ExpectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+                return [pscustomobject]@{ Matches = $true; Uncertain = $false }
+            }
+        }
+
+        return [pscustomobject]@{ Matches = $false; Uncertain = $false }
+    }
+
+    foreach ($token in @($Parsed.Tokens)) {
+        $tokenPath = ConvertTo-DevWSProcessPathIdentity -Path ([string]$token)
+
+        if ($null -ne $tokenPath -and [string]::Equals($tokenPath, $ExpectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ Matches = $false; Uncertain = $true }
+        }
+    }
+
+    return [pscustomobject]@{ Matches = $false; Uncertain = $false }
+}
+
+function Add-DevWSUnverifiedExecutedScriptRecord {
+    # Fail-closed fallback when the process handle is unavailable but the CIM
+    # command line still proves the target may be executing. The record is
+    # never terminated; it blocks uninstall until ownership is verifiable.
+    param(
+        [Parameter(Mandatory)]$Records,
+        [Parameter(Mandatory)]$Process,
+        [Parameter(Mandatory)][ValidateSet('PowerShell', 'AutoHotkey')][string]$Kind,
+        [Parameter(Mandatory)][string]$ExpectedPath,
+        [Parameter(Mandatory)][string]$Reason
+    )
+
+    $commandLine = [string]$Process.CommandLine
+
+    if ([string]::IsNullOrWhiteSpace($commandLine)) {
+        return
+    }
+
+    $parsed = Get-DevWSExecutedScript -CommandLine $commandLine -Kind $Kind
+    $match = Get-DevWSExecutedScriptTargetMatch -Parsed $parsed -ExpectedPath $ExpectedPath
+
+    if (-not $match.Matches -and -not $match.Uncertain) {
+        return
+    }
+
+    $ownerSid = $null
+
+    try {
+        $owner = Invoke-CimMethod -InputObject $Process -MethodName GetOwnerSid -ErrorAction Stop
+
+        if ($null -ne $owner -and [int]$owner.ReturnValue -eq 0 -and
+            -not [string]::IsNullOrWhiteSpace([string]$owner.Sid)) {
+            $ownerSid = [string]$owner.Sid
+        }
+    }
+    catch {
+        # Leave the owner unknown; Verified=false is the fail-closed outcome.
+    }
+
+    $Records.Add([pscustomobject]@{
+        Pid           = [int]$Process.ProcessId
+        ImageName     = [string]$Process.Name
+        ImagePath     = $null
+        CommandLine   = $commandLine
+        ExecutedScript = if ($null -ne $parsed) { [string]$parsed.ScriptPath } else { $null }
+        CreationTime  = [long]0
+        OwnerSid      = $ownerSid
+        Verified      = $false
+        IdentityError = $Reason
+    }) | Out-Null
+}
+
+function Get-DevWSExecutedScriptProcessRecords {
+    # Authoritative inventory: enumerate candidate images, then prove the
+    # executed script, image, owner SID and stable creation time from a process
+    # handle. A path appearing only as an argument or command text never
+    # becomes a target.
+    param(
+        [Parameter(Mandatory)][string[]]$ImageNames,
+        [Parameter(Mandatory)][ValidateSet('PowerShell', 'AutoHotkey')][string]$Kind,
+        [Parameter(Mandatory)][string]$ExpectedScriptPath,
+        [string]$UserSid = ""
+    )
+
+    Initialize-DevWSProcessIdentityNative
+
+    if ([string]::IsNullOrWhiteSpace($UserSid)) {
+        $UserSid = Get-DevWSCurrentUserSid
+    }
+
+    $expected = ConvertTo-DevWSProcessPathIdentity -Path $ExpectedScriptPath
+
+    if ([string]::IsNullOrWhiteSpace($expected)) {
+        throw "The expected process script path is not absolute: $ExpectedScriptPath"
+    }
+
+    $names = @($ImageNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+
+    if ($names.Count -eq 0) {
+        throw 'At least one process image name is required.'
+    }
+
+    $imageSet = @($names | ForEach-Object { $_.ToLowerInvariant() })
+    $filter = (@($names | ForEach-Object { "Name = '$_'" }) -join ' OR ')
+    $records = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($process in @(Get-CimInstance Win32_Process -Filter $filter -ErrorAction Stop)) {
+        $processId = [int]$process.ProcessId
+        $handle = [DevWSProcessIdentityNative]::OpenProcess(
+            [DevWSProcessIdentityNative]::ProcessQueryLimitedInformation,
+            $false,
+            [uint32]$processId)
+
+        if ($handle -eq [IntPtr]::Zero) {
+            Add-DevWSUnverifiedExecutedScriptRecord `
+                -Records $records `
+                -Process $process `
+                -Kind $Kind `
+                -ExpectedPath $expected `
+                -Reason 'process-handle-unavailable'
+            continue
+        }
+
+        try {
+            $identity = [DevWSProcessIdentityNative]::ReadIdentity($handle)
+        }
+        finally {
+            [void][DevWSProcessIdentityNative]::CloseHandle($handle)
+        }
+
+        if (-not [bool]$identity.Ok) {
+            Add-DevWSUnverifiedExecutedScriptRecord `
+                -Records $records `
+                -Process $process `
+                -Kind $Kind `
+                -ExpectedPath $expected `
+                -Reason "process-identity-unavailable ($($identity.Error))"
+            continue
+        }
+
+        $imageName = [System.IO.Path]::GetFileName([string]$identity.ImagePath)
+
+        if ([string]::IsNullOrWhiteSpace($imageName) -or $imageSet -notcontains $imageName.ToLowerInvariant()) {
+            continue
+        }
+
+        $commandLine = [string]$identity.CommandLine
+
+        if ([string]::IsNullOrWhiteSpace($commandLine)) {
+            $commandLine = [string]$process.CommandLine
+        }
+
+        if ([string]::IsNullOrWhiteSpace($commandLine)) {
+            continue
+        }
+
+        $parsed = Get-DevWSExecutedScript -CommandLine $commandLine -Kind $Kind
+        $match  = Get-DevWSExecutedScriptTargetMatch -Parsed $parsed -ExpectedPath $expected
+
+        if (-not $match.Matches -and -not $match.Uncertain) {
+            continue
+        }
+
+        $ownerSid = [string]$identity.UserSid
+
+        if ([string]::IsNullOrWhiteSpace($ownerSid)) {
+            try {
+                $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+
+                if ($null -ne $owner -and [int]$owner.ReturnValue -eq 0 -and
+                    -not [string]::IsNullOrWhiteSpace([string]$owner.Sid)) {
+                    $ownerSid = [string]$owner.Sid
+                }
+            }
+            catch {
+                # Leave the owner unknown; verification fails closed below.
+            }
+        }
+
+        $verified = $match.Matches -and
+            -not [string]::IsNullOrWhiteSpace($ownerSid) -and
+            [string]::Equals($ownerSid, $UserSid, [StringComparison]::OrdinalIgnoreCase)
+
+        $identityError = if (-not $match.Matches) {
+            'executed-script-unverified'
+        }
+        elseif ([string]::IsNullOrWhiteSpace([string]$identity.UserSid)) {
+            'owner-sid-unavailable'
+        }
+        elseif (-not $verified) {
+            'owner-sid-mismatch'
+        }
+        else {
+            $null
+        }
+
+        $records.Add([pscustomobject]@{
+            Pid            = $processId
+            ImageName      = $imageName
+            ImagePath      = [string]$identity.ImagePath
+            CommandLine    = $commandLine
+            ExecutedScript = if ($null -ne $parsed) { [string]$parsed.ScriptPath } else { $null }
+            CreationTime   = [long]$identity.CreationTime
+            OwnerSid       = $ownerSid
+            Verified       = $verified
+            IdentityError  = $identityError
+        }) | Out-Null
+    }
+
+    return @($records)
+}
+
+function Invoke-DevWSProcessIdentityAction {
+    # Re-verifies a record through a process handle and optionally terminates
+    # through that same handle. The exact kernel creation time binds the handle
+    # to the enumerated process: if the PID exited and was reused, the action
+    # reports 'reused' and performs no termination. Termination is never done
+    # by PID alone.
+    param(
+        [Parameter(Mandatory)]$Record,
+        [Parameter(Mandatory)][string[]]$ImageNames,
+        [Parameter(Mandatory)][ValidateSet('PowerShell', 'AutoHotkey')][string]$Kind,
+        [Parameter(Mandatory)][string]$ExpectedScriptPath,
+        [Parameter(Mandatory)][string]$UserSid,
+        [switch]$Terminate,
+        [int]$TimeoutMilliseconds = 5000
+    )
+
+    Initialize-DevWSProcessIdentityNative
+
+    if (-not [bool]$Record.Verified) {
+        return [pscustomobject]@{ State = 'unverified'; Pid = [int]$Record.Pid; Error = [string]$Record.IdentityError }
+    }
+
+    if ([long]$Record.CreationTime -le 0) {
+        return [pscustomobject]@{ State = 'unverified'; Pid = [int]$Record.Pid; Error = 'creation-time-unavailable' }
+    }
+
+    $expected = ConvertTo-DevWSProcessPathIdentity -Path $ExpectedScriptPath
+
+    if ([string]::IsNullOrWhiteSpace($expected)) {
+        return [pscustomobject]@{ State = 'unverified'; Pid = [int]$Record.Pid; Error = 'expected-script-path-not-absolute' }
+    }
+
+    $access = [DevWSProcessIdentityNative]::ProcessQueryLimitedInformation
+
+    if ($Terminate) {
+        $access = $access -bor [DevWSProcessIdentityNative]::ProcessTerminate -bor [DevWSProcessIdentityNative]::Synchronize
+    }
+
+    $handle = [DevWSProcessIdentityNative]::OpenProcess($access, $false, [uint32]$Record.Pid)
+
+    if ($handle -eq [IntPtr]::Zero) {
+        $win32 = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+
+        if ($win32 -eq 87) {
+            return [pscustomobject]@{ State = 'gone'; Pid = [int]$Record.Pid; Error = $null }
+        }
+
+        return [pscustomobject]@{ State = 'failed'; Pid = [int]$Record.Pid; Error = "open-process-failed (win32=$win32)" }
+    }
+
+    try {
+        $identity = [DevWSProcessIdentityNative]::ReadIdentity($handle)
+
+        if (-not [bool]$identity.Ok) {
+            return [pscustomobject]@{ State = 'failed'; Pid = [int]$Record.Pid; Error = [string]$identity.Error }
+        }
+
+        if ([long]$identity.CreationTime -ne [long]$Record.CreationTime) {
+            return [pscustomobject]@{ State = 'reused'; Pid = [int]$Record.Pid; Error = 'process creation time no longer matches the verified record' }
+        }
+
+        $imageName = [System.IO.Path]::GetFileName([string]$identity.ImagePath)
+        $imageSet  = @($ImageNames | ForEach-Object { $_.ToLowerInvariant() })
+
+        if ([string]::IsNullOrWhiteSpace($imageName) -or $imageSet -notcontains $imageName.ToLowerInvariant()) {
+            return [pscustomobject]@{ State = 'reused'; Pid = [int]$Record.Pid; Error = 'process image no longer matches the verified record' }
+        }
+
+        if ([string]::IsNullOrWhiteSpace([string]$identity.CommandLine)) {
+            return [pscustomobject]@{ State = 'failed'; Pid = [int]$Record.Pid; Error = 'command-line-unavailable' }
+        }
+
+        $parsed = Get-DevWSExecutedScript -CommandLine ([string]$identity.CommandLine) -Kind $Kind
+        $match  = Get-DevWSExecutedScriptTargetMatch -Parsed $parsed -ExpectedPath $expected
+
+        if (-not $match.Matches) {
+            return [pscustomobject]@{ State = 'reused'; Pid = [int]$Record.Pid; Error = 'executed script no longer matches the verified target' }
+        }
+
+        if ([string]::IsNullOrWhiteSpace([string]$identity.UserSid) -or
+            -not [string]::Equals([string]$identity.UserSid, $UserSid, [StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ State = 'unverified'; Pid = [int]$Record.Pid; Error = 'process owner SID no longer matches the invoking user' }
+        }
+
+        if (-not $Terminate) {
+            return [pscustomobject]@{ State = 'verified'; Pid = [int]$Record.Pid; Error = $null }
+        }
+
+        if (-not [DevWSProcessIdentityNative]::TerminateProcess($handle, 1)) {
+            return [pscustomobject]@{ State = 'failed'; Pid = [int]$Record.Pid; Error = "terminate-process-failed (win32=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
+        }
+
+        $wait = [DevWSProcessIdentityNative]::WaitForSingleObject($handle, [uint32]$TimeoutMilliseconds)
+
+        if ($wait -eq [DevWSProcessIdentityNative]::WaitObject0) {
+            return [pscustomobject]@{ State = 'stopped'; Pid = [int]$Record.Pid; Error = $null }
+        }
+
+        return [pscustomobject]@{ State = 'failed'; Pid = [int]$Record.Pid; Error = "process did not exit after termination (wait=$wait)" }
+    }
+    finally {
+        [void][DevWSProcessIdentityNative]::CloseHandle($handle)
+    }
+}
+
 function Get-DevWSManagedHotkeyProcessRecords {
-    # Exact managed-hotkey process inventory for the current user. A candidate
-    # is an AutoHotkey v2 process whose command line carries the exact managed
-    # TerminalShortcut.ahk path; the owner SID must match the invoking user.
-    # Unverified candidates are returned with Verified=false so uninstall can
-    # fail closed instead of silently leaving a DevWS-owned hotkey process.
+    # Exact managed-hotkey process inventory for the current user. Only the
+    # script operand AutoHotkey actually executes can match; a TerminalShortcut
+    # path supplied to another script as an argument is not a candidate. The
+    # owner SID must match the invoking user, and the record carries the exact
+    # kernel creation time used later for handle-bound termination.
     param(
         [Parameter(Mandatory)]
         [string]$HotkeyPath,
         [string]$UserSid = ""
     )
 
-    if ([string]::IsNullOrWhiteSpace($UserSid)) {
-        $UserSid = Get-DevWSCurrentUserSid
-    }
-
-    $escapedPath = [regex]::Escape($HotkeyPath)
-    $pattern     = '(?i)(?:^|[\s"])' + $escapedPath + '(?:[\s"]|$)'
-    $records     = [System.Collections.Generic.List[object]]::new()
-    $processes   = @(
-        @(Get-CimInstance Win32_Process -Filter "Name = 'AutoHotkey64.exe'" -ErrorAction Stop) +
-        @(Get-CimInstance Win32_Process -Filter "Name = 'AutoHotkey.exe'" -ErrorAction Stop)
-    )
-
-    foreach ($process in $processes) {
-        $commandLine = [string]$process.CommandLine
-
-        if ([string]::IsNullOrWhiteSpace($commandLine) -or $commandLine -notmatch $pattern) {
-            continue
-        }
-
-        $ownerSid = $null
-        $verified = $false
-
-        try {
-            $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
-
-            if ($null -ne $owner -and [int]$owner.ReturnValue -eq 0 -and
-                -not [string]::IsNullOrWhiteSpace([string]$owner.Sid)) {
-                $ownerSid = [string]$owner.Sid
-                $verified = [string]::Equals($ownerSid, $UserSid, [StringComparison]::OrdinalIgnoreCase)
-            }
-        }
-        catch {
-            # Leave Verified=false; the caller must not act on an unverified
-            # process identity.
-        }
-
-        $records.Add([pscustomobject]@{
-            Pid          = [int]$process.ProcessId
-            CommandLine  = $commandLine
-            CreationTime = $process.CreationDate
-            OwnerSid     = $ownerSid
-            Verified     = $verified
-        })
-    }
-
-    return @($records)
+    return @(Get-DevWSExecutedScriptProcessRecords `
+        -ImageNames @('AutoHotkey64.exe', 'AutoHotkey.exe') `
+        -Kind 'AutoHotkey' `
+        -ExpectedScriptPath $HotkeyPath `
+        -UserSid $UserSid)
 }
 
 function Wait-DevWSManagedHotkeyProcessesGone {
@@ -3876,15 +4352,19 @@ function Wait-DevWSManagedHotkeyProcessesGone {
 }
 
 function Stop-DevWSManagedHotkeyProcesses {
-    # Stops only an ownership-verified AutoHotkey process that is running the
-    # exact managed hotkey path. Missing/already-exited is a no-op; unverified
-    # candidates and stop failures are returned as explicit failures.
+    # Stops only a handle-verified AutoHotkey process whose actual executed
+    # script is the exact managed hotkey path. Missing/already-exited is a
+    # no-op; unverified candidates and identity changes are explicit failures.
     param(
         [Parameter(Mandatory)]
         [string]$HotkeyPath,
         [string]$UserSid = "",
         [int]$TimeoutMilliseconds = 5000
     )
+
+    if ([string]::IsNullOrWhiteSpace($UserSid)) {
+        $UserSid = Get-DevWSCurrentUserSid
+    }
 
     $records    = @(Get-DevWSManagedHotkeyProcessRecords -HotkeyPath $HotkeyPath -UserSid $UserSid)
     $unverified = @($records | Where-Object { -not [bool]$_.Verified })
@@ -3895,7 +4375,7 @@ function Stop-DevWSManagedHotkeyProcesses {
         return [pscustomobject]@{
             State  = "unverified"
             Pids   = $pids
-            Error  = "a managed-hotkey process could not be ownership-verified"
+            Error  = (@($unverified | ForEach-Object { "PID $($_.Pid): $($_.IdentityError)" }) -join "; ")
         }
     }
 
@@ -3908,13 +4388,23 @@ function Stop-DevWSManagedHotkeyProcesses {
     }
 
     $stopErrors = [System.Collections.Generic.List[string]]::new()
+    $stoppedPids = [System.Collections.Generic.List[int]]::new()
 
     foreach ($record in $verified) {
-        try {
-            Stop-Process -Id $record.Pid -Force -ErrorAction Stop
+        $action = Invoke-DevWSProcessIdentityAction `
+            -Record $record `
+            -ImageNames @('AutoHotkey64.exe', 'AutoHotkey.exe') `
+            -Kind 'AutoHotkey' `
+            -ExpectedScriptPath $HotkeyPath `
+            -UserSid $UserSid `
+            -Terminate `
+            -TimeoutMilliseconds $TimeoutMilliseconds
+
+        if ($action.State -eq "stopped") {
+            $stoppedPids.Add([int]$record.Pid) | Out-Null
         }
-        catch {
-            $stopErrors.Add("PID $($record.Pid): $($_.Exception.Message)") | Out-Null
+        elseif ($action.State -ne "gone") {
+            $stopErrors.Add("PID $($record.Pid): $($action.State) ($($action.Error))") | Out-Null
         }
     }
 
@@ -3923,7 +4413,7 @@ function Stop-DevWSManagedHotkeyProcesses {
     if ($gone) {
         return [pscustomobject]@{
             State  = "stopped"
-            Pids   = $pids
+            Pids   = if ($stoppedPids.Count -gt 0) { @($stoppedPids) } else { $pids }
             Error  = if ($stopErrors.Count -gt 0) { ($stopErrors -join "; ") } else { $null }
         }
     }

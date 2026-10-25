@@ -1250,6 +1250,74 @@ function Stop-TestFixtureProcess {
     }
 }
 
+function Start-TestPipeServer {
+    # Disposable same-user pipe server for negative pipe-target tests. It
+    # records whether a connection produced any shutdown frame and stays alive
+    # long enough for the test to prove it survived.
+    param(
+        [Parameter(Mandatory)][string]$PipeName,
+        [Parameter(Mandatory)][string]$Prefix
+    )
+
+    $scriptPath = Join-Path $TestRoot ($Prefix + ".ps1")
+    $readyPath  = Join-Path $TestRoot ($Prefix + ".ready")
+    $resultPath = Join-Path $TestRoot ($Prefix + ".result")
+
+    Set-Content -LiteralPath $scriptPath -Value @'
+param([string]$PipeName, [string]$ReadyPath, [string]$ResultPath)
+$ErrorActionPreference = 'Stop'
+$server = [System.IO.Pipes.NamedPipeServerStream]::new(
+    $PipeName,
+    [System.IO.Pipes.PipeDirection]::InOut,
+    1,
+    [System.IO.Pipes.PipeTransmissionMode]::Byte,
+    [System.IO.Pipes.PipeOptions]::CurrentUserOnly)
+try {
+    Set-Content -LiteralPath $ReadyPath -Value 'ready' -NoNewline
+    $server.WaitForConnection()
+    $reader = [System.IO.StreamReader]::new($server, [System.Text.UTF8Encoding]::new($false), $false, 4096, $true)
+    $line = $reader.ReadLine()
+    Set-Content -LiteralPath $ResultPath -Value ([string]$line) -NoNewline
+    Start-Sleep -Seconds 30
+}
+finally {
+    $server.Dispose()
+}
+'@ -NoNewline
+
+    $process = Start-Process -FilePath "pwsh" -ArgumentList @(
+        '-NoProfile', '-File', $scriptPath, $PipeName, $readyPath, $resultPath
+    ) -PassThru -WindowStyle Hidden
+
+    $deadline = (Get-Date).AddSeconds(20)
+
+    while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $readyPath)) {
+        Start-Sleep -Milliseconds 100
+    }
+
+    if (-not (Test-Path -LiteralPath $readyPath)) {
+        Stop-TestFixtureProcess $process
+        Remove-Item -LiteralPath $scriptPath, $readyPath, $resultPath -Force -ErrorAction SilentlyContinue
+        throw "the test pipe server did not become ready"
+    }
+
+    return [pscustomobject]@{
+        Process = $process
+        Script  = $scriptPath
+        Ready   = $readyPath
+        Result  = $resultPath
+    }
+}
+
+function Stop-TestPipeServer {
+    param($Server)
+
+    if ($null -eq $Server) { return }
+
+    Stop-TestFixtureProcess $Server.Process
+    Remove-Item -LiteralPath $Server.Script, $Server.Ready, $Server.Result -Force -ErrorAction SilentlyContinue
+}
+
 function Wait-TestFixtureProcessesGone {
     # Test-only bound for disposable fixture cleanup.
     #
@@ -18816,6 +18884,45 @@ $mutex.Dispose()
         }
     }
 
+    Test-Case "AutoHotkey script-argument mentions of the managed hotkey are not targets" {
+        $ahk = $null
+
+        try { $ahk = Get-DevWSAutoHotkeyPath } catch { $ahk = $null }
+
+        if ([string]::IsNullOrWhiteSpace($ahk) -or -not (Test-Path -LiteralPath $ahk -PathType Leaf)) {
+            Skip-Test "AutoHotkey v2 is unavailable on this host"
+        }
+
+        $fixture = New-InstallFixture "uninstall-ahk-negative"
+        $otherDir = Join-Path $fixture.Root "other"
+        New-Item -ItemType Directory -Path $otherDir -Force | Out-Null
+
+        $otherScript = Join-Path $otherDir "Other.ahk"
+        $hotkeyPath = Join-Path $otherDir "TerminalShortcut.ahk"
+        $scriptBody = "#Requires AutoHotkey v2.0`r`n#SingleInstance Force`r`n!+t::return`r`n"
+        Set-Content -LiteralPath $otherScript -Value $scriptBody -Encoding Ascii
+        Set-Content -LiteralPath $hotkeyPath -Value $scriptBody -Encoding Ascii
+
+        $process = $null
+
+        try {
+            $process = Start-Process -FilePath $ahk -ArgumentList @($otherScript, $hotkeyPath) -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+
+            Assert-True (-not $process.HasExited) "AutoHotkey running another script is alive"
+            $records = @(Get-DevWSManagedHotkeyProcessRecords -HotkeyPath $hotkeyPath)
+            Assert-Equal 0 @($records).Count "the hotkey path as a script argument is not the executed-script target"
+
+            $result = Stop-DevWSManagedHotkeyProcesses -HotkeyPath $hotkeyPath -TimeoutMilliseconds 1000
+            Assert-Equal "absent" $result.State "the other AutoHotkey script is not the managed hotkey"
+            Assert-Equal $false $process.HasExited "the other AutoHotkey script survives"
+        }
+        finally {
+            Stop-TestFixtureProcess $process
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     Test-Case "uninstall stops managed processes before runtime removal and repeated uninstall is safe" {
         $fixture = New-InstallFixture "uninstall-process-order"
         $null = Install-DevWSApplicationFiles -RepoRoot $RepoRoot -InstallRoot $fixture.Root
@@ -18876,6 +18983,53 @@ $mutex.Dispose()
 
             [void](Invoke-DevWSUninstall -Plan $plan -SkipTasks)
             Assert-Equal "hotkey,coordinator" ($script:uninstallProcessOrder -join ",") "repeated uninstall remains a safe process no-op"
+        }
+        finally {
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Test-Case "uninstall aborts before task or file mutation when coordinator cleanup fails" {
+        $fixture = New-InstallFixture "uninstall-process-failure"
+        $null = Install-DevWSApplicationFiles -RepoRoot $RepoRoot -InstallRoot $fixture.Root
+
+        $canonical = Join-Path $fixture.Root "canonical.json"
+        Set-Content -LiteralPath $canonical -Value "{}" -NoNewline
+
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "Startup") -Force | Out-Null
+        $hotkeyPath = Join-Path $fixture.Root "Startup\TerminalShortcut.ahk"
+        Set-Content -LiteralPath $hotkeyPath -Value (New-DevWSTerminalShortcutContent -AppScriptPath (Join-Path $fixture.Root "app\ws.ps1") -BindingsPath (Join-Path $fixture.State "hotkeys\bindings.ahk")) -NoNewline
+
+        $metadata = New-DevWSInstallMetadata
+        $metadata.hotkey.managed = $true
+        $metadata.hotkey.backup = ""
+
+        $plan = Get-DevWSUninstallPlan -InstallRoot $fixture.Root -CanonicalPath $canonical -LegacyShimPath (Join-Path $fixture.Root "local-bin\ws.cmd") -HotkeyPath $hotkeyPath -Metadata $metadata
+        $plan.RemoveHotkey = $true
+        $plan.RestoreHotkey = $false
+        $plan.CoordinatorPipeName = "DevWS.Test.Uninstall.Failure"
+        $plan.StopManagedHotkeyProcess = $false
+
+        function Stop-DevWSCoordinator {
+            param([string]$PipeName, [string]$InstallRoot)
+            return [pscustomobject]@{ State = "failed"; Pid = $null; Pids = @(999); Error = "simulated identity failure" }
+        }
+
+        try {
+            $threw = $false
+
+            try {
+                [void](Invoke-DevWSUninstall -Plan $plan -SkipTasks)
+            }
+            catch {
+                $threw = $true
+                Assert-Contains $_.Exception.Message "could not be stopped safely" "the failure names the lifecycle contract"
+            }
+
+            Assert-Equal $true $threw "uninstall fails closed"
+            Assert-True (Test-Path -LiteralPath $fixture.App) "runtime files remain after the failure"
+            Assert-True (Test-Path -LiteralPath $hotkeyPath) "the managed hotkey file remains after the failure"
+            Assert-True (Test-Path -LiteralPath $canonical) "the canonical configuration remains after the failure"
         }
         finally {
             Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
@@ -23128,6 +23282,20 @@ Write-Output "REPLACEMENT-LOADED"
         Assert-Contains $region "Stop-DevWSCoordinator" "uninstall stops the warm coordinator"
         Assert-True ($region.IndexOf("Stop-DevWSManagedHotkeyProcesses") -lt $region.IndexOf("if (`$Plan.RestoreHotkey)")) "hotkey process stop precedes hotkey file restore"
         Assert-True ($region.IndexOf("Stop-DevWSCoordinator") -lt $region.IndexOf("foreach (`$directory in @(`$Plan.AppPath")) "coordinator stop precedes runtime file removal"
+
+        $coordinatorLib = Get-SourceOf "src\lib\devws-coordinator.ps1"
+        Assert-NotContains $coordinatorLib "Stop-Process" "coordinator fallback never terminates by bare PID"
+        Assert-NotContains $coordinatorLib "regex::Escape" "coordinator inventory never uses command-line substring matching"
+        Assert-NotContains $coordinatorLib "CommandLine -notmatch" "coordinator inventory never regex-matches the raw command line"
+        Assert-Contains $coordinatorLib "Get-DevWSExecutedScriptProcessRecords" "coordinator inventory proves the executed script"
+        Assert-Contains $coordinatorLib "Get-DevWSCoordinatorPipeServerProcessId" "coordinator shutdown verifies the pipe server pid"
+        Assert-Contains $coordinatorLib "Invoke-DevWSProcessIdentityAction" "coordinator fallback uses handle-bound identity"
+        Assert-Contains $lib "function Get-DevWSExecutedScript" "shared executed-script parser"
+        Assert-Contains $lib "function Invoke-DevWSProcessIdentityAction" "shared handle-bound process action"
+        Assert-Contains $lib "ProcessTerminate" "termination requires the process-terminate right"
+        Assert-NotContains $lib "Stop-Process" "process lifecycle never terminates by bare PID"
+        Assert-NotContains $lib "regex::Escape" "hotkey inventory never uses command-line substring matching"
+        Assert-NotContains $lib "CommandLine -notmatch" "hotkey inventory never regex-matches the raw command line"
     }
 
     Test-Case "installer records the config action and backup in metadata" {
@@ -29466,11 +29634,11 @@ Start-Sleep -Seconds 6
         }
     }
 
-    Test-Case "coordinator shutdown falls back only to verified exact identity and preserves unrelated PowerShell" {
+    Test-Case "coordinator shutdown falls back only to verified executed-script identity and preserves unrelated PowerShell" {
         $fixture = New-InstallFixture "stage1-coordinator-fallback"
         New-Item -ItemType Directory -Path (Join-Path $fixture.Root "app") -Force | Out-Null
         $coordinatorPath = Join-Path $fixture.Root "app\coordinator.ps1"
-        Set-Content -LiteralPath $coordinatorPath -Value "# disposable coordinator-shaped fixture" -NoNewline
+        Set-Content -LiteralPath $coordinatorPath -Value "Start-Sleep -Seconds 120" -NoNewline
         $sleeperPath = Join-Path $fixture.Root "sleeper.ps1"
         Set-Content -LiteralPath $sleeperPath -Value "Start-Sleep -Seconds 120" -NoNewline
 
@@ -29480,26 +29648,203 @@ Start-Sleep -Seconds 6
 
         try {
             $fake = Start-Process -FilePath "pwsh" -ArgumentList @(
-                '-NoProfile', '-File', $sleeperPath, $coordinatorPath
+                '-NoProfile', '-File', $coordinatorPath
             ) -PassThru -WindowStyle Hidden
             $unrelated = Start-Process -FilePath "pwsh" -ArgumentList @(
                 '-NoProfile', '-Command', 'Start-Sleep -Seconds 120'
             ) -PassThru -WindowStyle Hidden
 
             Start-Sleep -Seconds 2
-            Assert-True (-not $fake.HasExited) "coordinator-shaped fixture process is running"
+            Assert-True (-not $fake.HasExited) "coordinator fixture process is running"
             Assert-True (-not $unrelated.HasExited) "unrelated PowerShell fixture is running"
+
+            $records = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $fixture.Root)
+            Assert-Equal 1 @($records).Count "only the actual executed coordinator script is inventoried"
+            Assert-Equal $fake.Id ([int]$records[0].Pid) "inventory identifies the executed-script process"
 
             $result = Stop-DevWSCoordinator -PipeName $pipe -InstallRoot $fixture.Root `
                 -ConnectTimeoutMilliseconds 300 -ResponseTimeoutMilliseconds 500 -ExitTimeoutMilliseconds 10000
 
-            Assert-Equal "stopped-fallback" $result.State "verified exact-identity fallback stops the unresponsive coordinator"
-            Assert-Equal $true ($fake.WaitForExit(15000)) "coordinator-shaped fixture process exited"
+            Assert-Equal "stopped-fallback" $result.State "verified executed-script fallback stops the unresponsive coordinator"
+            Assert-Equal $true ($fake.WaitForExit(15000)) "coordinator fixture process exited"
             Assert-Equal $false $unrelated.HasExited "unrelated PowerShell process is preserved"
         }
         finally {
             Stop-TestFixtureProcess $fake
             Stop-TestFixtureProcess $unrelated
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Test-Case "PowerShell argument and -Command mentions of the coordinator path are not targets" {
+        $fixture = New-InstallFixture "stage1-coordinator-negative-paths"
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "app") -Force | Out-Null
+        $coordinatorPath = Join-Path $fixture.Root "app\coordinator.ps1"
+        Set-Content -LiteralPath $coordinatorPath -Value "# path target fixture only" -NoNewline
+        $sleeperPath = Join-Path $fixture.Root "sleeper.ps1"
+        Set-Content -LiteralPath $sleeperPath -Value "Start-Sleep -Seconds 120" -NoNewline
+
+        $pipe = "DevWS.Stage1.Negative." + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        $fileArg = $null
+        $commandArg = $null
+
+        try {
+            $fileArg = Start-Process -FilePath "pwsh" -ArgumentList @(
+                '-NoProfile', '-File', $sleeperPath, $coordinatorPath
+            ) -PassThru -WindowStyle Hidden
+
+            $commandText = "Write-Output '" + $coordinatorPath + "'; Start-Sleep -Seconds 120"
+            $commandArg = Start-Process -FilePath "pwsh" -ArgumentList @(
+                '-NoProfile', '-Command', $commandText
+            ) -PassThru -WindowStyle Hidden
+
+            Start-Sleep -Seconds 2
+            Assert-True (-not $fileArg.HasExited) "sleeper script with the coordinator path as an argument is running"
+            Assert-True (-not $commandArg.HasExited) "-Command process carrying the path as data is running"
+
+            $records = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $fixture.Root)
+            Assert-Equal 0 @($records).Count "a path in a script argument or command text is not an executed-script match"
+
+            $result = Stop-DevWSCoordinator -PipeName $pipe -InstallRoot $fixture.Root `
+                -ConnectTimeoutMilliseconds 200 -ResponseTimeoutMilliseconds 500 -ExitTimeoutMilliseconds 1000
+
+            Assert-Equal "absent" $result.State "no verified coordinator process exists"
+            Assert-Equal $false $fileArg.HasExited "the other PowerShell script survives"
+            Assert-Equal $false $commandArg.HasExited "the -Command PowerShell process survives"
+        }
+        finally {
+            Stop-TestFixtureProcess $fileArg
+            Stop-TestFixtureProcess $commandArg
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Test-Case "verified process action refuses a reused PID and preserves the replacement process" {
+        $fixture = New-InstallFixture "stage1-coordinator-reuse"
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "app") -Force | Out-Null
+        $coordinatorPath = Join-Path $fixture.Root "app\coordinator.ps1"
+        Set-Content -LiteralPath $coordinatorPath -Value "Start-Sleep -Seconds 120" -NoNewline
+        $sleeperPath = Join-Path $fixture.Root "sleeper.ps1"
+        Set-Content -LiteralPath $sleeperPath -Value "Start-Sleep -Seconds 120" -NoNewline
+
+        $target = $null
+        $replacement = $null
+
+        try {
+            $target = Start-Process -FilePath "pwsh" -ArgumentList @(
+                '-NoProfile', '-File', $coordinatorPath
+            ) -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+
+            $records = @(Get-DevWSCoordinatorProcessRecords -InstallRoot $fixture.Root)
+            Assert-Equal 1 @($records).Count "the original target is inventoried"
+            $record = $records[0]
+
+            $unverifiedRecord = $record | Select-Object *
+            $unverifiedRecord.Verified = $false
+            $unverifiedAction = Invoke-DevWSProcessIdentityAction `
+                -Record $unverifiedRecord `
+                -ImageNames @('pwsh.exe') `
+                -Kind 'PowerShell' `
+                -ExpectedScriptPath $coordinatorPath `
+                -UserSid (Get-DevWSCurrentUserSid) `
+                -Terminate `
+                -TimeoutMilliseconds 2000
+
+            Assert-Equal "unverified" $unverifiedAction.State "an unverified record is never terminated"
+            Assert-Equal $false $target.HasExited "the unverified target survives"
+
+            $replacement = Start-Process -FilePath "pwsh" -ArgumentList @(
+                '-NoProfile', '-File', $sleeperPath
+            ) -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 1
+            Assert-True (-not $replacement.HasExited) "replacement process is running"
+
+            $forged = $record | Select-Object *
+            $forged.Pid = $replacement.Id
+
+            $action = Invoke-DevWSProcessIdentityAction `
+                -Record $forged `
+                -ImageNames @('pwsh.exe') `
+                -Kind 'PowerShell' `
+                -ExpectedScriptPath $coordinatorPath `
+                -UserSid (Get-DevWSCurrentUserSid) `
+                -Terminate `
+                -TimeoutMilliseconds 2000
+
+            Assert-Equal "reused" $action.State "a different process at the recorded PID is rejected"
+            Assert-Equal $false $replacement.HasExited "the replacement process is never terminated"
+            Assert-Equal $false $target.HasExited "the original target is untouched by the forged record"
+        }
+        finally {
+            Stop-TestFixtureProcess $target
+            Stop-TestFixtureProcess $replacement
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Test-Case "coordinator shutdown never contacts an unrelated pipe server with no verified coordinator" {
+        $fixture = New-InstallFixture "stage1-coordinator-pipe-absent"
+        $pipe = "DevWS.Stage1.PipeAbsent." + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        $prefix = "pipe-absent-" + [guid]::NewGuid().ToString("N")
+        $server = $null
+
+        try {
+            $server = Start-TestPipeServer -PipeName $pipe -Prefix $prefix
+
+            $result = Stop-DevWSCoordinator -PipeName $pipe -InstallRoot $fixture.Root `
+                -ConnectTimeoutMilliseconds 300 -ResponseTimeoutMilliseconds 500 -ExitTimeoutMilliseconds 1000
+
+            Assert-Equal "absent" $result.State "no verified coordinator means no pipe contact"
+            Start-Sleep -Seconds 1
+            Assert-Equal $false $server.Process.HasExited "the unrelated pipe server survives"
+            Assert-Equal $false (Test-Path -LiteralPath $server.Result) "the unrelated pipe server received no shutdown frame"
+        }
+        finally {
+            Stop-TestPipeServer $server
+            Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Test-Case "coordinator shutdown refuses an unrelated pipe server and falls back to the verified process" {
+        $fixture = New-InstallFixture "stage1-coordinator-pipe-verified"
+        New-Item -ItemType Directory -Path (Join-Path $fixture.Root "app") -Force | Out-Null
+        $coordinatorPath = Join-Path $fixture.Root "app\coordinator.ps1"
+        Set-Content -LiteralPath $coordinatorPath -Value "Start-Sleep -Seconds 120" -NoNewline
+
+        $pipe = "DevWS.Stage1.PipeVerified." + [guid]::NewGuid().ToString("N").Substring(0, 8)
+        $prefix = "pipe-verified-" + [guid]::NewGuid().ToString("N")
+        $server = $null
+        $fake = $null
+
+        try {
+            $server = Start-TestPipeServer -PipeName $pipe -Prefix $prefix
+            $fake = Start-Process -FilePath "pwsh" -ArgumentList @(
+                '-NoProfile', '-File', $coordinatorPath
+            ) -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+
+            $result = Stop-DevWSCoordinator -PipeName $pipe -InstallRoot $fixture.Root `
+                -ConnectTimeoutMilliseconds 1000 -ResponseTimeoutMilliseconds 2000 -ExitTimeoutMilliseconds 10000
+
+            Assert-Equal "stopped-fallback" $result.State "the verified process is stopped after the pipe target is refused"
+            Assert-Equal $true ($fake.WaitForExit(15000)) "the verified coordinator-shaped process exited"
+            Assert-True (@($result.Pids) -contains $fake.Id) "the fallback reports the verified process PID"
+            Assert-Equal $false $server.Process.HasExited "the unrelated pipe server survives"
+
+            $deadline = (Get-Date).AddSeconds(5)
+
+            while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $server.Result)) {
+                Start-Sleep -Milliseconds 100
+            }
+
+            Assert-True (Test-Path -LiteralPath $server.Result) "the unrelated pipe server observed the connection close"
+            $received = [string](Get-Content -LiteralPath $server.Result -Raw -ErrorAction SilentlyContinue)
+            Assert-NotContains $received "shutdown" "no shutdown frame was sent to the unrelated pipe server"
+        }
+        finally {
+            Stop-TestPipeServer $server
+            Stop-TestFixtureProcess $fake
             Remove-Item -LiteralPath $fixture.Root -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
