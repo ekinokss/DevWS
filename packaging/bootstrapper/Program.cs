@@ -219,6 +219,6 @@ internal static class Program
         Console.WriteLine("  DevWS-Setup.exe --help       show this help");
         Console.WriteLine();
         Console.WriteLine("No purge, reset-config, or arbitrary script arguments are exposed.");
-        Console.WriteLine("The setup does not download prerequisites and no WinGet package exists yet.");
+        Console.WriteLine("The setup can acquire the machine-wide AutoHotkey v2 prerequisite through WinGet.");
     }
 }

@@ -44,7 +44,25 @@ reboot. Registry values are discovery/ARP state only and are never used as execu
 authority.
 
 There is no MSI/MSIX, no Windows Installer product code, no service, no scheduled task, no
-self-update, no network acquisition, and no WinGet package in this phase.
+self-update, and no WinGet package in this phase. Package-mode setup can acquire the
+machine-wide AutoHotkey v2 prerequisite through the registered WinGet package.
+
+## AutoHotkey prerequisite acquisition
+
+Package mode (`install.ps1 -PackageMode`, used by `DevWS-Setup.exe`) first reuses a
+machine-wide AutoHotkey v2 installation that passes the existing trusted resolver. If none
+exists, it resolves the registered official Microsoft App Installer package, runs
+`winget.exe` directly from the protected WindowsApps package directory, and requests
+`AutoHotkey.AutoHotkey --scope machine`. It also passes the protected machine directory with
+`/installto` through WinGet's `--custom` switch: AutoHotkey Setup would otherwise follow an
+existing per-user registration even when elevated. WinGet verifies the AutoHotkey installer
+hash before execution. The existing resolver is then run again before any DevWS mutation.
+
+A current-user-only AutoHotkey installation is never used as elevated executable authority
+and is never removed. DevWS uninstall never uninstalls AutoHotkey because it may be shared by
+other applications. The final WinGet manifest must not declare `AutoHotkey.AutoHotkey` as a
+package dependency: that dependency can install a per-user copy, while the setup itself is
+responsible for the machine-wide prerequisite.
 
 ## Requirements
 
@@ -53,6 +71,9 @@ self-update, no network acquisition, and no WinGet package in this phase.
 - Visual C++ build tools required by Native AOT
 - PowerShell 7 on the target machine (machine-wide Program Files or official Microsoft
   PowerShell MSIX)
+- WinGet/App Installer on the target machine only when AutoHotkey v2 must be acquired
+  machine-wide; an existing trusted machine-wide installation avoids WinGet
+- AutoHotkey v2 for all users on the target machine (acquired by package mode when absent)
 
 The generated executable is Native AOT and self-contained. It requires no separately
 installed .NET runtime.
@@ -146,7 +167,8 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
   Add/Remove Programs registration, and setup-driven package uninstall with user-data
   preservation.
 - No self-update.
-- No network acquisition or prerequisite installation.
+- Package-mode setup may acquire AutoHotkey v2 for all users through the registered WinGet
+  package. It never uses or removes a current-user-only AutoHotkey installation.
 - No MSI/MSIX, Windows Installer product codes, published setup release or WinGet package.
 - The release-candidate Actions artifact is not a public release. The public `v0.1.0`
   source-only distribution statement remains true until an artifact is actually published.

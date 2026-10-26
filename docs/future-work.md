@@ -80,10 +80,11 @@ will not rearrange anything by itself.
 ### 1.4 AutoHotkey remains a required dependency
 
 AutoHotkey v2 is required for global hotkeys and for two window operations. Most window work
-has already moved in-process, but the dependency has not been removed. DevWS does not install,
-own or test the upstream AutoHotkey installer; the accepted contract is an installed
-machine-wide v2 instance under an administrator-protected Program Files root, validated by the
-trusted resolver. See §3.
+has already moved in-process, but the dependency has not been removed. A source installation
+does not install it; package mode can acquire a machine-wide v2 instance through WinGet when
+it is absent. The accepted contract is an installed machine-wide v2 instance under an
+administrator-protected Program Files root, validated by the trusted resolver. A user-scope
+installation is neither used nor removed. See §3.
 
 ### 1.5 Managed terminals must be elevated
 

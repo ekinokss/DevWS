@@ -15,6 +15,13 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preserves configuration and state. Package mode does not self-elevate, never resets or
   purges, and rejects destructive or alternate-mode combinations before mutation. No setup
   executable or WinGet package is included in this phase.
+- **Package-mode AutoHotkey acquisition** — `install.ps1 -PackageMode` now reuses an existing
+  trusted machine-wide AutoHotkey v2 installation or acquires one through the registered
+  WinGet/App Installer package with an explicit machine scope and protected machine install
+  directory. The installed result is revalidated by the existing trusted resolver before any
+  DevWS change. User-scope AutoHotkey is neither used nor removed, and DevWS uninstall
+  continues to leave AutoHotkey installed. Source-mode installation keeps its
+  manual-prerequisite behavior.
 - **Thin setup bootstrapper source** — an unreleased Native AOT Windows x64 bootstrapper under
   `packaging/` that resolves trusted PowerShell, requests elevation, stages the embedded
   DevWS source payload in protected ProgramData storage, extracts it safely and invokes

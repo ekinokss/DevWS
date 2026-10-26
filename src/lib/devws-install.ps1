@@ -861,6 +861,197 @@ function Test-DevWSAdministrator {
     }
 }
 
+function Test-DevWSUserScopedAutoHotkeyPresent {
+    # Diagnostic only. A per-user AutoHotkey installation is never accepted as
+    # elevated executable authority and is never modified by prerequisite
+    # acquisition.
+    $record = Get-DevWSAutoHotkeyInstallRecord -Scope User
+
+    if ($null -ne $record -and [bool]$record.Present -and -not [string]::IsNullOrWhiteSpace([string]$record.InstallDir)) {
+        $candidate = Join-Path ([string]$record.InstallDir) 'v2\AutoHotkey64.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $true }
+    }
+
+    $fallback = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Programs\AutoHotkey\v2\AutoHotkey64.exe'
+    return (Test-Path -LiteralPath $fallback -PathType Leaf)
+}
+
+function Get-DevWSWingetAutoHotkeyInstallArguments {
+    # AutoHotkey Setup follows an existing per-user registration even when it
+    # is launched elevated: only an explicit /installto keeps machine mode
+    # (see the upstream installer's ResolveInstallDir). WinGet's --scope alone
+    # is therefore insufficient when a user-scope package already exists.
+    # Pass the protected machine directory through --custom so WinGet still
+    # verifies and runs the signed-source installer itself.
+    $programFiles = [Environment]::GetFolderPath('ProgramFiles')
+
+    if ([string]::IsNullOrWhiteSpace($programFiles)) {
+        throw "The Program Files directory could not be resolved; AutoHotkey v2 cannot be acquired machine-wide."
+    }
+
+    $installDir = Join-Path $programFiles 'AutoHotkey'
+
+    if (-not [System.IO.Path]::IsPathRooted($installDir)) {
+        throw "The machine-wide AutoHotkey v2 installation path is not absolute: '$installDir'."
+    }
+
+    return @(
+        'install',
+        '--id', 'AutoHotkey.AutoHotkey',
+        '--exact',
+        '--scope', 'machine',
+        '--source', 'winget',
+        '--silent',
+        '--disable-interactivity',
+        '--accept-source-agreements',
+        '--accept-package-agreements',
+        '--custom', ('/installto "{0}"' -f $installDir),
+        '--force'
+    )
+}
+
+function Invoke-DevWSWingetAutoHotkeyMachineInstall {
+    # Runs the trusted, registered WinGet executable. WinGet verifies the
+    # AutoHotkey installer hash from its signed source before execution; the
+    # caller still re-validates the installed machine-wide path through the
+    # existing AutoHotkey resolver before DevWS proceeds.
+    param(
+        [Parameter(Mandatory)][string]$WingetPath,
+        [int]$TimeoutSeconds = 900
+    )
+
+    if ([string]::IsNullOrWhiteSpace($WingetPath) -or -not [System.IO.Path]::IsPathRooted($WingetPath)) {
+        throw "The resolved WinGet executable path is not absolute: '$WingetPath'."
+    }
+
+    if (-not (Test-Path -LiteralPath $WingetPath -PathType Leaf)) {
+        throw "The resolved WinGet executable does not exist: '$WingetPath'."
+    }
+
+    $arguments = @(Get-DevWSWingetAutoHotkeyInstallArguments)
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $WingetPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $startInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+
+    foreach ($argument in $arguments) {
+        $startInfo.ArgumentList.Add([string]$argument)
+    }
+
+    try {
+        $process = [System.Diagnostics.Process]::Start($startInfo)
+    }
+    catch {
+        throw "WinGet could not be started to install AutoHotkey v2 for all users: $($_.Exception.Message)"
+    }
+
+    if ($null -eq $process) {
+        throw "WinGet did not start to install AutoHotkey v2 for all users."
+    }
+
+    try {
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $process.Kill($true) } catch { }
+            throw "WinGet did not finish installing AutoHotkey v2 for all users within $TimeoutSeconds seconds."
+        }
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+        $combined = (($stdout + [Environment]::NewLine + $stderr).Trim())
+
+        if ($process.ExitCode -ne 0) {
+            if ($combined.Length -gt 4000) {
+                $combined = $combined.Substring($combined.Length - 4000)
+            }
+
+            throw "WinGet could not install AutoHotkey v2 for all users (exit $($process.ExitCode)).$([Environment]::NewLine)$combined"
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
+function Ensure-DevWSMachineWideAutoHotkey {
+    # Package-mode prerequisite acquisition. Reuses a valid machine-wide
+    # installation; otherwise installs AutoHotkey for all users through WinGet
+    # and verifies the result through the existing trusted resolver. A
+    # user-scope installation is neither trusted nor removed.
+    param(
+        [scriptblock]$ResolveMachineWide = { Resolve-DevWSTrustedAutoHotkeyPath },
+        [scriptblock]$ResolveWinget = { Resolve-DevWSTrustedWingetPath },
+        [scriptblock]$InstallMachineWide = { param($WingetPath) Invoke-DevWSWingetAutoHotkeyMachineInstall -WingetPath $WingetPath },
+        [scriptblock]$TestUserScoped = { Test-DevWSUserScopedAutoHotkeyPresent },
+        [switch]$Quiet
+    )
+
+    try {
+        $existing = & $ResolveMachineWide
+        if (-not [string]::IsNullOrWhiteSpace([string]$existing)) {
+            if (-not $Quiet) { Write-Host "  AutoHotkey v2 (machine-wide): $existing" }
+            return [string]$existing
+        }
+    }
+    catch {
+        # Absence is the normal acquisition path; the resolver's failure text
+        # is intentionally superseded by the acquisition-specific messages.
+    }
+
+    $userScoped = $false
+
+    try {
+        $userScoped = [bool](& $TestUserScoped)
+    }
+    catch {
+        $userScoped = $false
+    }
+
+    if (-not $Quiet) {
+        if ($userScoped) {
+            Write-Host "  A user-scope AutoHotkey v2 installation is present; it will not be used or removed."
+        }
+        Write-Host "  Machine-wide AutoHotkey v2 is required; installing it through WinGet..."
+    }
+
+    try {
+        $wingetPath = & $ResolveWinget
+    }
+    catch {
+        throw ("AutoHotkey v2 is not installed machine-wide, and WinGet is unavailable: " + $_.Exception.Message +
+            [Environment]::NewLine + "Install AutoHotkey v2 for all users manually, then rerun DevWS Setup.")
+    }
+
+    try {
+        $null = & $InstallMachineWide $wingetPath
+    }
+    catch {
+        throw ("Machine-wide AutoHotkey v2 acquisition failed: " + $_.Exception.Message +
+            [Environment]::NewLine + "DevWS was not installed.")
+    }
+
+    try {
+        $resolved = & $ResolveMachineWide
+    }
+    catch {
+        throw ("WinGet completed, but no trusted machine-wide AutoHotkey v2 installation was found: " + $_.Exception.Message +
+            [Environment]::NewLine + "DevWS was not installed.")
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$resolved)) {
+        throw "WinGet completed, but the trusted AutoHotkey v2 resolver returned no machine-wide executable. DevWS was not installed."
+    }
+
+    if (-not $Quiet) { Write-Host "  AutoHotkey v2 (machine-wide): $resolved" }
+    return [string]$resolved
+}
+
 function Get-DevWSPrerequisiteResults {
     param(
         [string]$WindowsTerminalPath,

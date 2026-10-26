@@ -38,21 +38,23 @@ through into the nine-step install/update flow, and cannot be combined with `-Re
 ### Package integration contract
 
 `install.ps1 -PackageMode` is the stable non-interactive contract for a future external
-package/bootstrap layer. It performs the ordinary install/idempotent-update path: prerequisite
-validation, elevation, configuration preservation/migration, the existing nine-step installer
-and the mandatory health check. It has no separate installation implementation and never
-resets a valid configuration.
+package/bootstrap layer. It performs the ordinary install/idempotent-update path:
+package-mode machine-wide AutoHotkey acquisition when needed, prerequisite validation,
+elevation, configuration preservation/migration, the existing nine-step installer and the
+mandatory health check. It has no separate installation implementation and never resets a
+valid configuration.
 
 `uninstall.ps1 -PackageMode` is the corresponding non-interactive default uninstall contract.
 It performs the ordinary uninstall without the confirmation prompt and preserves the canonical
 workspace configuration, disposable state/backups, `%USERPROFILE%\.ws` and unrelated resources
 exactly as a default uninstall does. It never implies `-Purge` or `-Force`.
 
-Package mode does **not** self-elevate and does **not** install prerequisites. The invoking
-package/bootstrap layer must run it from an elevated PowerShell and is responsible for any
-prerequisite acquisition outside DevWS. Package mode cannot reset or purge: the installer
-rejects `-PackageMode` with `-ResetConfig`, `-Force`, `-HealthCheck` or `-RepairTasks`, and the
-uninstaller rejects it with `-Purge` or `-Force`, before any machine mutation.
+Package mode does **not** self-elevate. The invoking package/bootstrap layer must run it from
+an elevated PowerShell. Package mode can acquire the machine-wide AutoHotkey v2 prerequisite
+through WinGet when it is absent; PowerShell 7 and Windows Terminal remain caller-managed
+prerequisites. Package mode cannot reset or purge: the installer rejects `-PackageMode` with
+`-ResetConfig`, `-Force`, `-HealthCheck` or `-RepairTasks`, and the uninstaller rejects it
+with `-Purge` or `-Force`, before any machine mutation.
 
 Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
 unchanged. The unreleased v0.2 source and its manual Actions release candidate contain a
@@ -65,11 +67,13 @@ completed; any nonzero exit means it did not.
 
 The v0.2 integration branch contains the source for a thin Windows x64 setup bootstrapper at
 `packaging/bootstrapper`. It embeds the DevWS installation payload and invokes
-`install.ps1 -PackageMode`; it does not replace the PowerShell installer's semantics. It does
-not install prerequisites or ship a WinGet package. The unreleased source does provide
-install, same-version reinstall/repair, upgrade, downgrade refusal, HKCU Add/Remove Programs
-registration, setup-driven package uninstall, and a protected persisted setup; see the
-lifecycle section below. The current build is x64-only.
+`install.ps1 -PackageMode`; it does not replace the PowerShell installer's semantics. It
+does not install PowerShell 7 or Windows Terminal, but package mode can acquire the
+machine-wide AutoHotkey v2 prerequisite through WinGet, and it does not ship a WinGet
+package. The unreleased source does provide install, same-version reinstall/repair, upgrade,
+downgrade refusal, HKCU Add/Remove Programs registration, setup-driven package uninstall,
+and a protected persisted setup; see the lifecycle section below. The current build is
+x64-only.
 
 The setup binary exists only in the unreleased source build and a retained Actions
 release-candidate artifact. No setup executable is published or downloadable as a v0.2
@@ -144,18 +148,23 @@ The currently published v0.1.0 remains source-only.
 
 ## 2. Prerequisites
 
-All prerequisites are checked **before anything is modified**. A failure aborts with an
-actionable message and leaves the machine untouched.
+All prerequisites are checked **before any DevWS modification**. A failure aborts with an
+actionable message. Package mode first validates the non-AutoHotkey prerequisites, then may
+acquire AutoHotkey v2 for all users through WinGet, and only then proceeds. Source mode never
+acquires software and leaves the machine untouched on failure.
 
 | Prerequisite | Check |
 | --- | --- |
 | **Windows** | The process is running on Windows. |
 | **PowerShell 7+** | Major version 7 or newer. |
 | **Windows Terminal** | A genuine registered Microsoft **stable** package is resolved through the operating system's package APIs, its publisher identity is validated, and a non-reparse `WindowsTerminal.exe` under the protected package location is confirmed. A foreign, repackaged or unregistered build is refused. No minimum Windows Terminal version is claimed. |
-| **AutoHotkey v2** | A machine-wide (all-users) installation whose recorded directory resolves to an existing `v2\AutoHotkey64.exe` under an administrator-protected Program Files root, with file metadata reporting major version 2. DevWS never installs it, does not own or test the upstream AutoHotkey installer, and rejects a current-user-only installation for installed operation. The accepted contract is the installed machine-wide state. |
-| **Administrator** | Checked after the prerequisites and before any modification. |
+| **AutoHotkey v2** | A machine-wide (all-users) installation whose recorded directory resolves to an existing `v2\AutoHotkey64.exe` under an administrator-protected Program Files root, with file metadata reporting major version 2. Package mode acquires it through WinGet when it is absent, then revalidates it through this resolver. A current-user-only installation is rejected and is neither used nor removed. The accepted contract is the installed machine-wide state. |
+| **Administrator** | Checked before package-mode AutoHotkey acquisition and before any DevWS modification. |
 
-DevWS never installs third-party software for you, and there is no onboarding wizard.
+Source installation never installs third-party software. Package mode may acquire
+AutoHotkey v2 for all users through the registered WinGet package; it does not install
+PowerShell 7 or Windows Terminal, and it does not remove a user-scope AutoHotkey
+installation. There is no onboarding wizard.
 
 ## 3. What gets installed where
 

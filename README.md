@@ -87,11 +87,15 @@ topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall a
 | **Windows** | DevWS is validated on Windows 11. No older Windows release is currently claimed as supported. |
 | **PowerShell 7+** | Required to run the CLI and the installer. Windows PowerShell 5.1 is not sufficient. |
 | **Windows Terminal** | A genuine packaged **stable** Windows Terminal installation. DevWS resolves it through the official package identity and refuses to launch an untrusted executable. No minimum Windows Terminal version is claimed. |
-| **AutoHotkey v2** | Required for global hotkeys and for the window focus/close helpers. It must be installed **for all users** under an administrator-protected Program Files location; a current-user-only installation is not accepted for installed DevWS because elevated operations launch AutoHotkey from High-integrity workers. DevWS does not install, own or test the upstream AutoHotkey installer; the accepted contract is the installed machine-wide v2 state. |
+| **AutoHotkey v2** | Required for global hotkeys and for the window focus/close helpers. It must be installed **for all users** under an administrator-protected Program Files location; a current-user-only installation is not accepted for installed DevWS because elevated operations launch AutoHotkey from High-integrity workers. The packaged setup can acquire a machine-wide AutoHotkey v2 installation through WinGet when it is missing; a source installation does not. |
 | **Administrator rights for installation** | The installer creates or updates DevWS-managed scheduled tasks and writes to a protected location. Normal `ws` commands do **not** require elevation. |
+| **WinGet** | Required only when the packaged setup must acquire the machine-wide AutoHotkey v2 prerequisite. If AutoHotkey v2 is already installed for all users, WinGet is not used. |
 
-DevWS never installs third-party software for you. If a prerequisite is missing the
-installer stops before making any change and tells you what is missing.
+DevWS source installation never installs third-party software. The packaged setup can
+acquire AutoHotkey v2 for all users through WinGet; it does not use or remove a
+current-user-only AutoHotkey installation. PowerShell 7 and Windows Terminal remain
+manual prerequisites. If a prerequisite is missing, the installer stops before making
+any DevWS change and reports what is missing.
 
 ## Installing
 

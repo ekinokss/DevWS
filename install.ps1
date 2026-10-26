@@ -150,6 +150,27 @@ try {
         throw "install.ps1 must run from the DevWS repository root (src\ws.ps1 was not found next to it)."
     }
 
+    # Package-mode setup acquires the machine-wide AutoHotkey prerequisite
+    # before the ordinary prerequisite gate and before any DevWS mutation.
+    # Source-mode installation keeps its historical manual-prerequisite
+    # contract.
+    if ($PackageMode) {
+        if (-not (Test-DevWSAdministrator)) {
+            throw ("The installer must run from an Administrator PowerShell so it can update the five managed DevWS scheduled tasks. Rerun it elevated:" + [Environment]::NewLine + "  " + (Get-DevWSInstallerRerunCommand))
+        }
+
+        # Validate every non-AutoHotkey prerequisite before acquiring anything:
+        # a missing PowerShell or Windows Terminal must not leave AutoHotkey
+        # installed. The ordinary gate below still reports all failures.
+        $preliminary = @(Get-DevWSPrerequisiteResults)
+        $otherFailures = @($preliminary | Where-Object { $_.Name -ne 'AutoHotkey v2' -and -not $_.Ok })
+
+        if ($otherFailures.Count -eq 0) {
+            Write-DevWSInstallSection "Package prerequisites"
+            $null = Ensure-DevWSMachineWideAutoHotkey
+        }
+    }
+
     # --- Prerequisites and elevation (before any modification) -------------
     Write-Host "Prerequisites:"
 

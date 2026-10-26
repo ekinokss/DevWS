@@ -23332,6 +23332,215 @@ Write-Output "REPLACEMENT-LOADED"
         }
     }
 
+    Test-Case "AutoHotkey acquisition reuses an existing trusted machine-wide installation" {
+        $state = [pscustomobject]@{ ResolveCalls = 0; InstallCalls = 0 }
+        $resolved = Ensure-DevWSMachineWideAutoHotkey `
+            -ResolveMachineWide { $state.ResolveCalls++; 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe' } `
+            -ResolveWinget { throw 'WinGet must not be resolved when AutoHotkey is already present' } `
+            -InstallMachineWide { $state.InstallCalls++; throw 'WinGet must not run when AutoHotkey is already present' } `
+            -TestUserScoped { $false } `
+            -Quiet
+
+        Assert-Equal 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe' $resolved "the existing machine-wide path is returned"
+        Assert-Equal 1 $state.ResolveCalls "the trusted resolver is consulted once"
+        Assert-Equal 0 $state.InstallCalls "no acquisition occurs when the machine-wide prerequisite exists"
+    }
+
+    Test-Case "AutoHotkey acquisition installs machine-wide, then verifies through the resolver" {
+        $state = [pscustomobject]@{
+            ResolveCalls = 0
+            InstallCalls = 0
+            WingetPath = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe'
+            Arguments = @()
+        }
+
+        $resolve = {
+            $state.ResolveCalls++
+            if ($state.ResolveCalls -eq 1) { throw 'No trusted machine-wide AutoHotkey v2 installation was found.' }
+            'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe'
+        }
+        $install = {
+            param($WingetPath)
+            $state.InstallCalls++
+            $state.WingetPath = $WingetPath
+            $state.Arguments = @(Get-DevWSWingetAutoHotkeyInstallArguments)
+        }
+
+        $resolved = Ensure-DevWSMachineWideAutoHotkey `
+            -ResolveMachineWide $resolve `
+            -ResolveWinget { $state.WingetPath } `
+            -InstallMachineWide $install `
+            -TestUserScoped { $false } `
+            -Quiet
+
+        Assert-Equal 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe' $resolved "the verified machine-wide path is returned"
+        Assert-Equal 2 $state.ResolveCalls "the resolver is consulted before and after acquisition"
+        Assert-Equal 1 $state.InstallCalls "acquisition runs exactly once"
+        Assert-Equal 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe' $state.WingetPath "the trusted WinGet path is used"
+
+        $scopeIndex = [array]::IndexOf($state.Arguments, '--scope')
+        Assert-True ($scopeIndex -ge 0) "machine scope is requested"
+        Assert-Equal 'machine' $state.Arguments[$scopeIndex + 1] "acquisition explicitly requests machine scope"
+        Assert-True ($state.Arguments -contains '--source') "an explicit source is requested"
+        Assert-Equal 'winget' $state.Arguments[[array]::IndexOf($state.Arguments, '--source') + 1] "the winget source is explicit"
+        Assert-True ($state.Arguments -contains '--silent') "acquisition is silent"
+        Assert-True ($state.Arguments -contains '--disable-interactivity') "acquisition is non-interactive"
+        $customIndex = [array]::IndexOf($state.Arguments, '--custom')
+        Assert-True ($customIndex -ge 0) "the machine install path is passed explicitly"
+        Assert-Contains $state.Arguments[$customIndex + 1] 'AutoHotkey' "the custom switch selects the AutoHotkey machine directory"
+        Assert-True (-not ($state.Arguments -contains '--uninstall')) "acquisition never uninstalls AutoHotkey"
+        Assert-True (-not ($state.Arguments -contains '--ignore-security-hash')) "acquisition never bypasses installer hash verification"
+    }
+
+    Test-Case "AutoHotkey acquisition does not trust a user-scope installation" {
+        $state = [pscustomobject]@{ ResolveCalls = 0; InstallCalls = 0 }
+        $resolve = {
+            $state.ResolveCalls++
+            if ($state.ResolveCalls -eq 1) { throw 'No trusted machine-wide AutoHotkey v2 installation was found.' }
+            'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe'
+        }
+        $install = { param($WingetPath) $state.InstallCalls++ }
+
+        $resolved = Ensure-DevWSMachineWideAutoHotkey `
+            -ResolveMachineWide $resolve `
+            -ResolveWinget { 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe' } `
+            -InstallMachineWide $install `
+            -TestUserScoped { $true } `
+            -Quiet
+
+        Assert-Equal 'C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe' $resolved "the machine-wide path is returned"
+        Assert-Equal 1 $state.InstallCalls "machine-wide acquisition runs despite the user-scope installation"
+        Assert-Equal 2 $state.ResolveCalls "the machine-wide resolver, not the user-scope path, is authoritative"
+
+        $lib = Get-SourceOf "src\lib\devws-install.ps1"
+        $start = $lib.IndexOf("function Ensure-DevWSMachineWideAutoHotkey")
+        $end = $lib.IndexOf("function Get-DevWSPrerequisiteResults")
+        Assert-True ($start -ge 0 -and $end -gt $start) "acquisition function located"
+        $region = $lib.Substring($start, $end - $start)
+        Assert-NotContains $region "LOCALAPPDATA" "the acquisition function never resolves a user-scope executable"
+        Assert-NotContains $region "--uninstall" "the acquisition function never uninstalls AutoHotkey"
+        Assert-NotContains $region "Remove-Item" "the acquisition function never removes AutoHotkey files"
+    }
+
+    Test-Case "AutoHotkey acquisition reports failed or canceled installation" {
+        $state = [pscustomobject]@{ ResolveCalls = 0; InstallCalls = 0 }
+        $resolve = { $state.ResolveCalls++; throw 'No trusted machine-wide AutoHotkey v2 installation was found.' }
+        $install = { param($WingetPath) $state.InstallCalls++; throw 'WinGet was canceled by the user.' }
+
+        $message = ''
+        try {
+            $null = Ensure-DevWSMachineWideAutoHotkey `
+                -ResolveMachineWide $resolve `
+                -ResolveWinget { 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe' } `
+                -InstallMachineWide $install `
+                -TestUserScoped { $false } `
+                -Quiet
+        }
+        catch { $message = $_.Exception.Message }
+
+        Assert-Contains $message "Machine-wide AutoHotkey v2 acquisition failed" "the acquisition failure is explicit"
+        Assert-Contains $message "canceled by the user" "the cancellation reason is preserved"
+        Assert-Equal 1 $state.ResolveCalls "the resolver is consulted before acquisition"
+        Assert-Equal 1 $state.InstallCalls "the failed acquisition is attempted once"
+    }
+
+    Test-Case "AutoHotkey acquisition fails closed when WinGet is unavailable" {
+        $state = [pscustomobject]@{ InstallCalls = 0 }
+        $message = ''
+        try {
+            $null = Ensure-DevWSMachineWideAutoHotkey `
+                -ResolveMachineWide { throw 'No trusted machine-wide AutoHotkey v2 installation was found.' } `
+                -ResolveWinget { throw 'App Installer is not registered.' } `
+                -InstallMachineWide { param($WingetPath) $state.InstallCalls++ } `
+                -TestUserScoped { $false } `
+                -Quiet
+        }
+        catch { $message = $_.Exception.Message }
+
+        Assert-Contains $message "WinGet is unavailable" "missing WinGet is reported clearly"
+        Assert-Contains $message "Install AutoHotkey v2 for all users manually" "the manual fallback is actionable"
+        Assert-Equal 0 $state.InstallCalls "no install command is attempted without WinGet"
+    }
+
+    Test-Case "AutoHotkey acquisition fails closed when post-install verification still fails" {
+        $state = [pscustomobject]@{ ResolveCalls = 0; InstallCalls = 0 }
+        $resolve = {
+            $state.ResolveCalls++
+            throw 'No trusted machine-wide AutoHotkey v2 installation was found.'
+        }
+        $install = { param($WingetPath) $state.InstallCalls++ }
+        $message = ''
+        try {
+            $null = Ensure-DevWSMachineWideAutoHotkey `
+                -ResolveMachineWide $resolve `
+                -ResolveWinget { 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.29.380.0_x64__8wekyb3d8bbwe\winget.exe' } `
+                -InstallMachineWide $install `
+                -TestUserScoped { $false } `
+                -Quiet
+        }
+        catch { $message = $_.Exception.Message }
+
+        Assert-Contains $message "WinGet completed, but no trusted machine-wide AutoHotkey v2 installation was found" "post-install verification failure is explicit"
+        Assert-Equal 2 $state.ResolveCalls "the resolver is consulted before and after acquisition"
+        Assert-Equal 1 $state.InstallCalls "acquisition was attempted"
+    }
+
+    Test-Case "package-mode acquisition runs before the prerequisite gate and source mode stays manual" {
+        $install = Get-SourceOf "install.ps1"
+        $packageGuard = $install.IndexOf('if ($PackageMode) {')
+        $ensureIndex = $install.IndexOf('Ensure-DevWSMachineWideAutoHotkey')
+        $prerequisiteIndex = $install.LastIndexOf('Get-DevWSPrerequisiteResults')
+        $mutationIndex = $install.IndexOf('Install-DevWSApplicationFiles')
+
+        Assert-True ($packageGuard -ge 0) "package-mode acquisition branch is present"
+        Assert-True ($ensureIndex -gt $packageGuard) "acquisition is inside the package-mode branch"
+        Assert-True ($ensureIndex -lt $prerequisiteIndex) "acquisition runs before the prerequisite gate"
+        Assert-True ($ensureIndex -lt $mutationIndex) "acquisition runs before any DevWS mutation"
+
+        $preliminaryIndex = $install.IndexOf('$preliminary = @(Get-DevWSPrerequisiteResults)')
+        $otherGuardIndex = $install.IndexOf('$otherFailures.Count -eq 0')
+        Assert-True ($preliminaryIndex -gt $packageGuard -and $preliminaryIndex -lt $ensureIndex) "non-AutoHotkey prerequisites are checked before acquisition"
+        Assert-True ($otherGuardIndex -gt $preliminaryIndex -and $otherGuardIndex -lt $ensureIndex) "acquisition is skipped when another prerequisite is missing"
+
+        $paths = Get-SourceOf "src\lib\devws-paths.ps1"
+        Assert-Contains $paths "function Resolve-DevWSTrustedWingetPath" "the trusted WinGet resolver is present"
+        Assert-Contains $paths "Get-DevWSWingetPackageRecords" "WinGet is found through the registered App Installer package"
+        Assert-Contains $paths "Test-DevWSTrustedWindowsTerminalCandidate" "WinGet shares the protected package-path policy"
+        Assert-Contains $paths "winget.exe" "the resolver requires the exact winget executable"
+
+        $resolverStart = $paths.IndexOf("function Resolve-DevWSTrustedWingetPath")
+        $resolverEnd = $paths.IndexOf("function Resolve-DevWSTrustedPowerShellPath")
+        Assert-True ($resolverStart -ge 0 -and $resolverEnd -gt $resolverStart) "WinGet resolver region is located"
+        $resolver = $paths.Substring($resolverStart, $resolverEnd - $resolverStart)
+        Assert-NotContains $resolver "Get-Command" "WinGet is never resolved through PATH or command discovery"
+        Assert-NotContains $resolver "Get-AppxPackage" "WinGet is never resolved through a module cmdlet"
+        Assert-NotContains $resolver "LOCALAPPDATA" "WinGet is never resolved through a user execution alias"
+    }
+
+    Test-Case "AutoHotkey acquisition argument builder is machine-scoped and fail-closed" {
+        $arguments = @(Get-DevWSWingetAutoHotkeyInstallArguments)
+        $scopeIndex = [array]::IndexOf($arguments, '--scope')
+        Assert-True ($scopeIndex -ge 0) "machine scope is present"
+        Assert-Equal 'machine' $arguments[$scopeIndex + 1] "machine scope is explicit"
+        Assert-True ($arguments -contains '--id') "the package id is explicit"
+        Assert-Equal 'AutoHotkey.AutoHotkey' $arguments[[array]::IndexOf($arguments, '--id') + 1] "the official AutoHotkey package is selected"
+        Assert-True ($arguments -contains '--source') "the source is explicit"
+        Assert-Equal 'winget' $arguments[[array]::IndexOf($arguments, '--source') + 1] "the winget source is selected"
+        Assert-True ($arguments -contains '--silent') "silent mode is requested"
+        Assert-True ($arguments -contains '--disable-interactivity') "interactivity is disabled"
+        Assert-True ($arguments -contains '--accept-source-agreements') "source agreements are accepted explicitly"
+        Assert-True ($arguments -contains '--accept-package-agreements') "package agreements are accepted explicitly"
+        $customIndex = [array]::IndexOf($arguments, '--custom')
+        Assert-True ($customIndex -ge 0) "the machine install path is passed explicitly"
+        $programFiles = [Environment]::GetFolderPath('ProgramFiles')
+        $expectedInstallDir = Join-Path $programFiles 'AutoHotkey'
+        Assert-Equal ('/installto "{0}"' -f $expectedInstallDir) $arguments[$customIndex + 1] "the custom switch selects the protected machine directory"
+        Assert-True ($arguments[$customIndex + 1].StartsWith('/installto "')) "the custom switch is the AutoHotkey install-location switch"
+        Assert-True (-not ($arguments -contains '--uninstall')) "the acquisition command never uninstalls AutoHotkey"
+        Assert-True (-not ($arguments -contains '--ignore-security-hash')) "the acquisition command never bypasses hash verification"
+        Assert-True (-not ($arguments -contains '--override')) "the acquisition command never replaces the installer's default switches"
+    }
+
     Test-Case "installer AutoHotkey prerequisite mirrors the trusted resolver" {
         $pf = Join-Path $TestRoot "ahk-prereq\Program Files"
         New-Item -ItemType Directory -Path (Join-Path $pf "AutoHotkey\v2") -Force | Out-Null

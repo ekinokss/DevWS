@@ -2290,6 +2290,8 @@ function Get-DevWSTrustedWindowsTerminalRoots {
 $script:DevWSOfficialWindowsTerminalPackageName       = "Microsoft.WindowsTerminal"
 $script:DevWSOfficialWindowsTerminalPackageFamilyName = "Microsoft.WindowsTerminal_8wekyb3d8bbwe"
 $script:DevWSOfficialWindowsTerminalPublisherId       = "8wekyb3d8bbwe"
+$script:DevWSOfficialWingetPackageFamilyName          = "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe"
+$script:DevWSOfficialWingetPublisherId                = "8wekyb3d8bbwe"
 
 function Initialize-DevWSPrivilegeNativeRuntime {
     # Privileged identity interop (Windows Terminal package query + process
@@ -2314,17 +2316,22 @@ function Initialize-DevWSPrivilegeNativeRuntime {
     Initialize-DevWSNativeRuntime
 }
 
-function Get-DevWSWindowsTerminalPackageRecords {
-    # Queries the registered instances of the OFFICIAL Windows Terminal
-    # package family for the current user through the OS appmodel APIs. Every
-    # record exposes Name / PackageFamilyName / PublisherId / Version /
-    # Architecture / PackageFullName / InstallLocation; the family name is
-    # verified a second time through PackageFamilyNameFromFullName, and the
-    # name/version/architecture/publisher fields are parsed from the documented
-    # full-name format (machine data, never localized display strings).
+function Get-DevWSPackageRecords {
+    # Queries the registered instances of one package family for the current
+    # user through the OS appmodel APIs. Every record exposes Name /
+    # PackageFamilyName / PublisherId / Version / Architecture / PackageFullName
+    # / InstallLocation; the family name is verified a second time through
+    # PackageFamilyNameFromFullName, and the name/version/architecture/publisher
+    # fields are parsed from the documented full-name format (machine data,
+    # never localized display strings).
+    param(
+        [Parameter(Mandatory)][string]$PackageFamilyName,
+        [Parameter(Mandatory)][string]$Label
+    )
+
     Initialize-DevWSPrivilegeNativeRuntime
 
-    $pfn = [string]$script:DevWSOfficialWindowsTerminalPackageFamilyName
+    $pfn = [string]$PackageFamilyName
     $records = [System.Collections.Generic.List[object]]::new()
 
     for ($attempt = 1; $attempt -le 2; $attempt++) {
@@ -2339,7 +2346,7 @@ function Get-DevWSWindowsTerminalPackageRecords {
         }
 
         if ($rc -ne 122) {
-            throw "The registered Windows Terminal package family could not be queried (Win32 $rc): $([System.ComponentModel.Win32Exception]::new($rc).Message)"
+            throw "The registered $Label could not be queried (Win32 $rc): $([System.ComponentModel.Win32Exception]::new($rc).Message)"
         }
 
         $namesPtr = [System.Runtime.InteropServices.Marshal]::AllocHGlobal([int]$count * [IntPtr]::Size)
@@ -2354,7 +2361,7 @@ function Get-DevWSWindowsTerminalPackageRecords {
             }
 
             if ($rc2 -ne 0) {
-                throw "The registered Windows Terminal package family changed while it was being enumerated (Win32 $rc2); refusing to continue."
+                throw "The registered $Label changed while it was being enumerated (Win32 $rc2); refusing to continue."
             }
 
             for ($index = 0; $index -lt $count; $index++) {
@@ -2430,6 +2437,16 @@ function Get-DevWSWindowsTerminalPackageRecords {
     }
 
     return $records.ToArray()
+}
+
+function Get-DevWSWindowsTerminalPackageRecords {
+    # Windows Terminal-specific wrapper over the generic appmodel package query.
+    return (Get-DevWSPackageRecords -PackageFamilyName $script:DevWSOfficialWindowsTerminalPackageFamilyName -Label "Windows Terminal package family")
+}
+
+function Get-DevWSWingetPackageRecords {
+    # App Installer / Windows Package Manager-specific wrapper.
+    return (Get-DevWSPackageRecords -PackageFamilyName $script:DevWSOfficialWingetPackageFamilyName -Label "Windows Package Manager (App Installer) package family")
 }
 
 function Select-DevWSTrustedWindowsTerminalPackage {
@@ -2579,7 +2596,8 @@ function Test-DevWSTrustedWindowsTerminalCandidate {
     # substitute is rejected even when the final file itself is ordinary).
     param(
         [AllowNull()][AllowEmptyString()][string]$Path,
-        [AllowNull()][AllowEmptyCollection()][string[]]$TrustedRoots
+        [AllowNull()][AllowEmptyCollection()][string[]]$TrustedRoots,
+        [string]$Leaf = 'WindowsTerminal.exe'
     )
 
     if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Path]::IsPathRooted($Path)) {
@@ -2593,7 +2611,7 @@ function Test-DevWSTrustedWindowsTerminalCandidate {
         return $false
     }
 
-    if ((Split-Path -Leaf $full) -ine "WindowsTerminal.exe") {
+    if ((Split-Path -Leaf $full) -ine $Leaf) {
         return $false
     }
 
@@ -2726,6 +2744,51 @@ function Resolve-DevWSTrustedWindowsTerminalPath {
     }
 
     return $candidate
+}
+
+function Resolve-DevWSTrustedWingetPath {
+    # Resolves the Windows Package Manager executable from the registered
+    # official App Installer package. The executable is never discovered
+    # through PATH, a user app-execution alias, or module autoload. The package
+    # family and publisher are verified by the appmodel query; the selected
+    # package directory must be under an administrator-protected WindowsApps
+    # root; and winget.exe must be an ordinary non-reparse file.
+    #
+    # Returns the absolute winget.exe path or throws an actionable error.
+    $records = @(Get-DevWSWingetPackageRecords)
+    $roots = @(Get-DevWSTrustedWindowsTerminalRoots)
+    $candidates = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($record in $records) {
+        if ($null -eq $record) { continue }
+        if ([string]$record.Name -ne 'Microsoft.DesktopAppInstaller') { continue }
+        if ([string]$record.PackageFamilyName -ne $script:DevWSOfficialWingetPackageFamilyName) { continue }
+        if ([string]$record.PublisherId -ne $script:DevWSOfficialWingetPublisherId) { continue }
+        if ([string]$record.Architecture -ine 'x64') { continue }
+        if ([string]::IsNullOrWhiteSpace([string]$record.InstallLocation)) { continue }
+
+        $version = $null
+        if (-not [version]::TryParse([string]$record.Version, [ref]$version)) { continue }
+
+        $candidate = Join-Path ([string]$record.InstallLocation) 'winget.exe'
+
+        if (-not (Test-DevWSTrustedWindowsTerminalCandidate -Path $candidate -TrustedRoots $roots -Leaf 'winget.exe')) {
+            continue
+        }
+
+        $candidates.Add([pscustomobject]@{
+            Path    = [System.IO.Path]::GetFullPath($candidate)
+            Version = $version
+        }) | Out-Null
+    }
+
+    if ($candidates.Count -eq 0) {
+        throw ("WinGet (Microsoft App Installer) is not available for this user, or its winget.exe failed the protected WindowsApps path checks. " +
+            "Install or update App Installer from the Microsoft Store, or install AutoHotkey v2 for all users manually.")
+    }
+
+    $selected = @($candidates | Sort-Object -Property @{ Expression = { $_.Version }; Descending = $true }, @{ Expression = { $_.Path }; Descending = $false })[0]
+    return [string]$selected.Path
 }
 
 function Resolve-DevWSTrustedPowerShellPath {
