@@ -57,33 +57,31 @@ prerequisites. Package mode cannot reset or purge: the installer rejects `-Packa
 with `-Purge` or `-Force`, before any machine mutation.
 
 Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
-unchanged. The unreleased v0.2 source and its manual Actions release candidate contain a
-`DevWS-Setup.exe` build. No v0.2 setup asset is publicly released, and no WinGet manifest or
-WinGet package exists. This contract fixes the arguments, non-interactive behavior and exit
-status the setup wrapper uses. Exit code `0` means the requested package-mode operation
-completed; any nonzero exit means it did not.
+unchanged. The v0.2 source and the public `v0.2.0-rc.1` pre-release contain a
+`DevWS-Setup.exe` build. The setup asset is publicly available as an unsigned pre-release;
+no WinGet manifest or WinGet package exists. This contract fixes the arguments,
+non-interactive behavior and exit status the setup wrapper uses. Exit code `0` means the
+requested package-mode operation completed; any nonzero exit means it did not.
 
-### Unreleased setup bootstrapper source
+### Setup bootstrapper source
 
 The v0.2 integration branch contains the source for a thin Windows x64 setup bootstrapper at
 `packaging/bootstrapper`. It embeds the DevWS installation payload and invokes
 `install.ps1 -PackageMode`; it does not replace the PowerShell installer's semantics. It
 does not install PowerShell 7 or Windows Terminal, but package mode can acquire the
 machine-wide AutoHotkey v2 prerequisite through WinGet, and it does not ship a WinGet
-package. The unreleased source does provide install, same-version reinstall/repair, upgrade,
+package. The setup source provides install, same-version reinstall/repair, upgrade,
 downgrade refusal, HKCU Add/Remove Programs registration, setup-driven package uninstall,
 and a protected persisted setup; see the lifecycle section below. The current build is
 x64-only.
 
-The setup binary exists only in the unreleased source build and a retained Actions
-release-candidate artifact. No setup executable is published or downloadable as a v0.2
-release asset. The public README's v0.1.0 source-only distribution statement remains
-unchanged. See [`packaging/README.md`](../packaging/README.md) for build and fixture-test
-instructions.
+The unsigned Windows x64 setup is published as the `v0.2.0-rc.1` GitHub pre-release. The
+final v0.2.0 release and the WinGet package are not published. See
+[`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
 
-### Unreleased v0.2 package lifecycle
+### v0.2 package lifecycle
 
-The unreleased setup source now models a per-user Windows package lifecycle. Its stable
+The setup source models a per-user Windows package lifecycle. Its stable
 identity is `ekinokss.DevWS`, display name `DevWS`, publisher `ekinokss`, and current version
 `0.2.0`. Discovery state is written to the 64-bit current-user uninstall key; no HKLM
 registration or Windows Installer product code is used.
@@ -99,11 +97,11 @@ as executable authority.
 `--uninstall` runs the ordinary package-mode uninstall, removes the ARP entry, then uses a
 protected post-exit helper to remove the per-SID setup directory without a reboot. Package
 uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` and unrelated
-resources exactly as the frozen Phase-1 contract requires. No v0.2 setup binary is publicly
-released and no WinGet package exists. Self-update, prerequisite acquisition, and
-MSI/MSIX/Windows Installer identity are not implemented.
+resources exactly as the frozen Phase-1 contract requires. The unsigned v0.2.0-rc.1 setup is
+publicly available as a pre-release; the final v0.2.0 release and the WinGet package are not
+published. Self-update and MSI/MSIX/Windows Installer identity are not implemented.
 
-### Unreleased release-candidate artifact pipeline
+### Release-candidate artifact pipeline
 
 The v0.2 branch uses `packaging/build-release.ps1` to wrap `build-setup.ps1` and assemble a
 commit-bound release candidate containing exactly `DevWS-Setup.exe`, `LICENSE`,
@@ -114,13 +112,13 @@ the non-mutating `--version` and `--help` surfaces.
 A manually dispatched bootstrapper workflow validates and retains this candidate as an Actions
 artifact for 30 days, then downloads and re-verifies the exact artifact in a separate job.
 Normal feature-branch pushes run only fixture lifecycle validation. The candidate is unsigned
-and no Native AOT reproducibility is claimed. This is not a published release: there is still
-no v0.2 tag, GitHub Release, release asset, public setup download, Windows Installer identity,
-attestation or WinGet package.
+and no Native AOT reproducibility is claimed. The workflow produced the unsigned
+`v0.2.0-rc.1` pre-release; the final v0.2.0 release, Windows Installer identity, attestation
+and WinGet package are not published.
 
 ### Release state
 
-**EXISTS IN UNRELEASED v0.2 SOURCE / ACTIONS CANDIDATE:**
+**EXISTS IN THE PUBLIC v0.2.0-rc.1 PRE-RELEASE:**
 
 - `DevWS-Setup.exe` build
 - install
@@ -134,17 +132,17 @@ attestation or WinGet package.
 
 **NOT PUBLICLY RELEASED YET:**
 
-- downloadable v0.2 GitHub Release setup asset
-- v0.2 tag/release
+- final v0.2.0 tag/release
+- final signed v0.2.0 installer
 - WinGet package
 
 **NOT IMPLEMENTED:**
 
 - self-update
-- prerequisite acquisition
 - MSI/MSIX or Windows Installer identity
 
-The currently published v0.1.0 remains source-only.
+The currently published v0.1.0 remains source-only. The unsigned
+`v0.2.0-rc.1` pre-release is the current public binary.
 
 ## 2. Prerequisites
 

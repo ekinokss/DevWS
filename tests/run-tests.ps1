@@ -36573,7 +36573,10 @@ exit 0
         Assert-Contains $build 'A custom PayloadZip is accepted only with the explicit -Fixture switch' "fixture identity overrides are not a production path"
 
         $readme = Get-SourceOf "README.md"
-        Assert-NotContains $readme "DevWS-Setup.exe" "the public README does not claim a published setup executable"
+        Assert-Contains $readme 'https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1' "the public README links the published pre-release"
+        Assert-Contains $readme 'CODE_SIGNING_POLICY.md' "the public README links the code signing policy"
+        Assert-Contains $readme 'PRIVACY.md' "the public README links the privacy information"
+        Assert-NotContains $readme 'There is no installer package' "the stale no-installer claim is gone"
 
         $packagingFiles = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'packaging') -Recurse -File -Force)
         foreach ($file in $packagingFiles) {
@@ -36705,7 +36708,7 @@ exit 0
         $installerDoc = Get-SourceOf "docs\installer.md"
         Assert-NotContains $installerDoc 'At this phase there is **no `DevWS-Setup.exe`' "the stale no-setup claim is gone"
         Assert-NotContains $installerDoc 'provide an uninstall/repair/Add-Remove-Programs lifecycle' "the stale no-lifecycle claim is gone"
-        Assert-Contains $installerDoc 'EXISTS IN UNRELEASED v0.2 SOURCE / ACTIONS CANDIDATE' "the unreleased setup lifecycle is documented"
+        Assert-Contains $installerDoc 'EXISTS IN THE PUBLIC v0.2.0-rc.1 PRE-RELEASE' "the published setup pre-release is documented"
         Assert-Contains $installerDoc 'NOT PUBLICLY RELEASED YET' "the public-release boundary is documented"
         Assert-Contains $installerDoc 'NOT IMPLEMENTED' "the unimplemented installer scope is documented"
         Assert-Contains $installerDoc 'currently published v0.1.0 remains source-only' "the public release truth is preserved"

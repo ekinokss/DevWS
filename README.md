@@ -10,10 +10,15 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: source-first, pre-1.0.** The current source release is **v0.1.0**. The repository
-> is the distribution: installation uses the tracked PowerShell installer. There is no
-> installer package, release binary, container image or package-manager distribution. The
-> generated native assembly is installation-time output and is not byte-reproducible.
+> **Status: pre-1.0, with a public binary pre-release.**
+>
+> The current public binary is **v0.2.0-rc.1**, an unsigned Windows x64 setup:
+> [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
+> The final v0.2.0 release is not yet published, and WinGet catalog distribution is pending.
+> Verify the published SHA-256 before running the installer. The frozen v0.1.0 source release
+> remains available, and source installation remains supported.
+>
+> [Code signing policy](CODE_SIGNING_POLICY.md) · [Privacy information](PRIVACY.md)
 
 ---
 
@@ -99,6 +104,21 @@ any DevWS change and reports what is missing.
 
 ## Installing
 
+### Packaged Windows pre-release
+
+The public `v0.2.0-rc.1` pre-release provides `DevWS-Setup.exe` for Windows 11 x64:
+[GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
+
+The executable is unsigned and may trigger Microsoft Defender SmartScreen. Download it only
+from the official release and verify the published SHA-256 before approving an unfamiliar
+executable warning. Installation requires administrator elevation. The packaged setup can
+acquire a trusted machine-wide AutoHotkey v2 installation through WinGet when it is missing.
+WinGet catalog distribution is planned but not yet available.
+
+See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
+
+### From source
+
 Start from a fresh clone or a source archive. From a clone:
 
 ```powershell
@@ -113,7 +133,7 @@ pwsh
 .\install.ps1
 ```
 
-The installer does not self-elevate; if it is not elevated it prints the exact command to
+The source installer does not self-elevate; if it is not elevated it prints the exact command to
 re-run.
 
 The installer is idempotent and preserve-oriented. In particular it does **not** replace

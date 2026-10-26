@@ -13,8 +13,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   non-interactive install/update path for a future package/bootstrap layer, while
   `uninstall.ps1 -PackageMode` performs the ordinary default uninstall non-interactively and
   preserves configuration and state. Package mode does not self-elevate, never resets or
-  purges, and rejects destructive or alternate-mode combinations before mutation. No setup
-  executable or WinGet package is included in this phase.
+  purges, and rejects destructive or alternate-mode combinations before mutation. The setup
+  executable is distributed as the `v0.2.0-rc.1` pre-release; no WinGet package is included
+  in this phase.
 - **Package-mode AutoHotkey acquisition** — `install.ps1 -PackageMode` now reuses an existing
   trusted machine-wide AutoHotkey v2 installation or acquires one through the registered
   WinGet/App Installer package with an explicit machine scope and protected machine install
@@ -22,22 +23,22 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   DevWS change. User-scope AutoHotkey is neither used nor removed, and DevWS uninstall
   continues to leave AutoHotkey installed. Source-mode installation keeps its
   manual-prerequisite behavior.
-- **Thin setup bootstrapper source** — an unreleased Native AOT Windows x64 bootstrapper under
+- **Thin setup bootstrapper source** — a Native AOT Windows x64 bootstrapper under
   `packaging/` that resolves trusted PowerShell, requests elevation, stages the embedded
   DevWS source payload in protected ProgramData storage, extracts it safely and invokes
-  `install.ps1 -PackageMode`. It is source-only: no setup binary is published and no WinGet
-  manifest exists.
+  `install.ps1 -PackageMode`. The unsigned `v0.2.0-rc.1` setup pre-release is public; no
+  WinGet manifest exists.
 - **Windows package lifecycle source** — per-user `ekinokss.DevWS` ARP registration, a
   protected SID-qualified persisted setup executable, numeric version policy (fresh,
   same-version repair, upgrade and downgrade refusal), setup-driven package uninstall, and
   protected post-exit self-removal. The existing PowerShell install/uninstall engines and
   user-data preservation semantics are unchanged.
-- **Release-candidate artifact pipeline (unreleased)** — commit-bound setup builds produce a
+- **Release-candidate artifact pipeline** — commit-bound setup builds produce a
   four-file candidate (`DevWS-Setup.exe`, `LICENSE`, `provenance.json`, `SHA256SUMS.txt`) with
   independent verification and privacy/path checks. Manual bootstrapper runs retain the
   verified candidate as a 30-day GitHub Actions artifact and re-verify the downloaded copy.
-  No v0.2 tag, GitHub Release, release asset, public setup download, attestation or WinGet
-  package is produced.
+  The unsigned `v0.2.0-rc.1` pre-release was produced from this pipeline; no final v0.2.0
+  tag/release, attestation or WinGet package is published.
 
 ## [0.1.0] - 2026-10-21
 

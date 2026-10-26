@@ -1,7 +1,8 @@
-# DevWS Setup Bootstrapper and Release Candidate (Phase 4 source)
+# DevWS Setup Bootstrapper and Release Candidate
 
-This directory contains the **unreleased** source for the Windows x64 setup lifecycle. It is
-not a published DevWS release artifact.
+This directory contains the source for the Windows x64 setup lifecycle used to build the
+public `v0.2.0-rc.1` pre-release. The setup executable is published only through the
+official GitHub pre-release, not from this directory.
 
 The bootstrapper embeds the tracked DevWS installation payload and invokes the accepted
 Phase-1 contracts:
@@ -169,9 +170,10 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
 - No self-update.
 - Package-mode setup may acquire AutoHotkey v2 for all users through the registered WinGet
   package. It never uses or removes a current-user-only AutoHotkey installation.
-- No MSI/MSIX, Windows Installer product codes, published setup release or WinGet package.
-- The release-candidate Actions artifact is not a public release. The public `v0.1.0`
-  source-only distribution statement remains true until an artifact is actually published.
+- No MSI/MSIX or Windows Installer product codes, and no WinGet package. The unsigned
+  `v0.2.0-rc.1` setup pre-release is public; the final v0.2.0 release is not.
+- The release-candidate Actions artifact is retained for verification. The public
+  `v0.2.0-rc.1` pre-release is the published binary; the final v0.2.0 release is not.
 
 ## Security boundaries
 
