@@ -133,6 +133,15 @@ try {
     $bundleExe = Join-Path $bundleTemp 'DevWS-Setup.exe'
     Copy-Item -LiteralPath $setupExe -Destination $bundleExe -Force
 
+    if ($RequireSignature) {
+        $preSignature = Get-AuthenticodeSignature -LiteralPath $bundleExe
+        Assert-Condition ($preSignature.Status -eq [System.Management.Automation.SignatureStatus]::Valid) "The supplied setup executable does not have a valid Authenticode signature; status: $($preSignature.Status)."
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedSignerSubject)) {
+            $preSignerSubject = if ($null -ne $preSignature.SignerCertificate) { [string]$preSignature.SignerCertificate.Subject } else { '' }
+            Assert-Condition ($preSignerSubject.IndexOf($ExpectedSignerSubject, [StringComparison]::OrdinalIgnoreCase) -ge 0) "The supplied setup executable signer subject '$preSignerSubject' does not contain the expected '$ExpectedSignerSubject'."
+        }
+    }
+
     # Hash and inspect the exact bytes that will be published. Signing, when
     # used, must already be complete before this point.
     $exeHash = (Get-FileHash -LiteralPath $bundleExe -Algorithm SHA256).Hash.ToLowerInvariant()

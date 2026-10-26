@@ -36691,6 +36691,7 @@ exit 0
         Assert-Contains $builder 'ExpectedSignerSubject' "the release builder supports signer pinning"
         Assert-Contains $builder '$bundleExe' "final hashing uses the copied executable bytes"
         Assert-Contains $builder 'prebuilt' "the prebuilt finalization path is explicit"
+        Assert-Contains $builder 'does not have a valid Authenticode signature' "signed finalization checks the signature before executing the setup"
 
         $verifier = Get-SourceOf "packaging\verify-release.ps1"
         Assert-Contains $verifier 'SHA256SUMS.txt' "the verifier parses checksums"
