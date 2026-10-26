@@ -175,6 +175,14 @@ bytes it receives. Do not sign, modify, or replace the executable after finaliza
 source-commit check still requires the executable's embedded source SHA to match the committed
 `HEAD`, and the canonical four-file bundle and committed LICENSE bytes are preserved.
 
+## WinGet submission preparation
+
+The prepared three-file package manifest and the finalization/submission checklist are in
+[`winget/README.md`](winget/README.md). The committed manifest is a template: the final
+`v0.2.0` asset URL is expected, while the installer hash and release metadata must be
+updated after publication. The public `v0.2.0-rc.1` binary is used only as a local
+validation reference, not as the final package.
+
 ## Fixture acceptance
 
 Run from an elevated PowerShell 7 (the fixture exercises the real protected staging and

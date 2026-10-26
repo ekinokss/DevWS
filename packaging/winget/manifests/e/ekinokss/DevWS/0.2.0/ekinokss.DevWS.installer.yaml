@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+# PREPARATION TEMPLATE: InstallerUrl targets the expected final v0.2.0 release.
+# InstallerSha256 is a placeholder and MUST be replaced after the final asset
+# is published. See packaging/winget/README.md for the finalization procedure.
+PackageIdentifier: ekinokss.DevWS
+PackageVersion: 0.2.0
+InstallerType: exe
+InstallModes:
+  - silent
+  - silentWithProgress
+UpgradeBehavior: install
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/ekinokss/DevWS/releases/download/v0.2.0/DevWS-Setup.exe
+    InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
+    Scope: user
+    ElevationRequirement: elevationRequired
+    ProductCode: ekinokss.DevWS
+    AppsAndFeaturesEntries:
+      - DisplayName: DevWS
+        Publisher: ekinokss
+        ProductCode: ekinokss.DevWS
+ManifestType: installer
+ManifestVersion: 1.12.0

@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+PackageIdentifier: ekinokss.DevWS
+PackageVersion: 0.2.0
+PackageLocale: en-US
+Publisher: ekinokss
+PublisherUrl: https://github.com/ekinokss/DevWS
+PublisherSupportUrl: https://github.com/ekinokss/DevWS/issues
+Author: ekinokss
+PackageName: DevWS
+PackageUrl: https://github.com/ekinokss/DevWS
+License: MIT
+LicenseUrl: https://github.com/ekinokss/DevWS/blob/main/LICENSE
+PrivacyUrl: https://github.com/ekinokss/DevWS/blob/main/PRIVACY.md
+Copyright: Copyright (c) 2026 ekinokss
+ShortDescription: A configuration-driven workspace orchestrator for Windows.
+Description: >-
+  DevWS restores and manages a complete multi-window development environment from a
+  single declarative configuration: Windows Terminal windows and tabs, desktop
+  applications, window geometry, and global hotkeys. It supports workspace sets,
+  layout capture and restore, topology-aware layout profiles, live-state saving, and
+  read-only inspection commands. Installation registers the product per user and
+  creates the protected DevWS scheduled tasks used for privileged operations.
+Tags:
+  - developer-tools
+  - workspace
+  - windows-terminal
+  - productivity
+  - powershell
+  - cli
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0

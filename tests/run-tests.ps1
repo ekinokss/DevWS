@@ -37002,6 +37002,39 @@ exit 0
         Assert-Contains $signerMismatchOutput 'does not contain the expected' 'signer mismatch is explicit'
     }
 
+    Test-Case "WinGet submission manifest is prepared and correlated" {
+        $manifestDir = Join-Path $RepoRoot 'packaging\winget\manifests\e\ekinokss\DevWS\0.2.0'
+        foreach ($name in @('ekinokss.DevWS.yaml', 'ekinokss.DevWS.installer.yaml', 'ekinokss.DevWS.locale.en-US.yaml')) {
+            Assert-True (Test-Path -LiteralPath (Join-Path $manifestDir $name) -PathType Leaf) "manifest file exists: $name"
+        }
+
+        $installer = Get-SourceOf "packaging\winget\manifests\e\ekinokss\DevWS\0.2.0\ekinokss.DevWS.installer.yaml"
+        Assert-Contains $installer 'PackageIdentifier: ekinokss.DevWS' "manifest package identity"
+        Assert-Contains $installer 'PackageVersion: 0.2.0' "manifest version"
+        Assert-Contains $installer 'InstallerType: exe' "manifest installer type"
+        Assert-Contains $installer 'Architecture: x64' "manifest architecture"
+        Assert-Contains $installer 'Scope: user' "manifest user scope matches HKCU ARP"
+        Assert-Contains $installer 'ElevationRequirement: elevationRequired' "manifest elevation requirement"
+        Assert-Contains $installer 'UpgradeBehavior: install' "manifest upgrade behavior"
+        Assert-Contains $installer 'ProductCode: ekinokss.DevWS' "manifest ARP product-code correlation"
+        Assert-Contains $installer 'DisplayName: DevWS' "manifest ARP display name"
+        Assert-Contains $installer 'Publisher: ekinokss' "manifest ARP publisher"
+        Assert-Contains $installer 'InstallerUrl: https://github.com/ekinokss/DevWS/releases/download/v0.2.0/DevWS-Setup.exe' "manifest targets the expected final asset"
+        Assert-True ($installer -match 'InstallerSha256: [0-9a-f]{64}') "manifest has a 64-hex installer hash field"
+        Assert-NotContains $installer 'v0.2.0-rc.1' "the committed manifest is not the RC validation copy"
+        Assert-NotContains $installer 'AutoHotkey.AutoHotkey' "no AutoHotkey package dependency"
+        Assert-NotContains $installer 'InstallerSwitches' "no invented installer switches"
+
+        $locale = Get-SourceOf "packaging\winget\manifests\e\ekinokss\DevWS\0.2.0\ekinokss.DevWS.locale.en-US.yaml"
+        Assert-Contains $locale 'PackageName: DevWS' "manifest package name"
+        Assert-Contains $locale 'Publisher: ekinokss' "manifest locale publisher"
+        Assert-Contains $locale 'License: MIT' "manifest license"
+        Assert-Contains $locale 'PrivacyUrl: https://github.com/ekinokss/DevWS/blob/main/PRIVACY.md' "manifest privacy link"
+
+        $readme = Get-SourceOf "packaging\winget\README.md"
+        Assert-Contains $readme 'microsoft/winget-pkgs' "README documents the submission target"
+    }
+
     Test-Case "trusted PowerShell and protected staging policy are explicit" {
         $resolver = Get-SourceOf "packaging\bootstrapper\PowerShellResolver.cs"
         Assert-Contains $resolver 'Microsoft.PowerShell_8wekyb3d8bbwe' "the official MSIX family is fixed"
