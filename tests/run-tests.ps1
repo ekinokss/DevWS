@@ -36686,6 +36686,11 @@ exit 0
         Assert-NotContains $builder "Join-Path `$RepoRoot 'LICENSE'" "the release builder never copies the materialized LICENSE"
         Assert-NotContains $builder '-Fixture' "the release builder cannot use fixture identity overrides"
         Assert-Contains $builder 'requires a clean worktree' "the release builder rejects dirty source"
+        Assert-Contains $builder 'SetupPath' "the release builder accepts a prebuilt or signed executable"
+        Assert-Contains $builder 'RequireSignature' "the release builder supports signed-release enforcement"
+        Assert-Contains $builder 'ExpectedSignerSubject' "the release builder supports signer pinning"
+        Assert-Contains $builder '$bundleExe' "final hashing uses the copied executable bytes"
+        Assert-Contains $builder 'prebuilt' "the prebuilt finalization path is explicit"
 
         $verifier = Get-SourceOf "packaging\verify-release.ps1"
         Assert-Contains $verifier 'SHA256SUMS.txt' "the verifier parses checksums"
@@ -36698,6 +36703,22 @@ exit 0
         Assert-Contains $verifier 'devws-base' "the verifier rejects historical private-repo markers"
         Assert-Contains $verifier 'USERPROFILE' "the verifier rejects local profile paths"
         Assert-Contains $verifier 'Authenticode' "the verifier reports unsigned status"
+        Assert-Contains $verifier 'RequireSignature' "the verifier supports signed-release enforcement"
+        Assert-Contains $verifier 'SignatureStatus]::Valid' "the verifier requires a valid signature when requested"
+        Assert-Contains $verifier 'ExpectedSignerSubject' "the verifier supports signer pinning"
+        Assert-Contains $verifier "ProductName -eq 'DevWS'" "the verifier checks the product name"
+        Assert-Contains $verifier "CompanyName -eq 'ekinokss'" "the verifier checks the company name"
+        Assert-Contains $verifier "FileDescription -eq 'DevWS setup'" "the verifier checks the file description"
+
+        $csproj = Get-SourceOf "packaging\bootstrapper\DevWS.Setup.csproj"
+        Assert-Contains $csproj '<Product>DevWS</Product>' "the setup product name is explicit"
+        Assert-Contains $csproj '<Company>ekinokss</Company>' "the setup company name is explicit"
+        Assert-Contains $csproj '<AssemblyTitle>DevWS setup</AssemblyTitle>' "the setup file description is explicit"
+
+        $buildSetup = Get-SourceOf "packaging\build-setup.ps1"
+        Assert-Contains $buildSetup "ProductName -eq 'DevWS'" "the setup build asserts the product name"
+        Assert-Contains $buildSetup "CompanyName -eq 'ekinokss'" "the setup build asserts the company name"
+        Assert-Contains $buildSetup "FileDescription -eq 'DevWS setup'" "the setup build asserts the file description"
 
         $packagingReadme = Get-SourceOf "packaging\README.md"
         Assert-Contains $packagingReadme 'same-version reinstall/repair' "the Phase-3 scope correction is documented"
@@ -36857,6 +36878,127 @@ exit 0
         $alteredExit = $LASTEXITCODE
         Assert-True ($alteredExit -ne 0) "altered LICENSE must fail even with recomputed checksums: $alteredOutput"
         Assert-Contains $alteredOutput 'LICENSE does not match' "the verifier names the committed-LICENSE mismatch"
+    }
+
+    Test-Case "signed-release verification accepts valid signatures and rejects invalid, unsigned, and mismatched bundles" {
+        function Get-SignatureTestCommittedBlob([string]$Commit, [string]$Path) {
+            $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+            $startInfo.FileName = 'git'
+            $startInfo.UseShellExecute = $false
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $startInfo.CreateNoWindow = $true
+            foreach ($argument in @('-C', $RepoRoot, 'cat-file', 'blob', "$Commit`:$Path")) {
+                $startInfo.ArgumentList.Add($argument)
+            }
+            $process = [System.Diagnostics.Process]::Start($startInfo)
+            if ($null -eq $process) { throw 'git did not start' }
+            try {
+                $stderrTask = $process.StandardError.ReadToEndAsync()
+                $memory = [System.IO.MemoryStream]::new()
+                try {
+                    $process.StandardOutput.BaseStream.CopyTo($memory)
+                    $stderr = $stderrTask.GetAwaiter().GetResult()
+                    $process.WaitForExit()
+                    if ($process.ExitCode -ne 0) { throw "Cannot read committed '$Path': $($stderr.Trim())" }
+                    return ,$memory.ToArray()
+                }
+                finally { $memory.Dispose() }
+            }
+            finally { $process.Dispose() }
+        }
+
+        function Get-SignatureTestSha256([byte[]]$Bytes) {
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try { return [Convert]::ToHexString($sha.ComputeHash($Bytes)).ToLowerInvariant() }
+            finally { $sha.Dispose() }
+        }
+
+        function Write-SignatureTestBundle([string]$Directory, [byte[]]$ExeBytes, [byte[]]$LicenseBytes, [string]$SourceSha, $Product, [string]$VersionOverride = '') {
+            New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+            [IO.File]::WriteAllBytes((Join-Path $Directory 'DevWS-Setup.exe'), $ExeBytes)
+            [IO.File]::WriteAllBytes((Join-Path $Directory 'LICENSE'), $LicenseBytes)
+            $version = if ([string]::IsNullOrWhiteSpace($VersionOverride)) { [string]$Product.version } else { $VersionOverride }
+            $provenance = [ordered]@{
+                schemaVersion = 1
+                productId = [string]$Product.productId
+                displayName = [string]$Product.displayName
+                publisher = [string]$Product.publisher
+                version = $version
+                architecture = 'x64'
+                runtimeIdentifier = 'win-x64'
+                sourceRepository = [string]$Product.urlInfoAbout
+                sourceCommit = $SourceSha
+                artifact = [ordered]@{
+                    file = 'DevWS-Setup.exe'
+                    sha256 = (Get-SignatureTestSha256 $ExeBytes)
+                    sizeBytes = $ExeBytes.Length
+                }
+                build = [ordered]@{
+                    configuration = 'Release'
+                    nativeAot = $true
+                    selfContained = $true
+                    dotnetSdk = '10.0.0'
+                }
+            }
+            [IO.File]::WriteAllText((Join-Path $Directory 'provenance.json'), ($provenance | ConvertTo-Json -Depth 8), [Text.UTF8Encoding]::new($false))
+            $sumLines = foreach ($name in @('DevWS-Setup.exe', 'LICENSE', 'provenance.json')) {
+                $hash = (Get-FileHash -LiteralPath (Join-Path $Directory $name) -Algorithm SHA256).Hash.ToLowerInvariant()
+                "$hash  $name"
+            }
+            [IO.File]::WriteAllText((Join-Path $Directory 'SHA256SUMS.txt'), (($sumLines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+        }
+
+        $sourceSha = (& git -C $RepoRoot rev-parse HEAD 2>&1 | Out-String).Trim()
+        $licenseBytes = Get-SignatureTestCommittedBlob -Commit $sourceSha -Path 'LICENSE'
+        $product = Get-Content -LiteralPath (Join-Path $RepoRoot 'packaging\product.json') -Raw | ConvertFrom-Json
+        $signedSource = Join-Path $env:WINDIR 'System32\notepad.exe'
+        Assert-True (Test-Path -LiteralPath $signedSource -PathType Leaf) 'signed Windows fixture exists'
+        $signedSignature = Get-AuthenticodeSignature -LiteralPath $signedSource
+        Assert-Equal 'Valid' ([string]$signedSignature.Status) 'the signed Windows fixture has a valid Authenticode signature'
+        $signedBytes = [IO.File]::ReadAllBytes($signedSource)
+        $unsignedBytes = [Text.Encoding]::ASCII.GetBytes('test setup executable')
+        $tamperedBytes = [byte[]]::new($signedBytes.Length)
+        [Array]::Copy($signedBytes, $tamperedBytes, $signedBytes.Length)
+        $tamperedOffset = [int]([Math]::Min(4096, $tamperedBytes.Length - 1))
+        $tamperedBytes[$tamperedOffset] = $tamperedBytes[$tamperedOffset] -bxor 0xFF
+        Assert-True ((Get-AuthenticodeSignature -LiteralPath $signedSource).Status -eq [System.Management.Automation.SignatureStatus]::Valid) 'the source fixture remains valid'
+
+        $root = Join-Path $TestRoot 'release-signature-policy'
+        $validBundle = Join-Path $root 'valid'
+        $unsignedBundle = Join-Path $root 'unsigned'
+        $tamperedBundle = Join-Path $root 'tampered'
+        $sourceMismatchBundle = Join-Path $root 'source-mismatch'
+        $versionMismatchBundle = Join-Path $root 'version-mismatch'
+        Write-SignatureTestBundle -Directory $validBundle -ExeBytes $signedBytes -LicenseBytes $licenseBytes -SourceSha $sourceSha -Product $product
+        Write-SignatureTestBundle -Directory $unsignedBundle -ExeBytes $unsignedBytes -LicenseBytes $licenseBytes -SourceSha $sourceSha -Product $product
+        Write-SignatureTestBundle -Directory $tamperedBundle -ExeBytes $tamperedBytes -LicenseBytes $licenseBytes -SourceSha $sourceSha -Product $product
+        Write-SignatureTestBundle -Directory $sourceMismatchBundle -ExeBytes $signedBytes -LicenseBytes $licenseBytes -SourceSha $sourceSha -Product $product
+        Write-SignatureTestBundle -Directory $versionMismatchBundle -ExeBytes $signedBytes -LicenseBytes $licenseBytes -SourceSha $sourceSha -Product $product -VersionOverride '9.9.9'
+
+        $validOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $validBundle -ExpectedSourceSha $sourceSha -LicenseCheckOnly -RequireSignature -ExpectedSignerSubject 'Microsoft' 2>&1 | Out-String)
+        Assert-Equal 0 $LASTEXITCODE "valid signed fixture passes: $validOutput"
+        Assert-Contains $validOutput 'Authenticode: Valid' 'valid signed fixture reports a valid signature'
+
+        $unsignedOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $unsignedBundle -ExpectedSourceSha $sourceSha -LicenseCheckOnly -RequireSignature 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -ne 0) "unsigned bundle fails under RequireSignature: $unsignedOutput"
+        Assert-Contains $unsignedOutput 'does not have a valid Authenticode signature' 'unsigned failure is explicit'
+
+        $tamperedOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $tamperedBundle -ExpectedSourceSha $sourceSha -LicenseCheckOnly -RequireSignature 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -ne 0) "tampered signature fails under RequireSignature: $tamperedOutput"
+        Assert-Contains $tamperedOutput 'does not have a valid Authenticode signature' 'tampered signature failure is explicit'
+
+        $sourceMismatchOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $sourceMismatchBundle -ExpectedSourceSha ('1' * 40) -LicenseCheckOnly -RequireSignature 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -ne 0) "source mismatch is rejected: $sourceMismatchOutput"
+        Assert-Contains $sourceMismatchOutput 'sourceCommit does not match' 'source mismatch is named'
+
+        $versionMismatchOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $versionMismatchBundle -ExpectedSourceSha $sourceSha -LicenseCheckOnly 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -ne 0) "version mismatch is rejected: $versionMismatchOutput"
+        Assert-Contains $versionMismatchOutput 'provenance.version does not match' 'version mismatch is named'
+
+        $signerMismatchOutput = (& pwsh -NoLogo -NoProfile -File (Join-Path $RepoRoot 'packaging\verify-release.ps1') -BundleDir $validBundle -ExpectedSourceSha $sourceSha -LicenseCheckOnly -RequireSignature -ExpectedSignerSubject 'CN=Definitely Not The Signer' 2>&1 | Out-String)
+        Assert-True ($LASTEXITCODE -ne 0) "signer mismatch is rejected: $signerMismatchOutput"
+        Assert-Contains $signerMismatchOutput 'does not contain the expected' 'signer mismatch is explicit'
     }
 
     Test-Case "trusted PowerShell and protected staging policy are explicit" {

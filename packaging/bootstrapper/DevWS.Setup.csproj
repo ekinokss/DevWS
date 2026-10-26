@@ -6,6 +6,9 @@
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <AssemblyName>DevWS-Setup</AssemblyName>
+    <AssemblyTitle>DevWS setup</AssemblyTitle>
+    <Product>DevWS</Product>
+    <Company>ekinokss</Company>
     <RootNamespace>DevWS.Setup</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>

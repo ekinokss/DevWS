@@ -2,10 +2,21 @@
 [CmdletBinding()]
 param(
     [string]$DotNetPath = 'dotnet',
-    [string]$OutputDir = ''
+    [string]$OutputDir = '',
+    # Optional prebuilt executable. When set, the build step is skipped and
+    # this exact file is finalized. It may be unsigned or Authenticode-signed.
+    [string]$SetupPath = '',
+    # Optional signed-release policy. Unsigned finalization keeps the historical
+    # behavior when RequireSignature is absent.
+    [switch]$RequireSignature,
+    [string]$ExpectedSignerSubject = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $RequireSignature -and -not [string]::IsNullOrWhiteSpace($ExpectedSignerSubject)) {
+    throw 'ExpectedSignerSubject requires RequireSignature.'
+}
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $BuildSetup = Join-Path $PSScriptRoot 'build-setup.ps1'
@@ -89,6 +100,13 @@ if (Test-Path -LiteralPath $outputFull) {
     Assert-Condition (@(Get-ChildItem -LiteralPath $outputFull -Force).Count -eq 0) "The output directory must be empty: $outputFull"
 }
 
+$providedSetup = -not [string]::IsNullOrWhiteSpace($SetupPath)
+if ($providedSetup) {
+    $SetupPath = [IO.Path]::GetFullPath($SetupPath)
+    Assert-Condition (Test-Path -LiteralPath $SetupPath -PathType Leaf) "The supplied setup executable was not found: $SetupPath"
+    Assert-Condition ((Split-Path -Leaf $SetupPath) -eq 'DevWS-Setup.exe') "The supplied setup executable must be named DevWS-Setup.exe: $SetupPath"
+}
+
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('devws-release-build-' + [guid]::NewGuid().ToString('N'))
 $setupOutput = Join-Path $tempRoot 'setup'
 $bundleTemp = Join-Path $tempRoot 'bundle'
@@ -99,21 +117,33 @@ try {
     New-Item -ItemType Directory -Path $setupOutput -Force | Out-Null
     New-Item -ItemType Directory -Path $bundleTemp -Force | Out-Null
 
-    & $BuildSetup -DotNetPath $DotNetPath -OutputDir $setupOutput
-    Assert-Condition ($LASTEXITCODE -eq 0) 'build-setup.ps1 failed while producing the release setup executable.'
+    if ($providedSetup) {
+        $setupExe = $SetupPath
+        Write-Output "[release] setup source: prebuilt"
+    }
+    else {
+        & $BuildSetup -DotNetPath $DotNetPath -OutputDir $setupOutput
+        Assert-Condition ($LASTEXITCODE -eq 0) 'build-setup.ps1 failed while producing the release setup executable.'
 
-    $setupExe = Join-Path $setupOutput 'DevWS-Setup.exe'
-    Assert-Condition (Test-Path -LiteralPath $setupExe -PathType Leaf) 'build-setup.ps1 did not produce DevWS-Setup.exe.'
-    $exeHash = (Get-FileHash -LiteralPath $setupExe -Algorithm SHA256).Hash.ToLowerInvariant()
-    $exeSize = (Get-Item -LiteralPath $setupExe).Length
+        $setupExe = Join-Path $setupOutput 'DevWS-Setup.exe'
+        Assert-Condition (Test-Path -LiteralPath $setupExe -PathType Leaf) 'build-setup.ps1 did not produce DevWS-Setup.exe.'
+        Write-Output "[release] setup source: built"
+    }
 
-    $versionOutput = (& $setupExe --version 2>&1 | Out-String).Trim()
+    $bundleExe = Join-Path $bundleTemp 'DevWS-Setup.exe'
+    Copy-Item -LiteralPath $setupExe -Destination $bundleExe -Force
+
+    # Hash and inspect the exact bytes that will be published. Signing, when
+    # used, must already be complete before this point.
+    $exeHash = (Get-FileHash -LiteralPath $bundleExe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $exeSize = (Get-Item -LiteralPath $bundleExe).Length
+
+    $versionOutput = (& $bundleExe --version 2>&1 | Out-String).Trim()
     Assert-Condition ($LASTEXITCODE -eq 0) 'DevWS-Setup.exe --version failed.'
     Assert-Condition ($versionOutput -match [regex]::Escape($displayName)) 'The setup version output does not identify the product display name.'
     Assert-Condition ($versionOutput -match [regex]::Escape($productVersion)) 'The setup version output does not identify the product version.'
     Assert-Condition ($versionOutput -match [regex]::Escape($sourceSha)) 'The setup executable source SHA does not match git HEAD.'
 
-    Copy-Item -LiteralPath $setupExe -Destination (Join-Path $bundleTemp 'DevWS-Setup.exe') -Force
     $licenseBytes = Get-CommittedGitBlob -Commit $sourceSha -Path 'LICENSE'
     [IO.File]::WriteAllBytes((Join-Path $bundleTemp 'LICENSE'), $licenseBytes)
 
@@ -148,7 +178,18 @@ try {
     }
     [IO.File]::WriteAllText((Join-Path $bundleTemp 'SHA256SUMS.txt'), (($sumLines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
 
-    & $VerifyRelease -BundleDir $bundleTemp -ExpectedSourceSha $sourceSha
+    $verifyArguments = @{
+        BundleDir = $bundleTemp
+        ExpectedSourceSha = $sourceSha
+    }
+    if ($RequireSignature) {
+        $verifyArguments.RequireSignature = $true
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedSignerSubject)) {
+            $verifyArguments.ExpectedSignerSubject = $ExpectedSignerSubject
+        }
+    }
+
+    & $VerifyRelease @verifyArguments
     Assert-Condition ($LASTEXITCODE -eq 0) 'The assembled release candidate failed verification.'
 
     New-Item -ItemType Directory -Path $outputFull -Force | Out-Null
@@ -157,7 +198,8 @@ try {
         Copy-Item -LiteralPath (Join-Path $bundleTemp $name) -Destination (Join-Path $outputFull $name) -Force
     }
 
-    & $VerifyRelease -BundleDir $outputFull -ExpectedSourceSha $sourceSha
+    $verifyArguments.BundleDir = $outputFull
+    & $VerifyRelease @verifyArguments
     Assert-Condition ($LASTEXITCODE -eq 0) 'The final release candidate failed verification.'
 
     $signature = Get-AuthenticodeSignature -LiteralPath (Join-Path $outputFull 'DevWS-Setup.exe')

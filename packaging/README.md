@@ -142,8 +142,38 @@ run of the bootstrapper workflow. Ordinary feature-branch pushes run the fixture
 only and do not upload a production candidate. No GitHub Release, tag, WinGet manifest,
 attestation or binary publication is produced by this pipeline.
 
-The candidate is unsigned for Phase 4; Authenticode status is reported by the verifier and
+The candidate is unsigned by default; Authenticode status is reported by the verifier and
 must not be treated as signed. Native AOT output is not claimed to be byte-reproducible.
+
+The setup executable metadata is asserted during the build and release verification:
+`ProductName=DevWS`, `CompanyName=ekinokss`, and `FileDescription=DevWS setup`. The
+executable filename remains `DevWS-Setup.exe`.
+
+### Optional signed finalization
+
+Signing is optional and is not configured in the current workflow. The same finalizer accepts
+an already-built executable, so a future signing service can be inserted without changing the
+provenance or checksum contract:
+
+```powershell
+# Build the unsigned executable (or obtain it from the external signing service).
+pwsh -NoLogo -NoProfile -File packaging\build-setup.ps1 -OutputDir C:\path\outside\repo\unsigned
+
+# Sign C:\path\outside\repo\unsigned\DevWS-Setup.exe externally, then finalize only:
+pwsh -NoLogo -NoProfile -File packaging\build-release.ps1 `
+  -SetupPath C:\path\outside\repo\signed\DevWS-Setup.exe `
+  -RequireSignature `
+  -OutputDir C:\path\outside\repo\bundle
+```
+
+With `-RequireSignature`, `verify-release.ps1` requires a valid Authenticode signature before
+the bundle is accepted. `-ExpectedSignerSubject` can additionally pin the signer subject.
+Without `-RequireSignature`, the existing unsigned release construction is unchanged.
+
+The finalizer hashes and writes `provenance.json`/`SHA256SUMS.txt` from the exact executable
+bytes it receives. Do not sign, modify, or replace the executable after finalization. The
+source-commit check still requires the executable's embedded source SHA to match the committed
+`HEAD`, and the canonical four-file bundle and committed LICENSE bytes are preserved.
 
 ## Fixture acceptance
 

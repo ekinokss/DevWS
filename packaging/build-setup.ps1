@@ -164,6 +164,10 @@ try {
     Get-ChildItem -LiteralPath $OutputDir -File | Where-Object { $_.Extension -in @('.pdb', '.dbg') } | Remove-Item -Force
 
     $artifact = $executables[0].FullName
+    $versionInfo = (Get-Item -LiteralPath $artifact).VersionInfo
+    Assert-Condition ([string]$versionInfo.ProductName -eq 'DevWS') "DevWS-Setup.exe ProductName must be 'DevWS'; found '$($versionInfo.ProductName)'."
+    Assert-Condition ([string]$versionInfo.CompanyName -eq 'ekinokss') "DevWS-Setup.exe CompanyName must be 'ekinokss'; found '$($versionInfo.CompanyName)'."
+    Assert-Condition ([string]$versionInfo.FileDescription -eq 'DevWS setup') "DevWS-Setup.exe FileDescription must be 'DevWS setup'; found '$($versionInfo.FileDescription)'."
     $hash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash
     $size = (Get-Item -LiteralPath $artifact).Length
 
@@ -172,6 +176,7 @@ try {
     Write-Output "[setup-build] product id: $ProductId"
     Write-Output "[setup-build] product version: $ProductVersion"
     Write-Output "[setup-build] display name: $DisplayName"
+    Write-Output "[setup-build] executable metadata: ProductName='$($versionInfo.ProductName)' CompanyName='$($versionInfo.CompanyName)' FileDescription='$($versionInfo.FileDescription)'"
     Write-Output "[setup-build] Program Files root leaf: $ProgramFilesRootLeaf"
     Write-Output "[setup-build] build mode: $(if ($isFixture) { 'fixture payload' } else { 'production payload' })"
     Write-Output "[setup-build] .NET SDK: $sdkVersion"

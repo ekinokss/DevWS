@@ -7,10 +7,18 @@ param(
     # exact inventory, provenance and checksums, but skips executable surfaces
     # so the regression does not need a Native AOT build. The release workflow
     # never passes this switch.
-    [switch]$LicenseCheckOnly
+    [switch]$LicenseCheckOnly,
+    # Optional signed-release policy. Unsigned release verification keeps the
+    # historical behavior when this switch is absent.
+    [switch]$RequireSignature,
+    [string]$ExpectedSignerSubject = ''
 )
 
 $ErrorActionPreference = 'Stop'
+
+if (-not $RequireSignature -and -not [string]::IsNullOrWhiteSpace($ExpectedSignerSubject)) {
+    throw 'ExpectedSignerSubject requires RequireSignature.'
+}
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $ProductPath = Join-Path $PSScriptRoot 'product.json'
@@ -162,12 +170,23 @@ if (-not (Test-ByteArrayEqual $bundleLicenseBytes $committedLicenseBytes)) {
 }
 Write-Output "[verify] committed LICENSE SHA-256: $committedLicenseHash"
 
+$exePath = Join-Path $bundle 'DevWS-Setup.exe'
+$signature = Get-AuthenticodeSignature -LiteralPath $exePath
+
+if ($RequireSignature) {
+    Assert-Condition ($signature.Status -eq [System.Management.Automation.SignatureStatus]::Valid) "DevWS-Setup.exe does not have a valid Authenticode signature; status: $($signature.Status)."
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSignerSubject)) {
+        $signerSubject = if ($null -ne $signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '' }
+        Assert-Condition ($signerSubject.IndexOf($ExpectedSignerSubject, [StringComparison]::OrdinalIgnoreCase) -ge 0) "DevWS-Setup.exe signer subject '$signerSubject' does not contain the expected '$ExpectedSignerSubject'."
+    }
+}
+
 if ($LicenseCheckOnly) {
+    if ($RequireSignature) { Write-Output "[verify] Authenticode: $($signature.Status)" }
     Write-Output '[verify] PASS (license-check-only; executable surfaces were not invoked)'
     return
 }
 
-$exePath = Join-Path $bundle 'DevWS-Setup.exe'
 $versionOutput = (& $exePath --version 2>&1 | Out-String).Trim()
 Assert-Condition ($LASTEXITCODE -eq 0) 'DevWS-Setup.exe --version failed.'
 Assert-Condition ($versionOutput.Contains($expectedDisplayName, [StringComparison]::Ordinal)) '--version does not identify the product display name.'
@@ -180,6 +199,9 @@ Assert-Condition ($helpOutput -match 'Windows x64') '--help does not identify th
 $fileVersion = (Get-Item -LiteralPath $exePath).VersionInfo
 Assert-Condition ([string]$fileVersion.FileVersion -like "$version*") "EXE FileVersion '$($fileVersion.FileVersion)' does not represent $version."
 Assert-Condition ([string]$fileVersion.ProductVersion -like "$version*") "EXE ProductVersion '$($fileVersion.ProductVersion)' does not represent $version."
+Assert-Condition ([string]$fileVersion.ProductName -eq 'DevWS') "EXE ProductName '$($fileVersion.ProductName)' is not 'DevWS'."
+Assert-Condition ([string]$fileVersion.CompanyName -eq 'ekinokss') "EXE CompanyName '$($fileVersion.CompanyName)' is not 'ekinokss'."
+Assert-Condition ([string]$fileVersion.FileDescription -eq 'DevWS setup') "EXE FileDescription '$($fileVersion.FileDescription)' is not 'DevWS setup'."
 
 $forbidden = [System.Collections.Generic.List[string]]::new()
 foreach ($value in @(
@@ -206,7 +228,6 @@ foreach ($name in $ExpectedFiles) {
     }
 }
 
-$signature = Get-AuthenticodeSignature -LiteralPath $exePath
 Write-Output "[verify] source commit: $ExpectedSourceSha"
 Write-Output "[verify] product version: $version"
 Write-Output "[verify] artifacts: $($ExpectedFiles -join ', ')"
