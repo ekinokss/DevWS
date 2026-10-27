@@ -1,8 +1,14 @@
-# WinGet submission preparation
+# WinGet submission preparation (blocked)
 
 This directory contains the three-file WinGet manifest for `ekinokss.DevWS` version
 `0.2.0`, plus the finalization procedure. It is **not submitted** to
 `microsoft/winget-pkgs`.
+
+**Current disposition: blocked. Do not submit this template for the v0.2.0 release.**
+WinGet's unattended installation validation runs without elevation and rejects blocking UAC
+prompts. DevWS requires same-account administrator elevation, and WinGet-managed elevation
+would pre-elevate the process and lose the original caller identity. No WinGet catalog package
+exists for DevWS.
 
 ## Current state
 
@@ -11,11 +17,11 @@ The committed manifest is a **preparation template**:
 - `InstallerUrl` points at the expected final release:
   `https://github.com/ekinokss/DevWS/releases/download/v0.2.0/DevWS-Setup.exe`
 - `InstallerSha256` is a zero placeholder and **must be replaced** with the final
-  published executable hash before submission.
+  published executable hash before any future submission.
 - `ReleaseDate` and `ReleaseNotesUrl` are intentionally omitted until publication.
 
 Do not submit the template, and do not silently replace it with the
-`v0.2.0-rc.1` pre-release binary. The final package must reference the actual
+`v0.2.0-rc.1` pre-release binary. Any future package must reference an actually
 published `v0.2.0` asset.
 
 The files live under the same path shape expected by `microsoft/winget-pkgs`:
@@ -70,26 +76,28 @@ registration. No MSI product code or machine-wide ARP registration is invented.
 
 ## Elevation and caller identity
 
-`ElevationRequirement: elevatesSelf` is intentional. WinGet must start the setup as the
-interactive caller, not pre-elevate it. The setup captures the caller SID, requests `runas`
-itself, and `UserIdentity.RequireSameElevatedSid()` requires the elevated process to have the
-same SID. If UAC selects a different administrator account, the elevated process rejects the
-operation and nothing is changed.
+`ElevationRequirement: elevatesSelf` is intentional for the current security model. WinGet
+must start the setup as the interactive caller, not pre-elevate it. The setup captures the
+caller SID, requests `runas` itself, and `UserIdentity.RequireSameElevatedSid()` requires the
+elevated process to have the same SID. If UAC selects a different administrator account, the
+elevated process rejects the operation and nothing is changed.
 
 Do not change this to `elevationRequired`: pre-elevation would hide the original caller
 identity and bypass DevWS's cross-account protection. The WinGet 1.12.0 schema defines
 `elevatesSelf` for installers that contain their own elevation logic and says WinGet will not
 elevate the installer itself.
 
-The earlier local-manifest experiment showed that ID-based uninstall may not
-correlate until the package is in the catalog; name-based uninstall worked. Do not
-re-investigate that local-manifest limitation here. Verify ID-based install and
-uninstall after catalog acceptance.
+That same behavior is why the template is blocked. WinGet validates installation from a
+standard, non-elevated context and treats a UAC prompt that blocks progress as a failure. The
+setup's own `runas` request is exactly such a prompt. `elevationRequired` is not an acceptable
+workaround because WinGet would initiate the elevation without DevWS's `--caller-sid`
+handshake; a standard user who supplies a different administrator account would install for
+that administrator.
 
 ## Validation reference
 
-The published pre-release is suitable for local manifest validation, but it is not
-the final package:
+The published pre-release is suitable for local manifest schema validation, but it is not
+the final package and schema success is not WinGet acceptance:
 
 - URL: `https://github.com/ekinokss/DevWS/releases/download/v0.2.0-rc.1/DevWS-Setup.exe`
 - SHA-256: `0ddd867691c21be57d98693bfef42d13672db485e36f493d78ceab8558a691f7`
@@ -121,7 +129,9 @@ manifest.
 
 ## Final publication values
 
-Replace or add these values when the final `v0.2.0` release exists:
+These values are retained for a future submission only after the elevation model can satisfy
+WinGet's unattended validation without losing caller identity. **Do not apply them to the
+v0.2.0 release.**
 
 | Value | Required action |
 | --- | --- |
@@ -144,47 +154,41 @@ Local validation on 2026-10-27:
   `InstallerType: exe`, the RC URL, and the real RC SHA-256.
 - The published RC installer was downloaded separately and its SHA-256 matched
   `0ddd8676…`.
-- Only the silent-switch warning below remains.
+
+The only schema warning is the missing explicit silent switch. Schema validation does not
+exercise installation, elevation, or WinGet's automated validation pipeline.
 
 ## Silent-install policy
 
-The community repository expects the installer to complete without
-application-level user interaction. The DevWS setup already has a no-argument,
-non-interactive install path after OS elevation; it has no application prompts.
-It does not expose a `/silent` switch.
-
-`winget validate` therefore warns:
+The community repository expects the installer to complete without user interaction. After
+elevation, the DevWS setup has no application-level prompts, but the required Windows UAC
+prompt is itself blocking interaction. The validator therefore warns:
 
 ```text
 Silent and SilentWithProgress switches are not specified for InstallerType exe.
 Please make sure the installer can run unattended.
 ```
 
-Do not add a fake switch. If repository validation or review requires an explicit
-silent argument, the smallest future correction is to add a harmless `/silent`
-accepted by the bootstrapper in a separate authorized product change. That change
-is not part of this preparation.
+Do not add a fake `/silent` switch to silence this warning. A switch cannot suppress UAC,
+cannot grant administrator rights, and would not resolve the documented unattended-installation
+conflict. The template remains blocked until the installation model changes.
 
-## Submission checklist
+## Submission disposition
 
-1. **Publish the final `v0.2.0` release asset** using the approved signed or
-   unsigned release pipeline.
-2. **Update the manifest** with the final URL, final SHA-256, and any release
-   date/notes values.
-3. **Validate:** run `winget validate --manifest` on the complete directory and
-   `winget show --manifest` to confirm identity, scope, elevation, and hash.
-4. **Run one targeted final integration test** with the final asset. The outer
-   WinGet → DevWS → nested AutoHotkey acquisition flow is still unproven because
-   the previous attempt was interrupted by SmartScreen before DevWS executed. Do
-   not claim it passed.
-5. **Fork `microsoft/winget-pkgs` and create a PR** containing only the three
-   manifest files under `manifests/e/ekinokss/DevWS/0.2.0`. Do not include this
-   README or any non-manifest file.
-6. **Monitor Microsoft's automated validation** and address labels/errors.
-   The known silent-switch warning may require maintainer confirmation or a
-   future explicit switch.
-7. **After catalog acceptance**, test `winget install ekinokss.DevWS` and
-   `winget uninstall ekinokss.DevWS` using the catalog package, including
-   ID-based correlation and configuration preservation.
+**Do not fork `microsoft/winget-pkgs` or open a submission PR for v0.2.0.**
+
+The following steps apply only if a future, separately authorized installer design can
+complete WinGet validation without losing the caller-SID guarantee:
+
+1. Publish the applicable GitHub release asset.
+2. Update the manifest with the final URL, final SHA-256, and any release date/notes values.
+3. Run `winget validate --manifest` and `winget show --manifest` on the complete directory.
+4. Run a targeted integration test, including the outer WinGet → DevWS → nested AutoHotkey
+   acquisition path. The prior attempt was interrupted by SmartScreen before DevWS executed,
+   so that flow is unproven and must not be claimed as passed.
+5. Fork `microsoft/winget-pkgs` and submit only the three manifest files under
+   `manifests/e/ekinokss/DevWS/0.2.0`.
+6. Monitor Microsoft's automated validation and address labels/errors.
+7. After catalog acceptance, test ID-based install/uninstall and configuration preservation.
 
 No fork, PR, release, tag, or WinGet submission was created in this preparation.

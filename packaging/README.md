@@ -1,8 +1,9 @@
 # DevWS Setup Bootstrapper and Release Candidate
 
 This directory contains the source for the Windows x64 setup lifecycle used to build the
-public `v0.2.0-rc.1` pre-release. The setup executable is published only through the
-official GitHub pre-release, not from this directory.
+public `v0.2.0-rc.1` pre-release and the prepared stable unsigned `v0.2.0` GitHub release.
+The setup executable is published only through official GitHub Releases, not from this
+directory.
 
 The bootstrapper embeds the tracked DevWS installation payload and invokes the accepted
 Phase-1 contracts:
@@ -44,9 +45,11 @@ reparse paths, removes only the lifecycle directory and staging, and does not re
 reboot. Registry values are discovery/ARP state only and are never used as execution
 authority.
 
-There is no MSI/MSIX, no Windows Installer product code, no service, no scheduled task, no
-self-update, and no WinGet package in this phase. Package-mode setup can acquire the
-machine-wide AutoHotkey v2 prerequisite through the registered WinGet package.
+There is no MSI/MSIX, no Windows Installer product code, no service or scheduled task owned by
+the setup itself, no self-update, and no WinGet catalog package. A WinGet submission template
+exists under `packaging/winget`, but it is blocked by WinGet's unattended-elevation validation
+and is not submitted. Package-mode setup can acquire the machine-wide AutoHotkey v2
+prerequisite through the registered WinGet package.
 
 ## AutoHotkey prerequisite acquisition
 
@@ -61,7 +64,7 @@ hash before execution. The existing resolver is then run again before any DevWS 
 
 A current-user-only AutoHotkey installation is never used as elevated executable authority
 and is never removed. DevWS uninstall never uninstalls AutoHotkey because it may be shared by
-other applications. The final WinGet manifest must not declare `AutoHotkey.AutoHotkey` as a
+other applications. A future WinGet manifest must not declare `AutoHotkey.AutoHotkey` as a
 package dependency: that dependency can install a per-user copy, while the setup itself is
 responsible for the machine-wide prerequisite.
 
@@ -73,7 +76,8 @@ responsible for the machine-wide prerequisite.
 - PowerShell 7 on the target machine (machine-wide Program Files or official Microsoft
   PowerShell MSIX)
 - WinGet/App Installer on the target machine only when AutoHotkey v2 must be acquired
-  machine-wide; an existing trusted machine-wide installation avoids WinGet
+  machine-wide; an existing trusted machine-wide installation avoids WinGet. WinGet is not
+  currently a distribution channel for DevWS itself.
 - AutoHotkey v2 for all users on the target machine (acquired by package mode when absent)
 
 The generated executable is Native AOT and self-contained. It requires no separately
@@ -100,7 +104,7 @@ config/**
 
 Generated output is written outside the repository by default. The script prints the source
 commit, SDK version, artifact path, size and SHA-256. It does not publish the artifact,
-create a WinGet manifest, or attach anything to a GitHub Release.
+create a WinGet submission, or attach anything to a GitHub Release.
 
 For a local toolchain outside `PATH`:
 
@@ -139,7 +143,7 @@ source bytes.
 
 The verified bundle is retained only as a GitHub Actions artifact on a manually dispatched
 run of the bootstrapper workflow. Ordinary feature-branch pushes run the fixture lifecycle
-only and do not upload a production candidate. No GitHub Release, tag, WinGet manifest,
+only and do not upload a production candidate. No GitHub Release, tag, WinGet submission,
 attestation or binary publication is produced by this pipeline.
 
 The candidate is unsigned by default; Authenticode status is reported by the verifier and
@@ -183,6 +187,11 @@ The prepared three-file package manifest and the finalization/submission checkli
 updated after publication. The public `v0.2.0-rc.1` binary is used only as a local
 validation reference, not as the final package.
 
+**The template is not submitted and is not ready for submission.** WinGet's unattended
+validation runs the installer without elevation and rejects blocking UAC prompts. DevWS
+requires same-account administrator elevation, and WinGet-managed elevation would bypass the
+caller-SID check by pre-elevating the process. No WinGet catalog package exists for DevWS.
+
 ## Fixture acceptance
 
 Run from an elevated PowerShell 7 (the fixture exercises the real protected staging and
@@ -208,10 +217,12 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
 - No self-update.
 - Package-mode setup may acquire AutoHotkey v2 for all users through the registered WinGet
   package. It never uses or removes a current-user-only AutoHotkey installation.
-- No MSI/MSIX or Windows Installer product codes, and no WinGet package. The unsigned
-  `v0.2.0-rc.1` setup pre-release is public; the final v0.2.0 release is not.
+- No MSI/MSIX or Windows Installer product codes, and no WinGet catalog package. The unsigned
+  `v0.2.0-rc.1` setup pre-release is public; the stable unsigned `v0.2.0` GitHub release is
+  prepared for publication.
 - The release-candidate Actions artifact is retained for verification. The public
-  `v0.2.0-rc.1` pre-release is the published binary; the final v0.2.0 release is not.
+  `v0.2.0-rc.1` pre-release is the published binary; the stable `v0.2.0` release is not yet
+  published.
 
 ## Security boundaries
 

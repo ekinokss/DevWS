@@ -36574,9 +36574,19 @@ exit 0
 
         $readme = Get-SourceOf "README.md"
         Assert-Contains $readme 'https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1' "the public README links the published pre-release"
+        Assert-Contains $readme 'stable **v0.2.0** GitHub release' "the public README names the stable release target"
+        Assert-Contains $readme 'No WinGet catalog package exists' "the public README states that no WinGet catalog package exists"
+        Assert-Contains $readme 'different administrator account is intentionally rejected' "the public README documents same-account elevation"
         Assert-Contains $readme 'CODE_SIGNING_POLICY.md' "the public README links the code signing policy"
         Assert-Contains $readme 'PRIVACY.md' "the public README links the privacy information"
         Assert-NotContains $readme 'There is no installer package' "the stale no-installer claim is gone"
+
+        $signing = Get-SourceOf "CODE_SIGNING_POLICY.md"
+        Assert-Contains $signing 'Current status: unsigned' "the signing policy states the current unsigned status"
+        Assert-Contains $signing 'not currently a SignPath Foundation participant' "the signing policy does not imply current SignPath participation"
+        Assert-Contains $signing 'does not receive free SignPath signing' "the signing policy is explicit about no free signing"
+        Assert-Contains $signing 'Optional future signing' "the signing policy preserves optional future controls"
+        Assert-NotContains $signing 'Free code signing provided by [SignPath.io]' "the stale current-signing claim is gone"
 
         $packagingFiles = @(Get-ChildItem -LiteralPath (Join-Path $RepoRoot 'packaging') -Recurse -File -Force)
         foreach ($file in $packagingFiles) {
@@ -36728,15 +36738,19 @@ exit 0
         Assert-Contains $packagingReadme 'same-version reinstall/repair' "the Phase-3 scope correction is documented"
         Assert-Contains $packagingReadme 'Release-candidate bundle' "the release-candidate pipeline is documented"
         Assert-Contains $packagingReadme 'git cat-file' "the commit-derived LICENSE provenance is documented"
+        Assert-Contains $packagingReadme 'not ready for submission' "the packaging guide records the blocked WinGet submission"
         Assert-NotContains $packagingReadme 'No setup uninstall, repair, upgrade, Add/Remove Programs registration' "the stale Phase-2 scope claim is gone"
 
         $installerDoc = Get-SourceOf "docs\installer.md"
         Assert-NotContains $installerDoc 'At this phase there is **no `DevWS-Setup.exe`' "the stale no-setup claim is gone"
         Assert-NotContains $installerDoc 'provide an uninstall/repair/Add-Remove-Programs lifecycle' "the stale no-lifecycle claim is gone"
-        Assert-Contains $installerDoc 'EXISTS IN THE PUBLIC v0.2.0-rc.1 PRE-RELEASE' "the published setup pre-release is documented"
-        Assert-Contains $installerDoc 'NOT PUBLICLY RELEASED YET' "the public-release boundary is documented"
+        Assert-Contains $installerDoc 'PUBLIC v0.2.0-rc.1 PRE-RELEASE' "the published setup pre-release is documented"
+        Assert-Contains $installerDoc 'PREPARED STABLE v0.2.0 GITHUB RELEASE' "the prepared stable release is documented"
+        Assert-Contains $installerDoc 'NOT PUBLISHED OR NOT AVAILABLE' "the public-release boundary is documented"
         Assert-Contains $installerDoc 'NOT IMPLEMENTED' "the unimplemented installer scope is documented"
         Assert-Contains $installerDoc 'currently published v0.1.0 remains source-only' "the public release truth is preserved"
+        Assert-Contains $installerDoc 'different Windows account' "the setup docs preserve same-account elevation"
+        Assert-Contains $installerDoc 'WinGet template is blocked' "the setup docs record the blocked WinGet template"
 
         $workflow = Get-SourceOf ".github\workflows\bootstrapper-ci.yml"
         Assert-Contains $workflow 'release-candidate:' "the workflow contains a production release-candidate job"
@@ -37037,6 +37051,9 @@ exit 0
 
         $readme = Get-SourceOf "packaging\winget\README.md"
         Assert-Contains $readme 'microsoft/winget-pkgs' "README documents the submission target"
+        Assert-Contains $readme 'Current disposition: blocked' "README records that submission is blocked"
+        Assert-Contains $readme 'Do not submit this template for the v0.2.0 release' "README blocks the v0.2.0 submission"
+        Assert-Contains $readme 'No WinGet catalog package' "README states that no catalog package exists"
         Assert-Contains $readme 'RequireSameElevatedSid' "README documents DevWS caller-SID enforcement"
         Assert-Contains $readme 'different administrator account' "README documents cross-account elevation rejection"
     }

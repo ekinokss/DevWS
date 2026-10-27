@@ -37,8 +37,8 @@ through into the nine-step install/update flow, and cannot be combined with `-Re
 
 ### Package integration contract
 
-`install.ps1 -PackageMode` is the stable non-interactive contract for a future external
-package/bootstrap layer. It performs the ordinary install/idempotent-update path:
+`install.ps1 -PackageMode` is the stable non-interactive contract for the DevWS setup
+bootstrapper. It performs the ordinary install/idempotent-update path:
 package-mode machine-wide AutoHotkey acquisition when needed, prerequisite validation,
 elevation, configuration preservation/migration, the existing nine-step installer and the
 mandatory health check. It has no separate installation implementation and never resets a
@@ -58,8 +58,9 @@ with `-Purge` or `-Force`, before any machine mutation.
 
 Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
 unchanged. The v0.2 source and the public `v0.2.0-rc.1` pre-release contain a
-`DevWS-Setup.exe` build. The setup asset is publicly available as an unsigned pre-release;
-no WinGet manifest or WinGet package exists. This contract fixes the arguments,
+`DevWS-Setup.exe` build. The unsigned stable `v0.2.0` GitHub release is prepared for
+publication. A WinGet submission template exists under `packaging/winget`, but no WinGet
+catalog package exists and the template is not submitted. This contract fixes the arguments,
 non-interactive behavior and exit status the setup wrapper uses. Exit code `0` means the
 requested package-mode operation completed; any nonzero exit means it did not.
 
@@ -76,8 +77,16 @@ and a protected persisted setup; see the lifecycle section below. The current bu
 x64-only.
 
 The unsigned Windows x64 setup is published as the `v0.2.0-rc.1` GitHub pre-release. The
-final v0.2.0 release and the WinGet package are not published. See
-[`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
+stable unsigned `v0.2.0` GitHub release is prepared for publication. No WinGet catalog
+package is available; the prepared WinGet template is blocked by WinGet's unattended
+validation and is not submitted. See [`packaging/README.md`](../packaging/README.md) for
+build and fixture-test instructions.
+
+The setup requests elevation itself. It captures the caller SID before elevation and the
+elevated child rejects any different Windows account before staging or changing anything.
+UAC elevation using another administrator account is therefore intentionally rejected.
+Running setup from an already-elevated process installs for that elevated account; the setup
+does not claim a different interactive caller in that case.
 
 ### v0.2 package lifecycle
 
@@ -98,8 +107,9 @@ as executable authority.
 protected post-exit helper to remove the per-SID setup directory without a reboot. Package
 uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` and unrelated
 resources exactly as the frozen Phase-1 contract requires. The unsigned v0.2.0-rc.1 setup is
-publicly available as a pre-release; the final v0.2.0 release and the WinGet package are not
-published. Self-update and MSI/MSIX/Windows Installer identity are not implemented.
+publicly available as a pre-release; the stable unsigned v0.2.0 GitHub release is prepared for
+publication. No WinGet catalog package is available. Self-update and MSI/MSIX/Windows
+Installer identity are not implemented.
 
 ### Release-candidate artifact pipeline
 
@@ -113,12 +123,13 @@ A manually dispatched bootstrapper workflow validates and retains this candidate
 artifact for 30 days, then downloads and re-verifies the exact artifact in a separate job.
 Normal feature-branch pushes run only fixture lifecycle validation. The candidate is unsigned
 and no Native AOT reproducibility is claimed. The workflow produced the unsigned
-`v0.2.0-rc.1` pre-release; the final v0.2.0 release, Windows Installer identity, attestation
-and WinGet package are not published.
+`v0.2.0-rc.1` pre-release and prepares the stable unsigned `v0.2.0` GitHub candidate. No
+`v0.2.0` GitHub Release, Windows Installer identity, attestation or WinGet catalog package is
+published.
 
 ### Release state
 
-**EXISTS IN THE PUBLIC v0.2.0-rc.1 PRE-RELEASE:**
+**PUBLIC v0.2.0-rc.1 PRE-RELEASE:**
 
 - `DevWS-Setup.exe` build
 - install
@@ -130,11 +141,19 @@ and WinGet package are not published.
 - protected persisted setup
 - release-candidate Actions artifact pipeline
 
-**NOT PUBLICLY RELEASED YET:**
+**PREPARED STABLE v0.2.0 GITHUB RELEASE:**
 
-- final v0.2.0 tag/release
-- final signed v0.2.0 installer
-- WinGet package
+- unsigned Windows 11 x64 GitHub release bundle
+- the same install, reinstall/repair, upgrade, downgrade-refusal, HKCU ARP, package-uninstall
+  and persisted-setup behavior accepted for the v0.2 line
+- commit-bound release-candidate artifact and downloaded-artifact verification
+
+**NOT PUBLISHED OR NOT AVAILABLE:**
+
+- `v0.2.0` tag and GitHub Release (publication requires supervisory authorization)
+- signed `v0.2.0` installer
+- WinGet catalog package: the submission template is prepared but blocked by WinGet's
+  unattended-elevation validation and is not submitted
 
 **NOT IMPLEMENTED:**
 
@@ -142,7 +161,8 @@ and WinGet package are not published.
 - MSI/MSIX or Windows Installer identity
 
 The currently published v0.1.0 remains source-only. The unsigned
-`v0.2.0-rc.1` pre-release is the current public binary.
+`v0.2.0-rc.1` pre-release is the current public binary; the stable unsigned `v0.2.0` GitHub
+release is prepared for publication.
 
 ## 2. Prerequisites
 

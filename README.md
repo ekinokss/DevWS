@@ -10,13 +10,15 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-1.0, with a public binary pre-release.**
+> **Status: pre-1.0, with an unsigned stable Windows binary target.**
 >
 > The current public binary is **v0.2.0-rc.1**, an unsigned Windows x64 setup:
 > [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
-> The final v0.2.0 release is not yet published, and WinGet catalog distribution is pending.
-> Verify the published SHA-256 before running the installer. The frozen v0.1.0 source release
-> remains available, and source installation remains supported.
+> The stable **v0.2.0** GitHub release is the next publication target. At the time of this
+> preparation commit it is not yet published. No WinGet catalog package exists; the prepared
+> WinGet submission is blocked by the installer's same-account elevation requirement. Verify
+> the published SHA-256 before running the installer. The frozen v0.1.0 source release remains
+> available, and source installation remains supported.
 >
 > [Code signing policy](CODE_SIGNING_POLICY.md) · [Privacy information](PRIVACY.md)
 
@@ -93,8 +95,8 @@ topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall a
 | **PowerShell 7+** | Required to run the CLI and the installer. Windows PowerShell 5.1 is not sufficient. |
 | **Windows Terminal** | A genuine packaged **stable** Windows Terminal installation. DevWS resolves it through the official package identity and refuses to launch an untrusted executable. No minimum Windows Terminal version is claimed. |
 | **AutoHotkey v2** | Required for global hotkeys and for the window focus/close helpers. It must be installed **for all users** under an administrator-protected Program Files location; a current-user-only installation is not accepted for installed DevWS because elevated operations launch AutoHotkey from High-integrity workers. The packaged setup can acquire a machine-wide AutoHotkey v2 installation through WinGet when it is missing; a source installation does not. |
-| **Administrator rights for installation** | The installer creates or updates DevWS-managed scheduled tasks and writes to a protected location. Normal `ws` commands do **not** require elevation. |
-| **WinGet** | Required only when the packaged setup must acquire the machine-wide AutoHotkey v2 prerequisite. If AutoHotkey v2 is already installed for all users, WinGet is not used. |
+| **Administrator rights for installation** | The installer creates or updates DevWS-managed scheduled tasks and writes to a protected location. Installation and removal must be elevated under the same Windows account that starts setup; UAC elevation using a different administrator account is intentionally rejected. Normal `ws` commands do **not** require elevation. |
+| **WinGet** | Required only when the packaged setup must acquire the machine-wide AutoHotkey v2 prerequisite. If AutoHotkey v2 is already installed for all users, WinGet is not used. DevWS itself is not currently distributed through WinGet. |
 
 DevWS source installation never installs third-party software. The packaged setup can
 acquire AutoHotkey v2 for all users through WinGet; it does not use or remove a
@@ -104,16 +106,20 @@ any DevWS change and reports what is missing.
 
 ## Installing
 
-### Packaged Windows pre-release
+### Packaged Windows release
 
-The public `v0.2.0-rc.1` pre-release provides `DevWS-Setup.exe` for Windows 11 x64:
-[GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
+The packaged Windows release is an unsigned Windows 11 x64 setup published on
+[GitHub Releases](https://github.com/ekinokss/DevWS/releases). The current public binary is
+the `v0.2.0-rc.1` pre-release; at the time of this preparation commit, the stable `v0.2.0`
+release is the next publication target. No WinGet catalog package is available, and
+`winget install` is not a supported installation path.
 
-The executable is unsigned and may trigger Microsoft Defender SmartScreen. Download it only
-from the official release and verify the published SHA-256 before approving an unfamiliar
-executable warning. Installation requires administrator elevation. The packaged setup can
-acquire a trusted machine-wide AutoHotkey v2 installation through WinGet when it is missing.
-WinGet catalog distribution is planned but not yet available.
+Download `DevWS-Setup.exe` only from the official release and verify the published SHA-256
+before approving an unfamiliar executable warning. The executable is unsigned and may trigger
+Microsoft Defender SmartScreen. Installation requires administrator elevation under the same
+Windows account that starts setup; UAC elevation using a different administrator account is
+intentionally rejected. The packaged setup can acquire a trusted machine-wide AutoHotkey v2
+installation through WinGet when it is missing, which requires network connectivity.
 
 See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
 
