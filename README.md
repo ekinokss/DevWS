@@ -124,6 +124,30 @@ installation through WinGet when it is missing, which requires network connectiv
 
 See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
 
+### Scoop
+
+DevWS is available from the first-party Scoop bucket. Run Scoop from an **elevated
+PowerShell** session under the same Windows account that should own DevWS:
+
+```powershell
+scoop bucket add ekinokss https://github.com/ekinokss/scoop-bucket
+scoop install ekinokss/devws
+```
+
+Update and uninstall:
+
+```powershell
+scoop update devws
+scoop uninstall devws
+```
+
+`scoop bucket add` requires Git; run `scoop install git` first if needed. The bucket uses the
+official `v0.2.0` GitHub Release asset and SHA-256. DevWS remains unsigned, and Microsoft
+Defender SmartScreen may warn about the downloaded executable; verify the published SHA-256.
+The official `ekinokss/scoop-bucket` is a first-party bucket and is distinct from the
+`ScoopInstaller/Nonportable` community bucket. DevWS is not currently available in
+Nonportable.
+
 ### From source
 
 Start from a fresh clone or a source archive. From a clone:

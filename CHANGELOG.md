@@ -50,6 +50,9 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Installation requires administrator elevation under the same Windows account that starts
   setup. UAC elevation using a different administrator account is intentionally rejected.
 - Download only from official GitHub Releases and verify the published SHA-256.
+- A first-party Scoop bucket is available at https://github.com/ekinokss/scoop-bucket. It is
+  distinct from the `ScoopInstaller/Nonportable` community bucket and requires an elevated
+  Scoop session under the same Windows account.
 - AutoHotkey v2 is acquired machine-wide through WinGet when a trusted all-users installation
   is absent; this requires network connectivity and the documented prerequisites.
 - No WinGet catalog package is currently available. The prepared WinGet template is blocked by
