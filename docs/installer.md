@@ -58,9 +58,9 @@ with `-Purge` or `-Force`, before any machine mutation.
 
 Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
 unchanged. The v0.2 source and the public `v0.2.0-rc.1` pre-release contain a
-`DevWS-Setup.exe` build. The unsigned stable `v0.2.0` GitHub release is prepared for
-publication. A WinGet submission template exists under `packaging/winget`, but no WinGet
-catalog package exists and the template is not submitted. This contract fixes the arguments,
+`DevWS-Setup.exe` build. The unsigned stable `v0.2.0` GitHub release is published. A WinGet
+submission template exists under `packaging/winget`, but no WinGet catalog package exists and
+the template is not submitted. This contract fixes the arguments,
 non-interactive behavior and exit status the setup wrapper uses. Exit code `0` means the
 requested package-mode operation completed; any nonzero exit means it did not.
 
@@ -76,11 +76,11 @@ downgrade refusal, HKCU Add/Remove Programs registration, setup-driven package u
 and a protected persisted setup; see the lifecycle section below. The current build is
 x64-only.
 
-The unsigned Windows x64 setup is published as the `v0.2.0-rc.1` GitHub pre-release. The
-stable unsigned `v0.2.0` GitHub release is prepared for publication. No WinGet catalog
-package is available; the prepared WinGet template is blocked by WinGet's unattended
-validation and is not submitted. See [`packaging/README.md`](../packaging/README.md) for
-build and fixture-test instructions.
+The unsigned Windows x64 setup is published as the stable `v0.2.0` GitHub release:
+https://github.com/ekinokss/DevWS/releases/tag/v0.2.0. The `v0.2.0-rc.1` pre-release remains
+available. No WinGet catalog package is available; the prepared WinGet template is blocked by
+WinGet's unattended validation and is not submitted. See
+[`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
 
 The setup requests elevation itself. It captures the caller SID before elevation and the
 elevated child rejects any different Windows account before staging or changing anything.
@@ -106,10 +106,10 @@ as executable authority.
 `--uninstall` runs the ordinary package-mode uninstall, removes the ARP entry, then uses a
 protected post-exit helper to remove the per-SID setup directory without a reboot. Package
 uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` and unrelated
-resources exactly as the frozen Phase-1 contract requires. The unsigned v0.2.0-rc.1 setup is
-publicly available as a pre-release; the stable unsigned v0.2.0 GitHub release is prepared for
-publication. No WinGet catalog package is available. Self-update and MSI/MSIX/Windows
-Installer identity are not implemented.
+resources exactly as the frozen Phase-1 contract requires. The unsigned v0.2.0 setup is
+publicly available as the stable GitHub release; the v0.2.0-rc.1 pre-release remains
+available. No WinGet catalog package is available. Self-update and MSI/MSIX/Windows Installer
+identity are not implemented.
 
 ### Release-candidate artifact pipeline
 
@@ -141,7 +141,7 @@ published.
 - protected persisted setup
 - release-candidate Actions artifact pipeline
 
-**PREPARED STABLE v0.2.0 GITHUB RELEASE:**
+**PREPARED STABLE v0.2.0 GITHUB RELEASE (PUBLISHED):**
 
 - unsigned Windows 11 x64 GitHub release bundle
 - the same install, reinstall/repair, upgrade, downgrade-refusal, HKCU ARP, package-uninstall
@@ -150,7 +150,6 @@ published.
 
 **NOT PUBLISHED OR NOT AVAILABLE:**
 
-- `v0.2.0` tag and GitHub Release (publication requires supervisory authorization)
 - signed `v0.2.0` installer
 - WinGet catalog package: the submission template is prepared but blocked by WinGet's
   unattended-elevation validation and is not submitted
@@ -160,9 +159,8 @@ published.
 - self-update
 - MSI/MSIX or Windows Installer identity
 
-The currently published v0.1.0 remains source-only. The unsigned
-`v0.2.0-rc.1` pre-release is the current public binary; the stable unsigned `v0.2.0` GitHub
-release is prepared for publication.
+The currently published v0.1.0 remains source-only. The unsigned `v0.2.0` GitHub release is
+the current stable public binary; the `v0.2.0-rc.1` pre-release remains available.
 
 ## 2. Prerequisites
 

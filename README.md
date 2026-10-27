@@ -10,15 +10,16 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-1.0, with an unsigned stable Windows binary target.**
+> **Status: pre-1.0, with an unsigned stable Windows binary release.**
 >
-> The current public binary is **v0.2.0-rc.1**, an unsigned Windows x64 setup:
+> The current stable binary is **v0.2.0**, an unsigned Windows x64 setup:
+> [GitHub stable release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0).
+> The earlier `v0.2.0-rc.1` pre-release remains available:
 > [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
-> The stable **v0.2.0** GitHub release is the next publication target. At the time of this
-> preparation commit it is not yet published. No WinGet catalog package exists; the prepared
-> WinGet submission is blocked by the installer's same-account elevation requirement. Verify
-> the published SHA-256 before running the installer. The frozen v0.1.0 source release remains
-> available, and source installation remains supported.
+> The stable **v0.2.0** GitHub release is published. No WinGet catalog package exists; the
+> prepared WinGet submission is blocked by the installer's same-account elevation requirement.
+> Verify the published SHA-256 before running the installer. The frozen v0.1.0 source release
+> remains available, and source installation remains supported.
 >
 > [Code signing policy](CODE_SIGNING_POLICY.md) · [Privacy information](PRIVACY.md)
 
@@ -109,10 +110,10 @@ any DevWS change and reports what is missing.
 ### Packaged Windows release
 
 The packaged Windows release is an unsigned Windows 11 x64 setup published on
-[GitHub Releases](https://github.com/ekinokss/DevWS/releases). The current public binary is
-the `v0.2.0-rc.1` pre-release; at the time of this preparation commit, the stable `v0.2.0`
-release is the next publication target. No WinGet catalog package is available, and
-`winget install` is not a supported installation path.
+[GitHub Releases](https://github.com/ekinokss/DevWS/releases). The current stable binary is
+`v0.2.0`: [GitHub stable release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0).
+The earlier `v0.2.0-rc.1` pre-release remains available. No WinGet catalog package is
+available, and `winget install` is not a supported installation path.
 
 Download `DevWS-Setup.exe` only from the official release and verify the published SHA-256
 before approving an unfamiliar executable warning. The executable is unsigned and may trigger

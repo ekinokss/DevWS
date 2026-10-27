@@ -14,8 +14,8 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `uninstall.ps1 -PackageMode` performs the ordinary default uninstall non-interactively and
   preserves configuration and state. Package mode does not self-elevate, never resets or
   purges, and rejects destructive or alternate-mode combinations before mutation. The setup
-  executable is distributed as the `v0.2.0-rc.1` pre-release. The unsigned stable `v0.2.0`
-  GitHub release is prepared for publication; no WinGet catalog package exists.
+  executable is distributed as the `v0.2.0-rc.1` pre-release and the published stable
+  `v0.2.0` GitHub release; no WinGet catalog package exists.
 - **Package-mode AutoHotkey acquisition** — `install.ps1 -PackageMode` now reuses an existing
   trusted machine-wide AutoHotkey v2 installation or acquires one through the registered
   WinGet/App Installer package with an explicit machine scope and protected machine install
@@ -39,13 +39,14 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   independent verification and privacy/path checks. Manual bootstrapper runs retain the
   verified candidate as a 30-day GitHub Actions artifact and re-verify the downloaded copy.
   The unsigned `v0.2.0-rc.1` pre-release was produced from this pipeline. The stable unsigned
-  `v0.2.0` GitHub release is prepared from the same pipeline; no `v0.2.0` tag/release,
-  attestation or WinGet catalog package is published.
+  `v0.2.0` GitHub release was published from the same pipeline on 2026-10-27; no attestation
+  or WinGet catalog package is published.
 
 ### Distribution
 
-- The stable release target is an unsigned Windows 11 x64 GitHub release. The executable is
-  not Authenticode-signed and may trigger Microsoft Defender SmartScreen.
+- The stable release is an unsigned Windows 11 x64 GitHub release, published on 2026-10-27 at
+  https://github.com/ekinokss/DevWS/releases/tag/v0.2.0. The executable is not
+  Authenticode-signed and may trigger Microsoft Defender SmartScreen.
 - Installation requires administrator elevation under the same Windows account that starts
   setup. UAC elevation using a different administrator account is intentionally rejected.
 - Download only from official GitHub Releases and verify the published SHA-256.

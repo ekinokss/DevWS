@@ -9,7 +9,7 @@ Optional future signing, if accepted, would be provided by [SignPath.io](https:/
 - Project: **DevWS**
 - Source repository: https://github.com/ekinokss/DevWS
 - Public pre-release: https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1
-- Stable release target: unsigned `v0.2.0` GitHub release (prepared; not yet published)
+- Published stable release: https://github.com/ekinokss/DevWS/releases/tag/v0.2.0 (unsigned)
 - License: [MIT](LICENSE)
 - Platform: Windows 11 x64
 

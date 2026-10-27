@@ -1,7 +1,7 @@
 # DevWS Setup Bootstrapper and Release Candidate
 
 This directory contains the source for the Windows x64 setup lifecycle used to build the
-public `v0.2.0-rc.1` pre-release and the prepared stable unsigned `v0.2.0` GitHub release.
+public `v0.2.0-rc.1` pre-release and the published stable unsigned `v0.2.0` GitHub release.
 The setup executable is published only through official GitHub Releases, not from this
 directory.
 
@@ -218,11 +218,9 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
 - Package-mode setup may acquire AutoHotkey v2 for all users through the registered WinGet
   package. It never uses or removes a current-user-only AutoHotkey installation.
 - No MSI/MSIX or Windows Installer product codes, and no WinGet catalog package. The unsigned
-  `v0.2.0-rc.1` setup pre-release is public; the stable unsigned `v0.2.0` GitHub release is
-  prepared for publication.
-- The release-candidate Actions artifact is retained for verification. The public
-  `v0.2.0-rc.1` pre-release is the published binary; the stable `v0.2.0` release is not yet
-  published.
+  `v0.2.0-rc.1` setup pre-release and the stable `v0.2.0` GitHub release are public.
+- The release-candidate Actions artifact is retained for verification. The stable `v0.2.0`
+  release is the current published binary; the `v0.2.0-rc.1` pre-release remains available.
 
 ## Security boundaries
 
