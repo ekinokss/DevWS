@@ -34,7 +34,7 @@ packaging/winget/manifests/e/ekinokss/DevWS/0.2.0/
 - `InstallerType: exe`
 - `Architecture: x64`
 - `Scope: user` (HKCU Add/Remove Programs registration)
-- `ElevationRequirement: elevationRequired` (protected runtime and scheduled tasks)
+- `ElevationRequirement: elevatesSelf` (the setup handles its own UAC request; WinGet must not pre-elevate it)
 - `UpgradeBehavior: install` (in-place update/repair, downgrade refusal)
 - `ProductCode: ekinokss.DevWS` (same value at installer and ARP correlation level)
 - `DisplayName: DevWS`, `Publisher: ekinokss`
@@ -67,6 +67,19 @@ It records:
 
 The manifest uses `ProductCode: ekinokss.DevWS` and `Scope: user` to match this
 registration. No MSI product code or machine-wide ARP registration is invented.
+
+## Elevation and caller identity
+
+`ElevationRequirement: elevatesSelf` is intentional. WinGet must start the setup as the
+interactive caller, not pre-elevate it. The setup captures the caller SID, requests `runas`
+itself, and `UserIdentity.RequireSameElevatedSid()` requires the elevated process to have the
+same SID. If UAC selects a different administrator account, the elevated process rejects the
+operation and nothing is changed.
+
+Do not change this to `elevationRequired`: pre-elevation would hide the original caller
+identity and bypass DevWS's cross-account protection. The WinGet 1.12.0 schema defines
+`elevatesSelf` for installers that contain their own elevation logic and says WinGet will not
+elevate the installer itself.
 
 The earlier local-manifest experiment showed that ID-based uninstall may not
 correlate until the package is in the catalog; name-based uninstall worked. Do not

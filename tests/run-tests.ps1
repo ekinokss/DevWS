@@ -36586,7 +36586,10 @@ exit 0
 
         $trackedPackaging = @(& git -C $RepoRoot ls-files -- packaging)
         Assert-True (@($trackedPackaging | Where-Object { $_ -match '(?i)\.(exe|zip|pdb|dbg)$|/(bin|obj)/' }).Count -eq 0) "no generated artifact is tracked"
-        Assert-True (@($trackedPackaging | Where-Object { $_ -match '(?i)winget|\.ya?ml$' }).Count -eq 0) "no WinGet manifest exists under packaging"
+        $trackedWinGet = @($trackedPackaging | Where-Object { $_ -match '(?i)^packaging[\\/]winget[\\/]' })
+        Assert-True ($trackedWinGet.Count -ge 4) "the prepared WinGet submission files are tracked"
+        $unexpectedYaml = @($trackedPackaging | Where-Object { $_ -match '(?i)\.ya?ml$' -and $_ -notmatch '(?i)^packaging[\\/]winget[\\/]' })
+        Assert-Equal 0 $unexpectedYaml.Count "no unexpected YAML files exist under packaging"
     }
 
     Test-Case "setup bootstrapper executes only the package-mode contract" {
@@ -37014,7 +37017,8 @@ exit 0
         Assert-Contains $installer 'InstallerType: exe' "manifest installer type"
         Assert-Contains $installer 'Architecture: x64' "manifest architecture"
         Assert-Contains $installer 'Scope: user' "manifest user scope matches HKCU ARP"
-        Assert-Contains $installer 'ElevationRequirement: elevationRequired' "manifest elevation requirement"
+        Assert-Contains $installer 'ElevationRequirement: elevatesSelf' "manifest leaves elevation to the DevWS setup"
+        Assert-NotContains $installer 'ElevationRequirement: elevationRequired' "manifest does not pre-elevate the setup"
         Assert-Contains $installer 'UpgradeBehavior: install' "manifest upgrade behavior"
         Assert-Contains $installer 'ProductCode: ekinokss.DevWS' "manifest ARP product-code correlation"
         Assert-Contains $installer 'DisplayName: DevWS' "manifest ARP display name"
@@ -37033,6 +37037,8 @@ exit 0
 
         $readme = Get-SourceOf "packaging\winget\README.md"
         Assert-Contains $readme 'microsoft/winget-pkgs' "README documents the submission target"
+        Assert-Contains $readme 'RequireSameElevatedSid' "README documents DevWS caller-SID enforcement"
+        Assert-Contains $readme 'different administrator account' "README documents cross-account elevation rejection"
     }
 
     Test-Case "trusted PowerShell and protected staging policy are explicit" {

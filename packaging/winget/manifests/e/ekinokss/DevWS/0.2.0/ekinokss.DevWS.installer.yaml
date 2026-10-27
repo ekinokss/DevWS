@@ -14,7 +14,7 @@ Installers:
     InstallerUrl: https://github.com/ekinokss/DevWS/releases/download/v0.2.0/DevWS-Setup.exe
     InstallerSha256: 0000000000000000000000000000000000000000000000000000000000000000
     Scope: user
-    ElevationRequirement: elevationRequired
+    ElevationRequirement: elevatesSelf
     ProductCode: ekinokss.DevWS
     AppsAndFeaturesEntries:
       - DisplayName: DevWS
