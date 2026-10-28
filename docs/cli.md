@@ -161,11 +161,12 @@ ws save --profile docked
 
 ### `ws show-layout [set]`
 
-Show the effective saved geometry for configured items (read-only).
+Show the effective saved geometry and relative-layout preview for configured items (read-only).
 
 - Shows the current topology fingerprint, the layout source (profile or fallback), and effective rectangles.
 - A sparse matched profile marks items that still fall back; unreachable rectangles are marked too.
-- Launch and terminal resets apply exactly these effective rectangles; there is no live monitor watcher or automatic retile.
+- Relative items also show their mode, monitor identity/instance, basis, normalized rectangle, resolved rectangle, and any fallback or missing/ambiguous/unavailable reason.
+- Relative placement is preview-only until Phase 3. Launch and terminal resets currently use absolute/profile geometry; there is no live monitor watcher or automatic retile.
 
 ```powershell
 ws show-layout

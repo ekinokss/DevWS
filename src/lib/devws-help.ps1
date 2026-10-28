@@ -175,8 +175,8 @@ function Get-DevWSHelpCommandInfo {
             Aliases  = @()
             Details  = @(
                 "Shows the current topology fingerprint, the layout source (profile or fallback), and effective rectangles.",
-                "A sparse matched profile marks items that still fall back; unreachable rectangles are marked too.",
-                "Launch and terminal resets apply exactly these effective rectangles; there is no live monitor watcher or automatic retile."
+                "Absolute and matched-profile items show lifecycle geometry; relative items also show mode, anchor, basis, normalized and resolved previews.",
+                "Relative previews are read-only and become operational in Phase 3. Launch and terminal resets currently use absolute/profile geometry; there is no live monitor watcher or automatic retile."
             )
             Examples = @("ws show-layout", "ws show-layout secondary")
             Warning  = $null

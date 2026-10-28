@@ -122,6 +122,7 @@ $script:TestGroupCatalog = [ordered]@{
     'layout-profiles'     = 'Topology layout profiles (Pass 5C)'
     'lifecycle-layouts'   = 'Lifecycle profile placement (Pass 5D)'
     'relative-layouts'    = 'Relative layout schema and pure model (v0.3 Phase 1)'
+    'relative-layout-display' = 'Relative layout preview rendering (v0.3 Phase 2)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
     'test-harness'        = 'Test harness'
@@ -7183,11 +7184,11 @@ function Find-DevWSReversiblyEncodedPrintableContent {
         Assert-Contains $ws "Save-DevWSWorkspace" "ws save implementation exists"
 
         # Future layout scope remains research-only in the runtime libraries.
-        # Pass 5B intentionally introduced read-only monitor diagnostics,
-        # Pass 5C introduced the optional topology-profile schema, and v0.3
-        # Phase 1 introduces the relative-layout schema in the config
-        # validator. Profile/grid vocabulary stays research-only elsewhere,
-        # and mutation code stays monitor-free.
+        # Pass 5B introduced read-only monitor diagnostics, Pass 5C introduced
+        # the optional topology-profile schema, v0.3 Phase 1 introduced the
+        # relative-layout schema, and Phase 2 adds read-only preview rendering.
+        # Profile/grid vocabulary stays research-only, and mutation code stays
+        # monitor-free.
         foreach ($file in @("devws-config.ps1", "devws-display.ps1", "devws-mutation.ps1")) {
             $codeLines = @(Get-Content -LiteralPath (Join-Path $RepoRoot "src\lib\$file") | Where-Object {
                 $trimmed = $_.Trim()
@@ -7195,13 +7196,11 @@ function Find-DevWSReversiblyEncodedPrintableContent {
             })
             $code = $codeLines -join "`n"
 
-            $layoutTokens = @("tiling", "named zone", "normalized")
-
-            if ($file -ne "devws-config.ps1") {
-                $layoutTokens += "relative"
-            }
+            $layoutTokens = @("tiling", "named zone")
 
             if ($file -eq "devws-mutation.ps1") {
+                $layoutTokens += "relative"
+                $layoutTokens += "normalized"
                 $layoutTokens += "monitor"
             }
 
@@ -34922,7 +34921,7 @@ Start-Sleep -Seconds 6
         Assert-Contains ([string]$setGeometry.Usage) "--layout" "set-geometry usage documents --layout"
 
         $showLayout = @($commands | Where-Object { $_.Name -eq "show-layout" })[0]
-        Assert-Contains ([string]($showLayout.Details -join " ")) "apply exactly these effective rectangles" "show-layout help states lifecycle usage"
+        Assert-Contains ([string]($showLayout.Details -join " ")) "Relative previews are read-only" "show-layout help distinguishes preview from lifecycle usage"
 
         $resetLayout = @($commands | Where-Object { $_.Name -eq "reset-layout" })[0]
         Assert-Contains ([string]($resetLayout.Details -join " ")) "never created, modified or deleted" "reset-layout help states profile preservation"
@@ -36770,6 +36769,456 @@ Start-Sleep -Seconds 6
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'relative-layout-display' -Title 'Relative layout preview rendering (v0.3 Phase 2)'
+
+    function New-RelativeDisplayRect {
+        param([int]$X = 0, [int]$Y = 0, [int]$W = 800, [int]$H = 600)
+        return [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+    }
+
+    function New-RelativeDisplayFractionRect {
+        param([double]$X = 0, [double]$Y = 0, [double]$W = 1, [double]$H = 1)
+        return [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+    }
+
+    function New-RelativeDisplayMonitor {
+        param(
+            [Parameter(Mandatory)][AllowEmptyString()][string]$Identity,
+            [string]$Instance,
+            [int]$X = 0,
+            [int]$Y = 0,
+            [int]$W = 1920,
+            [int]$H = 1080,
+            [int]$WorkX,
+            [int]$WorkY,
+            [int]$WorkW,
+            [int]$WorkH
+        )
+
+        $workXValue = if ($PSBoundParameters.ContainsKey("WorkX")) { $WorkX } else { $X }
+        $workYValue = if ($PSBoundParameters.ContainsKey("WorkY")) { $WorkY } else { $Y }
+        $workWValue = if ($PSBoundParameters.ContainsKey("WorkW")) { $WorkW } else { $W }
+        $workHValue = if ($PSBoundParameters.ContainsKey("WorkH")) { $WorkH } else { $H }
+
+        return [pscustomobject][ordered]@{
+            IdentityToken      = $Identity
+            DevicePathInstance = if ([string]::IsNullOrEmpty($Instance)) { $null } else { $Instance }
+            MonitorRect        = [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+            WorkRect           = [pscustomobject][ordered]@{ x = $workXValue; y = $workYValue; w = $workWValue; h = $workHValue }
+        }
+    }
+
+    function New-RelativeDisplayTopology {
+        param(
+            [string]$Signature = "",
+            [object[]]$Monitors = @(),
+            [bool]$Available = $true,
+            [bool]$IdentityComplete = $true,
+            [bool]$CorrelationComplete = $true,
+            [bool]$Ambiguous = $false
+        )
+
+        return [pscustomobject][ordered]@{
+            Available           = $Available
+            Signature           = if ([string]::IsNullOrWhiteSpace($Signature)) { $null } else { $Signature }
+            Fingerprint         = if ([string]::IsNullOrWhiteSpace($Signature)) { $null } else { "DISPLAYFP" }
+            IdentityComplete    = $IdentityComplete
+            CorrelationComplete = $CorrelationComplete
+            IdentityAmbiguous   = $Ambiguous
+            Monitors            = @($Monitors)
+        }
+    }
+
+    function New-RelativeDisplayRelative {
+        param(
+            [Parameter(Mandatory)][string]$Identity,
+            [string]$Instance,
+            [string]$Basis = "workArea",
+            [double]$X = 0,
+            [double]$Y = 0,
+            [double]$W = 1,
+            [double]$H = 1
+        )
+
+        $monitorFields = [ordered]@{ identity = $Identity }
+
+        if (-not [string]::IsNullOrEmpty($Instance)) {
+            $monitorFields["instance"] = $Instance
+        }
+
+        return [pscustomobject][ordered]@{
+            monitor = [pscustomobject]$monitorFields
+            basis   = $Basis
+            rect    = New-RelativeDisplayFractionRect -X $X -Y $Y -W $W -H $H
+        }
+    }
+
+    function New-RelativeDisplayTerminal {
+        param(
+            [string]$Id = "item",
+            [string]$Mode = "absolute",
+            $Relative = $null,
+            $Layout = $null
+        )
+
+        if ($null -eq $Layout) {
+            $Layout = New-RelativeDisplayRect
+        }
+
+        $item = [pscustomobject][ordered]@{
+            id        = $Id
+            type      = "terminal"
+            enabled   = $true
+            windowId  = "DevWS-display-$Id"
+            path      = 'C:\x'
+            elevated  = $true
+            tabs      = @([pscustomobject][ordered]@{ command = $null; args = @() })
+            activeTab = 0
+            layout    = $Layout
+        }
+
+        if ($Mode -eq "relative") {
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutMode" -Value "relative"
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutRelative" -Value $Relative
+        }
+
+        return $item
+    }
+
+    function New-RelativeDisplaySet {
+        param([object[]]$Items = @(), [object[]]$Profiles = @())
+
+        $set = [pscustomobject][ordered]@{ id = "main" }
+
+        if (@($Profiles).Count -gt 0) {
+            Add-Member -InputObject $set -MemberType NoteProperty -Name "layoutProfiles" -Value @($Profiles)
+        }
+
+        Add-Member -InputObject $set -MemberType NoteProperty -Name "windows" -Value @($Items)
+        return $set
+    }
+
+    Test-Case "show-layout keeps absolute-only rendering unchanged" {
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-RelativeDisplayTerminal -Id "absolute" -Layout (New-RelativeDisplayRect -X 10 -Y 20 -W 300 -H 400)
+        $set = New-RelativeDisplaySet -Items @($item)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal "absolute" ([string]$model.Items[0].LayoutMode) "absolute mode retained"
+        Assert-Equal "fallback" ([string]$model.Items[0].Source) "absolute fallback source retained"
+        Assert-Equal "not-applicable" ([string]$model.Items[0].RelativeStatus) "absolute item has no relative status"
+        Assert-Equal 10 ([int]$model.Items[0].Rect.x) "absolute rectangle retained"
+        Assert-Equal $false ([bool]$model.HasRelativeItems) "set has no relative items"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "apply exactly this effective layout" "absolute-only lifecycle note retained"
+        Assert-Contains $text "x=   10 y=   20 w=  300 h=  400" "absolute item line retained"
+        Assert-NotContains $text "Relative previews are read-only" "no relative preview note for absolute-only set"
+    }
+
+    Test-Case "show-layout previews resolved relative intent without claiming lifecycle placement" {
+        $monitor = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($monitor)
+        $relative = New-RelativeDisplayRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        $item = New-RelativeDisplayTerminal -Id "relative" -Mode "relative" -Relative $relative -Layout (New-RelativeDisplayRect -X 0 -Y 0 -W 800 -H 600)
+        $set = New-RelativeDisplaySet -Items @($item)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        $resolver = Resolve-DevWSRelativeLayout -RelativeLayout $relative -Topology $topology
+
+        Assert-Equal "relative" ([string]$model.Items[0].LayoutMode) "relative mode displayed"
+        Assert-Equal "relative" ([string]$model.Items[0].Source) "relative preview source"
+        Assert-Equal "resolved" ([string]$model.Items[0].RelativeStatus) "relative preview resolves"
+        Assert-Equal "edid:DEL-A1B2-ABC123" ([string]$model.Items[0].RelativeLayout.monitor.identity) "anchor identity retained"
+        Assert-Equal "workArea" ([string]$model.Items[0].RelativeLayout.basis) "basis retained"
+        Assert-Equal 960 ([int]$model.Items[0].Rect.x) "preview x matches resolver"
+        Assert-Equal 960 ([int]$model.Items[0].Rect.w) "preview width matches resolver"
+        Assert-Equal ([int]$resolver.Rect.x) ([int]$model.Items[0].RelativeRect.x) "preview x equals Phase 1 resolver"
+        Assert-Equal ([int]$resolver.Rect.w) ([int]$model.Items[0].RelativeRect.w) "preview width equals Phase 1 resolver"
+        Assert-Equal $true ([bool]$model.HasRelativeItems) "relative set flag"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "[relative preview]" "relative preview marker"
+        Assert-Contains $text "mode        relative" "mode detail"
+        Assert-Contains $text "anchor      edid:DEL-A1B2-ABC123  instance DELA1B2/5&2b" "anchor and instance detail"
+        Assert-Contains $text "basis       workArea" "basis detail"
+        Assert-Contains $text "normalized  x=0.5 y=0 w=0.5 h=1" "normalized detail"
+        Assert-Contains $text "resolved    x=960 y=0 w=960 h=1040" "resolved detail"
+        Assert-Contains $text "preview     relative preview only; current ws launch/reset use the absolute fallback until Phase 3" "preview is explicitly non-lifecycle"
+        Assert-Contains $text "status      resolved" "resolved status"
+        Assert-Contains $text "Relative previews are read-only" "read-only note"
+        Assert-NotContains $text "apply exactly this effective layout" "relative set does not claim lifecycle truth"
+    }
+
+    Test-Case "show-layout renders negative origins and both relative bases" {
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -X -1920 -Y -100 -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@-1920,-100,1920x1080" -Monitors @($monitor)
+        $monitorItem = New-RelativeDisplayTerminal -Id "monitor-basis" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "monitor" -X 0 -Y 0 -W 1 -H 1
+        )
+        $workItem = New-RelativeDisplayTerminal -Id "work-basis" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X 0 -Y 0 -W 1 -H 1
+        )
+        $set = New-RelativeDisplaySet -Items @($monitorItem, $workItem)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal -1920 ([int]$model.Items[0].Rect.x) "monitor basis negative origin"
+        Assert-Equal 1080 ([int]$model.Items[0].Rect.h) "monitor basis full height"
+        Assert-Equal 1040 ([int]$model.Items[1].Rect.h) "work-area basis height"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "resolved    x=-1920 y=-100 w=1920 h=1080" "negative full-monitor preview"
+        Assert-Contains $text "resolved    x=-1920 y=-100 w=1920 h=1040" "negative work-area preview"
+        Assert-Contains $text "basis       monitor" "monitor basis rendered"
+        Assert-Contains $text "basis       workArea" "work-area basis rendered"
+    }
+
+    Test-Case "show-layout previews reachable fallback for a missing anchor" {
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-RelativeDisplayTerminal -Id "missing-anchor" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "edid:DEL-A1B2-MISSING" -Basis "workArea" -X 0 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-RelativeDisplayRect -X 10 -Y 20 -W 300 -H 400)
+        $set = New-RelativeDisplaySet -Items @($item)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal "anchor-missing" ([string]$model.Items[0].RelativeStatus) "missing anchor status"
+        Assert-Equal "relative-fallback" ([string]$model.Items[0].Source) "fallback preview source"
+        Assert-Equal 10 ([int]$model.Items[0].Rect.x) "fallback x"
+        Assert-Equal $true ([bool]$model.Items[0].FallbackUsed) "fallback marked used"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "[relative fallback preview]" "fallback preview marker"
+        Assert-Contains $text "absolute fallback preview (anchor missing (identity-not-found))" "fallback reason"
+        Assert-Contains $text "status      anchor missing (identity-not-found)" "missing anchor detail"
+    }
+
+    Test-Case "show-layout previews fallback for an ambiguous anchor" {
+        $first = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
+        $second = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&3c" -X 1920 -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($first, $second)
+        $item = New-RelativeDisplayTerminal -Id "ambiguous-anchor" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea" -X 0 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-RelativeDisplayRect -X 10 -Y 20 -W 300 -H 400)
+        $set = New-RelativeDisplaySet -Items @($item)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal "anchor-ambiguous" ([string]$model.Items[0].RelativeStatus) "ambiguous anchor status"
+        Assert-Equal "relative-fallback" ([string]$model.Items[0].Source) "ambiguous fallback source"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "status      anchor ambiguous (duplicate-identity)" "ambiguous anchor detail"
+        Assert-Contains $text "absolute fallback preview" "ambiguous fallback preview"
+    }
+
+    Test-Case "show-layout reports unavailable topology without inventing relative geometry" {
+        $topology = New-RelativeDisplayTopology -Available $false -Monitors @()
+        $absoluteItem = New-RelativeDisplayTerminal -Id "absolute" -Layout (New-RelativeDisplayRect -X 10 -Y 20 -W 300 -H 400)
+        $relativeItem = New-RelativeDisplayTerminal -Id "relative" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea"
+        ) -Layout (New-RelativeDisplayRect -X 0 -Y 0 -W 800 -H 600)
+        $set = New-RelativeDisplaySet -Items @($absoluteItem, $relativeItem)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal $false ([bool]$model.TopologyAvailable) "topology unavailable"
+        Assert-Equal 10 ([int]$model.Items[0].Rect.x) "absolute item keeps its rectangle"
+        Assert-True ($null -eq $model.Items[1].Rect) "relative item has no verified geometry"
+        Assert-Equal "relative-unavailable" ([string]$model.Items[1].Source) "relative item source"
+        Assert-Equal "topology-unavailable" ([string]$model.Items[1].RelativeStatus) "relative item status"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "x=   10 y=   20 w=  300 h=  400" "absolute item still renders"
+        Assert-Contains $text "no verified geometry" "relative item has no geometry line"
+        Assert-Contains $text "status      topology unavailable" "unavailable status"
+        Assert-Contains $text "no verified geometry (topology unavailable)" "unavailable preview reason"
+        Assert-Contains $text "Relative previews are read-only" "preview note"
+        Assert-NotContains $text "apply exactly this effective layout" "relative set does not claim lifecycle truth"
+    }
+
+    Test-Case "show-layout previews reachable fallback for an unreachable relative target" {
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-RelativeDisplayTerminal -Id "far-relative" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X 10 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-RelativeDisplayRect -X 10 -Y 20 -W 300 -H 400)
+        $set = New-RelativeDisplaySet -Items @($item)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal "relative-unreachable" ([string]$model.Items[0].RelativeStatus) "unreachable relative status"
+        Assert-Equal "relative-fallback" ([string]$model.Items[0].Source) "reachable fallback selected"
+        Assert-Equal 10 ([int]$model.Items[0].Rect.x) "fallback rectangle"
+        Assert-Equal 19200 ([int]$model.Items[0].RelativeRect.x) "resolved relative target retained for inspection"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "status      relative target unreachable" "unreachable target status"
+        Assert-Contains $text "absolute fallback preview (relative target unreachable)" "fallback preview reason"
+        Assert-Contains $text "resolved    x=19200 y=0 w=960 h=1040" "resolved target rendered"
+    }
+
+    Test-Case "show-layout reports no verified geometry when relative and fallback are unreachable" {
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-RelativeDisplayTerminal -Id "far-all" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X 10 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-RelativeDisplayRect -X 9000 -Y 9000 -W 100 -H 100)
+        $set = New-RelativeDisplaySet -Items @($item)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-True ($null -eq $model.Items[0].Rect) "no verified geometry"
+        Assert-Equal "relative-unavailable" ([string]$model.Items[0].Source) "unavailable source"
+        Assert-Equal "relative-target-and-fallback-unreachable" ([string]$model.Items[0].RelativeReason) "both unreachable reason"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "no verified geometry" "no geometry line"
+        Assert-Contains $text "status      relative target and fallback unreachable" "both-unreachable status"
+        Assert-Contains $text "absolute fallback is not reachable" "fallback unavailable reason"
+    }
+
+    Test-Case "show-layout preserves matched-profile precedence over relative intent" {
+        $signature = "edid:DEL-A1B2-ABC123@0,0,1920x1080"
+        $monitor = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature $signature -Monitors @($monitor)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "relative" -Rect (New-RelativeDisplayRect -X 10 -Y 10 -W 500 -H 500)
+        $item = New-RelativeDisplayTerminal -Id "relative" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-RelativeDisplayRect -X 0 -Y 0 -W 800 -H 600)
+        $set = New-RelativeDisplaySet -Items @($item) -Profiles @($profile)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal "profile" ([string]$model.Items[0].Source) "profile wins"
+        Assert-Equal "docked" ([string]$model.Items[0].ProfileId) "profile id"
+        Assert-Equal $true ([bool]$model.Items[0].ProfileOverridesRelative) "profile override flag"
+        Assert-Equal 10 ([int]$model.Items[0].Rect.x) "profile rectangle"
+        Assert-Equal 960 ([int]$model.Items[0].RelativeRect.x) "relative resolution remains inspectable"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "[profile overrides relative]" "override marker"
+        Assert-Contains $text "preview     profile 'docked' is current lifecycle placement; relative preview is not used" "override preview"
+        Assert-Contains $text "profile 'docked'" "profile selection"
+        Assert-Contains $text "Relative previews are read-only" "relative note"
+    }
+
+    Test-Case "show-layout exposes profile omission for relative items" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature $signature -Monitors @($monitor)
+        $profile = New-DevWSLayoutProfile -Id "sparse" -MonitorTokens @($signature)
+        $item = New-RelativeDisplayTerminal -Id "omitted" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-RelativeDisplaySet -Items @($item) -Profiles @($profile)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal $true ([bool]$model.Items[0].ProfileMatched) "profile matched"
+        Assert-Equal $false ([bool]$model.Items[0].ProfileOverridesRelative) "profile omitted item"
+        Assert-Equal "relative" ([string]$model.Items[0].Source) "relative preview source"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "[profile omits item]" "omission marker"
+        Assert-Contains $text "[relative preview]" "relative preview marker"
+        Assert-Contains $text "preview     relative preview only" "relative preview detail"
+    }
+
+    Test-Case "show-layout preserves strict profile-safety diagnostics" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature $signature -Monitors @($monitor) -IdentityComplete $false
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        $item = New-RelativeDisplayTerminal -Id "relative" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-RelativeDisplaySet -Items @($item) -Profiles @($profile)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal "topology-incomplete" ([string]$model.ProfileLifecycleRefusal) "profile refusal reason"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "topology not fully identified" "existing profile-safety wording"
+        Assert-Contains $text "lifecycle   profile-aware launch/reset would refuse (topology not fully identified)" "strict refusal diagnostic"
+        Assert-Contains $text "profile-aware lifecycle refuses this topology; relative preview is not applied" "preview refusal detail"
+        Assert-Contains $text "Profile-aware launch/reset would refuse" "relative note refusal wording"
+    }
+
+    Test-Case "show-layout relative fractions are culture-invariant" {
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-RelativeDisplayTerminal -Id "culture" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X -0.25 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-RelativeDisplaySet -Items @($item)
+        $previousCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+
+        try {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo("de-DE")
+            $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+            $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        }
+        finally {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
+        }
+
+        Assert-Contains $text "normalized  x=-0.25 y=0 w=0.5 h=1" "invariant relative fractions"
+        Assert-Contains $text "resolved    x=-480 y=0 w=960 h=1040" "invariant resolved rectangle"
+        Assert-True (-not ($text -match '0,25|0,5')) "no comma decimal separators"
+    }
+
+    Test-Case "Show-DevWSLayout renders the relative preview through the CLI wrapper" {
+        $monitor = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-RelativeDisplayTerminal -Id "wrapper" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-RelativeDisplaySet -Items @($item)
+        $config = [pscustomobject][ordered]@{
+            version    = 3
+            defaultSet = "main"
+            bindings   = @()
+            sets       = @($set)
+        }
+
+        function Get-DevWSContext {
+            return [pscustomobject]@{
+                Config   = $config
+                Location = [pscustomobject]@{ Path = 'C:\unused'; IsWritable = $true }
+            }
+        }
+
+        function Get-DevWSMonitorTopology {
+            return $topology
+        }
+
+        $output = (& { Show-DevWSLayout -SetId "main" } 6>&1 | Out-String)
+
+        Assert-Contains $output "Saved layout for set 'main'" "wrapper heading"
+        Assert-Contains $output "[relative preview]" "wrapper relative marker"
+        Assert-Contains $output "preview     relative preview only" "wrapper preview detail"
+        Assert-Contains $output "Relative previews are read-only" "wrapper read-only note"
+    }
+
+    Test-Case "show-layout preview is read-only and never touches windows or config" {
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-RelativeDisplayTerminal -Id "readonly" -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-RelativeDisplaySet -Items @($item)
+        $before = $set | ConvertTo-Json -Depth 20 -Compress
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        $null = Get-DevWSEffectiveLayoutLines -Model $model
+
+        $after = $set | ConvertTo-Json -Depth 20 -Compress
+        Assert-Equal $before $after "display resolution does not mutate the set"
+
+        $displaySource = Get-SourceOf "src\lib\devws-display.ps1"
+        foreach ($forbidden in @("Move-DevWSWindowHwnd", "Set-DevWSWindowHwndPos", "Save-DevWSConfig", "Set-DevWSLayout", "Get-DevWSMonitorTopology")) {
+            Assert-NotContains $displaySource $forbidden "display renderer stays read-only: $forbidden"
+        }
+    }
+
+    Write-Host ""
     Start-TestGroup -Name 'trace-temp-hardening' -Title 'Public Security Phase 2-E trace and temporary-file hardening'
 
     function New-P2EInstalledProbe {
@@ -37939,8 +38388,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 64 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 64 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 65 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 65 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

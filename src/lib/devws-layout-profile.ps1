@@ -382,10 +382,20 @@ function Resolve-DevWSLayoutProfileSaveTarget {
 # ---------------------------------------------------------------------------
 
 function Get-DevWSEffectiveLayout {
-    # Effective per-item layout policy for the current topology:
-    # a matched profile entry when present, otherwise the mandatory fallback
-    # item.layout. Strictly read-only; reachability is diagnostic only and is
-    # computed only when monitor geometry is available.
+    # Read-only effective layout policy for the current topology.
+    #
+    # Absolute and matched-profile rectangles retain their established display
+    # semantics. Relative layouts are resolved through the Phase 1 pure model
+    # and exposed as a PREVIEW only: lifecycle integration arrives in Phase 3,
+    # so a relative preview never claims to be what ws launch/reset applies.
+    #
+    # Resolution policy mirrors the approved fallback rules:
+    #   - matched profile entry wins, including over relative intent;
+    #   - relative item with unavailable topology has no verified geometry;
+    #   - available topology + missing/ambiguous/unusable anchor previews the
+    #     absolute fallback only when the existing reachability rule accepts it;
+    #   - an unreachable relative target previews the fallback only when it is
+    #     reachable; otherwise no verified preview is advertised.
     param(
         [string]$SetId,
         $Set,
@@ -394,6 +404,7 @@ function Get-DevWSEffectiveLayout {
 
     $selection = Resolve-DevWSLayoutProfile -Set $Set -Topology $Topology
     $profiles  = @(Get-DevWSLayoutProfiles -Set $Set)
+    $profileAware = ($profiles.Count -gt 0)
 
     $monitorRects = @()
 
@@ -409,6 +420,16 @@ function Get-DevWSEffectiveLayout {
         }
     }
 
+    $measureReachability = {
+        param($Candidate)
+
+        if ($monitorRects.Count -eq 0 -or $null -eq $Candidate -or $Candidate -isnot [System.Management.Automation.PSCustomObject]) {
+            return $null
+        }
+
+        return Test-DevWSRectReachable -Rect $Candidate -MonitorRects $monitorRects
+    }
+
     $fingerprint = $null
     $signature   = $null
 
@@ -417,6 +438,21 @@ function Get-DevWSEffectiveLayout {
         $signature   = [string](Get-DevWSProperty -Object $Topology -Name "Signature")
     }
 
+    $profileRefusalReason = $null
+
+    if ($profileAware) {
+        $eligibility = Test-DevWSLayoutTopologyMatchable -Topology $Topology
+
+        if (-not $eligibility.Eligible) {
+            $profileRefusalReason = $eligibility.Reason
+        }
+        elseif ($selection.Status -eq "ambiguous") {
+            $profileRefusalReason = "ambiguous-matchers"
+        }
+    }
+
+    $hasRelativeItems = $false
+    $profileEntryUnreachable = $false
     $items = [System.Collections.Generic.List[object]]::new()
 
     foreach ($item in @($Set.windows)) {
@@ -424,18 +460,86 @@ function Get-DevWSEffectiveLayout {
             continue
         }
 
-        $itemId      = [string]$item.id
-        $effective   = $item.layout
-        $itemSource  = "fallback"
-        $profileId   = $null
+        $itemId       = [string]$item.id
+        $layoutMode   = if ((Get-DevWSProperty -Object $item -Name "layoutMode") -ceq "relative") { "relative" } else { "absolute" }
+        $relativeLayout = $null
+        $profileMatched = ($selection.Status -eq "matched")
+        $profileEntry   = $null
+        $profileId      = $null
+        $effective      = $item.layout
+        $itemSource     = "fallback"
 
-        if ($selection.Status -eq "matched") {
-            $entry = Get-DevWSLayoutProfileEntry -Profile $selection.Profile -ItemId $itemId
+        if ($layoutMode -eq "relative") {
+            $hasRelativeItems = $true
+            $relativeLayout = Get-DevWSProperty -Object $item -Name "layoutRelative"
+        }
 
-            if ($null -ne $entry) {
-                $effective  = $entry
-                $itemSource = "profile"
-                $profileId  = $selection.ProfileId
+        if ($profileMatched) {
+            $profileEntry = Get-DevWSLayoutProfileEntry -Profile $selection.Profile -ItemId $itemId
+
+            if ($null -ne $profileEntry) {
+                $effective   = $profileEntry
+                $itemSource  = "profile"
+                $profileId   = $selection.ProfileId
+            }
+        }
+
+        $profileOverridesRelative = ($layoutMode -eq "relative" -and $null -ne $profileEntry)
+        $relativeStatus    = "not-applicable"
+        $relativeReason    = $null
+        $relativeMessage   = $null
+        $relativeRect      = $null
+        $relativeReachable = $null
+        $fallbackReachable = $null
+        $fallbackUsed      = $false
+
+        if ($layoutMode -eq "relative") {
+            $resolution = Resolve-DevWSRelativeLayout -RelativeLayout $relativeLayout -Topology $Topology
+            $relativeStatus  = [string]$resolution.Status
+            $relativeReason  = [string]$resolution.Reason
+            $relativeMessage = [string]$resolution.Message
+
+            if ([bool]$resolution.Ok) {
+                $relativeRect = $resolution.Rect
+                $relativeMetrics = & $measureReachability $relativeRect
+
+                if ($null -ne $relativeMetrics) {
+                    $relativeReachable = [bool]$relativeMetrics.Reachable
+                }
+
+                if ($relativeReachable -eq $false) {
+                    $relativeStatus = "relative-unreachable"
+                    $relativeReason = "relative-target-unreachable"
+                    $relativeMessage = "The resolved relative target is not reachable on the current topology."
+                }
+            }
+
+            if (-not $profileOverridesRelative) {
+                $fallbackReachableMetrics = & $measureReachability $item.layout
+
+                if ($null -ne $fallbackReachableMetrics) {
+                    $fallbackReachable = [bool]$fallbackReachableMetrics.Reachable
+                }
+
+                $effective  = $null
+                $itemSource = "relative-unavailable"
+
+                if ([bool](Get-DevWSProperty -Object $Topology -Name "Available") -and $relativeStatus -ne "topology-unavailable") {
+                    if ($null -ne $relativeRect -and $relativeStatus -eq "resolved" -and $relativeReachable -eq $true) {
+                        $effective  = $relativeRect
+                        $itemSource = "relative"
+                    }
+                    elseif ($fallbackReachable -eq $true) {
+                        $effective   = $item.layout
+                        $itemSource  = "relative-fallback"
+                        $fallbackUsed = $true
+                    }
+                }
+
+                if ($relativeStatus -eq "relative-unreachable" -and $fallbackReachable -eq $false) {
+                    $relativeReason = "relative-target-and-fallback-unreachable"
+                    $relativeMessage = "The relative target and the absolute fallback are not reachable on the current topology."
+                }
             }
         }
 
@@ -444,42 +548,66 @@ function Get-DevWSEffectiveLayout {
         $visibleWidth = $null
         $visibleHeight = $null
 
-        if ($monitorRects.Count -gt 0 -and $null -ne $effective -and $effective -is [System.Management.Automation.PSCustomObject]) {
-            $metrics = Test-DevWSRectReachable -Rect $effective -MonitorRects $monitorRects
+        $effectiveMetrics = & $measureReachability $effective
 
-            $reachable     = [bool]$metrics.Reachable
-            $visibleRatio  = [double]$metrics.VisibleRatio
-            $visibleWidth  = [int]$metrics.VisibleWidth
-            $visibleHeight = [int]$metrics.VisibleHeight
+        if ($null -ne $effectiveMetrics) {
+            $reachable     = [bool]$effectiveMetrics.Reachable
+            $visibleRatio  = [double]$effectiveMetrics.VisibleRatio
+            $visibleWidth  = [int]$effectiveMetrics.VisibleWidth
+            $visibleHeight = [int]$effectiveMetrics.VisibleHeight
+        }
+
+        if ($itemSource -eq "profile" -and $reachable -eq $false) {
+            $profileEntryUnreachable = $true
         }
 
         $items.Add([pscustomobject]@{
-            ItemId        = $itemId
-            Type          = [string]$item.type
-            Enabled       = [bool]$item.enabled
-            Rect          = $effective
-            Source        = $itemSource
-            ProfileId     = $profileId
-            Reachable     = $reachable
-            VisibleRatio  = $visibleRatio
-            VisibleWidth  = $visibleWidth
-            VisibleHeight = $visibleHeight
+            ItemId                    = $itemId
+            Type                      = [string]$item.type
+            Enabled                   = [bool]$item.enabled
+            LayoutMode                = $layoutMode
+            Rect                      = $effective
+            Source                    = $itemSource
+            ProfileId                 = $profileId
+            ProfileMatched            = $profileMatched
+            ProfileOverridesRelative  = $profileOverridesRelative
+            RelativeLayout            = $relativeLayout
+            RelativeStatus            = $relativeStatus
+            RelativeReason            = $relativeReason
+            RelativeMessage           = $relativeMessage
+            RelativeRect              = $relativeRect
+            RelativeReachable         = $relativeReachable
+            FallbackRect              = $item.layout
+            FallbackReachable         = $fallbackReachable
+            FallbackUsed              = $fallbackUsed
+            Reachable                 = $reachable
+            VisibleRatio              = $visibleRatio
+            VisibleWidth              = $visibleWidth
+            VisibleHeight             = $visibleHeight
         }) | Out-Null
+    }
+
+    if ($null -eq $profileRefusalReason -and $profileEntryUnreachable) {
+        $profileRefusalReason = "unreachable-profile-entry"
     }
 
     $profileIds = @(Get-DevWSLayoutProfiles -Set $Set | ForEach-Object { [string]$_.id })
 
     return [pscustomobject]@{
-        SetId               = $SetId
-        Status              = $selection.Status
-        Source              = $selection.Source
-        ProfileId           = $selection.ProfileId
-        Reason              = $selection.Reason
-        TopologyAvailable   = ($null -ne $Topology -and [bool](Get-DevWSProperty -Object $Topology -Name "Available"))
-        TopologySignature   = $signature
-        TopologyFingerprint = $fingerprint
-        Profiles            = $profileIds
-        Items               = @($items.ToArray())
+        SetId                   = $SetId
+        Status                  = $selection.Status
+        Source                  = $selection.Source
+        ProfileId               = $selection.ProfileId
+        Reason                  = $selection.Reason
+        ProfileAware            = $profileAware
+        ProfileLifecycleRefusal = $profileRefusalReason
+        TopologyAvailable       = ($null -ne $Topology -and [bool](Get-DevWSProperty -Object $Topology -Name "Available"))
+        TopologySignature       = $signature
+        TopologyFingerprint     = $fingerprint
+        HasRelativeItems        = $hasRelativeItems
+        RelativePreviewOnly     = $hasRelativeItems
+        Profiles                = $profileIds
+        Items                   = @($items.ToArray())
     }
 }
 

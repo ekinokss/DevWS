@@ -1255,9 +1255,9 @@ function Save-DevWSWorkspace {
 
 function Show-DevWSLayout {
     # Read-only effective-layout preview: current topology, Pass-5C profile
-    # routing, and the effective per-item rectangles (sparse profile entries
-    # fall back per item). Launch and terminal resets consume exactly this
-    # effective layout (Pass 5D); the closing note states it.
+    # routing, and effective/preview rectangles. Relative items are explicitly
+    # preview-only in Phase 2; absolute/profile geometry remains the lifecycle
+    # truth until Phase 3 integration.
     param([string]$SetId)
 
     $context = Get-DevWSContext

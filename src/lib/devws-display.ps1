@@ -378,10 +378,93 @@ function Get-DevWSMonitorLines {
     return $lines
 }
 
+function Format-DevWSRelativeDisplayNumber {
+    param([double]$Value)
+    return $Value.ToString("0.######", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Format-DevWSRelativeDisplayRect {
+    param($Rect)
+
+    if ($null -eq $Rect -or $Rect -isnot [System.Management.Automation.PSCustomObject]) {
+        return "unavailable"
+    }
+
+    return ("x={0} y={1} w={2} h={3}" -f `
+        (Format-DevWSRelativeDisplayNumber -Value ([double]$Rect.x)), `
+        (Format-DevWSRelativeDisplayNumber -Value ([double]$Rect.y)), `
+        (Format-DevWSRelativeDisplayNumber -Value ([double]$Rect.w)), `
+        (Format-DevWSRelativeDisplayNumber -Value ([double]$Rect.h)))
+}
+
+function Get-DevWSRelativeDisplayStatusText {
+    param([string]$Status, [string]$Reason)
+
+    switch ($Status) {
+        "resolved"              { return "resolved" }
+        "relative-unreachable"  {
+            if ($Reason -eq "relative-target-and-fallback-unreachable") {
+                return "relative target and fallback unreachable"
+            }
+            return "relative target unreachable"
+        }
+        "anchor-missing"        { return "anchor missing ($Reason)" }
+        "anchor-ambiguous"      { return "anchor ambiguous ($Reason)" }
+        "topology-unavailable"  { return "topology unavailable" }
+        "basis-unavailable"     { return "basis unavailable ($Reason)" }
+        "relative-invalid"      { return "relative layout invalid ($Reason)" }
+        "rect-invalid"          { return "relative rectangle invalid ($Reason)" }
+        "overflow"              { return "relative rectangle overflow ($Reason)" }
+        "not-applicable"        { return "not applicable" }
+        default                 { return "$Status ($Reason)" }
+    }
+}
+
+function Get-DevWSRelativeDisplayPreviewText {
+    param($Item, [string]$ProfileLifecycleRefusal)
+
+    if (-not [string]::IsNullOrWhiteSpace($ProfileLifecycleRefusal)) {
+        return "profile-aware lifecycle refuses this topology; relative preview is not applied"
+    }
+
+    switch ([string]$Item.Source) {
+        "profile" {
+            if ($null -ne $Item.Reachable -and -not [bool]$Item.Reachable) {
+                return "profile '$($Item.ProfileId)' overrides relative intent; profile entry is unreachable (lifecycle would refuse)"
+            }
+
+            return "profile '$($Item.ProfileId)' is current lifecycle placement; relative preview is not used"
+        }
+        "relative" {
+            return "relative preview only; current ws launch/reset use the absolute fallback until Phase 3"
+        }
+        "relative-fallback" {
+            $reason = Get-DevWSRelativeDisplayStatusText -Status ([string]$Item.RelativeStatus) -Reason ([string]$Item.RelativeReason)
+            return "absolute fallback preview ($reason); current ws launch/reset use the absolute fallback until Phase 3"
+        }
+        "relative-unavailable" {
+            if ([string]$Item.RelativeStatus -eq "topology-unavailable") {
+                return "no verified geometry (topology unavailable); current ws launch/reset still use the absolute fallback until Phase 3"
+            }
+
+            if ($null -ne $Item.FallbackReachable -and -not [bool]$Item.FallbackReachable) {
+                return "no verified geometry (absolute fallback is not reachable); current ws launch/reset still use the absolute fallback until Phase 3"
+            }
+
+            return "no verified geometry; current ws launch/reset still use the absolute fallback until Phase 3"
+        }
+        default {
+            return "relative preview only; lifecycle integration is Phase 3"
+        }
+    }
+}
+
 function Get-DevWSEffectiveLayoutLines {
-    # Effective layout policy rendering for `ws show-layout` (Pass 5C):
-    # topology/profile selection plus the effective per-item rectangles.
-    # Read-only; the closing note states that lifecycle commands apply it.
+    # Read-only effective-layout rendering for `ws show-layout`.
+    #
+    # Absolute and matched-profile items preserve the established one-line
+    # rendering. Relative items add explicit preview detail lines and never
+    # claim that relative placement is applied by lifecycle commands yet.
     param([Parameter(Mandatory)]$Model)
 
     $lines = @()
@@ -422,6 +505,19 @@ function Get-DevWSEffectiveLayoutLines {
     $lines += "  topology    $topologyText"
     $lines += "  layout      $sourceText  ($reasonText)"
 
+    if ([bool]$Model.ProfileAware -and -not [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
+        $lifecycleReason = switch ([string]$Model.ProfileLifecycleRefusal) {
+            "topology-unavailable"    { "topology unavailable" }
+            "topology-incomplete"     { "topology not fully identified" }
+            "topology-ambiguous"      { "ambiguous monitor identities" }
+            "ambiguous-matchers"      { "duplicate profile matchers" }
+            "unreachable-profile-entry" { "matched profile entry is unreachable" }
+            default                   { [string]$Model.ProfileLifecycleRefusal }
+        }
+
+        $lines += "  lifecycle   profile-aware launch/reset would refuse ($lifecycleReason)"
+    }
+
     if (@($Model.Profiles).Count -gt 0) {
         $lines += "  profiles    " + (@($Model.Profiles) -join ", ")
     }
@@ -439,17 +535,88 @@ function Get-DevWSEffectiveLayoutLines {
             $suffix += "  [fallback]"
         }
 
+        if ([string]$item.LayoutMode -eq "relative") {
+            if ([bool]$item.ProfileOverridesRelative) {
+                $suffix += "  [profile overrides relative]"
+            }
+            elseif ([bool]$item.ProfileMatched) {
+                $suffix += "  [profile omits item]"
+            }
+
+            switch ([string]$item.Source) {
+                "relative"             { $suffix += "  [relative preview]" }
+                "relative-fallback"    { $suffix += "  [relative fallback preview]" }
+                "relative-unavailable" { $suffix += "  [relative unavailable]" }
+            }
+        }
+
         if ($null -ne $item.Reachable -and -not [bool]$item.Reachable) {
             $suffix += "  [unreachable]"
         }
 
         $rect = $item.Rect
-        $lines += ("  {0,-14} {1,-9} x={2,5} y={3,5} w={4,5} h={5,5}{6}" -f `
-            $item.ItemId, $item.Type, $rect.x, $rect.y, $rect.w, $rect.h, $suffix)
+
+        if ($null -eq $rect -or $rect -isnot [System.Management.Automation.PSCustomObject]) {
+            $lines += ("  {0,-14} {1,-9} no verified geometry{2}" -f `
+                $item.ItemId, $item.Type, $suffix)
+        }
+        else {
+            $lines += ("  {0,-14} {1,-9} x={2,5} y={3,5} w={4,5} h={5,5}{6}" -f `
+                $item.ItemId, $item.Type, $rect.x, $rect.y, $rect.w, $rect.h, $suffix)
+        }
+
+        if ([string]$item.LayoutMode -eq "relative") {
+            $relative = $item.RelativeLayout
+            $monitorSpec = Get-DevWSProperty -Object $relative -Name "monitor"
+            $identity = [string](Get-DevWSProperty -Object $monitorSpec -Name "identity")
+            $instance = [string](Get-DevWSProperty -Object $monitorSpec -Name "instance")
+            $basis = [string](Get-DevWSProperty -Object $relative -Name "basis")
+            $normalizedRect = Get-DevWSProperty -Object $relative -Name "rect"
+
+            if ([string]::IsNullOrWhiteSpace($identity)) {
+                $identity = "(not configured)"
+            }
+
+            $anchorText = $identity
+
+            if (-not [string]::IsNullOrWhiteSpace($instance)) {
+                $anchorText += "  instance $instance"
+            }
+
+            if ([string]::IsNullOrWhiteSpace($basis)) {
+                $basis = "(not configured)"
+            }
+
+            $previewText = Get-DevWSRelativeDisplayPreviewText -Item $item -ProfileLifecycleRefusal ([string]$Model.ProfileLifecycleRefusal)
+            $statusText = Get-DevWSRelativeDisplayStatusText -Status ([string]$item.RelativeStatus) -Reason ([string]$item.RelativeReason)
+
+            $lines += "      mode        relative"
+            $lines += "      anchor      $anchorText"
+            $lines += "      basis       $basis"
+            $lines += "      normalized  $(Format-DevWSRelativeDisplayRect -Rect $normalizedRect)"
+            $lines += "      resolved    $(Format-DevWSRelativeDisplayRect -Rect $item.RelativeRect)"
+            $lines += "      preview     $previewText"
+            $lines += "      status      $statusText"
+        }
     }
 
     $lines += ""
-    $lines += "  note        'ws launch' and terminal resets apply exactly this effective layout."
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
+        if ([bool]$Model.HasRelativeItems) {
+            $lines += "  note        Relative previews are read-only. Profile-aware launch/reset would refuse this topology; relative placement becomes operational in Phase 3."
+        }
+        else {
+            $lines += "  note        Profile-aware launch/reset would refuse this topology; no effective layout is applied by lifecycle commands."
+        }
+    }
+    elseif ([bool]$Model.HasRelativeItems) {
+        $lines += "  note        Relative previews are read-only. Current launch/reset use absolute/profile geometry; relative placement becomes operational in Phase 3."
+    }
+    else {
+        $lines += "  note        'ws launch' and terminal resets apply exactly this effective layout."
+    }
+
     $lines += ""
 
     return $lines
