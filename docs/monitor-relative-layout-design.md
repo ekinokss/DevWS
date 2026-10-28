@@ -58,8 +58,11 @@ section 11.
    strict refusal contract unchanged. Unavailable, incomplete or ambiguous topology,
    duplicate matchers, and unreachable matched profile entries all refuse before side
    effects, even when every target item is relative. No relative-only bypass is approved.
-   Profile-free relative sets instead degrade per item to the absolute fallback when
-   topology is unavailable or an anchor is missing/ambiguous; save re-anchors from the
+   Profile-free relative sets handle per-item degradation separately: when topology is
+   unavailable, a relative item warns and sets `ApplyGeometry = false` because reachability
+   cannot be established; absolute items in the same set keep their existing behavior.
+   When topology is available but an anchor is missing, ambiguous or unusable, the absolute
+   fallback is used only after the existing reachability rules. Save re-anchors from the
    capture and refuses only when it cannot select an anchor safely. Profile-free absolute
    sets retain the zero-topology path.
 3. **Save scope.** A profile-targeted save (implicit matched profile or explicit
@@ -611,14 +614,17 @@ and a stable topology A/B relative key; otherwise it refuses all-or-nothing.
 
 #### 6.7.2 Profile-free relative sets
 
-Launch/reset never refuses solely because a relative anchor is missing. It degrades:
+Launch/reset never refuses the whole profile-free operation solely because a relative anchor
+is missing or topology is unavailable. It degrades per item:
 
-- topology unavailable -> absolute fallback with warning; skip if the fallback is
-  unreachable;
-- anchor missing -> the same;
-- anchor ambiguous -> the same;
-- relative target unreachable -> absolute fallback with warning; skip if the fallback is
-  unreachable;
+- topology unavailable (`Available = false`, no monitor rectangles) -> warn and set
+  `ApplyGeometry = false` for the relative item. Reachability cannot be established, so the
+  absolute fallback is not applied blindly. Absolute items in the same set keep their
+  existing absolute-placement behavior.
+- anchor missing, ambiguous or unusable on an available topology -> use the absolute
+  fallback only after applying the existing reachability rules; skip if the fallback is
+  unreachable.
+- relative target unreachable -> the same absolute fallback path after reachability.
 - absolute fallback unreachable -> skip movement with warning.
 
 Save/save-layout is different because it persists intent and re-anchors from the captured
@@ -641,7 +647,7 @@ No topology access. Existing absolute behavior and the zero-topology fast path a
 | Set kind / operation | Topology unavailable | Missing or ambiguous anchor | Relative target unreachable |
 | --- | --- | --- | --- |
 | Profile-enabled launch/reset | Refuse (existing) | On a matchable topology with no profile entry: absolute fallback warning; skip if fallback unreachable | Absolute fallback warning; skip if fallback unreachable |
-| Profile-free relative launch/reset | Absolute fallback warning; skip if fallback unreachable | Absolute fallback warning; skip if fallback unreachable | Absolute fallback warning; skip if fallback unreachable |
+| Profile-free relative launch/reset | Warn + `ApplyGeometry = false` for the relative item; absolute items keep existing behavior | Absolute fallback only after reachability; skip if fallback unreachable | Absolute fallback only after reachability; skip if fallback unreachable |
 | Profile-free relative save/save-layout | Refuse | Re-anchor from capture; refuse only if selection is ambiguous or zero-visible without a resolvable stored anchor | Re-anchor from capture; same selection rule |
 | Profile-free absolute launch/reset/save | No topology access | n/a | n/a |
 
@@ -748,7 +754,9 @@ placement. Proposed fields per item:
 - for relative items: full anchor identity, optional instance, basis, and the normalized
   rectangle;
 - when relative resolution degrades: the reason (`anchor missing`, `anchor ambiguous`,
-  `topology unavailable`, `relative target unreachable`) and the fallback rectangle;
+  `topology unavailable`, `relative target unreachable`) and the fallback rectangle; for
+  `topology unavailable` on a profile-free relative item, state that no geometry will be
+  applied because reachability cannot be established;
 - existing `[disabled]` and `[unreachable]` markers;
 - a note when a path-based anchor is less durable than an EDID anchor.
 
@@ -780,9 +788,12 @@ Formatting requirements:
 - Profile-free relative sets take exactly one topology snapshot and freeze the resolved
   absolute rectangles. There is no second sample during placement.
 - Profile-aware sets keep the existing unsafe-topology refusal and exact-profile behaviour.
-- When a relative anchor is missing/ambiguous/unavailable, the plan records a deterministic
-  warning and uses the absolute fallback (or `ApplyGeometry = false` if the fallback is
-  unreachable).
+- When topology is unavailable for a profile-free set, each relative item records a
+  deterministic warning and `ApplyGeometry = false` because reachability cannot be
+  established. Absolute items in that set keep their existing absolute-placement behavior.
+- When topology is available but a relative anchor is missing, ambiguous or unusable, the
+  plan records a warning and uses the absolute fallback only after reachability; it uses
+  `ApplyGeometry = false` if the fallback is unreachable.
 - The frozen plan still carries only absolute integer rectangles. The elevated broker and
   reset worker never see anchor metadata and never sample topology.
 - A monitor change after the plan is frozen does not trigger rearrangement. The next
@@ -997,7 +1008,7 @@ internal behaviour first.
 | D4 | Coordinate basis | Required per-item `basis`: `workArea` or `monitor` | Global default; work area only | Taskbar and borderless layouts need different bases; explicit is safer. |
 | D5 | Units | Normalized fractions for phase 1 | Monitor-local pixels; hybrid | Fractions meet the resolution/rearrangement goal; pixels are a future fixed-size option. |
 | D6 | Precedence and profile safety | Matched profile entry > relative > absolute fallback; profile-enabled lifecycle keeps strict refusal and no relative-only bypass | Relative > profile; allow relative-only bypass on unsafe topology | Preserves existing exact-profile semantics and the approved refusal contract. |
-| D7 | Missing/ambiguous policy | Profile-free relative launch/reset: absolute fallback with warning, skip if fallback unreachable, never remap. Save re-anchors from capture; refuses only when no unique anchor can be selected. | Refuse; skip; nearest monitor | Keeps explicit operations usable across dock/undock without surprising moves or unsafe persistence. |
+| D7 | Missing/ambiguous policy | Profile-free relative launch/reset: unavailable topology -> warn + `ApplyGeometry = false` for the relative item, absolute items unchanged; missing/ambiguous anchor on an available topology -> absolute fallback only after reachability; never remap. Save re-anchors from capture; refuses only when no unique anchor can be selected. | Refuse; skip; nearest monitor | Keeps explicit operations usable across dock/undock without surprising moves or unsafe persistence. |
 | D8 | Save scope and re-anchor | Profile-targeted save writes profile entries only and never dual-writes; fallback-scope relative save re-anchors by greatest visible area and dual-writes `layoutRelative` + `item.layout`; tie/zero-visible without anchor refuses | Allow any save to update the fallback; preserve stored anchor always | Keeps exact-profile snapshots separate from universal fallback writes. |
 | D9 | Topology sampling | One snapshot for launch/reset; A/B stability for save; relative key includes basis rects; profile-enabled A/B gate unchanged | Always sample; no stability check | Preserves the profile-free fast path and prevents half-correct saves. |
 | D10 | Reset behaviour | Restore absolute layout and clear relative fields for matched items; profiles untouched | Leave relative mode; refuse reset | Otherwise reset-layout would not affect the next launch. |
@@ -1096,7 +1107,9 @@ behaviour changed.
 - Keep the profile-free absolute fast path with zero topology access.
 - For relative sets, sample topology once and freeze absolute rectangles.
 - Emit deterministic warnings for missing/ambiguous anchors and unreachable relative
-  targets; use absolute fallback or skip according to section 6.7.
+  targets; use absolute fallback only after reachability. For profile-free relative items on
+  unavailable topology, warn and set `ApplyGeometry = false`; absolute items in the same set
+  keep their existing behavior.
 - Keep profile-aware unsafe-topology refusal unchanged.
 - Update launch trace fields if useful (relative item count, fallback reasons).
 
@@ -1190,6 +1203,8 @@ capture fixtures and CLI harness. Real monitors are only needed for the final sm
   change with a unique identity resolves; port change with duplicate identities is
   ambiguous.
 - Path-only identity resolves; monitor missing; basis rectangle invalid; Int32 overflow.
+- Unavailable topology returns a structured `unavailable` status with no monitor rectangles;
+  it never fabricates a basis or a reachability decision.
 - Primary-role change, display reorder and topology order change do not affect resolution.
 - DPI proxy tests: same fractions with virtualized rectangles at different scale percentages
   resolve proportionally; `ScalePercent` does not alter the math.
@@ -1200,11 +1215,13 @@ capture fixtures and CLI harness. Real monitors are only needed for the final sm
 
 - Profile-free absolute set: topology provider is never called (existing guarantee).
 - Profile-free relative set: exactly one topology call; plan frozen; no post-plan calls.
-- Profile-free relative set, topology unavailable: absolute fallback with warning; no
-  whole-operation refusal; skip if fallback unreachable.
-- Profile-free relative set, missing anchor: absolute fallback with warning; no
-  `SetWindowPos` on the wrong monitor.
-- Profile-free relative set, ambiguous anchor: same.
+- Profile-free relative set, topology unavailable: relative items warn and set
+  `ApplyGeometry = false`; absolute items in the same set retain existing absolute
+  placement; no whole-operation refusal.
+- Profile-free relative set, missing anchor on an available topology: absolute fallback
+  only after reachability; skip if the fallback is unreachable; no `SetWindowPos` on the
+  wrong monitor.
+- Profile-free relative set, ambiguous anchor on an available topology: same.
 - Relative target unreachable: absolute fallback; both unreachable -> `ApplyGeometry=false`.
 - Matched profile entry wins over relative.
 - Matched profile omits item -> relative is used.
