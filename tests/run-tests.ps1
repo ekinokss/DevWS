@@ -35960,7 +35960,7 @@ Start-Sleep -Seconds 6
 
     function New-RelativeLayoutTestMonitor {
         param(
-            [Parameter(Mandatory)][string]$Identity,
+            [Parameter(Mandatory)][AllowEmptyString()][string]$Identity,
             [string]$Instance,
             [int]$X = 0,
             [int]$Y = 0,
@@ -36602,6 +36602,33 @@ Start-Sleep -Seconds 6
         Assert-Equal "basis-unavailable" ([string]$badBasis.Status) "invalid basis is rejected"
     }
 
+    Test-Case "relative conversion checks final output edges after minimum size" {
+        $max = [int]::MaxValue
+
+        $wideBasis = New-RelativeLayoutTestRect -X $max -Y 0 -W 1 -H 100
+        $wide = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (
+            New-RelativeLayoutTestRect -X 0 -Y 0 -W 0.4 -H 1
+        ) -BasisRect $wideBasis
+        Assert-Equal "overflow" ([string]$wide.Status) "right edge overflow is detected after minimum width"
+        Assert-Equal "int32-output-edge-overflow" ([string]$wide.Reason) "right edge overflow reason"
+
+        $tallBasis = New-RelativeLayoutTestRect -X 0 -Y $max -W 100 -H 1
+        $tall = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (
+            New-RelativeLayoutTestRect -X 0 -Y 0 -W 1 -H 0.4
+        ) -BasisRect $tallBasis
+        Assert-Equal "overflow" ([string]$tall.Status) "bottom edge overflow is detected after minimum height"
+        Assert-Equal "int32-output-edge-overflow" ([string]$tall.Reason) "bottom edge overflow reason"
+
+        $validBasis = New-RelativeLayoutTestRect -X ($max - 1) -Y 0 -W 1 -H 100
+        $valid = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (
+            New-RelativeLayoutTestRect -X 0 -Y 0 -W 0.4 -H 1
+        ) -BasisRect $validBasis
+        Assert-True ([bool]$valid.Ok) "rectangle ending exactly at Int32.MaxValue is valid"
+        Assert-Equal ($max - 1) ([int]$valid.Rect.x) "valid boundary x"
+        Assert-Equal 1 ([int]$valid.Rect.w) "valid boundary minimum width"
+        Assert-Equal $max ([long]$valid.Rect.x + [long]$valid.Rect.w) "valid boundary right edge"
+    }
+
     Test-Case "relative anchor selection uses greatest visible area" {
         $left = New-RelativeLayoutTestMonitor -Identity "path:AAA/1" -X 0 -W 1000
         $right = New-RelativeLayoutTestMonitor -Identity "path:BBB/2" -X 1000 -W 1000
@@ -36612,6 +36639,49 @@ Start-Sleep -Seconds 6
         Assert-True ([bool]$selected.Ok) "greatest-area anchor is selected"
         Assert-Equal "path:BBB/2" ([string]$selected.Monitor.IdentityToken) "right monitor has the greatest visible area"
         Assert-Equal 400000 ([double]$selected.VisibleArea) "visible area is exact"
+    }
+
+    Test-Case "relative anchor selection requires a persistable selected identity" {
+        $anonymous = New-RelativeLayoutTestMonitor -Identity "" -X 0 -W 1000
+        $valid = New-RelativeLayoutTestMonitor -Identity "path:BBB/2" -X 1000 -W 1000
+        $anonymousTopology = New-RelativeLayoutTestTopology -Monitors @($anonymous, $valid)
+
+        $noIdentity = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 800 -H 800) -Topology $anonymousTopology
+        Assert-Equal $false ([bool]$noIdentity.Ok) "anonymous selected monitor is refused"
+        Assert-Equal "anchor-unpersistable" ([string]$noIdentity.Status) "anonymous selected monitor status"
+        Assert-Equal "identity-unavailable" ([string]$noIdentity.Reason) "anonymous selected monitor reason"
+
+        $noInstanceFirst = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -X 0 -W 1000
+        $noInstanceSecond = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -X 1000 -W 1000
+        $noInstanceTopology = New-RelativeLayoutTestTopology -Monitors @($noInstanceFirst, $noInstanceSecond)
+
+        $noInstance = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 800 -H 800) -Topology $noInstanceTopology
+        Assert-Equal $false ([bool]$noInstance.Ok) "duplicate EDID without an instance is refused"
+        Assert-Equal "anchor-unpersistable" ([string]$noInstance.Status) "duplicate EDID status"
+        Assert-Equal "duplicate-identity" ([string]$noInstance.Reason) "duplicate EDID reason"
+
+        $first = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -X 0 -W 1000
+        $second = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&3c" -X 1000 -W 1000
+        $duplicateTopology = New-RelativeLayoutTestTopology -Monitors @($first, $second)
+
+        $sameInstanceA = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -X 0 -W 1000
+        $sameInstanceB = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -X 1000 -W 1000
+        $sameInstanceTopology = New-RelativeLayoutTestTopology -Monitors @($sameInstanceA, $sameInstanceB)
+
+        $ambiguousInstance = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 800 -H 800) -Topology $sameInstanceTopology
+        Assert-Equal $false ([bool]$ambiguousInstance.Ok) "duplicate identity plus instance is refused"
+        Assert-Equal "anchor-unpersistable" ([string]$ambiguousInstance.Status) "duplicate identity plus instance status"
+        Assert-Equal "duplicate-identity-instance" ([string]$ambiguousInstance.Reason) "duplicate identity plus instance reason"
+
+        $disambiguated = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 800 -H 800) -Topology $duplicateTopology
+        Assert-True ([bool]$disambiguated.Ok) "selected monitor with a distinct instance is persistable"
+        Assert-Equal "DELA1B2/5&2b" ([string]$disambiguated.Instance) "selected instance is returned for persistence"
+
+        $unique = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -X 0 -W 1000
+        $uniqueTopology = New-RelativeLayoutTestTopology -Monitors @($unique)
+        $uniqueSelection = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 800 -H 800) -Topology $uniqueTopology
+        Assert-True ([bool]$uniqueSelection.Ok) "unique EDID identity without instance is persistable"
+        Assert-Equal "edid:DEL-A1B2-ABC123" ([string]$uniqueSelection.Identity) "selected identity is returned for persistence"
     }
 
     Test-Case "relative anchor selection refuses ties and handles zero-visible cases" {

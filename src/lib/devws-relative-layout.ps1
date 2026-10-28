@@ -448,6 +448,26 @@ function ConvertTo-DevWSRelativeAbsoluteRect {
 
     $width  = [int][Math]::Max(1.0, $widthRaw)
     $height = [int][Math]::Max(1.0, $heightRaw)
+    $leftInt = [int]$left
+    $topInt  = [int]$top
+
+    # The edge checks above happen before the 1-pixel minimum is applied. A
+    # zero-width target at the positive Int32 boundary would otherwise become
+    # x=Int32.MaxValue, w=1, whose right edge is not representable. Use Int64
+    # intermediates so the final edge checks cannot wrap.
+    $finalRight  = [long]$leftInt + [long]$width
+    $finalBottom = [long]$topInt + [long]$height
+
+    if ($finalRight -lt [long][int]::MinValue -or $finalRight -gt [long][int]::MaxValue -or
+        $finalBottom -lt [long][int]::MinValue -or $finalBottom -gt [long][int]::MaxValue) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Status  = "overflow"
+            Reason  = "int32-output-edge-overflow"
+            Message = "The final relative rectangle's right or bottom edge does not fit the Windows 32-bit coordinate range."
+            Rect    = $null
+        }
+    }
 
     return [pscustomobject][ordered]@{
         Ok      = $true
@@ -455,8 +475,8 @@ function ConvertTo-DevWSRelativeAbsoluteRect {
         Reason  = "edge-rounded"
         Message = $null
         Rect    = [pscustomobject][ordered]@{
-            x = [int]$left
-            y = [int]$top
+            x = $leftInt
+            y = $topInt
             w = $width
             h = $height
         }
@@ -637,11 +657,95 @@ function Resolve-DevWSRelativeLayout {
     }
 }
 
+function Test-DevWSRelativeAnchorPersistable {
+    # Validate that one selected monitor can be written as a durable relative
+    # anchor and resolved uniquely on restore using the approved identity rules.
+    # Greatest-visible-area selection alone is not enough: a monitor without
+    # an identity, or one whose identity needs an absent/non-unique instance,
+    # cannot be persisted without falling back to ordinals or positions.
+    param(
+        $Monitor,
+        $Topology
+    )
+
+    if ($null -eq $Monitor -or $Monitor -isnot [System.Management.Automation.PSCustomObject]) {
+        return [pscustomobject][ordered]@{
+            Ok        = $false
+            Status    = "anchor-unpersistable"
+            Reason    = "monitor-invalid"
+            Message   = "The selected monitor is missing or invalid."
+            Monitor   = $null
+            Identity  = $null
+            Instance  = $null
+        }
+    }
+
+    $identity = [string](Get-DevWSProperty -Object $Monitor -Name "IdentityToken")
+
+    if ([string]::IsNullOrWhiteSpace($identity)) {
+        return [pscustomobject][ordered]@{
+            Ok        = $false
+            Status    = "anchor-unpersistable"
+            Reason    = "identity-unavailable"
+            Message   = "The selected monitor has no usable durable identity; its anchor cannot be persisted."
+            Monitor   = $Monitor
+            Identity  = $identity
+            Instance  = $null
+        }
+    }
+
+    $instance = [string](Get-DevWSProperty -Object $Monitor -Name "DevicePathInstance")
+
+    if ($identity.StartsWith("path:", [System.StringComparison]::Ordinal)) {
+        # A path identity already embeds the device-path instance.
+        $instance = $null
+    }
+
+    $monitorFields = [ordered]@{ identity = $identity }
+
+    if (-not [string]::IsNullOrWhiteSpace($instance)) {
+        $monitorFields["instance"] = $instance
+    }
+
+    $probe = [pscustomobject][ordered]@{
+        monitor = [pscustomobject]$monitorFields
+        basis   = "monitor"
+        rect    = [pscustomobject][ordered]@{ x = 0; y = 0; w = 1; h = 1 }
+    }
+
+    $resolved = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout $probe -Topology $Topology
+
+    if (-not [bool]$resolved.Ok) {
+        return [pscustomobject][ordered]@{
+            Ok             = $false
+            Status         = "anchor-unpersistable"
+            Reason         = $resolved.Reason
+            Message        = "The selected monitor's identity cannot be persisted as a unique relative anchor: $($resolved.Message)"
+            Monitor        = $Monitor
+            Identity       = $identity
+            Instance       = $instance
+            ResolvedStatus = $resolved.Status
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok             = $true
+        Status         = "persistable"
+        Reason         = $resolved.Reason
+        Message        = $null
+        Monitor        = $Monitor
+        Identity       = $identity
+        Instance       = $instance
+        ResolvedStatus = $resolved.Status
+    }
+}
+
 function Select-DevWSRelativeAnchorFromRect {
     # Choose the monitor with the strictly greatest visible intersection area
     # for a captured rectangle. Ties are ambiguous and refuse. A rectangle
     # with no visible area may retain an existing relative anchor only when
-    # that anchor resolves uniquely; otherwise it has no usable anchor.
+    # that anchor resolves uniquely; otherwise it has no usable anchor. The
+    # selected monitor must also be persistable as a durable relative anchor.
     param(
         $Rect,
         $Topology,
@@ -752,12 +856,30 @@ function Select-DevWSRelativeAnchorFromRect {
     }
 
     if ($winners.Count -eq 1) {
+        $persistable = Test-DevWSRelativeAnchorPersistable -Monitor $winners[0] -Topology $Topology
+
+        if (-not [bool]$persistable.Ok) {
+            return [pscustomobject][ordered]@{
+                Ok          = $false
+                Status      = $persistable.Status
+                Reason      = $persistable.Reason
+                Message     = $persistable.Message
+                Monitor     = $null
+                Identity    = $persistable.Identity
+                Instance    = $persistable.Instance
+                VisibleArea = [double]$maxArea
+                WinnerCount = 1
+            }
+        }
+
         return [pscustomobject][ordered]@{
             Ok          = $true
             Status      = "selected"
             Reason      = "greatest-visible-area"
             Message     = $null
             Monitor     = $winners[0]
+            Identity    = $persistable.Identity
+            Instance    = $persistable.Instance
             VisibleArea = [double]$maxArea
             WinnerCount = 1
         }
@@ -779,12 +901,30 @@ function Select-DevWSRelativeAnchorFromRect {
         $existing = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout $ExistingRelativeLayout -Topology $Topology
 
         if ([bool]$existing.Ok) {
+            $persistable = Test-DevWSRelativeAnchorPersistable -Monitor $existing.Monitor -Topology $Topology
+
+            if (-not [bool]$persistable.Ok) {
+                return [pscustomobject][ordered]@{
+                    Ok          = $false
+                    Status      = $persistable.Status
+                    Reason      = $persistable.Reason
+                    Message     = $persistable.Message
+                    Monitor     = $null
+                    Identity    = $persistable.Identity
+                    Instance    = $persistable.Instance
+                    VisibleArea = [double]0
+                    WinnerCount = 0
+                }
+            }
+
             return [pscustomobject][ordered]@{
                 Ok          = $true
                 Status      = "selected"
                 Reason      = "existing-anchor"
                 Message     = $null
                 Monitor     = $existing.Monitor
+                Identity    = $persistable.Identity
+                Instance    = $persistable.Instance
                 VisibleArea = [double]0
                 WinnerCount = 0
             }
