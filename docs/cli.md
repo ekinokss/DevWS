@@ -166,7 +166,7 @@ Show the effective saved geometry and relative-layout preview for configured ite
 - Shows the current topology fingerprint, the layout source (profile or fallback), and effective rectangles.
 - A sparse matched profile marks items that still fall back; unreachable rectangles are marked too.
 - Relative items also show their mode, monitor identity/instance, basis, normalized rectangle, resolved rectangle, and any fallback or missing/ambiguous/unavailable reason.
-- Relative placement is preview-only until Phase 3. Launch and terminal resets currently use absolute/profile geometry; there is no live monitor watcher or automatic retile.
+- Relative placement is preview-only until Phase 3. Ordinary set launch targets enabled items and currently uses absolute/profile geometry; explicit targeted resets follow their own target selection. There is no live monitor watcher or automatic retile.
 
 ```powershell
 ws show-layout

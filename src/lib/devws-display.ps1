@@ -424,34 +424,38 @@ function Get-DevWSRelativeDisplayPreviewText {
     param($Item, [string]$ProfileLifecycleRefusal)
 
     if (-not [string]::IsNullOrWhiteSpace($ProfileLifecycleRefusal)) {
-        return "profile-aware lifecycle refuses this topology; relative preview is not applied"
+        return "ordinary set launch would refuse this topology; relative preview is not applied"
+    }
+
+    if (-not [bool]$Item.Enabled) {
+        return "disabled item is shown for inspection; ordinary set launch does not target it; an explicit targeted reset follows its own selection"
     }
 
     switch ([string]$Item.Source) {
         "profile" {
             if ($null -ne $Item.Reachable -and -not [bool]$Item.Reachable) {
-                return "profile '$($Item.ProfileId)' overrides relative intent; profile entry is unreachable (lifecycle would refuse)"
+                return "profile '$($Item.ProfileId)' overrides relative intent; profile entry is unreachable (ordinary set launch would refuse)"
             }
 
-            return "profile '$($Item.ProfileId)' is current lifecycle placement; relative preview is not used"
+            return "profile '$($Item.ProfileId)' is current ordinary set launch placement; relative preview is not used"
         }
         "relative" {
-            return "relative preview only; current ws launch/reset use the absolute fallback until Phase 3"
+            return "relative preview only; ordinary set launch currently uses the absolute fallback until Phase 3"
         }
         "relative-fallback" {
             $reason = Get-DevWSRelativeDisplayStatusText -Status ([string]$Item.RelativeStatus) -Reason ([string]$Item.RelativeReason)
-            return "absolute fallback preview ($reason); current ws launch/reset use the absolute fallback until Phase 3"
+            return "absolute fallback preview ($reason); ordinary set launch currently uses the absolute fallback until Phase 3"
         }
         "relative-unavailable" {
             if ([string]$Item.RelativeStatus -eq "topology-unavailable") {
-                return "no verified geometry (topology unavailable); current ws launch/reset still use the absolute fallback until Phase 3"
+                return "no verified geometry (topology unavailable); ordinary set launch still uses the absolute fallback until Phase 3"
             }
 
             if ($null -ne $Item.FallbackReachable -and -not [bool]$Item.FallbackReachable) {
-                return "no verified geometry (absolute fallback is not reachable); current ws launch/reset still use the absolute fallback until Phase 3"
+                return "no verified geometry (absolute fallback is not reachable); ordinary set launch still uses the absolute fallback until Phase 3"
             }
 
-            return "no verified geometry; current ws launch/reset still use the absolute fallback until Phase 3"
+            return "no verified geometry; ordinary set launch still uses the absolute fallback until Phase 3"
         }
         default {
             return "relative preview only; lifecycle integration is Phase 3"
@@ -515,7 +519,7 @@ function Get-DevWSEffectiveLayoutLines {
             default                   { [string]$Model.ProfileLifecycleRefusal }
         }
 
-        $lines += "  lifecycle   profile-aware launch/reset would refuse ($lifecycleReason)"
+        $lines += "  lifecycle   ordinary set launch would refuse ($lifecycleReason)"
     }
 
     if (@($Model.Profiles).Count -gt 0) {
@@ -602,19 +606,48 @@ function Get-DevWSEffectiveLayoutLines {
 
     $lines += ""
 
-    if (-not [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
-        if ([bool]$Model.HasRelativeItems) {
-            $lines += "  note        Relative previews are read-only. Profile-aware launch/reset would refuse this topology; relative placement becomes operational in Phase 3."
-        }
-        else {
-            $lines += "  note        Profile-aware launch/reset would refuse this topology; no effective layout is applied by lifecycle commands."
-        }
-    }
-    elseif ([bool]$Model.HasRelativeItems) {
-        $lines += "  note        Relative previews are read-only. Current launch/reset use absolute/profile geometry; relative placement becomes operational in Phase 3."
+    $enabledItemCount = if (Test-DevWSProperty -Object $Model -Name "EnabledItemCount") {
+        [int]$Model.EnabledItemCount
     }
     else {
+        @($Model.Items | Where-Object { [bool]$_.Enabled }).Count
+    }
+
+    $hasDisabledItems = if (Test-DevWSProperty -Object $Model -Name "HasDisabledItems") {
+        [bool]$Model.HasDisabledItems
+    }
+    else {
+        @($Model.Items | Where-Object { -not [bool]$_.Enabled }).Count -gt 0
+    }
+
+    $notes = @()
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
+        $notes += "Ordinary set launch would refuse this topology; explicit targeted resets follow their own target selection."
+    }
+    elseif ($enabledItemCount -eq 0) {
+        $notes += "No enabled items for ordinary set launch; disabled items are shown for inspection. Explicit targeted resets follow their own target selection."
+    }
+    elseif ($hasDisabledItems) {
+        $notes += "Ordinary set launch targets enabled items only; explicit targeted resets may include disabled items."
+    }
+
+    if ([bool]$Model.HasRelativeItems) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
+            $notes += "Relative previews are read-only; relative placement becomes operational in Phase 3."
+        }
+        else {
+            $notes += "Relative previews are read-only; ordinary set launch currently uses absolute/profile geometry. Relative placement becomes operational in Phase 3."
+        }
+    }
+
+    if ($notes.Count -eq 0) {
         $lines += "  note        'ws launch' and terminal resets apply exactly this effective layout."
+    }
+    else {
+        foreach ($noteText in $notes) {
+            $lines += "  note        $noteText"
+        }
     }
 
     $lines += ""

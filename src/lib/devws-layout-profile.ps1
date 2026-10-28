@@ -438,9 +438,29 @@ function Get-DevWSEffectiveLayout {
         $signature   = [string](Get-DevWSProperty -Object $Topology -Name "Signature")
     }
 
+    # Ordinary set launch targets enabled items only. The no-target lifecycle
+    # path returns before topology/profile refusal, so the preview must not
+    # advertise a refusal that ordinary launch would never reach. Disabled
+    # items remain fully visible below for inspection and targeted operations.
+    $enabledItemCount = 0
+    $hasDisabledItems = $false
+
+    foreach ($window in @($Set.windows)) {
+        if ($null -eq $window -or $window -isnot [System.Management.Automation.PSCustomObject]) {
+            continue
+        }
+
+        if ([bool]$window.enabled) {
+            $enabledItemCount++
+        }
+        else {
+            $hasDisabledItems = $true
+        }
+    }
+
     $profileRefusalReason = $null
 
-    if ($profileAware) {
+    if ($profileAware -and $enabledItemCount -gt 0) {
         $eligibility = Test-DevWSLayoutTopologyMatchable -Topology $Topology
 
         if (-not $eligibility.Eligible) {
@@ -557,7 +577,7 @@ function Get-DevWSEffectiveLayout {
             $visibleHeight = [int]$effectiveMetrics.VisibleHeight
         }
 
-        if ($itemSource -eq "profile" -and $reachable -eq $false) {
+        if ([bool]$item.enabled -and $itemSource -eq "profile" -and $reachable -eq $false) {
             $profileEntryUnreachable = $true
         }
 
@@ -587,7 +607,7 @@ function Get-DevWSEffectiveLayout {
         }) | Out-Null
     }
 
-    if ($null -eq $profileRefusalReason -and $profileEntryUnreachable) {
+    if ($enabledItemCount -gt 0 -and $null -eq $profileRefusalReason -and $profileEntryUnreachable) {
         $profileRefusalReason = "unreachable-profile-entry"
     }
 
@@ -601,6 +621,8 @@ function Get-DevWSEffectiveLayout {
         Reason                  = $selection.Reason
         ProfileAware            = $profileAware
         ProfileLifecycleRefusal = $profileRefusalReason
+        EnabledItemCount        = $enabledItemCount
+        HasDisabledItems        = $hasDisabledItems
         TopologyAvailable       = ($null -ne $Topology -and [bool](Get-DevWSProperty -Object $Topology -Name "Available"))
         TopologySignature       = $signature
         TopologyFingerprint     = $fingerprint

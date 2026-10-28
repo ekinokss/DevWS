@@ -176,7 +176,7 @@ function Get-DevWSHelpCommandInfo {
             Details  = @(
                 "Shows the current topology fingerprint, the layout source (profile or fallback), and effective rectangles.",
                 "Absolute and matched-profile items show lifecycle geometry; relative items also show mode, anchor, basis, normalized and resolved previews.",
-                "Relative previews are read-only and become operational in Phase 3. Launch and terminal resets currently use absolute/profile geometry; there is no live monitor watcher or automatic retile."
+                "Relative previews are read-only and become operational in Phase 3. Ordinary set launch targets enabled items and currently uses absolute/profile geometry; explicit targeted resets follow their own target selection. There is no live monitor watcher or automatic retile."
             )
             Examples = @("ws show-layout", "ws show-layout secondary")
             Warning  = $null

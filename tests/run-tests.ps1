@@ -36858,7 +36858,8 @@ Start-Sleep -Seconds 6
             [string]$Id = "item",
             [string]$Mode = "absolute",
             $Relative = $null,
-            $Layout = $null
+            $Layout = $null,
+            [bool]$Enabled = $true
         )
 
         if ($null -eq $Layout) {
@@ -36868,7 +36869,7 @@ Start-Sleep -Seconds 6
         $item = [pscustomobject][ordered]@{
             id        = $Id
             type      = "terminal"
-            enabled   = $true
+            enabled   = $Enabled
             windowId  = "DevWS-display-$Id"
             path      = 'C:\x'
             elevated  = $true
@@ -36945,7 +36946,7 @@ Start-Sleep -Seconds 6
         Assert-Contains $text "basis       workArea" "basis detail"
         Assert-Contains $text "normalized  x=0.5 y=0 w=0.5 h=1" "normalized detail"
         Assert-Contains $text "resolved    x=960 y=0 w=960 h=1040" "resolved detail"
-        Assert-Contains $text "preview     relative preview only; current ws launch/reset use the absolute fallback until Phase 3" "preview is explicitly non-lifecycle"
+        Assert-Contains $text "preview     relative preview only; ordinary set launch currently uses the absolute fallback until Phase 3" "preview is explicitly non-lifecycle"
         Assert-Contains $text "status      resolved" "resolved status"
         Assert-Contains $text "Relative previews are read-only" "read-only note"
         Assert-NotContains $text "apply exactly this effective layout" "relative set does not claim lifecycle truth"
@@ -37095,7 +37096,7 @@ Start-Sleep -Seconds 6
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "[profile overrides relative]" "override marker"
-        Assert-Contains $text "preview     profile 'docked' is current lifecycle placement; relative preview is not used" "override preview"
+        Assert-Contains $text "preview     profile 'docked' is current ordinary set launch placement; relative preview is not used" "override preview"
         Assert-Contains $text "profile 'docked'" "profile selection"
         Assert-Contains $text "Relative previews are read-only" "relative note"
     }
@@ -37136,9 +37137,101 @@ Start-Sleep -Seconds 6
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "topology not fully identified" "existing profile-safety wording"
-        Assert-Contains $text "lifecycle   profile-aware launch/reset would refuse (topology not fully identified)" "strict refusal diagnostic"
-        Assert-Contains $text "profile-aware lifecycle refuses this topology; relative preview is not applied" "preview refusal detail"
-        Assert-Contains $text "Profile-aware launch/reset would refuse" "relative note refusal wording"
+        Assert-Contains $text "lifecycle   ordinary set launch would refuse (topology not fully identified)" "strict refusal diagnostic"
+        Assert-Contains $text "ordinary set launch would refuse this topology; relative preview is not applied" "preview refusal detail"
+        Assert-Contains $text "Ordinary set launch would refuse this topology" "ordinary launch refusal note"
+
+        $plannerMessage = $null
+        try {
+            $null = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider { $topology }
+        }
+        catch {
+            $plannerMessage = $_.Exception.Message
+        }
+        Assert-Contains ([string]$plannerMessage) "not safely matchable" "lifecycle planner refuses the same strict topology"
+    }
+
+    Test-Case "show-layout ignores disabled unreachable profile entries for ordinary launch refusal" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature $signature -Monitors @($monitor)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "enabled" -Rect (New-RelativeDisplayRect -X 10 -Y 10 -W 500 -H 500)
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "disabled" -Rect (New-RelativeDisplayRect -X 9000 -Y 9000 -W 100 -H 100)
+        $enabledItem = New-RelativeDisplayTerminal -Id "enabled" -Layout (New-RelativeDisplayRect -X 1 -Y 2 -W 300 -H 400)
+        $disabledItem = New-RelativeDisplayTerminal -Id "disabled" -Enabled $false -Layout (New-RelativeDisplayRect -X 3 -Y 4 -W 300 -H 400)
+        $set = New-RelativeDisplaySet -Items @($enabledItem, $disabledItem) -Profiles @($profile)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal 1 ([int]$model.EnabledItemCount) "one enabled target"
+        Assert-Equal $true ([bool]$model.HasDisabledItems) "disabled item present"
+        Assert-True ([string]::IsNullOrWhiteSpace([string]$model.ProfileLifecycleRefusal)) "disabled unreachable entry does not refuse ordinary launch"
+        $disabledModel = @($model.Items | Where-Object { $_.ItemId -eq "disabled" })[0]
+        Assert-Equal $false ([bool]$disabledModel.Enabled) "disabled item remains disabled in model"
+        Assert-Equal $false ([bool]$disabledModel.Reachable) "disabled unreachable diagnostic retained"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-NotContains $text "lifecycle   ordinary set launch would refuse" "no ordinary launch lifecycle refusal"
+        Assert-Contains $text "disabled" "disabled item remains visible"
+        Assert-Contains $text "[disabled]" "disabled marker retained"
+        Assert-Contains $text "[unreachable]" "disabled unreachable marker retained"
+        Assert-Contains $text "Ordinary set launch targets enabled items only" "target-scope note"
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider { $topology }
+        Assert-Equal 1 (@($plan.Items).Count) "ordinary lifecycle plan contains only enabled items"
+        Assert-Equal "enabled" ([string]@($plan.Items)[0].ItemId) "ordinary lifecycle plan targets the enabled item"
+    }
+
+    Test-Case "show-layout reports refusal for an enabled unreachable profile entry" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeDisplayTopology -Signature $signature -Monitors @($monitor)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "enabled" -Rect (New-RelativeDisplayRect -X 9000 -Y 9000 -W 100 -H 100)
+        $item = New-RelativeDisplayTerminal -Id "enabled" -Layout (New-RelativeDisplayRect -X 1 -Y 2 -W 300 -H 400)
+        $set = New-RelativeDisplaySet -Items @($item) -Profiles @($profile)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal "unreachable-profile-entry" ([string]$model.ProfileLifecycleRefusal) "enabled unreachable entry refuses"
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "lifecycle   ordinary set launch would refuse (matched profile entry is unreachable)" "enabled refusal diagnostic"
+        Assert-Contains $text "Ordinary set launch would refuse this topology" "enabled refusal note"
+
+        $plannerMessage = $null
+        try { $null = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider { $topology } }
+        catch { $plannerMessage = $_.Exception.Message }
+        Assert-Contains ([string]$plannerMessage) "not reachable" "lifecycle planner refuses the enabled unreachable entry"
+    }
+
+    Test-Case "show-layout avoids ordinary launch refusal when no enabled targets exist" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $topology = New-RelativeDisplayTopology -Available $false -Monitors @() -Signature $signature
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        $disabledAbsolute = New-RelativeDisplayTerminal -Id "disabled-absolute" -Enabled $false -Layout (New-RelativeDisplayRect -X 10 -Y 20 -W 300 -H 400)
+        $disabledRelative = New-RelativeDisplayTerminal -Id "disabled-relative" -Enabled $false -Mode "relative" -Relative (
+            New-RelativeDisplayRelative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-RelativeDisplaySet -Items @($disabledAbsolute, $disabledRelative) -Profiles @($profile)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        Assert-Equal 0 ([int]$model.EnabledItemCount) "no enabled targets"
+        Assert-True ([string]::IsNullOrWhiteSpace([string]$model.ProfileLifecycleRefusal)) "no ordinary launch refusal without targets"
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-NotContains $text "lifecycle   ordinary set launch would refuse" "no topology refusal without targets"
+        Assert-Contains $text "No enabled items for ordinary set launch" "no-target note"
+        Assert-Contains $text "disabled-absolute" "disabled absolute item visible"
+        Assert-Contains $text "disabled-relative" "disabled relative item visible"
+        Assert-Contains $text "[disabled]" "disabled markers retained"
+
+        $script:phase2PlannerTopologyCalls = 0
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider {
+            $script:phase2PlannerTopologyCalls++
+            return $topology
+        }
+        Assert-Equal "no-targets" ([string]$plan.Reason) "ordinary lifecycle plan takes the no-target path"
+        Assert-Equal 0 $script:phase2PlannerTopologyCalls "no-target lifecycle path does not sample topology"
+        Assert-Equal 0 (@($plan.Items).Count) "no-target lifecycle plan has no items"
     }
 
     Test-Case "show-layout relative fractions are culture-invariant" {
