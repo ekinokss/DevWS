@@ -93,7 +93,7 @@ try {
         "devws-lifecycle.ps1", "devws-terminal.ps1", "devws-app.ps1",
         "devws-window-ops.ps1", "devws-worker-protocol.ps1",
         "devws-terminal-launch.ps1", "devws-broker-protocol.ps1", "devws-launch.ps1",
-        "devws-monitor.ps1", "devws-layout-profile.ps1", "devws-lifecycle-layout.ps1"
+        "devws-monitor.ps1", "devws-relative-layout.ps1", "devws-layout-profile.ps1", "devws-lifecycle-layout.ps1"
     )) {
         . (Join-Path $LibDir $name)
     }

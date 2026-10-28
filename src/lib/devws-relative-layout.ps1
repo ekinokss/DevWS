@@ -657,6 +657,96 @@ function Resolve-DevWSRelativeLayout {
     }
 }
 
+function Resolve-DevWSRelativePlacement {
+    # Shared read-only placement policy for relative items. Used by both
+    # `ws show-layout` and the lifecycle planner so their fallback and skip
+    # decisions cannot diverge.
+    #
+    # Policy:
+    #   - resolve the relative target through the Phase 1 model;
+    #   - a reachable resolved target wins;
+    #   - otherwise use the absolute fallback only when the existing
+    #     reachability rule accepts it on an available topology;
+    #   - otherwise ApplyGeometry=false and no verified rectangle is reported;
+    #   - unavailable topology never advertises a fallback.
+    param(
+        $RelativeLayout,
+        $Topology,
+        [AllowEmptyCollection()][object[]]$MonitorRects = @(),
+        $FallbackRect = $null
+    )
+
+    $resolution = Resolve-DevWSRelativeLayout -RelativeLayout $RelativeLayout -Topology $Topology
+    $relativeStatus  = [string]$resolution.Status
+    $relativeReason  = [string]$resolution.Reason
+    $relativeMessage = [string]$resolution.Message
+    $relativeRect    = $null
+    $relativeReachable = $null
+    $fallbackReachable = $null
+
+    $monitorRectValues = @($MonitorRects)
+    $topologyAvailable = ($null -ne $Topology -and [bool](Get-DevWSProperty -Object $Topology -Name "Available"))
+
+    if ([bool]$resolution.Ok) {
+        $relativeRect = $resolution.Rect
+        $relativeMetrics = Test-DevWSRectReachable -Rect $relativeRect -MonitorRects $monitorRectValues
+        $relativeReachable = [bool]$relativeMetrics.Reachable
+
+        if (-not $relativeReachable) {
+            $relativeStatus = "relative-unreachable"
+            $relativeReason = "relative-target-unreachable"
+            $relativeMessage = "The resolved relative target is not reachable on the current topology."
+        }
+    }
+
+    if ($topologyAvailable -and $monitorRectValues.Count -gt 0 -and
+        $null -ne $FallbackRect -and $FallbackRect -is [System.Management.Automation.PSCustomObject]) {
+        $fallbackMetrics = Test-DevWSRectReachable -Rect $FallbackRect -MonitorRects $monitorRectValues
+        $fallbackReachable = [bool]$fallbackMetrics.Reachable
+    }
+
+    $effective      = $null
+    $itemSource     = "relative-unavailable"
+    $applyGeometry  = $false
+    $fallbackUsed   = $false
+    $effectiveReachable = $null
+
+    if ($topologyAvailable) {
+        if ($relativeStatus -eq "resolved" -and $relativeReachable -eq $true) {
+            $effective          = $relativeRect
+            $itemSource         = "relative"
+            $applyGeometry      = $true
+            $effectiveReachable = $true
+        }
+        elseif ($fallbackReachable -eq $true) {
+            $effective          = $FallbackRect
+            $itemSource         = "relative-fallback"
+            $applyGeometry      = $true
+            $fallbackUsed       = $true
+            $effectiveReachable = $true
+        }
+    }
+
+    if ($relativeStatus -eq "relative-unreachable" -and $fallbackReachable -eq $false) {
+        $relativeReason = "relative-target-and-fallback-unreachable"
+        $relativeMessage = "The relative target and the absolute fallback are not reachable on the current topology."
+    }
+
+    return [pscustomobject][ordered]@{
+        Status              = $relativeStatus
+        Reason              = $relativeReason
+        Message             = $relativeMessage
+        RelativeRect        = $relativeRect
+        RelativeReachable   = $relativeReachable
+        FallbackReachable   = $fallbackReachable
+        FallbackUsed        = $fallbackUsed
+        Source              = $itemSource
+        EffectiveRect       = $effective
+        EffectiveReachable  = $effectiveReachable
+        ApplyGeometry       = $applyGeometry
+    }
+}
+
 function Test-DevWSRelativeAnchorPersistable {
     # Validate that one selected monitor can be written as a durable relative
     # anchor and resolved uniquely on restore using the approved identity rules.

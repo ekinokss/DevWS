@@ -4,16 +4,20 @@
 # library (devws-monitor.ps1) and the Pass-5C pure layout-profile policy
 # (devws-layout-profile.ps1). For ONE lifecycle operation it:
 #
-#   - decides whether topology is required at all (a set with no
-#     layoutProfiles never touches the monitor layer);
-#   - acquires the topology snapshot AT MOST ONCE when profiles exist;
+#   - decides whether topology is required at all: a profile-free set whose
+#     actual targets are all absolute keeps the hard legacy fast path with
+#     zero topology calls; profile-aware sets and profile-free sets with a
+#     targeted relative item need one snapshot;
+#   - acquires the topology snapshot AT MOST ONCE when it is needed;
 #   - refuses the operation before any side effect when a profile-aware set
 #     cannot be placed safely (topology unavailable/incomplete/ambiguous,
 #     duplicate matchers, or an unreachable explicit profile rectangle);
 #   - resolves the effective rectangle per target item (exact matched profile
-#     override, sparse per-item fallback, or whole-set fallback on no match);
-#   - downgrades an unreachable FALLBACK rectangle to a deterministic warning
-#     plus ApplyGeometry=false ("handle the item, do not move it");
+#     override, then relative placement with a verified absolute fallback,
+#     then mandatory absolute fallback);
+#   - downgrades an unusable relative target or an unreachable absolute
+#     FALLBACK rectangle to a deterministic warning plus ApplyGeometry=false
+#     ("handle the item, do not move it");
 #   - freezes the whole decision into one plan that every consumer (app
 #     lifecycle, elevated broker, Helper fallback, reset worker) uses without
 #     ever re-sampling topology.
@@ -56,6 +60,16 @@ function Get-DevWSLifecycleTopologyRefusalMessage {
 function New-DevWSLifecycleLayoutPlan {
     # One frozen, read-only lifecycle placement decision for one explicit
     # operation. See the file header for the full policy.
+    #
+    # Phase 3 precedence per targeted item:
+    #   1. matched exact-profile entry (unreachable => refuse);
+    #   2. relative layout when explicitly enabled;
+    #   3. mandatory absolute fallback.
+    #
+    # Topology is acquired exactly once only when the operation actually needs
+    # it: a profile-aware set, or a profile-free set with at least one targeted
+    # relative item. A profile-free set whose targets are all absolute keeps
+    # the hard legacy fast path with zero topology calls.
     #
     # Inputs:
     #   Config/SetId - target set resolution (skipped when -Set is supplied)
@@ -112,40 +126,13 @@ function New-DevWSLifecycleLayoutPlan {
         }
     }
 
-    $profileAware = Test-DevWSSetHasLayoutProfiles -Set $setValue
+    $profileAware  = Test-DevWSSetHasLayoutProfiles -Set $setValue
+    $relativeTarget = $false
 
-    # ---- no profiles: the hard legacy fast path ----------------------------
-    # No monitor snapshot, no topology dependency, no reachability gate; every
-    # item keeps its fallback item.layout with movement enabled. This must
-    # keep working even when Get-DevWSMonitorTopology would throw.
-    if (-not $profileAware) {
-        $legacyItems = [System.Collections.Generic.List[object]]::new()
-
-        foreach ($window in $targetItems) {
-            $legacyItems.Add([pscustomobject]@{
-                ItemId        = [string]$window.id
-                Type          = [string]$window.type
-                Source        = "fallback"
-                ProfileId     = $null
-                ApplyGeometry = $true
-                Layout        = $window.layout
-                Reachable     = $null
-                VisibleRatio  = $null
-                VisibleWidth  = $null
-                VisibleHeight = $null
-            }) | Out-Null
-        }
-
-        return [pscustomobject]@{
-            SetId               = $setIdValue
-            ProfileAware        = $false
-            Source              = "fallback"
-            ProfileId           = $null
-            Reason              = "no-profiles"
-            TopologySignature   = $null
-            TopologyFingerprint = $null
-            Items               = @($legacyItems.ToArray())
-            Warnings            = @()
+    foreach ($window in @($targetItems)) {
+        if ((Get-DevWSProperty -Object $window -Name "layoutMode") -ceq "relative") {
+            $relativeTarget = $true
+            break
         }
     }
 
@@ -153,13 +140,54 @@ function New-DevWSLifecycleLayoutPlan {
     if ($targetItems.Count -eq 0) {
         return [pscustomobject]@{
             SetId               = $setIdValue
-            ProfileAware        = $true
+            ProfileAware        = $profileAware
+            RelativeAware       = $false
             Source              = "fallback"
             ProfileId           = $null
             Reason              = "no-targets"
             TopologySignature   = $null
             TopologyFingerprint = $null
             Items               = @()
+            Warnings            = @()
+        }
+    }
+
+    # ---- profile-free, all-absolute: the hard legacy fast path ------------
+    # No monitor snapshot, no topology dependency, no reachability gate; every
+    # target keeps its fallback item.layout with movement enabled. Disabled
+    # relative items that are not targeted never affect this path.
+    if (-not $profileAware -and -not $relativeTarget) {
+        $legacyItems = [System.Collections.Generic.List[object]]::new()
+
+        foreach ($window in $targetItems) {
+            $legacyItems.Add([pscustomobject]@{
+                ItemId           = [string]$window.id
+                Type             = [string]$window.type
+                Source           = "fallback"
+                ProfileId        = $null
+                ApplyGeometry    = $true
+                Layout           = $window.layout
+                Reachable        = $null
+                VisibleRatio     = $null
+                VisibleWidth     = $null
+                VisibleHeight    = $null
+                PlacementStatus  = "absolute"
+                PlacementReason  = "legacy-fast-path"
+                RelativeRect     = $null
+                FallbackUsed     = $false
+            }) | Out-Null
+        }
+
+        return [pscustomobject]@{
+            SetId               = $setIdValue
+            ProfileAware        = $false
+            RelativeAware       = $false
+            Source              = "fallback"
+            ProfileId           = $null
+            Reason              = "no-profiles"
+            TopologySignature   = $null
+            TopologyFingerprint = $null
+            Items               = @($legacyItems.ToArray())
             Warnings            = @()
         }
     }
@@ -171,6 +199,112 @@ function New-DevWSLifecycleLayoutPlan {
     # Exactly ONE snapshot for the whole operation (never re-sampled).
     $topology = & $TopologyProvider
 
+    $monitorRects = [System.Collections.Generic.List[object]]::new()
+
+    if ($null -ne $topology -and [bool](Get-DevWSProperty -Object $topology -Name "Available")) {
+        $topologyMonitors = Get-DevWSProperty -Object $topology -Name "Monitors"
+
+        if ($null -ne $topologyMonitors -and $topologyMonitors -is [array]) {
+            foreach ($topologyMonitor in @($topologyMonitors)) {
+                if ($null -ne $topologyMonitor -and $null -ne $topologyMonitor.MonitorRect) {
+                    $monitorRects.Add($topologyMonitor.MonitorRect) | Out-Null
+                }
+            }
+        }
+    }
+
+    $monitorRectValues = @($monitorRects.ToArray())
+    $planItems = [System.Collections.Generic.List[object]]::new()
+    $warnings  = [System.Collections.Generic.List[string]]::new()
+
+    $addRelativeWarning = {
+        param([string]$ItemId, $Decision)
+
+        if ([string]$Decision.Status -eq "topology-unavailable") {
+            $warnings.Add(("$setIdValue/$ItemId" + ": relative layout cannot be resolved because the current monitor topology is unavailable; the item will be handled normally but its window position will not be changed.")) | Out-Null
+        }
+        elseif ([bool]$Decision.FallbackUsed) {
+            $warnings.Add(("$setIdValue/$ItemId" + ": relative layout ($([string]$Decision.Status): $([string]$Decision.Reason)); using the reachable absolute fallback layout.")) | Out-Null
+        }
+        else {
+            $warnings.Add(("$setIdValue/$ItemId" + ": relative layout has no reachable placement ($([string]$Decision.Status): $([string]$Decision.Reason)); the item will be handled normally but its window position will not be changed.")) | Out-Null
+        }
+    }
+
+    # ---- profile-free relative path ---------------------------------------
+    if (-not $profileAware) {
+        foreach ($window in $targetItems) {
+            $itemId = [string]$window.id
+            $layoutMode = if ((Get-DevWSProperty -Object $window -Name "layoutMode") -ceq "relative") { "relative" } else { "absolute" }
+
+            if ($layoutMode -eq "relative") {
+                $decision = Resolve-DevWSRelativePlacement `
+                    -RelativeLayout (Get-DevWSProperty -Object $window -Name "layoutRelative") `
+                    -Topology $topology `
+                    -MonitorRects $monitorRectValues `
+                    -FallbackRect $window.layout
+
+                $apply = [bool]$decision.ApplyGeometry
+                $layout = if ($apply -and $null -ne $decision.EffectiveRect) { $decision.EffectiveRect } else { $window.layout }
+
+                if (-not $apply -or [bool]$decision.FallbackUsed) {
+                    & $addRelativeWarning $itemId $decision
+                }
+
+                $planItems.Add([pscustomobject]@{
+                    ItemId           = $itemId
+                    Type             = [string]$window.type
+                    Source           = [string]$decision.Source
+                    ProfileId        = $null
+                    ApplyGeometry    = $apply
+                    Layout           = $layout
+                    Reachable        = $decision.EffectiveReachable
+                    VisibleRatio     = $null
+                    VisibleWidth     = $null
+                    VisibleHeight    = $null
+                    PlacementStatus  = [string]$decision.Status
+                    PlacementReason  = [string]$decision.Reason
+                    RelativeRect     = $decision.RelativeRect
+                    FallbackUsed     = [bool]$decision.FallbackUsed
+                }) | Out-Null
+            }
+            else {
+                # Absolute items in a profile-free mixed set retain the legacy
+                # absolute-placement semantics: no topology gate, no skip.
+                $planItems.Add([pscustomobject]@{
+                    ItemId           = $itemId
+                    Type             = [string]$window.type
+                    Source           = "fallback"
+                    ProfileId        = $null
+                    ApplyGeometry    = $true
+                    Layout           = $window.layout
+                    Reachable        = $null
+                    VisibleRatio     = $null
+                    VisibleWidth     = $null
+                    VisibleHeight    = $null
+                    PlacementStatus  = "absolute"
+                    PlacementReason  = "legacy-absolute"
+                    RelativeRect     = $null
+                    FallbackUsed     = $false
+                }) | Out-Null
+            }
+        }
+
+        return [pscustomobject]@{
+            SetId               = $setIdValue
+            ProfileAware        = $false
+            RelativeAware       = $true
+            Source              = "relative"
+            ProfileId           = $null
+            Reason              = "relative"
+            TopologySignature   = [string](Get-DevWSProperty -Object $topology -Name "Signature")
+            TopologyFingerprint = [string](Get-DevWSProperty -Object $topology -Name "Fingerprint")
+            Items               = @($planItems.ToArray())
+            Warnings            = @($warnings.ToArray())
+        }
+    }
+
+    # ---- profile-aware path: strict topology/profile refusal unchanged ----
     $eligibility = Test-DevWSLayoutTopologyMatchable -Topology $topology
 
     if (-not $eligibility.Eligible) {
@@ -183,23 +317,13 @@ function New-DevWSLifecycleLayoutPlan {
         throw ("Set '$setIdValue': " + (Get-DevWSLifecycleTopologyRefusalMessage -Reason "ambiguous-matchers"))
     }
 
-    $monitorRects = [System.Collections.Generic.List[object]]::new()
-
-    foreach ($topologyMonitor in @($topology.Monitors)) {
-        if ($null -ne $topologyMonitor -and $null -ne $topologyMonitor.MonitorRect) {
-            $monitorRects.Add($topologyMonitor.MonitorRect) | Out-Null
-        }
-    }
-
-    $monitorRectValues = @($monitorRects.ToArray())
-    $planItems = [System.Collections.Generic.List[object]]::new()
-    $warnings  = [System.Collections.Generic.List[string]]::new()
-
     foreach ($window in $targetItems) {
         $itemId     = [string]$window.id
+        $layoutMode = if ((Get-DevWSProperty -Object $window -Name "layoutMode") -ceq "relative") { "relative" } else { "absolute" }
+        $profileId  = $null
         $effective  = $window.layout
         $itemSource = "fallback"
-        $profileId  = $null
+        $entry      = $null
 
         if ($selection.Status -eq "matched") {
             $entry = Get-DevWSLayoutProfileEntry -Profile $selection.Profile -ItemId $itemId
@@ -211,37 +335,98 @@ function New-DevWSLifecycleLayoutPlan {
             }
         }
 
-        $metrics = Test-DevWSRectReachable -Rect $effective -MonitorRects $monitorRectValues
-        $apply   = $true
+        if ($null -ne $entry) {
+            # Exact-topology profile precedence. Unreachable profile geometry
+            # is a configuration error and refuses; it never falls through to
+            # relative or absolute geometry.
+            $metrics = Test-DevWSRectReachable -Rect $effective -MonitorRects $monitorRectValues
 
-        if (-not [bool]$metrics.Reachable) {
-            if ($itemSource -eq "profile") {
-                # An exact-topology profile with unreachable explicit geometry
-                # is a configuration error, not a compatibility fallback.
+            if (-not [bool]$metrics.Reachable) {
                 throw "Set '$setIdValue' matches layout profile '$profileId' on the current monitor topology, but the profile rectangle for item '$itemId' (x=$([int]$effective.x) y=$([int]$effective.y) w=$([int]$effective.w) h=$([int]$effective.h)) is not reachable on that topology (visibleRatio=$([Math]::Round([double]$metrics.VisibleRatio, 4)), visible=$([int]$metrics.VisibleWidth)x$([int]$metrics.VisibleHeight)). The operation was refused before any side effect; fix the profile rectangle for '$setIdValue/$itemId' with 'ws set-geometry $setIdValue/$itemId --x ... --y ... --width ... --height ... --layout $profileId', or re-key the profile with 'ws layout-profile match $setIdValue/$profileId'."
             }
 
-            $apply = $false
+            $planItems.Add([pscustomobject]@{
+                ItemId           = $itemId
+                Type             = [string]$window.type
+                Source           = "profile"
+                ProfileId        = $profileId
+                ApplyGeometry    = $true
+                Layout           = $effective
+                Reachable        = [bool]$metrics.Reachable
+                VisibleRatio     = [double]$metrics.VisibleRatio
+                VisibleWidth     = [int]$metrics.VisibleWidth
+                VisibleHeight    = [int]$metrics.VisibleHeight
+                PlacementStatus  = "profile"
+                PlacementReason  = "profile"
+                RelativeRect     = $null
+                FallbackUsed     = $false
+            }) | Out-Null
+            continue
+        }
+
+        if ($layoutMode -eq "relative") {
+            $decision = Resolve-DevWSRelativePlacement `
+                -RelativeLayout (Get-DevWSProperty -Object $window -Name "layoutRelative") `
+                -Topology $topology `
+                -MonitorRects $monitorRectValues `
+                -FallbackRect $window.layout
+
+            $apply = [bool]$decision.ApplyGeometry
+            $layout = if ($apply -and $null -ne $decision.EffectiveRect) { $decision.EffectiveRect } else { $window.layout }
+
+            if (-not $apply -or [bool]$decision.FallbackUsed) {
+                & $addRelativeWarning $itemId $decision
+            }
+
+            $planItems.Add([pscustomobject]@{
+                ItemId           = $itemId
+                Type             = [string]$window.type
+                Source           = [string]$decision.Source
+                ProfileId        = $null
+                ApplyGeometry    = $apply
+                Layout           = $layout
+                Reachable        = $decision.EffectiveReachable
+                VisibleRatio     = $null
+                VisibleWidth     = $null
+                VisibleHeight    = $null
+                PlacementStatus  = [string]$decision.Status
+                PlacementReason  = [string]$decision.Reason
+                RelativeRect     = $decision.RelativeRect
+                FallbackUsed     = [bool]$decision.FallbackUsed
+            }) | Out-Null
+            continue
+        }
+
+        $metrics = Test-DevWSRectReachable -Rect $effective -MonitorRects $monitorRectValues
+        $apply   = [bool]$metrics.Reachable
+        $placementStatus = if ($apply) { "fallback" } else { "fallback-unreachable" }
+
+        if (-not $apply) {
             $warnings.Add(("$setIdValue/$itemId" + ": fallback layout is not reachable on the current monitor topology; the item will be handled normally but its window position will not be changed.")) | Out-Null
         }
 
         $planItems.Add([pscustomobject]@{
-            ItemId        = $itemId
-            Type          = [string]$window.type
-            Source        = $itemSource
-            ProfileId     = $profileId
-            ApplyGeometry = $apply
-            Layout        = $effective
-            Reachable     = [bool]$metrics.Reachable
-            VisibleRatio  = [double]$metrics.VisibleRatio
-            VisibleWidth  = [int]$metrics.VisibleWidth
-            VisibleHeight = [int]$metrics.VisibleHeight
+            ItemId           = $itemId
+            Type             = [string]$window.type
+            Source           = "fallback"
+            ProfileId        = $null
+            ApplyGeometry    = $apply
+            Layout           = $effective
+            Reachable        = [bool]$metrics.Reachable
+            VisibleRatio     = [double]$metrics.VisibleRatio
+            VisibleWidth     = [int]$metrics.VisibleWidth
+            VisibleHeight    = [int]$metrics.VisibleHeight
+            PlacementStatus  = $placementStatus
+            PlacementReason  = $placementStatus
+            RelativeRect     = $null
+            FallbackUsed     = $false
         }) | Out-Null
     }
 
     return [pscustomobject]@{
         SetId               = $setIdValue
         ProfileAware        = $true
+        RelativeAware       = $relativeTarget
         Source              = if ($selection.Status -eq "matched") { "profile" } else { "fallback" }
         ProfileId           = $selection.ProfileId
         Reason              = $selection.Reason

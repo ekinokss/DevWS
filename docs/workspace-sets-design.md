@@ -120,7 +120,9 @@ else falls back.
 
 That produces three useful properties:
 
-- a set with **no** profiles has no monitor dependency at all;
+- a set with **no** profiles and no targeted relative items has no monitor dependency at
+  all; a relative item uses one topology snapshot per launch/reset, while absolute items
+  keep their legacy placement;
 - a set with profiles still works on an unknown monitor arrangement, because the fallback
   always applies;
 - a profile is never partially applied: an operation either matches exactly one profile or
@@ -203,5 +205,5 @@ change to add:
 - per-set application dependency declarations;
 - arbitrary hotkey macros or actions beyond set launch bindings.
 
-Deferred layout ideas — monitor-relative geometry, missing-monitor retiling, grids, named
-zones — are collected in [future-work.md](future-work.md).
+Remaining layout research (missing-monitor retiling, grids and named zones) is collected in
+[future-work.md](future-work.md).

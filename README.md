@@ -296,12 +296,13 @@ Layout is captured from reality rather than typed in by hand:
    reliable tracked working directory and active tab of each managed terminal.
 
 Geometry capture is all-or-nothing: if any enabled item cannot be captured, nothing is
-written. `ws show-layout` previews exactly which rectangles the next launch or terminal
+written. `ws show-layout` reports exactly which rectangles the next launch or terminal
 reset will apply.
 
 If your monitors change, optional **topology layout profiles** let a set carry a different
 layout per monitor arrangement, while `item.layout` remains the universal fallback. A set
-with no profiles has no monitor dependency at all.
+with no profiles and no relative items has no monitor dependency at all; a targeted relative
+item resolves its anchor with one topology snapshot per launch or reset.
 
 ## Hotkeys
 

@@ -418,8 +418,9 @@ function New-DevWSLaunchLayoutPlan {
     #
     # Returns $null when the target has no enabled items: a no-op launch has
     # no placement policy and therefore pays no topology cost. Otherwise the
-    # set's layoutProfiles decide whether exactly one monitor snapshot is
-    # required (profile-free sets never touch the monitor layer).
+    # set's layoutProfiles and targeted relative items decide whether exactly
+    # one monitor snapshot is required; an all-absolute profile-free set keeps
+    # the legacy path with zero monitor access.
     param(
         $Config,
         [string]$SetId,
@@ -533,7 +534,8 @@ function Invoke-DevWSLaunchTransaction {
     # ---- Pass 5D lifecycle placement preflight (read-only, pre-lock) ------
     # The placement decision is frozen before ANY side effect: a precomputed
     # plan (warm coordinator pre-ack) is validated instead, and topology is
-    # never re-sampled for it. A profile-free set performs no monitor access.
+    # never re-sampled for it. An all-absolute profile-free set performs no
+    # monitor access; a targeted relative item uses exactly one snapshot.
     $frozenPlan = $LayoutPlan
 
     if ($null -ne $frozenPlan) {

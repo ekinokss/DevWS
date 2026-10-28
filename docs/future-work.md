@@ -181,13 +181,19 @@ without an explicit design decision.
 
 ### 3.1 Monitor-relative layouts
 
+> Status: v0.3 Phases 1-3 implemented the relative-layout schema, `ws show-layout` reporting,
+> and lifecycle placement. Save/capture authoring and release hardening remain later phases.
+> The questions below record the original design discussion; see
+> `docs/monitor-relative-layout-design.md` for the approved model.
+
 Today's geometry is an absolute rectangle, captured by arranging windows and running
 `ws save-layout`. Topology profiles already make a set carry several layouts, but each one is
 still absolute.
 
-A future layout model could express intent *relative to a monitor* — normalised coordinates,
-or a grid of rows and columns, or named zones. Open questions that must be answered together
-before such a model ships:
+The v0.3 implementation uses explicit normalised coordinates relative to a monitor. A
+broader model could also use a grid of rows and columns, or named zones. The approved design
+resolved these questions for normalised coordinates; the list remains useful for any broader
+model:
 
 - how a monitor is identified durably (hardware identity, device path, configured alias,
   dynamic primary role — ordinals are not durable);
@@ -201,6 +207,9 @@ before such a model ships:
 
 ### 3.2 Missing-monitor policy
 
+> Status: v0.3 uses a reachability-verified absolute fallback, then skips placement when
+> neither target is usable. The alternatives below remain research options.
+
 Monitor-relative layouts force an explicit policy for an absent monitor. Candidates, with
 their trade-offs:
 
@@ -212,7 +221,8 @@ their trade-offs:
 | Configured fallback monitor | Predictable for known setups | More configuration, and still needs a last resort |
 | Collapse and retile | Potentially the best experience | Needs a real layout engine; hardest to make deterministic |
 
-No policy is chosen. This must be decided **before** any monitor-relative mode ships.
+v0.3 chose the reachability-verified absolute fallback followed by a skip, as documented in
+`docs/monitor-relative-layout-design.md`. The other policies remain research options.
 
 ### 3.3 Grid, tiling and named-zone engines
 

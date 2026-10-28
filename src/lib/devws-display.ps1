@@ -420,11 +420,11 @@ function Get-DevWSRelativeDisplayStatusText {
     }
 }
 
-function Get-DevWSRelativeDisplayPreviewText {
+function Get-DevWSRelativeDisplayPlacementText {
     param($Item, [string]$ProfileLifecycleRefusal)
 
     if (-not [string]::IsNullOrWhiteSpace($ProfileLifecycleRefusal)) {
-        return "ordinary set launch would refuse this topology; relative preview is not applied"
+        return "ordinary set launch would refuse this topology; relative placement is not applied"
     }
 
     if (-not [bool]$Item.Enabled) {
@@ -437,38 +437,42 @@ function Get-DevWSRelativeDisplayPreviewText {
                 return "profile '$($Item.ProfileId)' overrides relative intent; profile entry is unreachable (ordinary set launch would refuse)"
             }
 
-            return "profile '$($Item.ProfileId)' is current ordinary set launch placement; relative preview is not used"
+            return "profile '$($Item.ProfileId)' is the applied ordinary set launch placement; relative intent is overridden"
         }
         "relative" {
-            return "relative preview only; ordinary set launch currently uses the absolute fallback until Phase 3"
+            if (-not [bool]$Item.ApplyGeometry) {
+                return "relative placement is not usable; the item is handled without moving its window"
+            }
+
+            return "relative placement is applied by ordinary set launch"
         }
         "relative-fallback" {
             $reason = Get-DevWSRelativeDisplayStatusText -Status ([string]$Item.RelativeStatus) -Reason ([string]$Item.RelativeReason)
-            return "absolute fallback preview ($reason); ordinary set launch currently uses the absolute fallback until Phase 3"
+            return "absolute fallback is applied ($reason); the relative target is not used"
         }
         "relative-unavailable" {
             if ([string]$Item.RelativeStatus -eq "topology-unavailable") {
-                return "no verified geometry (topology unavailable); ordinary set launch still uses the absolute fallback until Phase 3"
+                return "no verified geometry (topology unavailable); placement is skipped"
             }
 
             if ($null -ne $Item.FallbackReachable -and -not [bool]$Item.FallbackReachable) {
-                return "no verified geometry (absolute fallback is not reachable); ordinary set launch still uses the absolute fallback until Phase 3"
+                return "no verified geometry (absolute fallback is not reachable); placement is skipped"
             }
 
-            return "no verified geometry; ordinary set launch still uses the absolute fallback until Phase 3"
+            return "no verified geometry; placement is skipped"
         }
         default {
-            return "relative preview only; lifecycle integration is Phase 3"
+            return "relative placement status is unavailable"
         }
     }
 }
 
 function Get-DevWSEffectiveLayoutLines {
-    # Read-only effective-layout rendering for `ws show-layout`.
+    # Read-only operational-layout rendering for `ws show-layout`.
     #
     # Absolute and matched-profile items preserve the established one-line
-    # rendering. Relative items add explicit preview detail lines and never
-    # claim that relative placement is applied by lifecycle commands yet.
+    # rendering. Relative items add operational detail lines that mirror the
+    # frozen lifecycle placement policy (applied, fallback, or skipped).
     param([Parameter(Mandatory)]$Model)
 
     $lines = @()
@@ -493,6 +497,9 @@ function Get-DevWSEffectiveLayoutLines {
     }
     elseif ([string]$Model.Status -eq "ambiguous") {
         $sourceText = "ambiguous (config error)"
+    }
+    elseif ([bool]$Model.HasRelativeItems) {
+        $sourceText = "relative + fallback"
     }
 
     $reasonText = switch ([string]$Model.Reason) {
@@ -548,14 +555,19 @@ function Get-DevWSEffectiveLayoutLines {
             }
 
             switch ([string]$item.Source) {
-                "relative"             { $suffix += "  [relative preview]" }
-                "relative-fallback"    { $suffix += "  [relative fallback preview]" }
+                "relative"             { $suffix += "  [relative]" }
+                "relative-fallback"    { $suffix += "  [relative fallback]" }
                 "relative-unavailable" { $suffix += "  [relative unavailable]" }
             }
         }
 
         if ($null -ne $item.Reachable -and -not [bool]$item.Reachable) {
             $suffix += "  [unreachable]"
+        }
+
+        if ([bool]$item.Enabled -and -not [bool]$item.ApplyGeometry -and
+            [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
+            $suffix += "  [skipped]"
         }
 
         $rect = $item.Rect
@@ -591,7 +603,7 @@ function Get-DevWSEffectiveLayoutLines {
                 $basis = "(not configured)"
             }
 
-            $previewText = Get-DevWSRelativeDisplayPreviewText -Item $item -ProfileLifecycleRefusal ([string]$Model.ProfileLifecycleRefusal)
+            $placementText = Get-DevWSRelativeDisplayPlacementText -Item $item -ProfileLifecycleRefusal ([string]$Model.ProfileLifecycleRefusal)
             $statusText = Get-DevWSRelativeDisplayStatusText -Status ([string]$item.RelativeStatus) -Reason ([string]$item.RelativeReason)
 
             $lines += "      mode        relative"
@@ -599,7 +611,7 @@ function Get-DevWSEffectiveLayoutLines {
             $lines += "      basis       $basis"
             $lines += "      normalized  $(Format-DevWSRelativeDisplayRect -Rect $normalizedRect)"
             $lines += "      resolved    $(Format-DevWSRelativeDisplayRect -Rect $item.RelativeRect)"
-            $lines += "      preview     $previewText"
+            $lines += "      placement   $placementText"
             $lines += "      status      $statusText"
         }
     }
@@ -620,6 +632,12 @@ function Get-DevWSEffectiveLayoutLines {
         @($Model.Items | Where-Object { -not [bool]$_.Enabled }).Count -gt 0
     }
 
+    $skippedItemCount = @($Model.Items | Where-Object {
+        [bool]$_.Enabled -and
+        (Test-DevWSProperty -Object $_ -Name "ApplyGeometry") -and
+        -not [bool]$_.ApplyGeometry
+    }).Count
+
     $notes = @()
 
     if (-not [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
@@ -634,15 +652,20 @@ function Get-DevWSEffectiveLayoutLines {
 
     if ([bool]$Model.HasRelativeItems) {
         if (-not [string]::IsNullOrWhiteSpace([string]$Model.ProfileLifecycleRefusal)) {
-            $notes += "Relative previews are read-only; relative placement becomes operational in Phase 3."
+            $notes += "Relative placement is not applied when the operation refuses."
         }
         else {
-            $notes += "Relative previews are read-only; ordinary set launch currently uses absolute/profile geometry. Relative placement becomes operational in Phase 3."
+            $notes += "Relative placement is operational for targeted items; skipped placements are shown as [skipped]."
         }
     }
 
     if ($notes.Count -eq 0) {
-        $lines += "  note        'ws launch' and terminal resets apply exactly this effective layout."
+        if ($skippedItemCount -gt 0) {
+            $lines += "  note        Items marked [skipped] are handled without moving their windows; all other enabled items use the rectangles shown above."
+        }
+        else {
+            $lines += "  note        'ws launch' and terminal resets apply exactly this effective layout."
+        }
     }
     else {
         foreach ($noteText in $notes) {

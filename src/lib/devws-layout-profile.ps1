@@ -18,10 +18,12 @@
 # never mutates monitor settings. Callers own topology sampling, persistence
 # and output.
 #
-# Lifecycle boundary (Pass 5D): launch/reset placement consumes the frozen
-# effective decision (exact matched profile override or per-item fallback)
-# through devws-lifecycle-layout.ps1; this library itself stays pure policy
-# for configuration routing, diagnostics and that lifecycle preflight.
+# Lifecycle boundary (Pass 5D, extended in v0.3 Phase 3): launch/reset
+# placement consumes the frozen effective decision (exact matched profile
+# override, relative placement with verified absolute fallback, or absolute
+# fallback) through devws-lifecycle-layout.ps1. Preview and execution share
+# devws-relative-layout's placement policy; this library itself stays pure
+# policy for configuration routing, diagnostics and that lifecycle preflight.
 
 # ---------------------------------------------------------------------------
 # Profile access
@@ -385,17 +387,17 @@ function Get-DevWSEffectiveLayout {
     # Read-only effective layout policy for the current topology.
     #
     # Absolute and matched-profile rectangles retain their established display
-    # semantics. Relative layouts are resolved through the Phase 1 pure model
-    # and exposed as a PREVIEW only: lifecycle integration arrives in Phase 3,
-    # so a relative preview never claims to be what ws launch/reset applies.
+    # semantics. Relative layouts are resolved through the same shared
+    # placement policy lifecycle execution uses, so `ws show-layout` reports
+    # the applied, fallback, or skipped decision rather than a separate view.
     #
     # Resolution policy mirrors the approved fallback rules:
     #   - matched profile entry wins, including over relative intent;
     #   - relative item with unavailable topology has no verified geometry;
-    #   - available topology + missing/ambiguous/unusable anchor previews the
+    #   - available topology + missing/ambiguous/unusable anchor uses the
     #     absolute fallback only when the existing reachability rule accepts it;
-    #   - an unreachable relative target previews the fallback only when it is
-    #     reachable; otherwise no verified preview is advertised.
+    #   - an unreachable relative target uses the fallback only when it is
+    #     reachable; otherwise no verified geometry is advertised.
     param(
         [string]$SetId,
         $Set,
@@ -439,8 +441,8 @@ function Get-DevWSEffectiveLayout {
     }
 
     # Ordinary set launch targets enabled items only. The no-target lifecycle
-    # path returns before topology/profile refusal, so the preview must not
-    # advertise a refusal that ordinary launch would never reach. Disabled
+    # path returns before topology/profile refusal, so the display model must
+    # not advertise a refusal that ordinary launch would never reach. Disabled
     # items remain fully visible below for inspection and targeted operations.
     $enabledItemCount = 0
     $hasDisabledItems = $false
@@ -514,52 +516,23 @@ function Get-DevWSEffectiveLayout {
         $fallbackUsed      = $false
 
         if ($layoutMode -eq "relative") {
-            $resolution = Resolve-DevWSRelativeLayout -RelativeLayout $relativeLayout -Topology $Topology
-            $relativeStatus  = [string]$resolution.Status
-            $relativeReason  = [string]$resolution.Reason
-            $relativeMessage = [string]$resolution.Message
+            $relativeDecision = Resolve-DevWSRelativePlacement `
+                -RelativeLayout $relativeLayout `
+                -Topology $Topology `
+                -MonitorRects $monitorRects `
+                -FallbackRect $item.layout
 
-            if ([bool]$resolution.Ok) {
-                $relativeRect = $resolution.Rect
-                $relativeMetrics = & $measureReachability $relativeRect
-
-                if ($null -ne $relativeMetrics) {
-                    $relativeReachable = [bool]$relativeMetrics.Reachable
-                }
-
-                if ($relativeReachable -eq $false) {
-                    $relativeStatus = "relative-unreachable"
-                    $relativeReason = "relative-target-unreachable"
-                    $relativeMessage = "The resolved relative target is not reachable on the current topology."
-                }
-            }
+            $relativeStatus    = [string]$relativeDecision.Status
+            $relativeReason    = [string]$relativeDecision.Reason
+            $relativeMessage   = [string]$relativeDecision.Message
+            $relativeRect      = $relativeDecision.RelativeRect
+            $relativeReachable = $relativeDecision.RelativeReachable
+            $fallbackReachable = $relativeDecision.FallbackReachable
 
             if (-not $profileOverridesRelative) {
-                $fallbackReachableMetrics = & $measureReachability $item.layout
-
-                if ($null -ne $fallbackReachableMetrics) {
-                    $fallbackReachable = [bool]$fallbackReachableMetrics.Reachable
-                }
-
-                $effective  = $null
-                $itemSource = "relative-unavailable"
-
-                if ([bool](Get-DevWSProperty -Object $Topology -Name "Available") -and $relativeStatus -ne "topology-unavailable") {
-                    if ($null -ne $relativeRect -and $relativeStatus -eq "resolved" -and $relativeReachable -eq $true) {
-                        $effective  = $relativeRect
-                        $itemSource = "relative"
-                    }
-                    elseif ($fallbackReachable -eq $true) {
-                        $effective   = $item.layout
-                        $itemSource  = "relative-fallback"
-                        $fallbackUsed = $true
-                    }
-                }
-
-                if ($relativeStatus -eq "relative-unreachable" -and $fallbackReachable -eq $false) {
-                    $relativeReason = "relative-target-and-fallback-unreachable"
-                    $relativeMessage = "The relative target and the absolute fallback are not reachable on the current topology."
-                }
+                $effective   = $relativeDecision.EffectiveRect
+                $itemSource  = [string]$relativeDecision.Source
+                $fallbackUsed = [bool]$relativeDecision.FallbackUsed
             }
         }
 
@@ -567,18 +540,72 @@ function Get-DevWSEffectiveLayout {
         $visibleRatio = $null
         $visibleWidth = $null
         $visibleHeight = $null
+        $applyGeometry = $true
+        $placementStatus = "absolute"
+        $placementReason = "absolute"
 
-        $effectiveMetrics = & $measureReachability $effective
+        if ($null -ne $profileEntry) {
+            $effectiveMetrics = & $measureReachability $effective
 
-        if ($null -ne $effectiveMetrics) {
-            $reachable     = [bool]$effectiveMetrics.Reachable
-            $visibleRatio  = [double]$effectiveMetrics.VisibleRatio
-            $visibleWidth  = [int]$effectiveMetrics.VisibleWidth
-            $visibleHeight = [int]$effectiveMetrics.VisibleHeight
+            if ($null -ne $effectiveMetrics) {
+                $reachable     = [bool]$effectiveMetrics.Reachable
+                $visibleRatio  = [double]$effectiveMetrics.VisibleRatio
+                $visibleWidth  = [int]$effectiveMetrics.VisibleWidth
+                $visibleHeight = [int]$effectiveMetrics.VisibleHeight
+                $applyGeometry = $reachable
+                $placementStatus = if ($applyGeometry) { "profile" } else { "profile-unreachable" }
+                $placementReason = $placementStatus
+            }
+            else {
+                $applyGeometry = $false
+                $placementStatus = "profile-unreachable"
+                $placementReason = "profile-no-reachability"
+            }
+
+            if ([bool]$item.enabled -and -not $applyGeometry) {
+                $profileEntryUnreachable = $true
+            }
         }
+        elseif ($layoutMode -eq "relative") {
+            $reachable       = $relativeDecision.EffectiveReachable
+            $applyGeometry   = [bool]$relativeDecision.ApplyGeometry
+            $placementStatus = [string]$relativeDecision.Status
+            $placementReason = [string]$relativeDecision.Reason
 
-        if ([bool]$item.enabled -and $itemSource -eq "profile" -and $reachable -eq $false) {
-            $profileEntryUnreachable = $true
+            if ($null -ne $effective) {
+                $effectiveMetrics = & $measureReachability $effective
+
+                if ($null -ne $effectiveMetrics) {
+                    $visibleRatio  = [double]$effectiveMetrics.VisibleRatio
+                    $visibleWidth  = [int]$effectiveMetrics.VisibleWidth
+                    $visibleHeight = [int]$effectiveMetrics.VisibleHeight
+                }
+            }
+        }
+        elseif ($profileAware) {
+            $effectiveMetrics = & $measureReachability $effective
+
+            if ($null -ne $effectiveMetrics) {
+                $reachable     = [bool]$effectiveMetrics.Reachable
+                $visibleRatio  = [double]$effectiveMetrics.VisibleRatio
+                $visibleWidth  = [int]$effectiveMetrics.VisibleWidth
+                $visibleHeight = [int]$effectiveMetrics.VisibleHeight
+                $applyGeometry = $reachable
+            }
+            else {
+                $applyGeometry = $false
+            }
+
+            $placementStatus = if ($applyGeometry) { "fallback" } else { "fallback-unreachable" }
+            $placementReason = $placementStatus
+        }
+        else {
+            # Profile-free absolute targets retain the legacy placement
+            # semantics: applied without a reachability gate.
+            $reachable       = $null
+            $applyGeometry   = $true
+            $placementStatus = "absolute"
+            $placementReason = "legacy-absolute"
         }
 
         $items.Add([pscustomobject]@{
@@ -600,6 +627,9 @@ function Get-DevWSEffectiveLayout {
             FallbackRect              = $item.layout
             FallbackReachable         = $fallbackReachable
             FallbackUsed              = $fallbackUsed
+            ApplyGeometry             = $applyGeometry
+            PlacementStatus           = $placementStatus
+            PlacementReason           = $placementReason
             Reachable                 = $reachable
             VisibleRatio              = $visibleRatio
             VisibleWidth              = $visibleWidth
@@ -627,7 +657,7 @@ function Get-DevWSEffectiveLayout {
         TopologySignature       = $signature
         TopologyFingerprint     = $fingerprint
         HasRelativeItems        = $hasRelativeItems
-        RelativePreviewOnly     = $hasRelativeItems
+        RelativeOperational     = $hasRelativeItems
         Profiles                = $profileIds
         Items                   = @($items.ToArray())
     }

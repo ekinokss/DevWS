@@ -59,10 +59,10 @@ $LibDir = Join-Path $PSScriptRoot "lib"
 # only; no workspace-config, host or window awareness).
 . (Join-Path $LibDir "devws-monitor.ps1")
 
-# Relative-layout pure model (v0.3 Phase 1): anchor parsing/resolution,
-# normalized rectangle math and anchored capture/restore primitives. This is
-# schema/geometry support only; lifecycle and save policy arrive in later
-# phases.
+# Relative-layout model (v0.3 Phase 1): anchor parsing/resolution, normalized
+# rectangle math, anchored capture/restore primitives and the shared relative
+# placement policy consumed by lifecycle execution and `ws show-layout`.
+# Save/capture integration arrives in a later phase.
 . (Join-Path $LibDir "devws-relative-layout.ps1")
 
 # Topology layout-profile policy (Pass 5C): pure selection, write-scope
@@ -1254,10 +1254,10 @@ function Save-DevWSWorkspace {
 }
 
 function Show-DevWSLayout {
-    # Read-only effective-layout preview: current topology, Pass-5C profile
-    # routing, and effective/preview rectangles. Relative items are explicitly
-    # preview-only in Phase 2; absolute/profile geometry remains the lifecycle
-    # truth until Phase 3 integration.
+    # Read-only operational-layout view: current topology, profile routing,
+    # relative placement, and skipped/fallback diagnostics. Launch and reset
+    # consume the same frozen policy; ordinary set launch and explicit targeted
+    # resets differ only by target selection.
     param([string]$SetId)
 
     $context = Get-DevWSContext
@@ -2104,7 +2104,7 @@ function Invoke-DevWSSetGeometry {
     #                                             consulted or required;
     #   implicit: profile-free set -> fallback (legacy behavior, no monitor
     #             dependency); profile set -> the same routing a same-moment
-    #             launch preview uses (matched profile else fallback), and an
+    #             launch placement uses (matched profile else fallback), and an
     #             unsafe topology refuses the write.
     # Config only: the live window is never moved, resized or focused.
     param(

@@ -121,8 +121,9 @@ $script:TestGroupCatalog = [ordered]@{
     'monitors'            = 'Read-only monitor diagnostics'
     'layout-profiles'     = 'Topology layout profiles (Pass 5C)'
     'lifecycle-layouts'   = 'Lifecycle profile placement (Pass 5D)'
+    'relative-lifecycle'  = 'Relative lifecycle placement (v0.3 Phase 3)'
     'relative-layouts'    = 'Relative layout schema and pure model (v0.3 Phase 1)'
-    'relative-layout-display' = 'Relative layout preview rendering (v0.3 Phase 2)'
+    'relative-layout-display' = 'Relative layout display rendering (v0.3 Phase 2/3)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
     'test-harness'        = 'Test harness'
@@ -7186,7 +7187,7 @@ function Find-DevWSReversiblyEncodedPrintableContent {
         # Future layout scope remains research-only in the runtime libraries.
         # Pass 5B introduced read-only monitor diagnostics, Pass 5C introduced
         # the optional topology-profile schema, v0.3 Phase 1 introduced the
-        # relative-layout schema, and Phase 2 adds read-only preview rendering.
+        # relative-layout schema, Phase 2 added read-only display rendering, and Phase 3 applies relative placement.
         # Profile/grid vocabulary stays research-only, and mutation code stays
         # monitor-free.
         foreach ($file in @("devws-config.ps1", "devws-display.ps1", "devws-mutation.ps1")) {
@@ -34794,7 +34795,7 @@ Start-Sleep -Seconds 6
         $farText = (@(Get-DevWSEffectiveLayoutLines -Model $farModel)) -join "`n"
         Assert-Contains $farText "[unreachable]" "unreachable marker"
 
-        # Incomplete topology shows the fallback preview wording.
+        # Incomplete topology shows the fallback lifecycle wording.
         $incompleteModel = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology (New-LayoutProfileTestTopology -Signature $sigDocked -IdentityComplete $false)
         $incompleteText = (@(Get-DevWSEffectiveLayoutLines -Model $incompleteModel)) -join "`n"
         Assert-Contains $incompleteText "not fully identified" "incomplete topology wording"
@@ -34921,7 +34922,7 @@ Start-Sleep -Seconds 6
         Assert-Contains ([string]$setGeometry.Usage) "--layout" "set-geometry usage documents --layout"
 
         $showLayout = @($commands | Where-Object { $_.Name -eq "show-layout" })[0]
-        Assert-Contains ([string]($showLayout.Details -join " ")) "Relative previews are read-only" "show-layout help distinguishes preview from lifecycle usage"
+        Assert-Contains ([string]($showLayout.Details -join " ")) "Relative placement is operational" "show-layout help distinguishes operational placement from target selection"
 
         $resetLayout = @($commands | Where-Object { $_.Name -eq "reset-layout" })[0]
         Assert-Contains ([string]($resetLayout.Details -join " ")) "never created, modified or deleted" "reset-layout help states profile preservation"
@@ -35950,6 +35951,554 @@ Start-Sleep -Seconds 6
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'relative-lifecycle' -Title 'Relative lifecycle placement (v0.3 Phase 3)'
+
+    function New-P3Rect {
+        param([int]$X = 0, [int]$Y = 0, [int]$W = 800, [int]$H = 600)
+        return [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+    }
+
+    function New-P3FractionRect {
+        param([double]$X = 0, [double]$Y = 0, [double]$W = 1, [double]$H = 1)
+        return [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+    }
+
+    function New-P3Monitor {
+        param(
+            [Parameter(Mandatory)][AllowEmptyString()][string]$Identity,
+            [string]$Instance,
+            [int]$X = 0,
+            [int]$Y = 0,
+            [int]$W = 1920,
+            [int]$H = 1080,
+            [int]$WorkX,
+            [int]$WorkY,
+            [int]$WorkW,
+            [int]$WorkH
+        )
+
+        $workXValue = if ($PSBoundParameters.ContainsKey("WorkX")) { $WorkX } else { $X }
+        $workYValue = if ($PSBoundParameters.ContainsKey("WorkY")) { $WorkY } else { $Y }
+        $workWValue = if ($PSBoundParameters.ContainsKey("WorkW")) { $WorkW } else { $W }
+        $workHValue = if ($PSBoundParameters.ContainsKey("WorkH")) { $WorkH } else { $H }
+
+        return [pscustomobject][ordered]@{
+            IdentityToken      = $Identity
+            DevicePathInstance = if ([string]::IsNullOrEmpty($Instance)) { $null } else { $Instance }
+            MonitorRect        = [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+            WorkRect           = [pscustomobject][ordered]@{ x = $workXValue; y = $workYValue; w = $workWValue; h = $workHValue }
+        }
+    }
+
+    function New-P3Topology {
+        param(
+            [string]$Signature = "",
+            [object[]]$Monitors = @(),
+            [bool]$Available = $true,
+            [bool]$IdentityComplete = $true,
+            [bool]$CorrelationComplete = $true,
+            [bool]$Ambiguous = $false
+        )
+
+        $signatureValue = if ([string]::IsNullOrWhiteSpace($Signature)) { $null } else { $Signature }
+
+        return [pscustomobject][ordered]@{
+            Available           = $Available
+            Signature           = $signatureValue
+            Fingerprint         = if ($null -ne $signatureValue) { "P3FP" } else { $null }
+            IdentityComplete    = $IdentityComplete
+            CorrelationComplete = $CorrelationComplete
+            IdentityAmbiguous   = $Ambiguous
+            Monitors            = @($Monitors)
+        }
+    }
+
+    function New-P3Relative {
+        param(
+            [Parameter(Mandatory)][string]$Identity,
+            [string]$Instance,
+            [string]$Basis = "workArea",
+            [double]$X = 0,
+            [double]$Y = 0,
+            [double]$W = 1,
+            [double]$H = 1
+        )
+
+        $monitorFields = [ordered]@{ identity = $Identity }
+
+        if (-not [string]::IsNullOrEmpty($Instance)) {
+            $monitorFields["instance"] = $Instance
+        }
+
+        return [pscustomobject][ordered]@{
+            monitor = [pscustomobject]$monitorFields
+            basis   = $Basis
+            rect    = New-P3FractionRect -X $X -Y $Y -W $W -H $H
+        }
+    }
+
+    function New-P3Terminal {
+        param(
+            [string]$Id = "term",
+            [string]$Mode = "absolute",
+            $Relative = $null,
+            $Layout = $null,
+            [bool]$Enabled = $true
+        )
+
+        if ($null -eq $Layout) { $Layout = New-P3Rect }
+
+        $item = [pscustomobject][ordered]@{
+            id        = $Id
+            type      = "terminal"
+            enabled   = $Enabled
+            windowId  = "DevWS-p3-$Id"
+            path      = 'C:\x'
+            elevated  = $true
+            tabs      = @([pscustomobject][ordered]@{ command = $null; args = @() })
+            activeTab = 0
+            layout    = $Layout
+        }
+
+        if ($Mode -eq "relative") {
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutMode" -Value "relative"
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutRelative" -Value $Relative
+        }
+
+        return $item
+    }
+
+    function New-P3App {
+        param(
+            [string]$Id = "app",
+            [string]$Mode = "absolute",
+            $Relative = $null,
+            $Layout = $null,
+            [bool]$Enabled = $true
+        )
+
+        if ($null -eq $Layout) { $Layout = New-P3Rect }
+
+        $item = [pscustomobject][ordered]@{
+            id           = $Id
+            type         = "app"
+            enabled      = $Enabled
+            match        = [pscustomobject][ordered]@{ kind = "exe"; value = "$Id.exe" }
+            launch       = [pscustomobject][ordered]@{ kind = "exe"; value = "C:\$Id.exe"; args = @() }
+            instanceMode = "dedicated"
+            layout       = $Layout
+        }
+
+        if ($Mode -eq "relative") {
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutMode" -Value "relative"
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutRelative" -Value $Relative
+        }
+
+        return $item
+    }
+
+    function New-P3Set {
+        param([object[]]$Items = @(), [object[]]$Profiles = @())
+
+        $set = [pscustomobject][ordered]@{ id = "main" }
+
+        if (@($Profiles).Count -gt 0) {
+            Add-Member -InputObject $set -MemberType NoteProperty -Name "layoutProfiles" -Value @($Profiles)
+        }
+
+        Add-Member -InputObject $set -MemberType NoteProperty -Name "windows" -Value @($Items)
+        return $set
+    }
+
+    function Get-P3PlanItem {
+        param($Plan, [string]$Id)
+        return @($Plan.Items | Where-Object { ([string]$_.ItemId) -ieq $Id })[0]
+    }
+
+    Test-Case "relative lifecycle preserves the absolute-only zero-topology fast path" {
+        $enabledAbs = New-P3Terminal -Id "enabled-abs" -Layout (New-P3Rect -X 10 -Y 20 -W 300 -H 400)
+        $disabledRel = New-P3Terminal -Id "disabled-rel" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0 -Y 0 -W 0.5 -H 1
+        ) -Enabled $false
+        $set = New-P3Set -Items @($enabledAbs, $disabledRel)
+        $script:p3TopologyCalls = 0
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider {
+            $script:p3TopologyCalls++
+            throw "topology must not be sampled"
+        }
+
+        Assert-Equal 0 $script:p3TopologyCalls "absolute-only targets perform zero topology calls"
+        Assert-Equal $false ([bool]$plan.ProfileAware) "profile-free plan"
+        Assert-Equal $false ([bool]$plan.RelativeAware) "no targeted relative item"
+        Assert-Equal 1 (@($plan.Items).Count) "only the enabled absolute target is planned"
+        $planItem = Get-P3PlanItem -Plan $plan -Id "enabled-abs"
+        Assert-Equal $true ([bool]$planItem.ApplyGeometry) "absolute movement enabled"
+        Assert-Equal 10 ([int]$planItem.Layout.x) "absolute fallback retained"
+        Assert-Equal $null $planItem.Reachable "no reachability gate"
+
+        $untargetedRel = New-P3Terminal -Id "untargeted-rel" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $targetedOnlySet = New-P3Set -Items @($enabledAbs, $untargetedRel)
+        $script:p3TopologyCalls = 0
+
+        $targetedOnlyPlan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $targetedOnlySet -Items @($enabledAbs) -TopologyProvider {
+            $script:p3TopologyCalls++
+            throw "topology must not be sampled"
+        }
+
+        Assert-Equal 0 $script:p3TopologyCalls "an enabled untargeted relative item performs zero topology calls"
+        Assert-Equal 1 (@($targetedOnlyPlan.Items).Count) "only the explicit absolute target is planned"
+    }
+
+    Test-Case "relative lifecycle no-target operation performs no topology call" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        $disabledRel = New-P3Terminal -Id "disabled-rel" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        ) -Enabled $false
+        $set = New-P3Set -Items @($disabledRel) -Profiles @($profile)
+        $script:p3TopologyCalls = 0
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -Items @() -TopologyProvider {
+            $script:p3TopologyCalls++
+            throw "topology must not be sampled"
+        }
+
+        Assert-Equal 0 $script:p3TopologyCalls "no-target operation performs zero topology calls"
+        Assert-Equal "no-targets" ([string]$plan.Reason) "no-target reason"
+        Assert-Equal 0 (@($plan.Items).Count) "no plan items"
+
+        $script:p3TopologyCalls = 0
+        $profileFreePlan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set (New-P3Set -Items @($disabledRel)) -Items @() -TopologyProvider {
+            $script:p3TopologyCalls++
+            throw "topology must not be sampled"
+        }
+
+        Assert-Equal 0 $script:p3TopologyCalls "profile-free no-target operation performs zero topology calls"
+        Assert-Equal "no-targets" ([string]$profileFreePlan.Reason) "profile-free no-target reason"
+        Assert-Equal 0 (@($profileFreePlan.Items).Count) "profile-free no plan items"
+    }
+
+    Test-Case "relative lifecycle resolves mixed profile-free targets with one topology call" {
+        $monitor = New-P3Monitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($monitor)
+        $relative = New-P3Relative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        $relItem = New-P3Terminal -Id "relative" -Mode "relative" -Relative $relative -Layout (New-P3Rect -X 0 -Y 0 -W 800 -H 600)
+        $absItem = New-P3Terminal -Id "absolute" -Layout (New-P3Rect -X 10 -Y 20 -W 300 -H 400)
+        $set = New-P3Set -Items @($relItem, $absItem)
+        $script:p3TopologyCalls = 0
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider {
+            $script:p3TopologyCalls++
+            return $topology
+        }
+
+        Assert-Equal 1 $script:p3TopologyCalls "exactly one topology call"
+        Assert-Equal $true ([bool]$plan.RelativeAware) "relative-aware plan"
+        $relPlan = Get-P3PlanItem -Plan $plan -Id "relative"
+        Assert-Equal $true ([bool]$relPlan.ApplyGeometry) "relative movement enabled"
+        Assert-Equal "relative" ([string]$relPlan.Source) "relative source"
+        Assert-Equal 960 ([int]$relPlan.Layout.x) "relative resolved x"
+        Assert-Equal 1040 ([int]$relPlan.Layout.h) "relative work-area height"
+        $absPlan = Get-P3PlanItem -Plan $plan -Id "absolute"
+        Assert-Equal $true ([bool]$absPlan.ApplyGeometry) "absolute movement enabled"
+        Assert-Equal 10 ([int]$absPlan.Layout.x) "absolute layout retained"
+        Assert-Equal $null $absPlan.Reachable "absolute target has no reachability gate"
+        Assert-Equal 0 (@($plan.Warnings).Count) "no warnings"
+    }
+
+    Test-Case "relative lifecycle respects negative origins and both bases" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -X -1920 -Y -100 -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@-1920,-100,1920x1080" -Monitors @($monitor)
+        $monitorItem = New-P3Terminal -Id "monitor-basis" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "monitor" -X 0 -Y 0 -W 1 -H 1
+        )
+        $workItem = New-P3Terminal -Id "work-basis" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0 -Y 0 -W 1 -H 1
+        )
+        $set = New-P3Set -Items @($monitorItem, $workItem)
+        $script:p3TopologyCalls = 0
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider {
+            $script:p3TopologyCalls++
+            return $topology
+        }
+
+        Assert-Equal 1 $script:p3TopologyCalls "one topology call for both bases"
+        $monitorPlan = Get-P3PlanItem -Plan $plan -Id "monitor-basis"
+        $workPlan = Get-P3PlanItem -Plan $plan -Id "work-basis"
+        Assert-Equal -1920 ([int]$monitorPlan.Layout.x) "negative monitor-basis x"
+        Assert-Equal 1080 ([int]$monitorPlan.Layout.h) "full monitor-basis height"
+        Assert-Equal 1040 ([int]$workPlan.Layout.h) "work-area basis height"
+    }
+
+    Test-Case "relative lifecycle uses a reachable fallback for missing and ambiguous anchors" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $missing = New-P3Terminal -Id "missing" -Mode "relative" -Relative (
+            New-P3Relative -Identity "edid:DEL-A1B2-MISSING" -Basis "workArea" -X 0 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-P3Rect -X 10 -Y 20 -W 300 -H 400)
+        $missingPlan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set (New-P3Set -Items @($missing)) -TopologyProvider { $topology }
+        $missingItem = Get-P3PlanItem -Plan $missingPlan -Id "missing"
+        Assert-Equal "relative-fallback" ([string]$missingItem.Source) "missing anchor fallback source"
+        Assert-Equal $true ([bool]$missingItem.ApplyGeometry) "missing anchor fallback applied"
+        Assert-Equal 10 ([int]$missingItem.Layout.x) "missing anchor fallback x"
+        Assert-Contains (@($missingPlan.Warnings) -join "`n") "using the reachable absolute fallback" "missing anchor warning"
+
+        $first = New-P3Monitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
+        $second = New-P3Monitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&3c" -X 1920 -W 1920 -H 1080 -WorkH 1040
+        $ambiguousTopology = New-P3Topology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($first, $second)
+        $ambiguous = New-P3Terminal -Id "ambiguous" -Mode "relative" -Relative (
+            New-P3Relative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea" -X 0 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-P3Rect -X 10 -Y 20 -W 300 -H 400)
+        $ambiguousPlan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set (New-P3Set -Items @($ambiguous)) -TopologyProvider { $ambiguousTopology }
+        $ambiguousItem = Get-P3PlanItem -Plan $ambiguousPlan -Id "ambiguous"
+        Assert-Equal "relative-fallback" ([string]$ambiguousItem.Source) "ambiguous anchor fallback source"
+        Assert-Equal $true ([bool]$ambiguousItem.ApplyGeometry) "ambiguous anchor fallback applied"
+    }
+
+    Test-Case "relative lifecycle uses reachable fallback for an unreachable target" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-P3Terminal -Id "far-relative" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 10 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-P3Rect -X 10 -Y 20 -W 300 -H 400)
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set (New-P3Set -Items @($item)) -TopologyProvider { $topology }
+        $planItem = Get-P3PlanItem -Plan $plan -Id "far-relative"
+
+        Assert-Equal "relative-unreachable" ([string]$planItem.PlacementStatus) "relative target unreachable status"
+        Assert-Equal "relative-fallback" ([string]$planItem.Source) "reachable fallback source"
+        Assert-Equal $true ([bool]$planItem.ApplyGeometry) "fallback movement enabled"
+        Assert-Equal 10 ([int]$planItem.Layout.x) "fallback x"
+        Assert-Contains (@($plan.Warnings) -join "`n") "using the reachable absolute fallback" "relative target warning"
+    }
+
+    Test-Case "relative lifecycle skips placement when relative and fallback are unreachable" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-P3Terminal -Id "far-all" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 10 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-P3Rect -X 9000 -Y 9000 -W 100 -H 100)
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set (New-P3Set -Items @($item)) -TopologyProvider { $topology }
+        $planItem = Get-P3PlanItem -Plan $plan -Id "far-all"
+
+        Assert-Equal $false ([bool]$planItem.ApplyGeometry) "unusable placement skipped"
+        Assert-Equal "relative-unavailable" ([string]$planItem.Source) "unavailable source"
+        Assert-Equal "relative-target-and-fallback-unreachable" ([string]$planItem.PlacementReason) "both-unreachable reason"
+        Assert-Contains (@($plan.Warnings) -join "`n") "no reachable placement" "skip warning"
+    }
+
+    Test-Case "relative lifecycle handles completely unavailable topology without moving relative items" {
+        $topology = New-P3Topology -Available $false -Monitors @()
+        $absItem = New-P3Terminal -Id "absolute" -Layout (New-P3Rect -X 10 -Y 20 -W 300 -H 400)
+        $relItem = New-P3Terminal -Id "relative" -Mode "relative" -Relative (
+            New-P3Relative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-P3Set -Items @($absItem, $relItem)
+        $script:p3TopologyCalls = 0
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider {
+            $script:p3TopologyCalls++
+            return $topology
+        }
+
+        Assert-Equal 1 $script:p3TopologyCalls "one unavailable-topology call"
+        $absPlan = Get-P3PlanItem -Plan $plan -Id "absolute"
+        $relPlan = Get-P3PlanItem -Plan $plan -Id "relative"
+        Assert-Equal $true ([bool]$absPlan.ApplyGeometry) "absolute item retains movement"
+        Assert-Equal 10 ([int]$absPlan.Layout.x) "absolute layout retained"
+        Assert-Equal $false ([bool]$relPlan.ApplyGeometry) "relative item skipped"
+        Assert-Equal "topology-unavailable" ([string]$relPlan.PlacementStatus) "relative unavailable status"
+        Assert-Contains (@($plan.Warnings) -join "`n") "topology is unavailable" "unavailable topology warning"
+    }
+
+    Test-Case "relative lifecycle preserves matched-profile precedence and sparse omission" {
+        $signature = "edid:DEL-A1B2-ABC123@0,0,1920x1080"
+        $monitor = New-P3Monitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature $signature -Monitors @($monitor)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "relative" -Rect (New-P3Rect -X 10 -Y 10 -W 500 -H 500)
+        $item = New-P3Terminal -Id "relative" -Mode "relative" -Relative (
+            New-P3Relative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-P3Set -Items @($item) -Profiles @($profile)
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider { $topology }
+        $planItem = Get-P3PlanItem -Plan $plan -Id "relative"
+        Assert-Equal "profile" ([string]$planItem.Source) "profile wins"
+        Assert-Equal "docked" ([string]$planItem.ProfileId) "profile id"
+        Assert-Equal 10 ([int]$planItem.Layout.x) "profile rectangle"
+
+        $sparse = New-DevWSLayoutProfile -Id "sparse" -MonitorTokens @($signature)
+        $sparseSet = New-P3Set -Items @($item) -Profiles @($sparse)
+        $sparsePlan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $sparseSet -TopologyProvider { $topology }
+        $sparseItem = Get-P3PlanItem -Plan $sparsePlan -Id "relative"
+        Assert-Equal "relative" ([string]$sparseItem.Source) "sparse profile omission uses relative"
+        Assert-Equal 960 ([int]$sparseItem.Layout.x) "relative placement after omission"
+    }
+
+    Test-Case "relative lifecycle preserves strict profile refusal for relative targets" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature $signature -Monitors @($monitor) -IdentityComplete $false
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        $item = New-P3Terminal -Id "relative" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $set = New-P3Set -Items @($item) -Profiles @($profile)
+        $message = $null
+
+        try {
+            $null = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider { $topology }
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        Assert-Contains ([string]$message) "not safely matchable" "relative target cannot bypass strict profile refusal"
+    }
+
+    Test-Case "relative lifecycle honors disabled single-reset targets and enabled reset-all targets" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $relative = New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        $enabled = New-P3Terminal -Id "enabled" -Mode "relative" -Relative $relative
+        $disabled = New-P3Terminal -Id "disabled" -Mode "relative" -Relative $relative -Enabled $false
+        $set = New-P3Set -Items @($enabled, $disabled)
+        $script:p3TopologyCalls = 0
+
+        $singlePlan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -Items @($disabled) -TopologyProvider {
+            $script:p3TopologyCalls++
+            return $topology
+        }
+        Assert-Equal 1 $script:p3TopologyCalls "disabled targeted reset samples topology"
+        Assert-Equal 1 (@($singlePlan.Items).Count) "single reset plans the disabled terminal"
+        Assert-Equal "disabled" ([string]@($singlePlan.Items)[0].ItemId) "disabled target selected"
+        Assert-Equal $true ([bool]@($singlePlan.Items)[0].ApplyGeometry) "disabled targeted placement applies"
+
+        $script:p3TopologyCalls = 0
+        $resetAllPlan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -Items @($enabled) -TopologyProvider {
+            $script:p3TopologyCalls++
+            return $topology
+        }
+        Assert-Equal 1 $script:p3TopologyCalls "reset-all samples topology once"
+        Assert-Equal 1 (@($resetAllPlan.Items).Count) "reset-all plans only enabled terminals"
+        Assert-Equal "enabled" ([string]@($resetAllPlan.Items)[0].ItemId) "enabled target selected"
+    }
+
+    Test-Case "relative lifecycle freezes absolute wire records and app placement" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $relative = New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        $terminal = New-P3Terminal -Id "terminal" -Mode "relative" -Relative $relative
+        $app = New-P3App -Id "app" -Mode "relative" -Relative $relative
+        $set = New-P3Set -Items @($terminal, $app)
+        $script:p3TopologyCalls = 0
+
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider {
+            $script:p3TopologyCalls++
+            return $topology
+        }
+
+        Assert-Equal 1 $script:p3TopologyCalls "one planning snapshot"
+        $null = Assert-DevWSLifecycleLayoutPlan -Plan $plan -SetId "main" -Items @($terminal, $app)
+        $records = @(Get-DevWSLifecycleTerminalPlacementRecords -Plan $plan)
+        Assert-Equal 1 $records.Count "one terminal wire record"
+        $record = $records[0]
+        $keys = @($record.PSObject.Properties.Name | Sort-Object)
+        Assert-Equal "h,id,move,w,x,y" ($keys -join ",") "terminal record carries only absolute geometry and move"
+        Assert-Equal 960 ([int]$record.x) "terminal record x"
+        Assert-Equal 1040 ([int]$record.h) "terminal record h"
+        Assert-Equal 1 $script:p3TopologyCalls "frozen plan validation and records do not sample topology"
+
+        $appPlan = Get-P3PlanItem -Plan $plan -Id "app"
+        $placements = @{}
+        $placements["app"] = [pscustomobject]@{ ApplyGeometry = [bool]$appPlan.ApplyGeometry; Layout = $appPlan.Layout }
+        $appPlacement = Get-DevWSAppLaunchPlacement -Plan ([pscustomobject]@{ Placements = $placements }) -App $app
+        Assert-Equal $true ([bool]$appPlacement.ApplyGeometry) "app placement applies"
+        Assert-Equal 960 ([int]$appPlacement.Layout.x) "app receives frozen relative geometry"
+        Assert-Equal 1040 ([int]$appPlacement.Layout.h) "app receives frozen relative height"
+    }
+
+    Test-Case "relative lifecycle wire record omits geometry when placement is skipped" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $item = New-P3Terminal -Id "skipped" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 10 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-P3Rect -X 9000 -Y 9000 -W 100 -H 100)
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set (New-P3Set -Items @($item)) -TopologyProvider { $topology }
+        $records = @(Get-DevWSLifecycleTerminalPlacementRecords -Plan $plan)
+        $record = $records[0]
+
+        Assert-Equal $false ([bool]$record.move) "skipped record has move=false"
+        Assert-True (-not (Test-DevWSProperty -Object $record -Name "x")) "skipped record omits x"
+        Assert-True (-not (Test-DevWSProperty -Object $record -Name "y")) "skipped record omits y"
+        Assert-True (-not (Test-DevWSProperty -Object $record -Name "w")) "skipped record omits w"
+        Assert-True (-not (Test-DevWSProperty -Object $record -Name "h")) "skipped record omits h"
+    }
+
+    Test-Case "show-layout and lifecycle planning share the same operational placement" {
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
+        $relative = New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        $resolved = New-P3Terminal -Id "resolved" -Mode "relative" -Relative $relative
+        $fallback = New-P3Terminal -Id "fallback" -Mode "relative" -Relative (
+            New-P3Relative -Identity "edid:NO" -Basis "workArea" -X 0 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-P3Rect -X 10 -Y 20 -W 300 -H 400)
+        $skipped = New-P3Terminal -Id "skipped" -Mode "relative" -Relative (
+            New-P3Relative -Identity "path:AAA/1" -Basis "workArea" -X 10 -Y 0 -W 0.5 -H 1
+        ) -Layout (New-P3Rect -X 9000 -Y 9000 -W 100 -H 100)
+        $set = New-P3Set -Items @($resolved, $fallback, $skipped)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        $plan = New-DevWSLifecycleLayoutPlan -SetId "main" -Set $set -TopologyProvider { $topology }
+
+        foreach ($id in @("resolved", "fallback", "skipped")) {
+            $modelItem = @($model.Items | Where-Object { $_.ItemId -eq $id })[0]
+            $planItem = Get-P3PlanItem -Plan $plan -Id $id
+            Assert-Equal ([bool]$planItem.ApplyGeometry) ([bool]$modelItem.ApplyGeometry) "$id apply flag matches show-layout"
+            Assert-Equal ([string]$planItem.Source) ([string]$modelItem.Source) "$id source matches show-layout"
+            if ([bool]$planItem.ApplyGeometry) {
+                Assert-Equal ([int]$planItem.Layout.x) ([int]$modelItem.Rect.x) "$id x matches show-layout"
+                Assert-Equal ([int]$planItem.Layout.w) ([int]$modelItem.Rect.w) "$id width matches show-layout"
+            }
+            else {
+                Assert-True ($null -eq $modelItem.Rect) "$id has no verified display rectangle"
+            }
+        }
+
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+        Assert-Contains $text "[relative]" "resolved operational marker"
+        Assert-Contains $text "[relative fallback]" "fallback operational marker"
+        Assert-Contains $text "[relative unavailable]" "unavailable marker"
+        Assert-Contains $text "[skipped]" "skipped placement marker"
+        Assert-Contains $text "Relative placement is operational" "operational note"
+    }
+
+    Test-Case "show-layout explains skipped profile fallback without claiming applied geometry" {
+        $signature = "path:AAA/1@0,0,1920x1080"
+        $monitor = New-P3Monitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-P3Topology -Signature "path:ZZZ/9@0,0,1920x1080" -Monitors @($monitor)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @($signature)
+        $far = New-P3Terminal -Id "far" -Layout (New-P3Rect -X 9000 -Y 9000 -W 100 -H 100)
+        $set = New-P3Set -Items @($far) -Profiles @($profile)
+
+        $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
+        $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
+
+        Assert-Equal $false ([bool]$model.Items[0].ApplyGeometry) "unreachable profile-free fallback is skipped"
+        Assert-Contains $text "[skipped]" "skipped fallback marker"
+        Assert-Contains $text "Items marked [skipped] are handled without moving their windows" "skipped note explains the operational effect"
+        Assert-NotContains $text "apply exactly this effective layout" "skipped note does not claim every item is applied"
+    }
+
+    Test-Case "relative lifecycle coordinator loads the shared relative model" {
+        Assert-Contains (Get-SourceOf "src\coordinator\coordinator.ps1") '"devws-relative-layout.ps1"' "coordinator loads relative policy"
+    }
+
+    Write-Host ""
     Start-TestGroup -Name 'relative-layouts' -Title 'Relative layout schema and pure model (v0.3 Phase 1)'
 
     function New-RelativeLayoutTestRect {
@@ -36769,7 +37318,7 @@ Start-Sleep -Seconds 6
     }
 
     Write-Host ""
-    Start-TestGroup -Name 'relative-layout-display' -Title 'Relative layout preview rendering (v0.3 Phase 2)'
+    Start-TestGroup -Name 'relative-layout-display' -Title 'Relative layout display rendering (v0.3 Phase 2/3)'
 
     function New-RelativeDisplayRect {
         param([int]$X = 0, [int]$Y = 0, [int]$W = 800, [int]$H = 600)
@@ -36915,10 +37464,10 @@ Start-Sleep -Seconds 6
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "apply exactly this effective layout" "absolute-only lifecycle note retained"
         Assert-Contains $text "x=   10 y=   20 w=  300 h=  400" "absolute item line retained"
-        Assert-NotContains $text "Relative previews are read-only" "no relative preview note for absolute-only set"
+        Assert-NotContains $text "Relative placement is operational" "no relative placement note for absolute-only set"
     }
 
-    Test-Case "show-layout previews resolved relative intent without claiming lifecycle placement" {
+    Test-Case "show-layout reports resolved relative placement as operational" {
         $monitor = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
         $topology = New-RelativeDisplayTopology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($monitor)
         $relative = New-RelativeDisplayRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
@@ -36929,26 +37478,27 @@ Start-Sleep -Seconds 6
         $resolver = Resolve-DevWSRelativeLayout -RelativeLayout $relative -Topology $topology
 
         Assert-Equal "relative" ([string]$model.Items[0].LayoutMode) "relative mode displayed"
-        Assert-Equal "relative" ([string]$model.Items[0].Source) "relative preview source"
-        Assert-Equal "resolved" ([string]$model.Items[0].RelativeStatus) "relative preview resolves"
+        Assert-Equal "relative" ([string]$model.Items[0].Source) "relative placement source"
+        Assert-Equal "resolved" ([string]$model.Items[0].RelativeStatus) "relative placement resolves"
         Assert-Equal "edid:DEL-A1B2-ABC123" ([string]$model.Items[0].RelativeLayout.monitor.identity) "anchor identity retained"
         Assert-Equal "workArea" ([string]$model.Items[0].RelativeLayout.basis) "basis retained"
-        Assert-Equal 960 ([int]$model.Items[0].Rect.x) "preview x matches resolver"
-        Assert-Equal 960 ([int]$model.Items[0].Rect.w) "preview width matches resolver"
-        Assert-Equal ([int]$resolver.Rect.x) ([int]$model.Items[0].RelativeRect.x) "preview x equals Phase 1 resolver"
-        Assert-Equal ([int]$resolver.Rect.w) ([int]$model.Items[0].RelativeRect.w) "preview width equals Phase 1 resolver"
+        Assert-Equal 960 ([int]$model.Items[0].Rect.x) "reported x matches resolver"
+        Assert-Equal 960 ([int]$model.Items[0].Rect.w) "reported width matches resolver"
+        Assert-Equal ([int]$resolver.Rect.x) ([int]$model.Items[0].RelativeRect.x) "reported x equals Phase 1 resolver"
+        Assert-Equal ([int]$resolver.Rect.w) ([int]$model.Items[0].RelativeRect.w) "reported width equals Phase 1 resolver"
         Assert-Equal $true ([bool]$model.HasRelativeItems) "relative set flag"
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
-        Assert-Contains $text "[relative preview]" "relative preview marker"
+        Assert-Contains $text "layout      relative + fallback  (no profiles configured)" "relative routing shown in the layout header"
+        Assert-Contains $text "[relative]" "relative marker"
         Assert-Contains $text "mode        relative" "mode detail"
         Assert-Contains $text "anchor      edid:DEL-A1B2-ABC123  instance DELA1B2/5&2b" "anchor and instance detail"
         Assert-Contains $text "basis       workArea" "basis detail"
         Assert-Contains $text "normalized  x=0.5 y=0 w=0.5 h=1" "normalized detail"
         Assert-Contains $text "resolved    x=960 y=0 w=960 h=1040" "resolved detail"
-        Assert-Contains $text "preview     relative preview only; ordinary set launch currently uses the absolute fallback until Phase 3" "preview is explicitly non-lifecycle"
+        Assert-Contains $text "placement   relative placement is applied by ordinary set launch" "relative placement is operational"
         Assert-Contains $text "status      resolved" "resolved status"
-        Assert-Contains $text "Relative previews are read-only" "read-only note"
+        Assert-Contains $text "Relative placement is operational" "operational note"
         Assert-NotContains $text "apply exactly this effective layout" "relative set does not claim lifecycle truth"
     }
 
@@ -36969,13 +37519,13 @@ Start-Sleep -Seconds 6
         Assert-Equal 1040 ([int]$model.Items[1].Rect.h) "work-area basis height"
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
-        Assert-Contains $text "resolved    x=-1920 y=-100 w=1920 h=1080" "negative full-monitor preview"
-        Assert-Contains $text "resolved    x=-1920 y=-100 w=1920 h=1040" "negative work-area preview"
+        Assert-Contains $text "resolved    x=-1920 y=-100 w=1920 h=1080" "negative full-monitor resolution"
+        Assert-Contains $text "resolved    x=-1920 y=-100 w=1920 h=1040" "negative work-area resolution"
         Assert-Contains $text "basis       monitor" "monitor basis rendered"
         Assert-Contains $text "basis       workArea" "work-area basis rendered"
     }
 
-    Test-Case "show-layout previews reachable fallback for a missing anchor" {
+    Test-Case "show-layout reports reachable fallback for a missing anchor" {
         $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
         $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
         $item = New-RelativeDisplayTerminal -Id "missing-anchor" -Mode "relative" -Relative (
@@ -36985,17 +37535,17 @@ Start-Sleep -Seconds 6
 
         $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
         Assert-Equal "anchor-missing" ([string]$model.Items[0].RelativeStatus) "missing anchor status"
-        Assert-Equal "relative-fallback" ([string]$model.Items[0].Source) "fallback preview source"
+        Assert-Equal "relative-fallback" ([string]$model.Items[0].Source) "fallback placement source"
         Assert-Equal 10 ([int]$model.Items[0].Rect.x) "fallback x"
         Assert-Equal $true ([bool]$model.Items[0].FallbackUsed) "fallback marked used"
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
-        Assert-Contains $text "[relative fallback preview]" "fallback preview marker"
-        Assert-Contains $text "absolute fallback preview (anchor missing (identity-not-found))" "fallback reason"
+        Assert-Contains $text "[relative fallback]" "fallback marker"
+        Assert-Contains $text "absolute fallback is applied (anchor missing (identity-not-found))" "fallback reason"
         Assert-Contains $text "status      anchor missing (identity-not-found)" "missing anchor detail"
     }
 
-    Test-Case "show-layout previews fallback for an ambiguous anchor" {
+    Test-Case "show-layout reports fallback for an ambiguous anchor" {
         $first = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
         $second = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&3c" -X 1920 -W 1920 -H 1080 -WorkH 1040
         $topology = New-RelativeDisplayTopology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($first, $second)
@@ -37010,7 +37560,7 @@ Start-Sleep -Seconds 6
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "status      anchor ambiguous (duplicate-identity)" "ambiguous anchor detail"
-        Assert-Contains $text "absolute fallback preview" "ambiguous fallback preview"
+        Assert-Contains $text "absolute fallback is applied" "ambiguous fallback placement"
     }
 
     Test-Case "show-layout reports unavailable topology without inventing relative geometry" {
@@ -37032,12 +37582,12 @@ Start-Sleep -Seconds 6
         Assert-Contains $text "x=   10 y=   20 w=  300 h=  400" "absolute item still renders"
         Assert-Contains $text "no verified geometry" "relative item has no geometry line"
         Assert-Contains $text "status      topology unavailable" "unavailable status"
-        Assert-Contains $text "no verified geometry (topology unavailable)" "unavailable preview reason"
-        Assert-Contains $text "Relative previews are read-only" "preview note"
+        Assert-Contains $text "no verified geometry (topology unavailable)" "unavailable placement reason"
+        Assert-Contains $text "Relative placement is operational" "operational note"
         Assert-NotContains $text "apply exactly this effective layout" "relative set does not claim lifecycle truth"
     }
 
-    Test-Case "show-layout previews reachable fallback for an unreachable relative target" {
+    Test-Case "show-layout reports reachable fallback for an unreachable relative target" {
         $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
         $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
         $item = New-RelativeDisplayTerminal -Id "far-relative" -Mode "relative" -Relative (
@@ -37053,7 +37603,7 @@ Start-Sleep -Seconds 6
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "status      relative target unreachable" "unreachable target status"
-        Assert-Contains $text "absolute fallback preview (relative target unreachable)" "fallback preview reason"
+        Assert-Contains $text "absolute fallback is applied (relative target unreachable)" "fallback placement reason"
         Assert-Contains $text "resolved    x=19200 y=0 w=960 h=1040" "resolved target rendered"
     }
 
@@ -37096,9 +37646,9 @@ Start-Sleep -Seconds 6
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "[profile overrides relative]" "override marker"
-        Assert-Contains $text "preview     profile 'docked' is current ordinary set launch placement; relative preview is not used" "override preview"
+        Assert-Contains $text "placement   profile 'docked' is the applied ordinary set launch placement; relative intent is overridden" "override placement"
         Assert-Contains $text "profile 'docked'" "profile selection"
-        Assert-Contains $text "Relative previews are read-only" "relative note"
+        Assert-Contains $text "Relative placement is operational" "relative note"
     }
 
     Test-Case "show-layout exposes profile omission for relative items" {
@@ -37114,12 +37664,12 @@ Start-Sleep -Seconds 6
         $model = Get-DevWSEffectiveLayout -SetId "main" -Set $set -Topology $topology
         Assert-Equal $true ([bool]$model.Items[0].ProfileMatched) "profile matched"
         Assert-Equal $false ([bool]$model.Items[0].ProfileOverridesRelative) "profile omitted item"
-        Assert-Equal "relative" ([string]$model.Items[0].Source) "relative preview source"
+        Assert-Equal "relative" ([string]$model.Items[0].Source) "relative placement source"
 
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "[profile omits item]" "omission marker"
-        Assert-Contains $text "[relative preview]" "relative preview marker"
-        Assert-Contains $text "preview     relative preview only" "relative preview detail"
+        Assert-Contains $text "[relative]" "relative marker"
+        Assert-Contains $text "placement   relative placement is applied" "relative placement detail"
     }
 
     Test-Case "show-layout preserves strict profile-safety diagnostics" {
@@ -37138,7 +37688,7 @@ Start-Sleep -Seconds 6
         $text = (@(Get-DevWSEffectiveLayoutLines -Model $model)) -join "`n"
         Assert-Contains $text "topology not fully identified" "existing profile-safety wording"
         Assert-Contains $text "lifecycle   ordinary set launch would refuse (topology not fully identified)" "strict refusal diagnostic"
-        Assert-Contains $text "ordinary set launch would refuse this topology; relative preview is not applied" "preview refusal detail"
+        Assert-Contains $text "ordinary set launch would refuse this topology; relative placement is not applied" "refusal detail"
         Assert-Contains $text "Ordinary set launch would refuse this topology" "ordinary launch refusal note"
 
         $plannerMessage = $null
@@ -37257,7 +37807,7 @@ Start-Sleep -Seconds 6
         Assert-True (-not ($text -match '0,25|0,5')) "no comma decimal separators"
     }
 
-    Test-Case "Show-DevWSLayout renders the relative preview through the CLI wrapper" {
+    Test-Case "Show-DevWSLayout renders relative placement through the CLI wrapper" {
         $monitor = New-RelativeDisplayMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -W 1920 -H 1080 -WorkH 1040
         $topology = New-RelativeDisplayTopology -Signature "edid:DEL-A1B2-ABC123@0,0,1920x1080" -Monitors @($monitor)
         $item = New-RelativeDisplayTerminal -Id "wrapper" -Mode "relative" -Relative (
@@ -37285,12 +37835,12 @@ Start-Sleep -Seconds 6
         $output = (& { Show-DevWSLayout -SetId "main" } 6>&1 | Out-String)
 
         Assert-Contains $output "Saved layout for set 'main'" "wrapper heading"
-        Assert-Contains $output "[relative preview]" "wrapper relative marker"
-        Assert-Contains $output "preview     relative preview only" "wrapper preview detail"
-        Assert-Contains $output "Relative previews are read-only" "wrapper read-only note"
+        Assert-Contains $output "[relative]" "wrapper relative marker"
+        Assert-Contains $output "placement   relative placement is applied" "wrapper placement detail"
+        Assert-Contains $output "Relative placement is operational" "wrapper operational note"
     }
 
-    Test-Case "show-layout preview is read-only and never touches windows or config" {
+    Test-Case "show-layout reporting is read-only and never touches windows or config" {
         $monitor = New-RelativeDisplayMonitor -Identity "path:AAA/1" -W 1920 -H 1080 -WorkH 1040
         $topology = New-RelativeDisplayTopology -Signature "path:AAA/1@0,0,1920x1080" -Monitors @($monitor)
         $item = New-RelativeDisplayTerminal -Id "readonly" -Mode "relative" -Relative (
@@ -38481,8 +39031,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 65 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 65 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 66 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 66 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

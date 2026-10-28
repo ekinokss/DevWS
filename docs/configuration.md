@@ -279,7 +279,9 @@ arrangement.
 `item.layout` remains the **universal fallback** and is mandatory for every item. Profiles
 are sparse: an item omitted from a matched profile falls back to its own `item.layout`.
 
-- A set with **no** profiles has no monitor dependency at all.
+- A set with **no** profiles and no targeted relative items has no monitor dependency at
+  all. A profile-free set with a targeted relative item samples the topology exactly once,
+  before any side effect, while absolute items in that set keep their legacy placement.
 - A set with profiles samples the monitor topology exactly once per operation, before any
   side effect. An unsafe or ambiguous topology refuses the operation; a matched profile
   rectangle that is unreachable on the current desktop also refuses; an unreachable
