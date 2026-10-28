@@ -121,6 +121,7 @@ $script:TestGroupCatalog = [ordered]@{
     'monitors'            = 'Read-only monitor diagnostics'
     'layout-profiles'     = 'Topology layout profiles (Pass 5C)'
     'lifecycle-layouts'   = 'Lifecycle profile placement (Pass 5D)'
+    'relative-layouts'    = 'Relative layout schema and pure model (v0.3 Phase 1)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
     'test-harness'        = 'Test harness'
@@ -7182,11 +7183,11 @@ function Find-DevWSReversiblyEncodedPrintableContent {
         Assert-Contains $ws "Save-DevWSWorkspace" "ws save implementation exists"
 
         # Future layout scope remains research-only in the runtime libraries.
-        # Pass 5B intentionally introduced read-only monitor diagnostics and
-        # Pass 5C introduces the optional topology-profile schema; the monitor
-        # vocabulary is therefore allowed in the display renderer and the
-        # config validator. Profile/relative/grid layout vocabulary stays
-        # research-only everywhere, and mutation code stays monitor-free.
+        # Pass 5B intentionally introduced read-only monitor diagnostics,
+        # Pass 5C introduced the optional topology-profile schema, and v0.3
+        # Phase 1 introduces the relative-layout schema in the config
+        # validator. Profile/grid vocabulary stays research-only elsewhere,
+        # and mutation code stays monitor-free.
         foreach ($file in @("devws-config.ps1", "devws-display.ps1", "devws-mutation.ps1")) {
             $codeLines = @(Get-Content -LiteralPath (Join-Path $RepoRoot "src\lib\$file") | Where-Object {
                 $trimmed = $_.Trim()
@@ -7194,7 +7195,11 @@ function Find-DevWSReversiblyEncodedPrintableContent {
             })
             $code = $codeLines -join "`n"
 
-            $layoutTokens = @("relative", "tiling", "named zone", "normalized")
+            $layoutTokens = @("tiling", "named zone", "normalized")
+
+            if ($file -ne "devws-config.ps1") {
+                $layoutTokens += "relative"
+            }
 
             if ($file -eq "devws-mutation.ps1") {
                 $layoutTokens += "monitor"
@@ -18594,7 +18599,7 @@ $mutex.Dispose()
         $leafName = "devws-cwd-paths.ps1"
 
         $required = @(Get-DevWSRequiredLibraryNames)
-        Assert-Equal 34 $required.Count "the normal required set carries 34 libraries"
+        Assert-Equal 35 $required.Count "the normal required set carries 35 libraries"
         Assert-True ($required -contains $leafName) "the normal required set carries the leaf"
 
         $privilegedNames = @(Get-DevWSPrivilegedLibraryNames)
@@ -21979,7 +21984,7 @@ Invoke-DevWSWithLifecycleLock -MutexName $MutexName -TimeoutSeconds $TimeoutSeco
         Assert-Equal $false (Test-DevWSWindowHwnd -Hwnd 0) "hot path usable after repeated initialization"
 
         $manifest = @(Get-DevWSInstallManifest -RepoRoot $RepoRoot)
-        Assert-Equal 39 $manifest.Count "normal install manifest includes the protected-cwd path leaf"
+        Assert-Equal 40 $manifest.Count "normal install manifest includes the protected-cwd path leaf"
         Assert-Equal 27 @(Get-DevWSPrivilegedInstallManifest -RepoRoot $RepoRoot).Count "privileged manifest carried alongside"
         Assert-Contains (Get-SourceOf "src\workers\elevated.ps1") "Get-DevWSTerminalLaunchPlan" "canonical terminal launch policy wired"
     }
@@ -22741,7 +22746,7 @@ Write-Output "REPLACEMENT-LOADED"
         $manifest = @(Get-DevWSInstallManifest -RepoRoot $RepoRoot)
         $targets = @($manifest | ForEach-Object { $_.Target })
 
-        Assert-Equal 39 $manifest.Count "normal source-managed manifest carries 39 files"
+        Assert-Equal 40 $manifest.Count "normal source-managed manifest carries 40 files"
         $privilegedManifest = @(Get-DevWSPrivilegedInstallManifest -RepoRoot $RepoRoot)
         Assert-Equal 27 $privilegedManifest.Count "privileged source-managed manifest carries 27 files"
         Assert-True ($targets -contains "app\lib\devws-native.ps1") "shared native loader is a source manifest entry"
@@ -24399,8 +24404,8 @@ exit 0
         $required = @(Get-DevWSRequiredLibraryNames)
         $srcLibs  = @(Get-ChildItem -Path (Join-Path $RepoRoot "src\lib") -Filter "*.ps1" -File)
 
-        Assert-Equal 34 $required.Count "required library count is 34 with the protected-cwd path leaf"
-        Assert-Equal 34 $srcLibs.Count "src lib count is 34 with the protected-cwd path leaf"
+        Assert-Equal 35 $required.Count "required library count is 35 with the relative-layout library"
+        Assert-Equal 35 $srcLibs.Count "src lib count is 35 with the relative-layout library"
         Assert-True ($required -contains "devws-cwd.ps1") "cwd library is in the required set"
         Assert-True ($required -contains "devws-terminal-launch.ps1") "canonical terminal launch library is in the required set"
         Assert-True ($required -contains "devws-broker-protocol.ps1") "broker protocol library is in the required set"
@@ -32152,8 +32157,8 @@ Start-Sleep -Seconds 6
         $privilegedManifest = @(Get-DevWSPrivilegedInstallManifest -RepoRoot $RepoRoot)
         $privilegedTargets  = @($privilegedManifest | ForEach-Object { $_.Target })
 
-        Assert-Equal 39 $manifest.Count "normal manifest carries 39 files"
-        Assert-Equal 34 @($targets | Where-Object { $_ -like "app\lib\*.ps1" }).Count "34 runtime libraries"
+        Assert-Equal 40 $manifest.Count "normal manifest carries 40 files"
+        Assert-Equal 35 @($targets | Where-Object { $_ -like "app\lib\*.ps1" }).Count "35 runtime libraries"
         Assert-Equal 1  @($targets | Where-Object { $_ -like "helpers\*" }).Count "1 user-owned helper"
         Assert-Equal 0  @($targets | Where-Object { $_ -like "workers\*.ps1" }).Count "0 user-owned workers after the privileged split"
         Assert-Equal 27 $privilegedManifest.Count "privileged manifest carries 27 files"
@@ -35946,6 +35951,755 @@ Start-Sleep -Seconds 6
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'relative-layouts' -Title 'Relative layout schema and pure model (v0.3 Phase 1)'
+
+    function New-RelativeLayoutTestRect {
+        param([double]$X = 0, [double]$Y = 0, [double]$W = 1, [double]$H = 1)
+        return [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+    }
+
+    function New-RelativeLayoutTestMonitor {
+        param(
+            [Parameter(Mandatory)][string]$Identity,
+            [string]$Instance,
+            [int]$X = 0,
+            [int]$Y = 0,
+            [int]$W = 1920,
+            [int]$H = 1080,
+            [int]$WorkX,
+            [int]$WorkY,
+            [int]$WorkW,
+            [int]$WorkH
+        )
+
+        $workXValue = if ($PSBoundParameters.ContainsKey("WorkX")) { $WorkX } else { $X }
+        $workYValue = if ($PSBoundParameters.ContainsKey("WorkY")) { $WorkY } else { $Y }
+        $workWValue = if ($PSBoundParameters.ContainsKey("WorkW")) { $WorkW } else { $W }
+        $workHValue = if ($PSBoundParameters.ContainsKey("WorkH")) { $WorkH } else { $H }
+
+        return [pscustomobject][ordered]@{
+            IdentityToken      = $Identity
+            DevicePathInstance = if ([string]::IsNullOrEmpty($Instance)) { $null } else { $Instance }
+            MonitorRect        = [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+            WorkRect           = [pscustomobject][ordered]@{ x = $workXValue; y = $workYValue; w = $workWValue; h = $workHValue }
+        }
+    }
+
+    function New-RelativeLayoutTestTopology {
+        param([object[]]$Monitors = @(), [bool]$Available = $true)
+
+        return [pscustomobject][ordered]@{
+            Available = $Available
+            Monitors  = @($Monitors)
+        }
+    }
+
+    function New-RelativeLayoutTestRelative {
+        param(
+            [Parameter(Mandatory)][string]$Identity,
+            [string]$Instance,
+            [string]$Basis = "workArea",
+            [double]$X = 0,
+            [double]$Y = 0,
+            [double]$W = 1,
+            [double]$H = 1
+        )
+
+        $monitorFields = [ordered]@{ identity = $Identity }
+
+        if (-not [string]::IsNullOrEmpty($Instance)) {
+            $monitorFields["instance"] = $Instance
+        }
+
+        return [pscustomobject][ordered]@{
+            monitor = [pscustomobject]$monitorFields
+            basis   = $Basis
+            rect    = New-RelativeLayoutTestRect -X $X -Y $Y -W $W -H $H
+        }
+    }
+
+    function New-RelativeLayoutTestTerminal {
+        param([string]$Id = "term")
+
+        return [pscustomobject][ordered]@{
+            id        = $Id
+            type      = "terminal"
+            enabled   = $true
+            windowId  = "DevWS-relative-$Id"
+            path      = 'C:\x'
+            elevated  = $true
+            tabs      = @([pscustomobject][ordered]@{ command = $null; args = @() })
+            activeTab = 0
+            layout    = [pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 }
+        }
+    }
+
+    function New-RelativeLayoutTestConfig {
+        param([object[]]$Items = @())
+
+        return [pscustomobject][ordered]@{
+            version    = 3
+            defaultSet = "main"
+            bindings   = @()
+            sets       = @([pscustomobject][ordered]@{ id = "main"; windows = @($Items) })
+        }
+    }
+
+    function Add-RelativeLayoutTestField {
+        param($Item, [string]$Name, $Value)
+        $Item | Add-Member -MemberType NoteProperty -Name $Name -Value $Value -Force
+    }
+
+    function Assert-RelativeLayoutTestInvalid {
+        param($Item, [string]$Needle, [string]$CaseName)
+
+        $message = $null
+
+        try {
+            Assert-DevWSConfig -Config (New-RelativeLayoutTestConfig -Items @($Item)) -Source "relative-layout-test"
+        }
+        catch {
+            $message = $_.Exception.Message
+        }
+
+        Assert-True ($null -ne $message) "$CaseName was rejected"
+        Assert-Contains ([string]$message) $Needle "$CaseName reports the expected reason"
+    }
+
+    Test-Case "relative-layout schema accepts absolute and relative items" {
+        $absolute = New-RelativeLayoutTestTerminal -Id "absolute"
+
+        $relative = New-RelativeLayoutTestTerminal -Id "relative"
+        Add-RelativeLayoutTestField -Item $relative -Name "layoutMode" -Value "relative"
+        Add-RelativeLayoutTestField -Item $relative -Name "layoutRelative" -Value (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+
+        $monitorBasis = New-RelativeLayoutTestTerminal -Id "monitor-basis"
+        Add-RelativeLayoutTestField -Item $monitorBasis -Name "layoutMode" -Value "relative"
+        Add-RelativeLayoutTestField -Item $monitorBasis -Name "layoutRelative" -Value (
+            New-RelativeLayoutTestRelative -Identity "path:AAA/1" -Basis "monitor" -X 0 -Y 0 -W 1 -H 1
+        )
+
+        Assert-DevWSConfig -Config (New-RelativeLayoutTestConfig -Items @($absolute, $relative, $monitorBasis)) -Source "relative-layout-test"
+    }
+
+    Test-Case "relative-layout schema is accepted by the installer's relaxed v3 recognizer" {
+        $item = New-RelativeLayoutTestTerminal -Id "installer"
+        Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "relative"
+        Add-RelativeLayoutTestField -Item $item -Name "layoutRelative" -Value (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea"
+        )
+        $config = New-RelativeLayoutTestConfig -Items @($item)
+
+        Assert-DevWSConfig -Config $config -Source "relative-layout-test"
+        Assert-DevWSPreInstanceModeV3Config -Config $config -Source "relative-layout-installer-test"
+    }
+
+    Test-Case "relative-layout schema rejects malformed mode combinations" {
+        $cases = @(
+            @{
+                Name = "wrong case"
+                Needle = "must be exactly 'absolute' or 'relative'"
+                Build = {
+                    $item = New-RelativeLayoutTestTerminal -Id "mode"
+                    Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "Relative"
+                    return $item
+                }
+            },
+            @{
+                Name = "non-string mode"
+                Needle = "must be the string 'absolute' or 'relative'"
+                Build = {
+                    $item = New-RelativeLayoutTestTerminal -Id "mode"
+                    Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value 5
+                    return $item
+                }
+            },
+            @{
+                Name = "relative without object"
+                Needle = "'layoutRelative' is required"
+                Build = {
+                    $item = New-RelativeLayoutTestTerminal -Id "mode"
+                    Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "relative"
+                    return $item
+                }
+            },
+            @{
+                Name = "object without mode"
+                Needle = "'layoutRelative' is only allowed"
+                Build = {
+                    $item = New-RelativeLayoutTestTerminal -Id "mode"
+                    Add-RelativeLayoutTestField -Item $item -Name "layoutRelative" -Value (
+                        New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    )
+                    return $item
+                }
+            },
+            @{
+                Name = "absolute with object"
+                Needle = "'layoutRelative' is only allowed"
+                Build = {
+                    $item = New-RelativeLayoutTestTerminal -Id "mode"
+                    Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "absolute"
+                    Add-RelativeLayoutTestField -Item $item -Name "layoutRelative" -Value (
+                        New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    )
+                    return $item
+                }
+            }
+        )
+
+        foreach ($case in $cases) {
+            $item = & $case.Build
+            Assert-RelativeLayoutTestInvalid -Item $item -Needle $case.Needle -CaseName $case.Name
+        }
+    }
+
+    Test-Case "relative-layout schema rejects malformed monitor anchors" {
+        $cases = @(
+            @{
+                Name = "missing identity"
+                Needle = "monitor.identity"
+                Relative = {
+                    [pscustomobject][ordered]@{
+                        monitor = [pscustomobject][ordered]@{ instance = "AAA/1" }
+                        basis   = "workArea"
+                        rect    = New-RelativeLayoutTestRect
+                    }
+                }
+            },
+            @{
+                Name = "ordinal identity"
+                Needle = "monitor.identity"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity '\\.\DISPLAY1'
+                }
+            },
+            @{
+                Name = "empty edid identity"
+                Needle = "monitor.identity"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity "edid:"
+                }
+            },
+            @{
+                Name = "path identity without instance separator"
+                Needle = "monitor.identity"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity "path:AAA"
+                }
+            },
+            @{
+                Name = "malformed device-path instance"
+                Needle = "monitor.instance"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "foo"
+                }
+            },
+            @{
+                Name = "instance on path identity"
+                Needle = "instance is not allowed"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity "path:AAA/1" -Instance "AAA/1"
+                }
+            },
+            @{
+                Name = "unknown monitor property"
+                Needle = "unexpected property"
+                Relative = {
+                    $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    Add-RelativeLayoutTestField -Item $relative.monitor -Name "extra" -Value $true
+                    return $relative
+                }
+            }
+        )
+
+        foreach ($case in $cases) {
+            $item = New-RelativeLayoutTestTerminal -Id "anchor"
+            Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "relative"
+            Add-RelativeLayoutTestField -Item $item -Name "layoutRelative" -Value (& $case.Relative)
+            Assert-RelativeLayoutTestInvalid -Item $item -Needle $case.Needle -CaseName $case.Name
+        }
+    }
+
+    Test-Case "relative-layout schema rejects malformed basis, rect and object fields" {
+        $cases = @(
+            @{
+                Name = "missing basis"
+                Needle = "basis must be exactly"
+                Relative = {
+                    $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    $relative.PSObject.Properties.Remove("basis")
+                    return $relative
+                }
+            },
+            @{
+                Name = "invalid basis"
+                Needle = "basis must be exactly"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "screen"
+                }
+            },
+            @{
+                Name = "missing rect"
+                Needle = "rect must be an object"
+                Relative = {
+                    $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    $relative.PSObject.Properties.Remove("rect")
+                    return $relative
+                }
+            },
+            @{
+                Name = "string fraction"
+                Needle = "rect.x must be a finite number"
+                Relative = {
+                    $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    Add-RelativeLayoutTestField -Item $relative.rect -Name "x" -Value "0.5"
+                    return $relative
+                }
+            },
+            @{
+                Name = "zero width"
+                Needle = "rect.w must be greater than 0"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -W 0
+                }
+            },
+            @{
+                Name = "negative height"
+                Needle = "rect.h must be greater than 0"
+                Relative = {
+                    New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -H -1
+                }
+            },
+            @{
+                Name = "unknown rect property"
+                Needle = "unexpected property"
+                Relative = {
+                    $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    Add-RelativeLayoutTestField -Item $relative.rect -Name "z" -Value 0
+                    return $relative
+                }
+            },
+            @{
+                Name = "unknown relative property"
+                Needle = "unexpected property"
+                Relative = {
+                    $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+                    Add-RelativeLayoutTestField -Item $relative -Name "extra" -Value $true
+                    return $relative
+                }
+            }
+        )
+
+        foreach ($case in $cases) {
+            $item = New-RelativeLayoutTestTerminal -Id "shape"
+            Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "relative"
+            Add-RelativeLayoutTestField -Item $item -Name "layoutRelative" -Value (& $case.Relative)
+            Assert-RelativeLayoutTestInvalid -Item $item -Needle $case.Needle -CaseName $case.Name
+        }
+    }
+
+    Test-Case "relative-layout schema preserves unknown item fields" {
+        $absolute = New-RelativeLayoutTestTerminal -Id "absolute"
+        Add-RelativeLayoutTestField -Item $absolute -Name "futureField" -Value "keep"
+
+        $relative = New-RelativeLayoutTestTerminal -Id "relative"
+        Add-RelativeLayoutTestField -Item $relative -Name "layoutMode" -Value "relative"
+        Add-RelativeLayoutTestField -Item $relative -Name "layoutRelative" -Value (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+        )
+        Add-RelativeLayoutTestField -Item $relative -Name "futureField" -Value "keep"
+
+        $config = New-RelativeLayoutTestConfig -Items @($absolute, $relative)
+        Assert-DevWSConfig -Config $config -Source "relative-layout-test"
+
+        $roundTrip = $config | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+        Assert-Equal "keep" ([string]$roundTrip.sets[0].windows[0].futureField) "absolute item unknown field survives"
+        Assert-Equal "keep" ([string]$roundTrip.sets[0].windows[1].futureField) "relative item unknown field survives"
+    }
+
+    Test-Case "relative-layout schema round-trips and serializes invariantly" {
+        $item = New-RelativeLayoutTestTerminal -Id "roundtrip"
+        Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "relative"
+        Add-RelativeLayoutTestField -Item $item -Name "layoutRelative" -Value (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $config = New-RelativeLayoutTestConfig -Items @($item)
+
+        $dir = Join-Path $TestRoot "relative-layout-roundtrip"
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $path = Join-Path $dir "workspace.json"
+        $location = [pscustomobject]@{ Path = $path; IsWritable = $true }
+        $previousCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+
+        try {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::GetCultureInfo("de-DE")
+            Save-DevWSConfig -Config $config -Location $location
+        }
+        finally {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = $previousCulture
+        }
+
+        $reloaded = Read-DevWSConfigFile -Path $path
+        Assert-DevWSConfig -Config $reloaded -Source $path
+        Assert-Equal "relative" ([string]$reloaded.sets[0].windows[0].layoutMode) "mode round-trips"
+        Assert-Equal 0.5 ([double]$reloaded.sets[0].windows[0].layoutRelative.rect.w) "fraction round-trips"
+        Assert-Equal "DELA1B2/5&2b" ([string]$reloaded.sets[0].windows[0].layoutRelative.monitor.instance) "instance round-trips"
+
+        $json = Get-Content -LiteralPath $path -Raw
+        Assert-True ([regex]::IsMatch($json, '"w"\s*:\s*0\.5')) "decimal point is invariant"
+        Assert-True (-not ($json -match '0,5')) "comma decimal separator is absent"
+    }
+
+    Test-Case "absolute-only configurations remain unchanged and valid" {
+        $item = New-RelativeLayoutTestTerminal -Id "legacy"
+        $config = New-RelativeLayoutTestConfig -Items @($item)
+
+        Assert-DevWSConfig -Config $config -Source "relative-layout-test"
+        $json = $config | ConvertTo-Json -Depth 20 -Compress
+        Assert-True (-not ($json -match 'layoutMode|layoutRelative')) "legacy item has no relative fields"
+        Assert-Equal 3 ([int]$config.version) "schema version remains 3"
+        Assert-Equal 800 ([int]$config.sets[0].windows[0].layout.w) "absolute fallback remains mandatory"
+    }
+
+    Test-Case "absolute layout writes preserve relative fields for later phases" {
+        $item = New-RelativeLayoutTestTerminal -Id "preserve"
+        Add-RelativeLayoutTestField -Item $item -Name "layoutMode" -Value "relative"
+        Add-RelativeLayoutTestField -Item $item -Name "layoutRelative" -Value (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+        )
+        $config = New-RelativeLayoutTestConfig -Items @($item)
+        Assert-DevWSConfig -Config $config -Source "relative-layout-test"
+
+        Set-DevWSLayout -Item $item -Rect ([pscustomobject]@{ x = 10; y = 20; w = 300; h = 400 })
+
+        Assert-Equal 10 ([int]$item.layout.x) "absolute fallback is updated"
+        Assert-Equal "relative" ([string]$item.layoutMode) "mode is not cleared by an absolute write"
+        Assert-Equal 0.5 ([double]$item.layoutRelative.rect.w) "relative rect is not cleared by an absolute write"
+        Assert-DevWSConfig -Config $config -Source "relative-layout-test"
+    }
+
+    Test-Case "relative anchor resolves unique EDID and path identities" {
+        $edidMonitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b"
+        $pathMonitor = New-RelativeLayoutTestMonitor -Identity "path:BBB/2" -X 1920
+        $topology = New-RelativeLayoutTestTopology -Monitors @($edidMonitor, $pathMonitor)
+
+        $edidResult = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+        ) -Topology $topology
+
+        Assert-True ([bool]$edidResult.Ok) "EDID identity resolves"
+        Assert-Equal "resolved" ([string]$edidResult.Status) "EDID status"
+        Assert-Equal "edid:DEL-A1B2-ABC123" ([string]$edidResult.Monitor.IdentityToken) "EDID monitor selected"
+
+        $pathResult = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "path:BBB/2"
+        ) -Topology $topology
+
+        Assert-True ([bool]$pathResult.Ok) "path identity resolves"
+        Assert-Equal "path:BBB/2" ([string]$pathResult.Monitor.IdentityToken) "path monitor selected"
+    }
+
+    Test-Case "relative anchor uses device-path instance for duplicate identities" {
+        $first = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b"
+        $second = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&3c" -X 1920
+        $topology = New-RelativeLayoutTestTopology -Monitors @($first, $second)
+
+        $selected = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&3c"
+        ) -Topology $topology
+
+        Assert-True ([bool]$selected.Ok) "matching instance resolves"
+        Assert-Equal "DELA1B2/5&3c" ([string]$selected.Monitor.DevicePathInstance) "correct duplicate monitor selected"
+
+        $ambiguous = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+        ) -Topology $topology
+
+        Assert-Equal "anchor-ambiguous" ([string]$ambiguous.Status) "duplicate identity without instance is ambiguous"
+
+        $wrongInstance = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&9z"
+        ) -Topology $topology
+
+        Assert-Equal "anchor-ambiguous" ([string]$wrongInstance.Status) "wrong instance does not guess between duplicates"
+
+        $uniqueTopology = New-RelativeLayoutTestTopology -Monitors @($first)
+        $portChanged = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&9z"
+        ) -Topology $uniqueTopology
+
+        Assert-True ([bool]$portChanged.Ok) "unique identity resolves after a port change"
+        Assert-Equal "identity-port-changed" ([string]$portChanged.Reason) "port-change reason is explicit"
+
+        $duplicateInstanceTopology = New-RelativeLayoutTestTopology -Monitors @($first, $first)
+        $duplicateInstance = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b"
+        ) -Topology $duplicateInstanceTopology
+
+        Assert-Equal "anchor-ambiguous" ([string]$duplicateInstance.Status) "duplicate identity and instance is ambiguous"
+    }
+
+    Test-Case "relative anchor reports missing and unavailable topology" {
+        $monitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b"
+        $topology = New-RelativeLayoutTestTopology -Monitors @($monitor)
+
+        $missing = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-NOPE"
+        ) -Topology $topology
+
+        Assert-Equal "anchor-missing" ([string]$missing.Status) "missing identity is explicit"
+        Assert-True ($null -eq $missing.BasisRect) "missing anchor has no basis"
+
+        $badIdentity = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity '\\.\DISPLAY1'
+        ) -Topology $topology
+        Assert-Equal "relative-invalid" ([string]$badIdentity.Status) "ordinal anchor is invalid in the pure model"
+
+        $badInstance = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "not-an-instance"
+        ) -Topology $topology
+        Assert-Equal "relative-invalid" ([string]$badInstance.Status) "malformed instance is invalid in the pure model"
+
+        $unavailableTopology = New-RelativeLayoutTestTopology -Monitors @() -Available $false
+        $unavailable = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+        ) -Topology $unavailableTopology
+
+        Assert-Equal "topology-unavailable" ([string]$unavailable.Status) "unavailable topology status"
+        Assert-True ($null -eq $unavailable.Monitor) "unavailable topology has no monitor"
+        Assert-True ($null -eq $unavailable.BasisRect) "unavailable topology has no basis"
+
+        $resolved = Resolve-DevWSRelativeLayout -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123"
+        ) -Topology $unavailableTopology
+
+        Assert-Equal "topology-unavailable" ([string]$resolved.Status) "composed resolver propagates unavailable topology"
+        Assert-True ($null -eq $resolved.Rect) "unavailable topology never fabricates a rectangle"
+
+        $selected = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 100 -H 100) -Topology $unavailableTopology
+        Assert-Equal "topology-unavailable" ([string]$selected.Status) "anchor selection reports unavailable topology"
+    }
+
+    Test-Case "relative basis selection uses work area and full monitor" {
+        $monitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeLayoutTestTopology -Monitors @($monitor)
+
+        $work = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea"
+        ) -Topology $topology
+
+        Assert-Equal 1040 ([int]$work.BasisRect.h) "work area basis excludes the taskbar"
+
+        $full = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "monitor"
+        ) -Topology $topology
+
+        Assert-Equal 1080 ([int]$full.BasisRect.h) "monitor basis includes the full height"
+
+        $invalid = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "screen"
+        ) -Topology $topology
+
+        Assert-Equal "basis-unavailable" ([string]$invalid.Status) "invalid basis is rejected by the pure resolver"
+    }
+
+    Test-Case "relative capture and restore round-trip exactly" {
+        $monitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -X 0 -Y 0 -W 1920 -H 1080 -WorkH 1040
+        $absolute = New-RelativeLayoutTestRect -X 960 -Y 0 -W 960 -H 1040
+
+        $captured = ConvertFrom-DevWSAbsoluteRectToRelative -Rect $absolute -BasisRect $monitor.WorkRect
+        Assert-True ([bool]$captured.Ok) "capture succeeds"
+        Assert-Equal 0.5 ([double]$captured.Rect.x) "captured x fraction"
+        Assert-Equal 0.5 ([double]$captured.Rect.w) "captured width fraction"
+
+        $restored = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect $captured.Rect -BasisRect $monitor.WorkRect
+        Assert-True ([bool]$restored.Ok) "restore succeeds"
+        Assert-Equal 960 ([int]$restored.Rect.x) "restored x"
+        Assert-Equal 0 ([int]$restored.Rect.y) "restored y"
+        Assert-Equal 960 ([int]$restored.Rect.w) "restored width"
+        Assert-Equal 1040 ([int]$restored.Rect.h) "restored height"
+    }
+
+    Test-Case "relative placement scales across resolution changes" {
+        $oldMonitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -W 1920 -H 1080 -WorkH 1040
+        $newMonitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -W 2560 -H 1440 -WorkH 1400
+        $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea" -X 0 -Y 0 -W 0.5 -H 1
+
+        $oldResult = Resolve-DevWSRelativeLayout -RelativeLayout $relative -Topology (New-RelativeLayoutTestTopology -Monitors @($oldMonitor))
+        $newResult = Resolve-DevWSRelativeLayout -RelativeLayout $relative -Topology (New-RelativeLayoutTestTopology -Monitors @($newMonitor))
+
+        Assert-Equal 960 ([int]$oldResult.Rect.w) "old resolution width"
+        Assert-Equal 1280 ([int]$newResult.Rect.w) "new resolution width"
+        Assert-Equal 1040 ([int]$oldResult.Rect.h) "old work-area height"
+        Assert-Equal 1400 ([int]$newResult.Rect.h) "new work-area height"
+    }
+
+    Test-Case "relative capture handles negative origins and off-screen geometry" {
+        $monitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -X -1920 -Y -100 -W 1920 -H 1080 -WorkH 1040
+        $absolute = New-RelativeLayoutTestRect -X -2020 -Y -50 -W 500 -H 600
+
+        $captured = ConvertFrom-DevWSAbsoluteRectToRelative -Rect $absolute -BasisRect $monitor.WorkRect
+        Assert-True ([bool]$captured.Ok) "negative-origin capture succeeds"
+        Assert-True ([double]$captured.Rect.x -lt 0) "negative x fraction is preserved"
+
+        $restored = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect $captured.Rect -BasisRect $monitor.WorkRect
+        Assert-Equal -2020 ([int]$restored.Rect.x) "negative absolute x restores"
+        Assert-Equal -50 ([int]$restored.Rect.y) "negative absolute y restores"
+        Assert-Equal 500 ([int]$restored.Rect.w) "off-screen width restores"
+        Assert-Equal 600 ([int]$restored.Rect.h) "off-screen height restores"
+    }
+
+    Test-Case "relative fractions preserve overlap and spans without clamping" {
+        $basis = New-RelativeLayoutTestRect -X 0 -Y 0 -W 1000 -H 1000
+
+        $first = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 1 -H 1) -BasisRect $basis
+        $second = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (New-RelativeLayoutTestRect -X 0.5 -Y 0 -W 1 -H 1) -BasisRect $basis
+
+        Assert-Equal 0 ([int]$first.Rect.x) "first layout starts at the basis origin"
+        Assert-Equal 1000 ([int]$first.Rect.w) "first layout fills the basis"
+        Assert-Equal 500 ([int]$second.Rect.x) "second layout overlaps the first"
+        Assert-Equal 1000 ([int]$second.Rect.w) "span width is not clamped"
+    }
+
+    Test-Case "relative edge rounding and six-decimal capture are deterministic" {
+        $basis = New-RelativeLayoutTestRect -X 0 -Y 0 -W 101 -H 1000
+
+        $positive = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (New-RelativeLayoutTestRect -X 0.5 -Y 0 -W 0.5 -H 1) -BasisRect $basis
+        Assert-Equal 51 ([int]$positive.Rect.x) "positive midpoint rounds away from zero"
+        Assert-Equal 50 ([int]$positive.Rect.w) "right edge rounding derives width"
+
+        $negative = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (New-RelativeLayoutTestRect -X -0.5 -Y 0 -W 0.5 -H 1) -BasisRect $basis
+        Assert-Equal -51 ([int]$negative.Rect.x) "negative midpoint rounds away from zero"
+        Assert-Equal 51 ([int]$negative.Rect.w) "negative edge width is derived"
+
+        $thirdsBasis = New-RelativeLayoutTestRect -X 0 -Y 0 -W 3 -H 3
+        $captured = ConvertFrom-DevWSAbsoluteRectToRelative -Rect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 1 -H 1) -BasisRect $thirdsBasis
+        Assert-Equal 0.333333 ([double]$captured.Rect.w) "capture is rounded to six decimals"
+    }
+
+    Test-Case "relative conversion rejects non-finite values and overflow" {
+        $basis = New-RelativeLayoutTestRect -X 0 -Y 0 -W 1920 -H 1080
+
+        $overflow = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (
+            New-RelativeLayoutTestRect -X 1000000000 -Y 0 -W 1000000000 -H 1
+        ) -BasisRect $basis
+        Assert-Equal "overflow" ([string]$overflow.Status) "Int32 overflow is detected"
+
+        $zero = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (New-RelativeLayoutTestRect -X 0 -Y 0 -W 0 -H 1) -BasisRect $basis
+        Assert-Equal "rect-invalid" ([string]$zero.Status) "zero width is rejected"
+
+        $infinite = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (
+            New-RelativeLayoutTestRect -X 0 -Y 0 -W ([double]::PositiveInfinity) -H 1
+        ) -BasisRect $basis
+        Assert-Equal "rect-invalid" ([string]$infinite.Status) "non-finite fraction is rejected"
+
+        $badBasis = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect (New-RelativeLayoutTestRect) -BasisRect (
+            New-RelativeLayoutTestRect -X 0 -Y 0 -W 0 -H 0
+        )
+        Assert-Equal "basis-unavailable" ([string]$badBasis.Status) "invalid basis is rejected"
+    }
+
+    Test-Case "relative anchor selection uses greatest visible area" {
+        $left = New-RelativeLayoutTestMonitor -Identity "path:AAA/1" -X 0 -W 1000
+        $right = New-RelativeLayoutTestMonitor -Identity "path:BBB/2" -X 1000 -W 1000
+        $topology = New-RelativeLayoutTestTopology -Monitors @($left, $right)
+
+        $selected = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 900 -Y 0 -W 600 -H 800) -Topology $topology
+
+        Assert-True ([bool]$selected.Ok) "greatest-area anchor is selected"
+        Assert-Equal "path:BBB/2" ([string]$selected.Monitor.IdentityToken) "right monitor has the greatest visible area"
+        Assert-Equal 400000 ([double]$selected.VisibleArea) "visible area is exact"
+    }
+
+    Test-Case "relative anchor selection refuses ties and handles zero-visible cases" {
+        $left = New-RelativeLayoutTestMonitor -Identity "path:AAA/1" -X 0 -W 1000
+        $right = New-RelativeLayoutTestMonitor -Identity "path:BBB/2" -X 1000 -W 1000
+        $topology = New-RelativeLayoutTestTopology -Monitors @($left, $right)
+
+        $tie = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 980 -Y 0 -W 40 -H 100) -Topology $topology
+        Assert-Equal "ambiguous-visible-area" ([string]$tie.Status) "equal visible area is ambiguous"
+
+        $none = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 5000 -Y 0 -W 100 -H 100) -Topology $topology
+        Assert-Equal "no-visible-area" ([string]$none.Status) "off-screen rectangle has no anchor"
+
+        $existing = New-RelativeLayoutTestRelative -Identity "path:AAA/1" -Basis "workArea" -X 0 -Y 0 -W 1 -H 1
+        $kept = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 5000 -Y 0 -W 100 -H 100) -Topology $topology -ExistingRelativeLayout $existing
+        Assert-True ([bool]$kept.Ok) "existing resolvable anchor survives zero visible area"
+        Assert-Equal "existing-anchor" ([string]$kept.Reason) "existing-anchor reason"
+        Assert-Equal "path:AAA/1" ([string]$kept.Monitor.IdentityToken) "existing anchor monitor"
+
+        $missing = New-RelativeLayoutTestRelative -Identity "path:ZZZ/9" -Basis "workArea"
+        $notKept = Select-DevWSRelativeAnchorFromRect -Rect (New-RelativeLayoutTestRect -X 5000 -Y 0 -W 100 -H 100) -Topology $topology -ExistingRelativeLayout $missing
+        Assert-Equal "no-visible-area" ([string]$notKept.Status) "missing existing anchor cannot rescue zero visibility"
+    }
+
+    Test-Case "relative deep copy is independent" {
+        $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Instance "DELA1B2/5&2b" -Basis "monitor" -X 0.25 -Y 0.5 -W 0.5 -H 0.25
+        $copy = Copy-DevWSRelativeLayout -RelativeLayout $relative
+
+        Assert-Equal "edid:DEL-A1B2-ABC123" ([string]$copy.monitor.identity) "identity copied"
+        Assert-Equal "DELA1B2/5&2b" ([string]$copy.monitor.instance) "instance copied"
+        Assert-Equal 0.25 ([double]$copy.rect.x) "fraction copied"
+
+        $copy.monitor.identity = "edid:CHANGED"
+        $copy.monitor.instance = "CHANGED/1"
+        $copy.rect.x = 0.75
+
+        Assert-Equal "edid:DEL-A1B2-ABC123" ([string]$relative.monitor.identity) "source identity is independent"
+        Assert-Equal "DELA1B2/5&2b" ([string]$relative.monitor.instance) "source instance is independent"
+        Assert-Equal 0.25 ([double]$relative.rect.x) "source rectangle is independent"
+
+        Assert-True ($null -eq (Copy-DevWSRelativeLayout -RelativeLayout $null)) "null copy is null"
+    }
+
+    Test-Case "relative resolver composes anchor and conversion" {
+        $monitor = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -W 1920 -H 1080 -WorkH 1040
+        $topology = New-RelativeLayoutTestTopology -Monitors @($monitor)
+        $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea" -X 0.5 -Y 0 -W 0.5 -H 1
+
+        $resolved = Resolve-DevWSRelativeLayout -RelativeLayout $relative -Topology $topology
+        Assert-True ([bool]$resolved.Ok) "composed resolution succeeds"
+        Assert-Equal 960 ([int]$resolved.Rect.x) "composed x"
+        Assert-Equal 960 ([int]$resolved.Rect.w) "composed width"
+
+        $missing = Resolve-DevWSRelativeLayout -RelativeLayout (
+            New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-MISSING"
+        ) -Topology $topology
+        Assert-Equal "anchor-missing" ([string]$missing.Status) "composed resolution reports the anchor failure"
+        Assert-True ($null -eq $missing.Rect) "failed resolution has no rectangle"
+    }
+
+    Test-Case "relative work-area basis follows taskbar changes" {
+        $largerWorkArea = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -W 1920 -H 1080 -WorkH 1040
+        $smallerWorkArea = New-RelativeLayoutTestMonitor -Identity "edid:DEL-A1B2-ABC123" -W 1920 -H 1080 -WorkH 1000
+        $relative = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "workArea" -X 0 -Y 0 -W 1 -H 1
+
+        $first = Resolve-DevWSRelativeLayout -RelativeLayout $relative -Topology (New-RelativeLayoutTestTopology -Monitors @($largerWorkArea))
+        $second = Resolve-DevWSRelativeLayout -RelativeLayout $relative -Topology (New-RelativeLayoutTestTopology -Monitors @($smallerWorkArea))
+
+        Assert-Equal 1040 ([int]$first.Rect.h) "first work-area height"
+        Assert-Equal 1000 ([int]$second.Rect.h) "second work-area height adapts"
+
+        $monitorBasis = New-RelativeLayoutTestRelative -Identity "edid:DEL-A1B2-ABC123" -Basis "monitor" -X 0 -Y 0 -W 1 -H 1
+        $full = Resolve-DevWSRelativeLayout -RelativeLayout $monitorBasis -Topology (New-RelativeLayoutTestTopology -Monitors @($smallerWorkArea))
+        Assert-Equal 1080 ([int]$full.Rect.h) "monitor basis ignores the taskbar"
+    }
+
+    Test-Case "relative library stays observational and is loaded by the CLI" {
+        $source = Get-SourceOf "src\lib\devws-relative-layout.ps1"
+
+        foreach ($forbidden in @("Get-DevWSMonitorTopology", "Move-DevWSWindowHwnd", "Save-DevWSConfig", "Start-DevWSWorkerRequest", "New-DevWSElevatedBrokerPrepare")) {
+            Assert-NotContains $source $forbidden "relative model stays pure: $forbidden"
+        }
+
+        Assert-Contains (Get-SourceOf "src\ws.ps1") '"devws-relative-layout.ps1"' "CLI loads the pure relative-layout model"
+        Assert-Contains (Get-SourceOf "src\lib\devws-install.ps1") '"devws-relative-layout.ps1"' "installer health knows the library"
+    }
+
+    Write-Host ""
     Start-TestGroup -Name 'trace-temp-hardening' -Title 'Public Security Phase 2-E trace and temporary-file hardening'
 
     function New-P2EInstalledProbe {
@@ -37115,8 +37869,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 63 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 63 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 64 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 64 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

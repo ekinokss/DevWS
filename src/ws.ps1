@@ -59,6 +59,12 @@ $LibDir = Join-Path $PSScriptRoot "lib"
 # only; no workspace-config, host or window awareness).
 . (Join-Path $LibDir "devws-monitor.ps1")
 
+# Relative-layout pure model (v0.3 Phase 1): anchor parsing/resolution,
+# normalized rectangle math and anchored capture/restore primitives. This is
+# schema/geometry support only; lifecycle and save policy arrive in later
+# phases.
+. (Join-Path $LibDir "devws-relative-layout.ps1")
+
 # Topology layout-profile policy (Pass 5C): pure selection, write-scope
 # routing, sparse effective layouts and in-memory profile mutations.
 . (Join-Path $LibDir "devws-layout-profile.ps1")

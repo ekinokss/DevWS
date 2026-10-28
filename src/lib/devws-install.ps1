@@ -89,6 +89,7 @@ function Get-DevWSRequiredLibraryNames {
         "devws-mutation.ps1",
         "devws-native.ps1",
         "devws-paths.ps1",
+        "devws-relative-layout.ps1",
         "devws-state.ps1",
         "devws-status.ps1",
         "devws-terminal.ps1",

@@ -799,6 +799,220 @@ function Add-DevWSRectValidationErrors {
     }
 }
 
+function Test-DevWSFiniteNumber {
+    # JSON numbers may arrive as integer or floating-point CLR types. Reject
+    # booleans, strings and non-finite values; accept only finite numeric
+    # values for the relative-layout fractions.
+    param($Value)
+
+    if ($null -eq $Value -or $Value -is [bool]) {
+        return $false
+    }
+
+    $isNumeric = (
+        $Value -is [int] -or
+        $Value -is [long] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [uint32] -or
+        $Value -is [uint64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]
+    )
+
+    if (-not $isNumeric) {
+        return $false
+    }
+
+    try {
+        return [double]::IsFinite([double]$Value)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-DevWSRelativeMonitorIdentitySyntax {
+    # A relative anchor identity uses the same durable prefix family as the
+    # topology signature: edid:<serial identity> or path:<hardwareId>/<instance>.
+    # Ordinals are never accepted. Internal punctuation (including '@') is
+    # allowed because the identity is not re-parsed from a signature token.
+    param([AllowEmptyString()][string]$Identity)
+
+    if ([string]::IsNullOrWhiteSpace($Identity)) {
+        return $false
+    }
+
+    if ($Identity -cne $Identity.Trim()) {
+        return $false
+    }
+
+    foreach ($character in $Identity.ToCharArray()) {
+        if ([int]$character -lt 32 -or [int]$character -eq 127) {
+            return $false
+        }
+    }
+
+    if ($Identity.StartsWith("path:", [System.StringComparison]::Ordinal)) {
+        $pathIdentity = $Identity.Substring(5)
+
+        if ($pathIdentity -cne $pathIdentity.Trim()) {
+            return $false
+        }
+
+        return ($pathIdentity -match '^[^/\\#\s]+/[^/\\#\s]+$')
+    }
+
+    if ($Identity.StartsWith("edid:", [System.StringComparison]::Ordinal)) {
+        $serialIdentity = $Identity.Substring(5)
+        return (-not [string]::IsNullOrWhiteSpace($serialIdentity) -and $serialIdentity -ceq $serialIdentity.Trim())
+    }
+
+    return $false
+}
+
+function Test-DevWSRelativeMonitorInstanceSyntax {
+    # DevicePathInstance is the normalized <hardwareId>/<instance> form used by
+    # the monitor topology model. It is a tie-breaker for EDID anchors, not an
+    # ordinal or a path identity.
+    param([AllowEmptyString()][string]$Instance)
+
+    if ([string]::IsNullOrWhiteSpace($Instance)) {
+        return $false
+    }
+
+    if ($Instance -cne $Instance.Trim()) {
+        return $false
+    }
+
+    return ($Instance -match '^[^/\\#\s]+/[^/\\#\s]+$')
+}
+
+function Add-DevWSRelativeLayoutValidationErrors {
+    # Additive v3 per-item relative-layout fields. Existing item properties stay
+    # tolerant: this validator checks only layoutMode/layoutRelative and does
+    # not introduce a general item allowlist.
+    param(
+        [Parameter(Mandatory)]
+        $Errors,
+        [Parameter(Mandatory)]
+        $Item,
+        [Parameter(Mandatory)]
+        [string]$Label
+    )
+
+    $hasMode     = Test-DevWSProperty -Object $Item -Name "layoutMode"
+    $hasRelative = Test-DevWSProperty -Object $Item -Name "layoutRelative"
+    $relativeMode = $false
+
+    if ($hasMode) {
+        $mode = Get-DevWSProperty -Object $Item -Name "layoutMode"
+
+        if ($mode -isnot [string]) {
+            $Errors.Add("$Label 'layoutMode' must be the string 'absolute' or 'relative'.")
+        }
+        elseif ($mode -cne "absolute" -and $mode -cne "relative") {
+            $Errors.Add("$Label 'layoutMode' must be exactly 'absolute' or 'relative' (got '$mode').")
+        }
+        elseif ($mode -ceq "relative") {
+            $relativeMode = $true
+        }
+    }
+
+    if ($hasRelative -and -not $relativeMode) {
+        $Errors.Add("$Label 'layoutRelative' is only allowed when 'layoutMode' is 'relative'.")
+        return
+    }
+
+    if ($relativeMode -and -not $hasRelative) {
+        $Errors.Add("$Label 'layoutRelative' is required when 'layoutMode' is 'relative'.")
+        return
+    }
+
+    if (-not $hasRelative) {
+        return
+    }
+
+    $relative = Get-DevWSProperty -Object $Item -Name "layoutRelative"
+
+    if ($null -eq $relative -or $relative -isnot [System.Management.Automation.PSCustomObject]) {
+        $Errors.Add("$Label 'layoutRelative' must be an object with monitor, basis and rect.")
+        return
+    }
+
+    foreach ($property in @($relative.PSObject.Properties)) {
+        if ($property.Name -notin @("monitor", "basis", "rect")) {
+            $Errors.Add("$Label layoutRelative has unexpected property '$($property.Name)'. Allowed: monitor, basis, rect.")
+        }
+    }
+
+    $monitor = Get-DevWSProperty -Object $relative -Name "monitor"
+
+    if ($null -eq $monitor -or $monitor -isnot [System.Management.Automation.PSCustomObject]) {
+        $Errors.Add("$Label layoutRelative.monitor must be an object with identity and optional instance.")
+    }
+    else {
+        foreach ($property in @($monitor.PSObject.Properties)) {
+            if ($property.Name -notin @("identity", "instance")) {
+                $Errors.Add("$Label layoutRelative.monitor has unexpected property '$($property.Name)'. Allowed: identity, instance.")
+            }
+        }
+
+        $identity = Get-DevWSProperty -Object $monitor -Name "identity"
+
+        if ($identity -isnot [string] -or -not (Test-DevWSRelativeMonitorIdentitySyntax -Identity ([string]$identity))) {
+            $Errors.Add("$Label layoutRelative.monitor.identity must be a non-empty durable monitor identity beginning with 'edid:' or 'path:'.")
+        }
+
+        if (Test-DevWSProperty -Object $monitor -Name "instance") {
+            $instance = Get-DevWSProperty -Object $monitor -Name "instance"
+
+            if ($instance -isnot [string] -or -not (Test-DevWSRelativeMonitorInstanceSyntax -Instance ([string]$instance))) {
+                $Errors.Add("$Label layoutRelative.monitor.instance must be a non-empty device-path instance '<hardwareId>/<instance>'.")
+            }
+            elseif ($identity -is [string] -and $identity.StartsWith("path:", [System.StringComparison]::Ordinal)) {
+                $Errors.Add("$Label layoutRelative.monitor.instance is not allowed when monitor.identity uses the 'path:' prefix.")
+            }
+        }
+    }
+
+    $basis = Get-DevWSProperty -Object $relative -Name "basis"
+
+    if ($basis -isnot [string] -or ($basis -cne "workArea" -and $basis -cne "monitor")) {
+        $Errors.Add("$Label layoutRelative.basis must be exactly 'workArea' or 'monitor' (got '$basis').")
+    }
+
+    $rect = Get-DevWSProperty -Object $relative -Name "rect"
+
+    if ($null -eq $rect -or $rect -isnot [System.Management.Automation.PSCustomObject]) {
+        $Errors.Add("$Label layoutRelative.rect must be an object with finite numeric x, y, w, h.")
+    }
+    else {
+        foreach ($property in @($rect.PSObject.Properties)) {
+            if ($property.Name -notin @("x", "y", "w", "h")) {
+                $Errors.Add("$Label layoutRelative.rect has unexpected property '$($property.Name)'. Allowed: x, y, w, h.")
+            }
+        }
+
+        foreach ($field in @("x", "y", "w", "h")) {
+            $value = Get-DevWSProperty -Object $rect -Name $field
+
+            if (-not (Test-DevWSFiniteNumber -Value $value)) {
+                $Errors.Add("$Label layoutRelative.rect.$field must be a finite number.")
+            }
+        }
+
+        if ((Test-DevWSFiniteNumber -Value (Get-DevWSProperty -Object $rect -Name "w")) -and [double]$rect.w -le 0) {
+            $Errors.Add("$Label layoutRelative.rect.w must be greater than 0 (got $($rect.w)).")
+        }
+
+        if ((Test-DevWSFiniteNumber -Value (Get-DevWSProperty -Object $rect -Name "h")) -and [double]$rect.h -le 0) {
+            $Errors.Add("$Label layoutRelative.rect.h must be greater than 0 (got $($rect.h)).")
+        }
+    }
+}
+
 function Add-DevWSWindowValidationErrors {
     param(
         [Parameter(Mandatory)]
@@ -882,6 +1096,10 @@ function Add-DevWSWindowValidationErrors {
         $layout = Get-DevWSProperty -Object $item -Name "layout"
 
         Add-DevWSRectValidationErrors -Errors $Errors -Rect $layout -Label $label -FieldLabel "layout"
+
+        if ($RuleSet -eq "v3") {
+            Add-DevWSRelativeLayoutValidationErrors -Errors $Errors -Item $item -Label $label
+        }
 
         if ($type -eq "terminal") {
             if (-not (Test-DevWSProperty -Object $item -Name "windowId") -or $item.windowId -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$item.windowId)) {
