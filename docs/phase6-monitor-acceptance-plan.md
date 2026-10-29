@@ -38,6 +38,19 @@ may be performed without approval.
    command output, captured rectangles, verdict, and cleanup.
 6. A bounded evidence directory and cleanup owner.
 
+### Proposed acceptance VM (not provisioned)
+
+If a fresh VM is required, propose and approve this resource envelope first:
+
+- Windows 11 x64, 4 vCPU, 8 GB RAM, 64 GB dynamically allocated disk.
+- Isolated virtual network with no access to the primary LAN; updates may be
+  staged offline.
+- Two virtual displays at different resolutions/scaling (for example
+  2560x1440 at 150% and 1920x1080 at 100%) with reversible topology changes.
+- Snapshot before acceptance; restore or dispose within seven days of
+  completion. No production credentials, no cloud archive access, and no
+  upload of evidence.
+
 ## Matrix
 
 | ID | Scenario | Action | Expected result |
