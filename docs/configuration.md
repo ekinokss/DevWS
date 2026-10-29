@@ -233,6 +233,65 @@ Absolute rectangles are precise and work well with manual arrangement followed b
 `ws save-layout`, but they are tied to the monitor arrangement they were captured on. That
 is what topology layout profiles address.
 
+### Monitor-relative layout
+
+An item may instead carry a normalized monitor-relative layer. The absolute `layout` remains
+mandatory and is always the universal fallback.
+
+```json
+{
+  "id": "notes",
+  "type": "app",
+  "layout": { "x": 633, "y": 0, "w": 1294, "h": 1407 },
+  "layoutMode": "relative",
+  "layoutRelative": {
+    "monitor": { "identity": "edid:ACME001", "instance": "DELA1B2/5" },
+    "basis": "workArea",
+    "rect": { "x": 0.0, "y": 0.0, "w": 0.5, "h": 1.0 }
+  }
+}
+```
+
+| Field | Type | Required | Rules |
+| --- | --- | --- | --- |
+| `layoutMode` | string | no | `relative` or `absolute`; absent means absolute. |
+| `layoutRelative` | object | only with `relative` | `monitor`, `basis` and `rect` only. |
+| `layoutRelative.monitor.identity` | string | yes | Durable `edid:` serial identity or `path:` display device-path identity. Monitor ordinals are rejected. |
+| `layoutRelative.monitor.instance` | string | no | Device-path tie-breaker in `<hardwareId>/<instance>` form. Omitted for `path:` identities. |
+| `layoutRelative.basis` | string | yes | Exactly `workArea` or `monitor`. |
+| `layoutRelative.rect` | object | yes | Finite normalized `x`, `y`, `w`, `h`; `w` and `h` are greater than zero. |
+
+Normalized fractions may be negative or greater than one: intentional gaps, overlaps and
+spans across monitors are preserved. Capture rounds fractions to six decimal places; explicit
+authoring stores the supplied finite values. `layoutRelative` is accepted only when
+`layoutMode` is `relative`; a relative item must carry it.
+
+Placement precedence is **matched profile entry > relative target > absolute fallback**. A
+relative anchor is durable intent, not proof that the monitor is currently connected:
+
+- authoring validates syntax only and never samples topology or reads live windows;
+- launch and `ws show-layout` resolve the anchor against the current topology and report a
+  missing, ambiguous or unreachable target separately;
+- fallback-scope save re-anchors from the captured rectangle and dual-writes
+  `layoutRelative` + `item.layout`; profile-targeted saves never touch either universal field.
+
+Author relative geometry explicitly:
+
+```powershell
+ws set-geometry notes --relative --anchor edid:ACME001 --instance DELA1B2/5 --basis workArea --x 0 --y 0 --width 0.5 --height 1
+ws set-geometry notes --relative --anchor path:DELA1B2/5 --basis monitor --x -0.1 --y 0 --width 1.2 --height 1
+```
+
+A plain absolute fallback edit on a relative item is refused because relative placement would
+override it. An explicit `--layout <profileId>` still edits that profile's absolute entry.
+Convert back with `ws set-geometry <id> --mode absolute`, which removes `layoutRelative`, records
+`layoutMode: "absolute"`, and preserves `item.layout` unless replacement coordinates are supplied.
+
+`ws reset-layout` restores the bundled absolute baseline and clears relative fields for every
+matched item. Unmatched items keep their relative intent, and layout profiles are untouched.
+Clone operations (`clone-terminal`, `clone-app`, `clone-set`) deep-copy the mode, anchor,
+instance, basis and normalized rectangle while retaining the absolute fallback.
+
 ## 9. Topology layout profiles
 
 An optional per-set array that lets one set carry a different layout for a different monitor

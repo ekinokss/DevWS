@@ -2432,17 +2432,15 @@ function Invoke-DevWSCloneApp {
 }
 
 function Invoke-DevWSSetGeometry {
-    # `ws set-geometry <item-ref> --x ... --y ... --width ... --height ...
-    #  [--layout <profileId|fallback>]`
+    # `ws set-geometry <item-ref>` supports three explicit forms:
+    #   absolute rectangle + optional --layout <profileId|fallback>;
+    #   --relative --anchor ... --basis ... --x/--y/--width/--height;
+    #   --mode absolute with optional replacement absolute coordinates.
     #
-    # Storage scope (Pass 5C):
-    #   --layout fallback / --layout <profileId>  explicit; topology is NOT
-    #                                             consulted or required;
-    #   implicit: profile-free set -> fallback (legacy behavior, no monitor
-    #             dependency); profile set -> the same routing a same-moment
-    #             launch placement uses (matched profile else fallback), and an
-    #             unsafe topology refuses the write.
-    # Config only: the live window is never moved, resized or focused.
+    # Relative authoring is config-only and never samples topology. A plain
+    # absolute fallback edit is refused for a relative item because relative
+    # placement would override it; an explicit absolute profile entry remains
+    # editable regardless of the item's mode.
     param(
         [string]$Reference,
         [AllowEmptyCollection()]
@@ -2450,7 +2448,7 @@ function Invoke-DevWSSetGeometry {
     )
 
     if ([string]::IsNullOrWhiteSpace($Reference)) {
-        throw "Usage: ws set-geometry <id> --x <x> --y <y> --width <width> --height <height> [--layout <profileId|fallback>]"
+        throw "Usage: ws set-geometry <id> --x <x> --y <y> --width <width> --height <height> [--layout <profileId|fallback>] or ws set-geometry <id> --relative --anchor <identity> [--instance <instance>] --basis workArea|monitor --x <fx> --y <fy> --width <fw> --height <fh> or ws set-geometry <id> --mode absolute"
     }
 
     $geometry = ConvertFrom-DevWSGeometryArguments -Parts $Arguments -CommandName "ws set-geometry" -AllowLayoutSelector
@@ -2459,6 +2457,78 @@ function Invoke-DevWSSetGeometry {
     $configReference = Resolve-DevWSConfigReference -Config $context.Config -Reference $Reference -CommandName "ws set-geometry"
     $item = Resolve-DevWSItemById -Config $context.Config -Reference $configReference.ItemId -CommandName "ws set-geometry" -Set $configReference.Set
     $itemSet = $configReference.Set
+
+    if ($geometry.Relative) {
+        $fallbackText = "x=$([int]$item.layout.x) y=$([int]$item.layout.y) w=$([int]$item.layout.w) h=$([int]$item.layout.h)"
+        $oldRelative = Get-DevWSProperty -Object $item -Name "layoutRelative"
+        $oldRelativeText = if ($null -ne $oldRelative) {
+            "x=$($oldRelative.rect.x) y=$($oldRelative.rect.y) w=$($oldRelative.rect.w) h=$($oldRelative.rect.h)"
+        }
+        else {
+            "(absolute mode)"
+        }
+
+        [void](Set-DevWSItemRelativeGeometry `
+            -Config $context.Config `
+            -Item $item `
+            -Anchor $geometry.Anchor `
+            -Instance $geometry.Instance `
+            -Basis $geometry.Basis `
+            -X $geometry.x `
+            -Y $geometry.y `
+            -W $geometry.w `
+            -H $geometry.h)
+
+        Save-DevWSConfig -Config $context.Config -Location $context.Location
+
+        $label = Get-DevWSItemDisplayLabel -Config $context.Config -SetId $configReference.SetId -ItemId $item.id -Scoped:$configReference.Scoped
+
+        $instanceText = if ($null -ne $geometry.Instance) { " (instance $($geometry.Instance))" } else { "" }
+
+        Write-Host "Updated relative layout for '$label'. Scope: fallback relative layout." -ForegroundColor Green
+        Write-Host "  old: $oldRelativeText"
+        Write-Host "  new: x=$($geometry.x) y=$($geometry.y) w=$($geometry.w) h=$($geometry.h)"
+        Write-Host "  anchor: $($geometry.Anchor)$instanceText"
+        Write-Host "  basis:  $($geometry.Basis)"
+        Write-Host "  absolute fallback item.layout preserved: $fallbackText"
+        Write-Host ""
+        Write-Host "Config only: the live window was not moved or resized, and no monitor topology was read." -ForegroundColor DarkGray
+        Write-Host "The anchor is stored as intent; 'ws show-layout' and 'ws launch' report whether it is currently resolvable." -ForegroundColor DarkGray
+        return
+    }
+
+    if ($geometry.ModeExplicit) {
+        $wasRelative = Test-DevWSItemRelativeMode -Item $item
+        $oldLayoutText = "x=$([int]$item.layout.x) y=$([int]$item.layout.y) w=$([int]$item.layout.w) h=$([int]$item.layout.h)"
+        $replacement = $null
+
+        if ($null -ne $geometry.x) {
+            $replacement = [pscustomobject]@{
+                x = [int]$geometry.x
+                y = [int]$geometry.y
+                w = [int]$geometry.w
+                h = [int]$geometry.h
+            }
+        }
+
+        [void](Set-DevWSItemAbsoluteGeometry -Config $context.Config -Item $item -Rect $replacement)
+
+        Save-DevWSConfig -Config $context.Config -Location $context.Location
+
+        $label = Get-DevWSItemDisplayLabel -Config $context.Config -SetId $configReference.SetId -ItemId $item.id -Scoped:$configReference.Scoped
+        $fallbackText = "x=$([int]$item.layout.x) y=$([int]$item.layout.y) w=$([int]$item.layout.w) h=$([int]$item.layout.h)"
+
+        $relativeSuffix = if ($wasRelative) { " (layoutRelative removed)" } else { "" }
+
+        Write-Host "Set '$label' to absolute layout mode." -ForegroundColor Green
+        Write-Host "  old layout: $oldLayoutText"
+        Write-Host "  layoutMode: absolute$relativeSuffix"
+        Write-Host "  absolute fallback: $fallbackText"
+        Write-Host ""
+        Write-Host "Config only: the live window was not moved or resized, and no monitor topology was read." -ForegroundColor DarkGray
+        Write-Host "Layout changes take effect on the next 'ws launch' or terminal reset." -ForegroundColor DarkGray
+        return
+    }
 
     $newRect = [pscustomobject]@{
         x = [int]$geometry.x
@@ -2508,6 +2578,10 @@ function Invoke-DevWSSetGeometry {
         else {
             $storageScope = "fallback"
         }
+    }
+
+    if ($storageScope -eq "fallback" -and (Test-DevWSItemRelativeMode -Item $item)) {
+        throw "Item '$Reference' uses relative layout mode; editing the universal fallback item.layout would be misleading because relative placement takes precedence. Use 'ws set-geometry $Reference --relative ...' to change the relative layout, 'ws set-geometry $Reference --mode absolute' to convert it explicitly, or '--layout <profileId>' to edit an absolute profile entry. Nothing was changed."
     }
 
     $oldText = $null
@@ -2625,12 +2699,26 @@ function Invoke-DevWSResetLayout {
     Write-Host "Restored saved layout for $($matched.Count) item(s):" -ForegroundColor Green
 
     foreach ($match in $matched) {
+        $suffix = ""
+
+        if ([bool]$match.ClearedRelative) {
+            $suffix = " (relative mode cleared)"
+        }
+
         if ($match.MatchedBy -eq "windowId") {
-            Write-Host "  $($match.Item.id) <- bundled terminal '$($match.Default.id)' via windowId $($match.Item.windowId)"
+            Write-Host "  $($match.Item.id) <- bundled terminal '$($match.Default.id)' via windowId $($match.Item.windowId)$suffix"
         }
         else {
-            Write-Host "  $($match.Item.id)"
+            Write-Host "  $($match.Item.id)$suffix"
         }
+    }
+
+    $relativeCleared = @($result.RelativeCleared)
+
+    if ($relativeCleared.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Cleared relative layout mode for $($relativeCleared.Count) item(s): $((@($relativeCleared | ForEach-Object { $_.id })) -join ', ')" -ForegroundColor Yellow
+        Write-Host "Those items now use the restored absolute item.layout." -ForegroundColor DarkGray
     }
 
     if ($skipped.Count -gt 0) {

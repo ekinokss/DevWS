@@ -299,6 +299,12 @@ Geometry capture is all-or-nothing: if any enabled item cannot be captured, noth
 written. `ws show-layout` reports exactly which rectangles the next launch or terminal
 reset will apply.
 
+Relative intent can also be authored explicitly with `ws set-geometry <id> --relative
+--anchor <identity> --basis workArea|monitor --x ... --y ... --width ... --height ...`.
+This stores normalized intent without reading topology or moving windows; use `--mode
+absolute` to convert an item back deliberately. Relative geometry is deep-copied by clone
+operations and cleared for matched items by `ws reset-layout`.
+
 If your monitors change, optional **topology layout profiles** let a set carry a different
 layout per monitor arrangement, while `item.layout` remains the universal fallback. A set
 with no profiles and no relative items has no monitor dependency at all; a targeted relative

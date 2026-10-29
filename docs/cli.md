@@ -318,26 +318,57 @@ Rename a configured item (config only).
 Clone a terminal definition (config only).
 
 - The clone is not launched and gets a fresh set-qualified windowId.
+- Layout mode and relative geometry are deep-copied; the absolute fallback is retained.
 
 ### `ws clone-app <source-id> <new-id>`
 
 Clone an app definition as a disabled template (config only).
 
 - The clone starts disabled because it shares the source match rule.
+- Layout mode and relative geometry are deep-copied; the clone is always an explicit dedicated template.
 
 ## Layout
 
 ### `ws set-geometry <id> --x <x> --y <y> --width <width> --height <height> [--layout <profileId|fallback>]`
 
-Set a saved layout rectangle in the fallback or an explicit profile (config only).
+Set a saved absolute layout rectangle in the fallback or an explicit profile (config only).
 
 - Saved geometry only; the live window is not moved.
 - --layout fallback edits item.layout; --layout <profileId> edits that profile's sparse entry (no topology read).
 - Without --layout the scope follows the current topology when the set has profiles: matched profile, otherwise fallback; an unmatchable topology refuses the write.
+- A plain absolute fallback edit on a relative item is refused because relative placement takes precedence. Use `--relative`, `--mode absolute`, or `--layout <profileId>`.
 
 ```powershell
 ws set-geometry notes --x -7 --y 0 --width 654 --height 1407
 ws set-geometry notes --x 0 --y 0 --width 800 --height 600 --layout docked
+```
+
+### `ws set-geometry <id> --relative --anchor <identity> [--instance <instance>] --basis workArea|monitor --x <fx> --y <fy> --width <fw> --height <fh>`
+
+Author fallback relative geometry explicitly (config only).
+
+- `--relative` requires a durable `edid:` or `path:` anchor, a basis, and all four normalized fractions.
+- The optional instance disambiguates duplicate EDID identities and must be omitted for `path:` anchors.
+- Negative and greater-than-one fractions are preserved; relative width and height must be positive.
+- No monitor topology is sampled and the anchor is not checked for current connectivity. `ws show-layout` and launch report resolution separately.
+- Relative authoring edits the fallback relative layer only. The mandatory absolute `item.layout` is preserved. `--relative` cannot be combined with `--layout`.
+
+```powershell
+ws set-geometry notes --relative --anchor edid:ACME001 --instance DELA1B2/5 --basis workArea --x 0 --y 0 --width 0.5 --height 1
+ws set-geometry notes --relative --anchor path:DELA1B2/5 --basis monitor --x -0.1 --y 0 --width 1.2 --height 1
+```
+
+### `ws set-geometry <id> --mode absolute [--x <x> --y <y> --width <width> --height <height>]`
+
+Explicitly switch an item to absolute mode (config only).
+
+- Removes `layoutRelative` and records `layoutMode: "absolute"`.
+- Preserves the existing absolute `item.layout` unless replacement coordinates are supplied.
+- This is an intentional mode conversion; ordinary absolute `set-geometry` never silently changes a relative item's mode.
+
+```powershell
+ws set-geometry notes --mode absolute
+ws set-geometry notes --mode absolute --x 0 --y 0 --width 800 --height 600
 ```
 
 ### `ws reset-layout [set] [-Force]`
@@ -345,7 +376,9 @@ ws set-geometry notes --x 0 --y 0 --width 800 --height 600 --layout docked
 Restore saved layouts from the bundled default config (config only).
 
 - Matches by id/type; terminals may match by preserved windowId fallback; unmatched items are skipped.
-- Restores fallback item.layout only; topology layout profiles are never created, modified or deleted.
+- For matched items, restores fallback `item.layout`, removes `layoutRelative` and records absolute mode when the item was relative.
+- Unmatched items retain their complete relative intent.
+- Topology layout profiles are never created, modified or deleted.
 - Prompts for confirmation unless -Force is supplied.
 
 ```powershell
@@ -385,6 +418,7 @@ Add an empty workspace set (config only).
 Deep-copy a workspace set (config only).
 
 - Cloned terminals get new set-qualified windowIds.
+- Item layout mode, relative geometry and layout profiles are deep-copied.
 
 ### `ws rename-set <old-set> <new-set>`
 

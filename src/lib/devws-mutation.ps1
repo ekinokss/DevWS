@@ -727,6 +727,189 @@ function Copy-DevWSLayout {
     }
 }
 
+function Get-DevWSItemRelativeLayoutCopyFields {
+    # Ordered copy of the optional v3 relative-layout properties. Every clone
+    # path merges these fields into its rebuilt definition so relative intent
+    # cannot be silently dropped. The relative object is deep-copied through
+    # the Phase 1 helper; Copy-DevWSLayout remains absolute-only.
+    param(
+        [Parameter(Mandatory)]
+        $Item
+    )
+
+    $fields = [ordered]@{}
+
+    if (Test-DevWSProperty -Object $Item -Name "layoutMode") {
+        $fields["layoutMode"] = [string](Get-DevWSProperty -Object $Item -Name "layoutMode")
+    }
+
+    if (Test-DevWSProperty -Object $Item -Name "layoutRelative") {
+        $relative = Get-DevWSProperty -Object $Item -Name "layoutRelative"
+
+        if ($null -ne $relative) {
+            $fields["layoutRelative"] = Copy-DevWSRelativeLayout -RelativeLayout $relative
+        }
+    }
+
+    return $fields
+}
+
+function Test-DevWSItemRelativeMode {
+    # Explicit relative mode is authoritative; a relative object without the
+    # explicit mode is not valid schema, but treating it as relative here makes
+    # every mutation fail safe rather than silently overwriting intent.
+    param(
+        [Parameter(Mandatory)]
+        $Item
+    )
+
+    if ([string](Get-DevWSProperty -Object $Item -Name "layoutMode") -ceq "relative") {
+        return $true
+    }
+
+    return (Test-DevWSProperty -Object $Item -Name "layoutRelative")
+}
+
+function Clear-DevWSItemRelativeMode {
+    # Intentional absolute conversion used by `set-geometry --mode absolute`
+    # and reset-layout only. It removes layoutRelative and records the explicit
+    # absolute mode when the item was relative; an already-absolute item keeps
+    # its existing representation (absent or explicit 'absolute').
+    param(
+        [Parameter(Mandatory)]
+        $Item
+    )
+
+    $changed = $false
+
+    if (Test-DevWSProperty -Object $Item -Name "layoutRelative") {
+        $Item.PSObject.Properties.Remove("layoutRelative")
+        $changed = $true
+    }
+
+    if ([string](Get-DevWSProperty -Object $Item -Name "layoutMode") -ceq "relative") {
+        $Item.layoutMode = "absolute"
+        $changed = $true
+    }
+    elseif ($changed -and -not (Test-DevWSProperty -Object $Item -Name "layoutMode")) {
+        $Item | Add-Member -NotePropertyName "layoutMode" -NotePropertyValue "absolute" -Force
+    }
+
+    return $changed
+}
+
+function Set-DevWSItemRelativeGeometry {
+    # Config-only relative authoring. No monitor snapshot is taken and the
+    # anchor is not required to be connected; syntax and intent are stored,
+    # while launch/show-layout report resolution separately.
+    param(
+        [Parameter(Mandatory)]
+        $Config,
+        [Parameter(Mandatory)]
+        $Item,
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$Anchor,
+        [AllowEmptyString()]
+        [string]$Instance = $null,
+        [Parameter(Mandatory)]
+        [string]$Basis,
+        [Parameter(Mandatory)]
+        [double]$X,
+        [Parameter(Mandatory)]
+        [double]$Y,
+        [Parameter(Mandatory)]
+        [double]$W,
+        [Parameter(Mandatory)]
+        [double]$H
+    )
+
+    if (-not (Test-DevWSRelativeMonitorIdentitySyntax -Identity $Anchor)) {
+        throw "Relative anchor must be a durable monitor identity beginning with 'edid:' or 'path:' (got '$Anchor')."
+    }
+
+    $hasInstance = -not [string]::IsNullOrWhiteSpace($Instance)
+
+    if ($hasInstance) {
+        if (-not (Test-DevWSRelativeMonitorInstanceSyntax -Instance $Instance)) {
+            throw "Relative monitor instance must use the '<hardwareId>/<instance>' form (got '$Instance')."
+        }
+
+        if ($Anchor.StartsWith("path:", [System.StringComparison]::Ordinal)) {
+            throw "A 'path:' relative anchor already embeds the device-path instance; omit --instance."
+        }
+    }
+
+    if ($Basis -cne "workArea" -and $Basis -cne "monitor") {
+        throw "Relative basis must be exactly 'workArea' or 'monitor' (got '$Basis')."
+    }
+
+    foreach ($pair in @(
+        @{ Name = "x"; Value = $X },
+        @{ Name = "y"; Value = $Y },
+        @{ Name = "width"; Value = $W },
+        @{ Name = "height"; Value = $H }
+    )) {
+        if (-not [double]::IsFinite([double]$pair.Value)) {
+            throw "Relative $($pair.Name) must be a finite number."
+        }
+    }
+
+    if ($W -le 0) {
+        throw "Relative width must be greater than 0 (got $W)."
+    }
+
+    if ($H -le 0) {
+        throw "Relative height must be greater than 0 (got $H)."
+    }
+
+    $monitorFields = [ordered]@{ identity = $Anchor }
+
+    if ($hasInstance) {
+        $monitorFields["instance"] = $Instance
+    }
+
+    $relativeLayout = [pscustomobject][ordered]@{
+        monitor = [pscustomobject]$monitorFields
+        basis   = $Basis
+        rect    = [pscustomobject][ordered]@{
+            x = $X
+            y = $Y
+            w = $W
+            h = $H
+        }
+    }
+
+    $Item | Add-Member -NotePropertyName "layoutMode" -NotePropertyValue "relative" -Force
+    $Item | Add-Member -NotePropertyName "layoutRelative" -NotePropertyValue $relativeLayout -Force
+
+    Assert-DevWSConfig -Config $Config -Source "workspace mutation"
+
+    return $Item
+}
+
+function Set-DevWSItemAbsoluteGeometry {
+    # Explicit relative-to-absolute conversion. The universal fallback
+    # item.layout is preserved unless a replacement rectangle is supplied.
+    param(
+        [Parameter(Mandatory)]
+        $Config,
+        [Parameter(Mandatory)]
+        $Item,
+        $Rect = $null
+    )
+
+    if ($null -ne $Rect) {
+        Set-DevWSLayout -Item $Item -Rect $Rect
+    }
+
+    $null = Clear-DevWSItemRelativeMode -Item $Item
+
+    Assert-DevWSConfig -Config $Config -Source "workspace mutation"
+
+    return $Item
+}
+
 function Copy-DevWSTerminalTabs {
     param(
         [Parameter(Mandatory)]
@@ -907,6 +1090,12 @@ function Clone-DevWSTerminal {
         layout    = Copy-DevWSLayout -Layout $source.layout
     }
 
+    $relativeFields = Get-DevWSItemRelativeLayoutCopyFields -Item $source
+
+    foreach ($name in @($relativeFields.Keys)) {
+        $clone | Add-Member -NotePropertyName $name -NotePropertyValue $relativeFields[$name] -Force
+    }
+
     $target.windows = @($target.windows) + $clone
 
     Copy-DevWSItemProfileOverrides `
@@ -971,6 +1160,12 @@ function Clone-DevWSApp {
     # explicit 'dedicated' (even when the source is shared or transitional).
     $cloneDefinition["instanceMode"] = "dedicated"
 
+    $relativeFields = Get-DevWSItemRelativeLayoutCopyFields -Item $source
+
+    foreach ($name in @($relativeFields.Keys)) {
+        $cloneDefinition[$name] = $relativeFields[$name]
+    }
+
     $clone = [pscustomobject]$cloneDefinition
 
     $target.windows = @($target.windows) + $clone
@@ -1010,7 +1205,7 @@ function Copy-DevWSTerminalDefinition {
         [string]$WindowId
     )
 
-    return [pscustomobject][ordered]@{
+    $definition = [ordered]@{
         id        = [string]$Terminal.id
         type      = "terminal"
         enabled   = [bool]$Terminal.enabled
@@ -1021,6 +1216,14 @@ function Copy-DevWSTerminalDefinition {
         activeTab = [int]$Terminal.activeTab
         layout    = Copy-DevWSLayout -Layout $Terminal.layout
     }
+
+    $relativeFields = Get-DevWSItemRelativeLayoutCopyFields -Item $Terminal
+
+    foreach ($name in @($relativeFields.Keys)) {
+        $definition[$name] = $relativeFields[$name]
+    }
+
+    return [pscustomobject]$definition
 }
 
 function Copy-DevWSAppDefinition {
@@ -1044,6 +1247,12 @@ function Copy-DevWSAppDefinition {
 
     if ($null -ne $instanceMode) {
         $definition["instanceMode"] = $instanceMode
+    }
+
+    $relativeFields = Get-DevWSItemRelativeLayoutCopyFields -Item $App
+
+    foreach ($name in @($relativeFields.Keys)) {
+        $definition[$name] = $relativeFields[$name]
     }
 
     return [pscustomobject]$definition
@@ -1493,10 +1702,9 @@ function ConvertFrom-DevWSGeometryArguments {
         [switch]$AllowLayoutSelector
     )
 
-    # Recognized switch names; values are stored against x/y/w/h so the rest
-    # of the layout code keeps its existing shape. `--layout <id|fallback>`
-    # is an opt-in storage selector for set-geometry only; existing callers
-    # keep their exact behavior.
+    # Parses the ordinary absolute form, explicit relative authoring, and the
+    # explicit `--mode absolute` conversion. Configuration-only: no topology
+    # is read and no live window is inspected here.
     $names = @{
         x      = "x"
         y      = "y"
@@ -1504,15 +1712,26 @@ function ConvertFrom-DevWSGeometryArguments {
         height = "h"
     }
 
-    $values = @{ x = $null; y = $null; w = $null; h = $null }
-    $layoutValue = $null
-    $tokens = @($Parts)
-    $index  = 0
+    $values = @{
+        x        = $null
+        y        = $null
+        w        = $null
+        h        = $null
+        anchor   = $null
+        instance = $null
+        basis    = $null
+        mode     = $null
+    }
 
-    $supportedSwitches = "--x, --y, --width, --height"
+    $relative    = $false
+    $layoutValue = $null
+    $tokens      = @($Parts)
+    $index       = 0
+
+    $supportedSwitches = "--x, --y, --width, --height, --relative, --anchor, --instance, --basis, --mode"
 
     if ($AllowLayoutSelector) {
-        $supportedSwitches = "--x, --y, --width, --height, --layout"
+        $supportedSwitches = "--x, --y, --width, --height, --layout, --relative, --anchor, --instance, --basis, --mode"
     }
 
     while ($index -lt $tokens.Count) {
@@ -1522,10 +1741,25 @@ function ConvertFrom-DevWSGeometryArguments {
             throw "$CommandName expects --x/--y/--width/--height switches; got '$token'."
         }
 
-        $name = $token.TrimStart('-').ToLowerInvariant()
+        $name       = $token.TrimStart('-').ToLowerInvariant()
+        $doubleDash = $token.StartsWith("--", [System.StringComparison]::Ordinal)
 
-        if ($AllowLayoutSelector -and $name -eq "layout") {
-            if (-not ($token -ceq "--layout")) {
+        if ($name -eq "relative") {
+            if (-not $doubleDash) {
+                throw "Unknown switch '$token'. Supported switches: $supportedSwitches."
+            }
+
+            if ($relative) {
+                throw "Duplicate switch '--relative'."
+            }
+
+            $relative = $true
+            $index += 1
+            continue
+        }
+
+        if ($name -eq "layout") {
+            if (-not $AllowLayoutSelector -or -not $doubleDash) {
                 throw "Unknown switch '$token'. Supported switches: $supportedSwitches."
             }
 
@@ -1552,6 +1786,30 @@ function ConvertFrom-DevWSGeometryArguments {
             continue
         }
 
+        if ($name -in @("anchor", "instance", "basis", "mode")) {
+            if (-not $doubleDash) {
+                throw "Unknown switch '$token'. Supported switches: $supportedSwitches."
+            }
+
+            if ($null -ne $values[$name]) {
+                throw "Duplicate switch '$token'."
+            }
+
+            if (($index + 1) -ge $tokens.Count) {
+                throw "Switch '--$name' requires a value."
+            }
+
+            $raw = [string]$tokens[$index + 1]
+
+            if ([string]::IsNullOrWhiteSpace($raw) -or $raw.StartsWith('-')) {
+                throw "Switch '--$name' requires a value."
+            }
+
+            $values[$name] = $raw
+            $index += 2
+            continue
+        }
+
         if (-not $names.ContainsKey($name)) {
             throw "Unknown switch '$token'. Supported switches: $supportedSwitches."
         }
@@ -1566,43 +1824,199 @@ function ConvertFrom-DevWSGeometryArguments {
             throw "Switch '$token' requires an integer value."
         }
 
-        $raw    = [string]$tokens[$index + 1]
-        $parsed = 0
-
-        if (-not [int]::TryParse($raw, [ref]$parsed)) {
-            throw "Switch '$token' requires an integer value (got '$raw'); decimals are not accepted."
-        }
-
-        $values[$valueName] = $parsed
+        $values[$valueName] = [string]$tokens[$index + 1]
         $index += 2
     }
 
-    foreach ($valueName in @("x", "y", "w", "h")) {
-        if ($null -eq $values[$valueName]) {
-            $usageSuffix = ""
+    $modeExplicit = $null -ne $values.mode
 
-            if ($AllowLayoutSelector) {
-                $usageSuffix = " [--layout <profileId|fallback>]"
-            }
+    if ($relative -and $modeExplicit) {
+        throw "--relative cannot be combined with --mode for $CommandName."
+    }
 
-            throw "Usage: $CommandName <id> --x <x> --y <y> --width <width> --height <height>$usageSuffix"
+    if ($relative -and $null -ne $layoutValue) {
+        throw "--relative cannot be combined with --layout; relative authoring always edits the fallback relative layout for $CommandName."
+    }
+
+    if ($modeExplicit -and $null -ne $layoutValue) {
+        throw "--mode cannot be combined with --layout for $CommandName."
+    }
+
+    if (-not $relative -and
+        ($null -ne $values.anchor -or $null -ne $values.instance -or $null -ne $values.basis)) {
+        throw "--anchor, --instance and --basis are only valid with --relative for $CommandName."
+    }
+
+    if ($modeExplicit -and $values.mode -ine "absolute") {
+        if ($values.mode -ieq "relative") {
+            throw "Use --relative to author relative geometry; --mode accepts only 'absolute' for $CommandName."
+        }
+
+        throw "Unsupported --mode value '$($values.mode)' for $CommandName; only 'absolute' is accepted."
+    }
+
+    $hasAnyCoordinate = $false
+
+    foreach ($field in @("x", "y", "w", "h")) {
+        if ($null -ne $values[$field]) {
+            $hasAnyCoordinate = $true
         }
     }
 
-    if ([int]$values.w -le 0) {
-        throw "Width must be greater than 0 (got $($values.w))."
+    if ($relative) {
+        if ($null -eq $values.anchor) {
+            throw "--relative requires --anchor <identity> for $CommandName."
+        }
+
+        if ($null -eq $values.basis) {
+            throw "--relative requires --basis workArea|monitor for $CommandName."
+        }
+
+        if (-not $hasAnyCoordinate) {
+            throw "Usage: $CommandName <id> --relative --anchor <identity> [--instance <instance>] --basis workArea|monitor --x <fx> --y <fy> --width <fw> --height <fh>"
+        }
+
+        if (-not (Test-DevWSRelativeMonitorIdentitySyntax -Identity ([string]$values.anchor))) {
+            throw "Relative anchor must be a durable monitor identity beginning with 'edid:' or 'path:' (got '$($values.anchor)')."
+        }
+
+        if ($null -ne $values.instance -and
+            -not (Test-DevWSRelativeMonitorInstanceSyntax -Instance ([string]$values.instance))) {
+            throw "Relative monitor instance must use the '<hardwareId>/<instance>' form (got '$($values.instance)')."
+        }
+
+        if ($null -ne $values.instance -and
+            ([string]$values.anchor).StartsWith("path:", [System.StringComparison]::Ordinal)) {
+            throw "A 'path:' relative anchor already embeds the device-path instance; omit --instance."
+        }
+
+        if ($values.basis -cne "workArea" -and $values.basis -cne "monitor") {
+            throw "Relative basis must be exactly 'workArea' or 'monitor' (got '$($values.basis)')."
+        }
+
+        $fractionNames = @{ x = "--x"; y = "--y"; w = "--width"; h = "--height" }
+        $fractions     = @{}
+
+        foreach ($field in @("x", "y", "w", "h")) {
+            if ($null -eq $values[$field]) {
+                throw "Usage: $CommandName <id> --relative --anchor <identity> [--instance <instance>] --basis workArea|monitor --x <fx> --y <fy> --width <fw> --height <fh>"
+            }
+
+            $parsed = [double]0
+            $raw    = [string]$values[$field]
+
+            if (-not [double]::TryParse(
+                $raw,
+                [System.Globalization.NumberStyles]::Float,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsed) -or
+                -not [double]::IsFinite($parsed)) {
+                throw "Switch '$($fractionNames[$field])' requires a finite fraction (got '$raw')."
+            }
+
+            $fractions[$field] = $parsed
+        }
+
+        if ($fractions.w -le 0) {
+            throw "Relative width must be greater than 0 (got $($fractions.w))."
+        }
+
+        if ($fractions.h -le 0) {
+            throw "Relative height must be greater than 0 (got $($fractions.h))."
+        }
+
+        return [pscustomobject][ordered]@{
+            x            = [double]$fractions.x
+            y            = [double]$fractions.y
+            w            = [double]$fractions.w
+            h            = [double]$fractions.h
+            Layout       = $layoutValue
+            Relative     = $true
+            Anchor       = [string]$values.anchor
+            Instance     = if ($null -ne $values.instance) { [string]$values.instance } else { $null }
+            Basis        = [string]$values.basis
+            Mode         = "relative"
+            ModeExplicit = $false
+        }
     }
 
-    if ([int]$values.h -le 0) {
-        throw "Height must be greater than 0 (got $($values.h))."
+    if ($modeExplicit) {
+        if (-not $hasAnyCoordinate) {
+            return [pscustomobject][ordered]@{
+                x            = $null
+                y            = $null
+                w            = $null
+                h            = $null
+                Layout       = $layoutValue
+                Relative     = $false
+                Anchor       = $null
+                Instance     = $null
+                Basis        = $null
+                Mode         = "absolute"
+                ModeExplicit = $true
+            }
+        }
+
+        $missingModeCoordinate = $false
+
+        foreach ($field in @("x", "y", "w", "h")) {
+            if ($null -eq $values[$field]) {
+                $missingModeCoordinate = $true
+            }
+        }
+
+        if ($missingModeCoordinate) {
+            throw "Usage: $CommandName <id> --mode absolute [--x <x> --y <y> --width <width> --height <height>]"
+        }
+    }
+    else {
+        foreach ($field in @("x", "y", "w", "h")) {
+            if ($null -eq $values[$field]) {
+                $usageSuffix = ""
+
+                if ($AllowLayoutSelector) {
+                    $usageSuffix = " [--layout <profileId|fallback>]"
+                }
+
+                throw "Usage: $CommandName <id> --x <x> --y <y> --width <width> --height <height>$usageSuffix"
+            }
+        }
+    }
+
+    $parsedValues = @{}
+
+    foreach ($field in @("x", "y", "w", "h")) {
+        $raw    = [string]$values[$field]
+        $parsed = 0
+
+        if (-not [int]::TryParse($raw, [ref]$parsed)) {
+            $switchName = switch ($field) { "x" { "--x" } "y" { "--y" } "w" { "--width" } "h" { "--height" } }
+            throw "Switch '$switchName' requires an integer value (got '$raw'); decimals are not accepted."
+        }
+
+        $parsedValues[$field] = $parsed
+    }
+
+    if ([int]$parsedValues.w -le 0) {
+        throw "Width must be greater than 0 (got $($parsedValues.w))."
+    }
+
+    if ([int]$parsedValues.h -le 0) {
+        throw "Height must be greater than 0 (got $($parsedValues.h))."
     }
 
     return [pscustomobject][ordered]@{
-        x      = [int]$values.x
-        y      = [int]$values.y
-        w      = [int]$values.w
-        h      = [int]$values.h
-        Layout = $layoutValue
+        x            = [int]$parsedValues.x
+        y            = [int]$parsedValues.y
+        w            = [int]$parsedValues.w
+        h            = [int]$parsedValues.h
+        Layout       = $layoutValue
+        Relative     = $false
+        Anchor       = $null
+        Instance     = $null
+        Basis        = $null
+        Mode         = "absolute"
+        ModeExplicit = [bool]$modeExplicit
     }
 }
 
@@ -1672,9 +2086,10 @@ function Reset-DevWSLayoutsFromDefault {
 
     if ($null -eq $defaultSetObject) {
         return [pscustomobject]@{
-            BaselineFound = $false
-            Matches       = @()
-            Skipped       = @($target.windows)
+            BaselineFound  = $false
+            Matches        = @()
+            Skipped        = @($target.windows)
+            RelativeCleared = @()
         }
     }
 
@@ -1735,24 +2150,29 @@ function Reset-DevWSLayoutsFromDefault {
         }
 
         $matches.Add([pscustomobject]@{
-            Item      = $item
-            Default   = $defaultItem
-            MatchedBy = $matchedBy
+            Item             = $item
+            Default          = $defaultItem
+            MatchedBy        = $matchedBy
+            ClearedRelative  = $false
         })
     }
 
     # Pass 2: apply every resolved match in memory; the caller saves once.
     foreach ($match in $matches) {
         Set-DevWSLayout -Item $match.Item -Rect (Copy-DevWSLayout -Layout $match.Default.layout)
+        $match.ClearedRelative = Clear-DevWSItemRelativeMode -Item $match.Item
     }
 
     if ($matches.Count -gt 0) {
         Assert-DevWSConfig -Config $Config -Source "workspace mutation"
     }
 
+    $relativeCleared = @($matches | Where-Object { [bool]$_.ClearedRelative } | ForEach-Object { $_.Item })
+
     return [pscustomobject]@{
-        BaselineFound = $true
-        Matches = $matches.ToArray()
-        Skipped = $skipped.ToArray()
+        BaselineFound   = $true
+        Matches         = $matches.ToArray()
+        Skipped         = $skipped.ToArray()
+        RelativeCleared = $relativeCleared
     }
 }

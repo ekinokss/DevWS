@@ -364,7 +364,8 @@ function Get-DevWSHelpCommandInfo {
             Section  = "Item configuration"
             Aliases  = @()
             Details  = @(
-                "The clone is not launched and gets a fresh set-qualified windowId."
+                "The clone is not launched and gets a fresh set-qualified windowId.",
+                "Layout mode and relative geometry are deep-copied; the absolute fallback is retained."
             )
             Examples = @()
             Warning  = $null
@@ -377,7 +378,8 @@ function Get-DevWSHelpCommandInfo {
             Section  = "Item configuration"
             Aliases  = @()
             Details  = @(
-                "The clone starts disabled because it shares the source match rule."
+                "The clone starts disabled because it shares the source match rule.",
+                "Layout mode and relative geometry are deep-copied; the clone is always an explicit dedicated template."
             )
             Examples = @()
             Warning  = $null
@@ -385,16 +387,24 @@ function Get-DevWSHelpCommandInfo {
 
         [pscustomobject]@{
             Name     = "set-geometry"
-            Usage    = "ws set-geometry <id> --x <x> --y <y> --width <width> --height <height> [--layout <profileId|fallback>]"
-            Summary  = "Set a saved layout rectangle in the fallback or an explicit profile (config only)."
+            Usage    = "ws set-geometry <id> --x <x> --y <y> --width <width> --height <height> [--layout <profileId|fallback>] | --relative --anchor <identity> [--instance <instance>] --basis workArea|monitor --x <fx> --y <fy> --width <fw> --height <fh> | --mode absolute [--x <x> --y <y> --width <width> --height <height>]"
+            Summary  = "Set saved absolute or relative geometry, or explicitly switch layout mode (config only)."
             Section  = "Layout"
             Aliases  = @()
             Details  = @(
-                "Saved geometry only; the live window is not moved.",
-                "--layout fallback edits item.layout; --layout <profileId> edits that profile's sparse entry (no topology read).",
-                "Without --layout the scope follows the current topology when the set has profiles: matched profile, otherwise fallback; an unmatchable topology refuses the write."
+                "Saved geometry only; the live window is not moved or inspected.",
+                "Absolute form: --layout fallback edits item.layout; --layout <profileId> edits that profile's sparse entry (no topology read). Without --layout, a set with profiles follows the current topology: matched profile, otherwise fallback.",
+                "--relative stores fallback relative geometry and requires --anchor, --basis and all four fractions. It never samples topology or proves the anchor is currently connected; launch/show-layout report that separately.",
+                "A plain absolute fallback edit on a relative item is refused because relative placement takes precedence. Use --relative, --mode absolute, or an explicit --layout <profileId>.",
+                "--mode absolute removes layoutRelative and records absolute mode; item.layout is preserved unless replacement coordinates are supplied.",
+                "Profiles are absolute-only; --relative and --layout are mutually exclusive."
             )
-            Examples = @("ws set-geometry notes --x -7 --y 0 --width 654 --height 1407", "ws set-geometry notes --x 0 --y 0 --width 800 --height 600 --layout docked")
+            Examples = @(
+                "ws set-geometry notes --x -7 --y 0 --width 654 --height 1407",
+                "ws set-geometry notes --x 0 --y 0 --width 800 --height 600 --layout docked",
+                'ws set-geometry notes --relative --anchor edid:ACME001 --instance DELA1B2/5 --basis workArea --x 0 --y 0 --width 0.5 --height 1',
+                "ws set-geometry notes --mode absolute"
+            )
             Warning  = $null
         }
 
@@ -406,7 +416,8 @@ function Get-DevWSHelpCommandInfo {
             Aliases  = @()
             Details  = @(
                 "Matches by id/type; terminals may match by preserved windowId fallback; unmatched items are skipped.",
-                "Restores fallback item.layout only; topology layout profiles are never created, modified or deleted.",
+                "For matched items, restores fallback item.layout, removes layoutRelative and records absolute mode when the item was relative; unmatched items keep their complete relative intent.",
+                "Topology layout profiles are never created, modified or deleted.",
                 "Prompts for confirmation unless -Force is supplied."
             )
             Examples = @("ws reset-layout", "ws reset-layout secondary")
@@ -460,7 +471,8 @@ function Get-DevWSHelpCommandInfo {
             Section  = "Workspace sets"
             Aliases  = @()
             Details  = @(
-                "Cloned terminals get new set-qualified windowIds."
+                "Cloned terminals get new set-qualified windowIds.",
+                "Item layout mode, relative geometry and layout profiles are deep-copied."
             )
             Examples = @()
             Warning  = $null
@@ -566,6 +578,7 @@ function Get-DevWSHelpCommandInfo {
             Aliases  = @()
             Details  = @(
                 "Canonical config changes only after validation; derived hotkeys are not synced.",
+                "layoutMode and layoutRelative are validated and written through the same atomic save.",
                 "Editor order: DEVWS_EDITOR, then VS Code (--wait), then Notepad."
             )
             Examples = @("ws edit")

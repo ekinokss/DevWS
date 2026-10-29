@@ -125,6 +125,7 @@ $script:TestGroupCatalog = [ordered]@{
     'relative-layouts'    = 'Relative layout schema and pure model (v0.3 Phase 1)'
     'relative-layout-display' = 'Relative layout display rendering (v0.3 Phase 2/3)'
     'relative-save'       = 'Relative layout capture and save (v0.3 Phase 4)'
+    'relative-authoring'  = 'Relative layout authoring and mutation (v0.3 Phase 5)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
     'test-harness'        = 'Test harness'
@@ -7188,9 +7189,11 @@ function Find-DevWSReversiblyEncodedPrintableContent {
         # Future layout scope remains research-only in the runtime libraries.
         # Pass 5B introduced read-only monitor diagnostics, Pass 5C introduced
         # the optional topology-profile schema, v0.3 Phase 1 introduced the
-        # relative-layout schema, Phase 2 added read-only display rendering, and Phase 3 applies relative placement.
-        # Profile/grid vocabulary stays research-only, and mutation code stays
-        # monitor-free.
+        # relative-layout schema, Phase 2 added read-only display rendering,
+        # Phase 3 applies relative placement, Phase 4 captures/saves it and
+        # Phase 5 adds config-only authoring/reset/clone handling in mutations.
+        # Profile/grid vocabulary stays research-only; mutation code may
+        # validate relative intent but must never read topology or live windows.
         foreach ($file in @("devws-config.ps1", "devws-display.ps1", "devws-mutation.ps1")) {
             $codeLines = @(Get-Content -LiteralPath (Join-Path $RepoRoot "src\lib\$file") | Where-Object {
                 $trimmed = $_.Trim()
@@ -7198,16 +7201,14 @@ function Find-DevWSReversiblyEncodedPrintableContent {
             })
             $code = $codeLines -join "`n"
 
-            $layoutTokens = @("tiling", "named zone")
-
-            if ($file -eq "devws-mutation.ps1") {
-                $layoutTokens += "relative"
-                $layoutTokens += "normalized"
-                $layoutTokens += "monitor"
+            foreach ($token in @("tiling", "named zone")) {
+                Assert-True (-not [regex]::IsMatch($code, $token)) "future layout token '$token' must not appear in $file"
             }
 
-            foreach ($token in $layoutTokens) {
-                Assert-True (-not [regex]::IsMatch($code, $token)) "future layout token '$token' must not appear in $file"
+            if ($file -eq "devws-mutation.ps1") {
+                foreach ($token in @("Get-DevWSMonitorTopology", "Get-DevWSMonitorSnapshot", "Get-DevWSLiveLayoutCapture", "Move-DevWSWindow", "Set-DevWSWindowRect")) {
+                    Assert-True (-not [regex]::IsMatch($code, $token)) "config-only mutation code must not read topology or move windows: $token in $file"
+                }
             }
         }
     }
@@ -38718,6 +38719,732 @@ Start-Sleep -Seconds 6
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'relative-authoring' -Title 'Relative layout authoring and mutation (v0.3 Phase 5)'
+
+    function New-P5Rect {
+        param([int]$X = 0, [int]$Y = 0, [int]$W = 800, [int]$H = 600)
+        return [ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+    }
+
+    function New-P5Relative {
+        param(
+            [Parameter(Mandatory)][string]$Identity,
+            [string]$Instance = "",
+            [string]$Basis = "workArea",
+            [double]$X = 0,
+            [double]$Y = 0,
+            [double]$W = 1,
+            [double]$H = 1
+        )
+
+        $monitor = [ordered]@{ identity = $Identity }
+
+        if (-not [string]::IsNullOrWhiteSpace($Instance)) {
+            $monitor["instance"] = $Instance
+        }
+
+        return [ordered]@{
+            monitor = [pscustomobject]$monitor
+            basis   = $Basis
+            rect    = [ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+        }
+    }
+
+    function New-P5Terminal {
+        param(
+            [Parameter(Mandatory)][string]$Id,
+            $Relative = $null,
+            $Layout = $null,
+            [string]$Mode = $null
+        )
+
+        if ($null -eq $Layout) { $Layout = New-P5Rect }
+
+        $item = [ordered]@{
+            id        = $Id
+            type      = "terminal"
+            enabled   = $true
+            windowId  = "DevWS-$Id"
+            path      = 'C:\p5'
+            elevated  = $true
+            tabs      = @([ordered]@{ command = $null; args = @() })
+            activeTab = 0
+            layout    = $Layout
+        }
+
+        if ($null -ne $Relative) {
+            $item["layoutMode"] = "relative"
+            $item["layoutRelative"] = $Relative
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($Mode)) {
+            $item["layoutMode"] = $Mode
+        }
+
+        return $item
+    }
+
+    function New-P5App {
+        param(
+            [Parameter(Mandatory)][string]$Id,
+            $Relative = $null,
+            $Layout = $null,
+            [string]$Mode = $null,
+            [string]$InstanceMode = "dedicated"
+        )
+
+        if ($null -eq $Layout) { $Layout = New-P5Rect }
+
+        $item = [ordered]@{
+            id           = $Id
+            type         = "app"
+            enabled      = $true
+            match        = [ordered]@{ kind = "exe"; value = "$Id.exe" }
+            launch       = [ordered]@{ kind = "exe"; value = "C:\$Id.exe"; args = @() }
+            instanceMode = $InstanceMode
+            layout       = $Layout
+        }
+
+        if ($null -ne $Relative) {
+            $item["layoutMode"] = "relative"
+            $item["layoutRelative"] = $Relative
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($Mode)) {
+            $item["layoutMode"] = $Mode
+        }
+
+        return $item
+    }
+
+    function New-P5Config {
+        param([object[]]$Items = @(), [object[]]$Profiles = @())
+
+        $set = [ordered]@{ id = "main" }
+
+        if (@($Profiles).Count -gt 0) {
+            $set["layoutProfiles"] = @($Profiles)
+        }
+
+        $set["windows"] = @($Items)
+        return (ConvertTo-TestConfig -Sets @($set))
+    }
+
+    function Write-P5Config {
+        param([string]$Name, $Config)
+
+        $dir = Join-Path $TestRoot ("relative-authoring\$Name")
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $path = Join-Path $dir "workspace.json"
+        Save-DevWSConfig -Config $Config -Location (New-DevWSWritableConfigLocation -Path $path)
+        return $path
+    }
+
+    function Get-P5Item {
+        param($Config, [string]$Id)
+        return @($Config.sets[0].windows | Where-Object { [string]$_.id -eq $Id })[0]
+    }
+
+    Test-Case "relative geometry parser accepts explicit relative and absolute-mode forms" {
+        $relative = ConvertFrom-DevWSGeometryArguments -Parts @(
+            "--relative", "--anchor", "edid:ACME001", "--instance", "DELA1B2/5",
+            "--basis", "monitor", "--x", "-0.2", "--y", "0.25", "--width", "1.2", "--height", "0.5"
+        ) -CommandName "ws set-geometry" -AllowLayoutSelector
+
+        Assert-Equal $true $relative.Relative "relative form recognized"
+        Assert-Equal "edid:ACME001" ([string]$relative.Anchor) "anchor parsed"
+        Assert-Equal "DELA1B2/5" ([string]$relative.Instance) "instance parsed"
+        Assert-Equal "monitor" ([string]$relative.Basis) "basis parsed"
+        Assert-Equal -0.2 ([double]$relative.x) "negative fraction parsed"
+        Assert-Equal 1.2 ([double]$relative.w) "greater-than-one fraction parsed"
+        Assert-Equal $null $relative.Layout "relative authoring has no layout selector"
+
+        $pathRelative = ConvertFrom-DevWSGeometryArguments -Parts @(
+            "--relative", "--anchor", "path:DELA1B2/5", "--basis", "workArea",
+            "--x", "0", "--y", "0", "--width", "0.5", "--height", "1"
+        ) -CommandName "ws set-geometry"
+
+        Assert-Equal "path:DELA1B2/5" ([string]$pathRelative.Anchor) "path anchor parsed"
+        Assert-Equal $null $pathRelative.Instance "path anchor omits instance"
+
+        $mode = ConvertFrom-DevWSGeometryArguments -Parts @("--mode", "absolute") -CommandName "ws set-geometry"
+        Assert-Equal $true $mode.ModeExplicit "explicit absolute mode recognized"
+        Assert-Equal $null $mode.x "mode-only form has no replacement coordinates"
+
+        $modeWithRect = ConvertFrom-DevWSGeometryArguments -Parts @(
+            "--mode", "absolute", "--x", "10", "--y", "20", "--width", "30", "--height", "40"
+        ) -CommandName "ws set-geometry"
+
+        Assert-Equal 10 ([int]$modeWithRect.x) "replacement x parsed"
+        Assert-Equal 40 ([int]$modeWithRect.h) "replacement height parsed"
+
+        $absolute = ConvertFrom-DevWSGeometryArguments -Parts @("--x", "-7", "--y", "0", "--width", "654", "--height", "1407") -CommandName "ws set-geometry"
+        Assert-Equal $false $absolute.Relative "ordinary absolute form remains absolute"
+        Assert-Equal $false $absolute.ModeExplicit "ordinary absolute form is not an explicit mode conversion"
+    }
+
+    Test-Case "relative geometry parser rejects malformed and incompatible forms" {
+        $base = @("--relative", "--anchor", "edid:ACME001", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1", "--height", "1")
+
+        $cases = @(
+            @{ Name = "missing anchor";        Args = @("--relative", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "--anchor" },
+            @{ Name = "missing basis";         Args = @("--relative", "--anchor", "edid:ACME001", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "--basis" },
+            @{ Name = "missing fraction";      Args = @("--relative", "--anchor", "edid:ACME001", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1"); Error = "Usage: ws set-geometry" },
+            @{ Name = "bad identity";          Args = @("--relative", "--anchor", '\\.\DISPLAY1', "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "durable monitor identity" },
+            @{ Name = "bad instance";          Args = @("--relative", "--anchor", "edid:ACME001", "--instance", "not-an-instance", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "hardwareId" },
+            @{ Name = "path with instance";    Args = @("--relative", "--anchor", "path:DELA1B2/5", "--instance", "DELA1B2/5", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "omit --instance" },
+            @{ Name = "bad basis";             Args = @("--relative", "--anchor", "edid:ACME001", "--basis", "workarea", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "workArea" },
+            @{ Name = "non-numeric fraction";  Args = @("--relative", "--anchor", "edid:ACME001", "--basis", "workArea", "--x", "nope", "--y", "0", "--width", "1", "--height", "1"); Error = "finite fraction" },
+            @{ Name = "zero width";            Args = @("--relative", "--anchor", "edid:ACME001", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "0", "--height", "1"); Error = "Relative width" },
+            @{ Name = "negative height";       Args = @("--relative", "--anchor", "edid:ACME001", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1", "--height", "-1"); Error = "Relative height" },
+            @{ Name = "relative plus mode";    Args = @($base + @("--mode", "absolute")); Error = "cannot be combined with --mode" },
+            @{ Name = "relative plus layout";  Args = @($base + @("--layout", "fallback")); Error = "cannot be combined with --layout" },
+            @{ Name = "anchor without relative"; Args = @("--anchor", "edid:ACME001", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "only valid with --relative" },
+            @{ Name = "mode relative";         Args = @("--mode", "relative"); Error = "Use --relative" },
+            @{ Name = "unknown mode";          Args = @("--mode", "bogus"); Error = "only 'absolute'" },
+            @{ Name = "mode plus layout";      Args = @("--mode", "absolute", "--layout", "fallback"); Error = "cannot be combined with --layout" },
+            @{ Name = "duplicate relative";    Args = @($base + @("--relative")); Error = "Duplicate switch" },
+            @{ Name = "duplicate anchor";      Args = @($base + @("--anchor", "edid:OTHER")); Error = "Duplicate switch" },
+            @{ Name = "single-dash relative";  Args = @("-relative", "--anchor", "edid:ACME001", "--basis", "workArea", "--x", "0", "--y", "0", "--width", "1", "--height", "1"); Error = "Unknown switch" },
+            @{ Name = "partial mode replacement"; Args = @("--mode", "absolute", "--x", "1"); Error = "Usage: ws set-geometry" },
+            @{ Name = "unknown switch";        Args = @("--relative", "--anchor", "edid:ACME001", "--basis", "workArea", "--z", "1"); Error = "Unknown switch" }
+        )
+
+        foreach ($case in $cases) {
+            $thrown = Get-ThrownMessage {
+                ConvertFrom-DevWSGeometryArguments -Parts $case.Args -CommandName "ws set-geometry" -AllowLayoutSelector | Out-Null
+            }
+            Assert-Contains ([string]$thrown) $case.Error "$($case.Name) rejected"
+        }
+    }
+
+    Test-Case "relative authoring updates terminal and app without topology or live capture" {
+        $config = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4)),
+            (New-P5App -Id "app" -Layout (New-P5Rect -X 5 -Y 6 -W 7 -H 8))
+        )
+        $path = Write-P5Config -Name "author-both" -Config $config
+
+        $state = @{ Saves = 0; TopologyCalls = 0 }
+        $context = [pscustomobject]@{
+            Config   = $config
+            Location = [pscustomobject]@{ Path = $path; IsWritable = $true }
+        }
+
+        function Get-DevWSContext { return $context }
+        function Get-DevWSMonitorTopology { $state.TopologyCalls++; throw "topology must not be read while authoring relative geometry" }
+        function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+        $termOutput = (& {
+            Invoke-DevWSSetGeometry -Reference "term" -Arguments @(
+                "--relative", "--anchor", "edid:ACME001", "--instance", "DELA1B2/5",
+                "--basis", "monitor", "--x", "-0.25", "--y", "0", "--width", "1.5", "--height", "1"
+            )
+        } *>&1 | Out-String)
+
+        $appOutput = (& {
+            Invoke-DevWSSetGeometry -Reference "app" -Arguments @(
+                "--relative", "--anchor", "path:DELA1B2/5", "--basis", "workArea",
+                "--x", "0", "--y", "-0.5", "--width", "0.5", "--height", "1.25"
+            )
+        } *>&1 | Out-String)
+
+        $term = Get-P5Item -Config $config -Id "term"
+        $app = Get-P5Item -Config $config -Id "app"
+
+        Assert-Equal 0 $state.TopologyCalls "relative authoring never samples topology"
+        Assert-Equal 2 $state.Saves "one canonical save per authoring command"
+        Assert-Contains $termOutput "fallback relative layout" "terminal scope reported"
+        Assert-Contains $appOutput "fallback relative layout" "app scope reported"
+
+        Assert-Equal "relative" ([string]$term.layoutMode) "terminal mode"
+        Assert-Equal "edid:ACME001" ([string]$term.layoutRelative.monitor.identity) "terminal anchor"
+        Assert-Equal "DELA1B2/5" ([string]$term.layoutRelative.monitor.instance) "terminal instance"
+        Assert-Equal "monitor" ([string]$term.layoutRelative.basis) "terminal basis"
+        Assert-Equal -0.25 ([double]$term.layoutRelative.rect.x) "negative fraction retained"
+        Assert-Equal 1.5 ([double]$term.layoutRelative.rect.w) "greater-than-one fraction retained"
+        Assert-Equal 1 ([int]$term.layout.x) "terminal absolute fallback preserved"
+
+        Assert-Equal "relative" ([string]$app.layoutMode) "app mode"
+        Assert-Equal "path:DELA1B2/5" ([string]$app.layoutRelative.monitor.identity) "app path anchor"
+        Assert-True (-not (Test-DevWSProperty -Object $app.layoutRelative.monitor -Name "instance")) "path anchor has no instance"
+        Assert-Equal "workArea" ([string]$app.layoutRelative.basis) "app basis"
+        Assert-Equal -0.5 ([double]$app.layoutRelative.rect.y) "app negative fraction retained"
+        Assert-Equal 1.25 ([double]$app.layoutRelative.rect.h) "app greater-than-one fraction retained"
+        Assert-Equal 5 ([int]$app.layout.x) "app absolute fallback preserved"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+    Test-Case "relative authoring is topology-free even in a profile-enabled set" {
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:ACME001@0,0,1920x1080")
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "term" -Rect ([pscustomobject]@{ x = 10; y = 11; w = 12; h = 13 })
+        $config = New-P5Config -Profiles @($profile) -Items @((New-P5Terminal -Id "term"))
+        $path = Write-P5Config -Name "author-profile-set" -Config $config
+        $state = @{ Saves = 0; TopologyCalls = 0 }
+        $context = [pscustomobject]@{
+            Config   = $config
+            Location = [pscustomobject]@{ Path = $path; IsWritable = $true }
+        }
+
+        function Get-DevWSContext { return $context }
+        function Get-DevWSMonitorTopology { $state.TopologyCalls++; throw "profile-aware authoring must not sample topology" }
+        function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+        Invoke-DevWSSetGeometry -Reference "term" -Arguments @(
+            "--relative", "--anchor", "edid:ACME001", "--basis", "workArea",
+            "--x", "0.1", "--y", "0.2", "--width", "0.3", "--height", "0.4"
+        ) | Out-Null
+
+        $term = Get-P5Item -Config $config -Id "term"
+        $profileAfter = @($config.sets[0].layoutProfiles)[0]
+
+        Assert-Equal 0 $state.TopologyCalls "no topology call with profiles present"
+        Assert-Equal 1 $state.Saves "single save"
+        Assert-Equal 10 ([int](Get-DevWSLayoutProfileEntry -Profile $profileAfter -ItemId "term").x) "absolute profile entry untouched"
+        Assert-Equal "relative" ([string]$term.layoutMode) "relative mode stored"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+    Test-Case "explicit absolute mode preserves or replaces the fallback geometry" {
+        $config = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Relative (New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "workArea" -W 0.5) -Layout (New-P5Rect -X 11 -Y 12 -W 13 -H 14)),
+            (New-P5App -Id "abs" -Layout (New-P5Rect -X 21 -Y 22 -W 23 -H 24))
+        )
+        $path = Write-P5Config -Name "absolute-mode" -Config $config
+        $state = @{ Saves = 0; TopologyCalls = 0 }
+        $context = [pscustomobject]@{
+            Config   = $config
+            Location = [pscustomobject]@{ Path = $path; IsWritable = $true }
+        }
+
+        function Get-DevWSContext { return $context }
+        function Get-DevWSMonitorTopology { $state.TopologyCalls++; throw "mode conversion must not sample topology" }
+        function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+        Invoke-DevWSSetGeometry -Reference "term" -Arguments @("--mode", "absolute") | Out-Null
+
+        $term = Get-P5Item -Config $config -Id "term"
+        Assert-Equal 0 $state.TopologyCalls "mode conversion is topology-free"
+        Assert-Equal 1 $state.Saves "mode conversion saves once"
+        Assert-Equal "absolute" ([string]$term.layoutMode) "explicit absolute mode recorded"
+        Assert-True (-not (Test-DevWSProperty -Object $term -Name "layoutRelative")) "relative object removed"
+        Assert-Equal "11,12,13,14" "$($term.layout.x),$($term.layout.y),$($term.layout.w),$($term.layout.h)" "existing fallback preserved"
+
+        Invoke-DevWSSetGeometry -Reference "term" -Arguments @(
+            "--mode", "absolute", "--x", "31", "--y", "32", "--width", "33", "--height", "34"
+        ) | Out-Null
+
+        Assert-Equal "31,32,33,34" "$($term.layout.x),$($term.layout.y),$($term.layout.w),$($term.layout.h)" "replacement absolute coordinates applied"
+        Assert-Equal 2 $state.Saves "two explicit saves"
+
+        Invoke-DevWSSetGeometry -Reference "abs" -Arguments @("--mode", "absolute") | Out-Null
+        $abs = Get-P5Item -Config $config -Id "abs"
+        Assert-True (-not (Test-DevWSProperty -Object $abs -Name "layoutMode")) "already-absolute item keeps its representation"
+        Assert-Equal "21,22,23,24" "$($abs.layout.x),$($abs.layout.y),$($abs.layout.w),$($abs.layout.h)" "already-absolute fallback preserved"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+    Test-Case "plain fallback geometry refuses relative items while profile editing stays available" {
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:ACME001@0,0,1920x1080")
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "term" -Rect ([pscustomobject]@{ x = 50; y = 51; w = 52; h = 53 })
+        $config = New-P5Config -Profiles @($profile) -Items @(
+            (New-P5Terminal -Id "term" -Relative (New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "workArea" -W 0.5) -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4))
+        )
+        $path = Write-P5Config -Name "fallback-refusal" -Config $config
+        $state = @{ Saves = 0; TopologyCalls = 0 }
+        $context = [pscustomobject]@{
+            Config   = $config
+            Location = [pscustomobject]@{ Path = $path; IsWritable = $true }
+        }
+
+        function Get-DevWSContext { return $context }
+        function Get-DevWSMonitorTopology { $state.TopologyCalls++; throw "profile-aware implicit fallback must not need this test path" }
+        function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+        $implicitConfig = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Relative (New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "workArea" -W 0.5) -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4))
+        )
+        $context.Config = $implicitConfig
+
+        $implicitMessage = Get-ThrownMessage {
+            Invoke-DevWSSetGeometry -Reference "term" -Arguments @("--x", "10", "--y", "20", "--width", "30", "--height", "40") | Out-Null
+        }
+        Assert-Contains $implicitMessage "uses relative layout mode" "implicit fallback edit refused"
+        Assert-Contains $implicitMessage "--mode absolute" "refusal names the conversion path"
+
+        $context.Config = $config
+
+        $explicitMessage = Get-ThrownMessage {
+            Invoke-DevWSSetGeometry -Reference "term" -Arguments @("--x", "10", "--y", "20", "--width", "30", "--height", "40", "--layout", "fallback") | Out-Null
+        }
+        Assert-Contains $explicitMessage "uses relative layout mode" "--layout fallback is not reinterpreted as --relative"
+
+        Assert-Equal 0 $state.Saves "refused writes never save"
+        $term = Get-P5Item -Config $config -Id "term"
+        Assert-Equal "1,2,3,4" "$($term.layout.x),$($term.layout.y),$($term.layout.w),$($term.layout.h)" "refused fallback unchanged"
+
+        Invoke-DevWSSetGeometry -Reference "term" -Arguments @(
+            "--x", "100", "--y", "101", "--width", "102", "--height", "103", "--layout", "docked"
+        ) | Out-Null
+
+        $profileAfter = @($config.sets[0].layoutProfiles)[0]
+        Assert-Equal 1 $state.Saves "profile edit saves once"
+        Assert-Equal 100 ([int](Get-DevWSLayoutProfileEntry -Profile $profileAfter -ItemId "term").x) "explicit profile entry updated"
+        Assert-Equal "1,2,3,4" "$($term.layout.x),$($term.layout.y),$($term.layout.w),$($term.layout.h)" "relative fallback untouched by profile edit"
+        Assert-Equal "relative" ([string]$term.layoutMode) "profile edit never changes item mode"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+    Test-Case "reset-layout clears matched relative fields and preserves unmatched relative intent" {
+        $default = ConvertTo-TestConfig -Windows @(
+            (New-TerminalDefinition -Id "term" -WindowId "DevWS-term")
+        )
+        Set-DevWSLayout -Item $default.sets[0].windows[0] -Rect ([pscustomobject]@{ x = 200; y = 201; w = 202; h = 203 })
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:ACME001@0,0,1920x1080")
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "term" -Rect ([pscustomobject]@{ x = 7; y = 8; w = 9; h = 10 })
+        $config = New-P5Config -Profiles @($profile) -Items @(
+            (New-P5Terminal -Id "term" -Relative (New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "workArea" -W 0.5) -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4)),
+            (New-P5Terminal -Id "custom" -Relative (New-P5Relative -Identity "path:DELA1B2/5" -Basis "monitor" -X -0.1 -W 1.1) -Layout (New-P5Rect -X 5 -Y 6 -W 7 -H 8)),
+            (New-P5App -Id "app" -Layout (New-P5Rect -X 9 -Y 10 -W 11 -H 12))
+        )
+        $customBefore = $config.sets[0].windows[1].layoutRelative | ConvertTo-Json -Depth 10 -Compress
+
+        $result = Reset-DevWSLayoutsFromDefault -Config $config -DefaultConfig $default -DefaultSource "test default"
+
+        $term = Get-P5Item -Config $config -Id "term"
+        $custom = Get-P5Item -Config $config -Id "custom"
+        $profileAfter = @($config.sets[0].layoutProfiles)[0]
+
+        Assert-Equal 1 @($result.Matches).Count "one default match"
+        Assert-Equal 1 @($result.RelativeCleared).Count "one relative item cleared"
+        Assert-Equal "term" ([string]$result.RelativeCleared[0].id) "cleared item reported"
+        Assert-Equal "200,201,202,203" "$($term.layout.x),$($term.layout.y),$($term.layout.w),$($term.layout.h)" "baseline absolute rectangle restored"
+        Assert-Equal "absolute" ([string]$term.layoutMode) "matched relative item is absolute"
+        Assert-True (-not (Test-DevWSProperty -Object $term -Name "layoutRelative")) "matched relative object removed"
+        Assert-Equal "relative" ([string]$custom.layoutMode) "unmatched relative mode preserved"
+        Assert-Equal $customBefore ($custom.layoutRelative | ConvertTo-Json -Depth 10 -Compress) "unmatched relative object preserved"
+        Assert-Equal 7 ([int](Get-DevWSLayoutProfileEntry -Profile $profileAfter -ItemId "term").x) "profile entry untouched"
+        Assert-Equal 2 @($result.Skipped).Count "unmatched items reported"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+    Test-Case "reset-layout no-baseline keeps relative intent and confirmation cancellation saves nothing" {
+        $relative = New-P5Relative -Identity "edid:ACME001" -Basis "workArea" -W 0.5
+        $config = ConvertTo-TestConfig -Sets @(
+            [ordered]@{ id = "main"; windows = @() },
+            [ordered]@{ id = "secondary"; windows = @((New-P5Terminal -Id "term" -Relative $relative)) }
+        )
+        $default = ConvertTo-TestConfig -Windows @(
+            (New-TerminalDefinition -Id "term" -WindowId "DevWS-term")
+        )
+        $secondaryBefore = $config.sets[1].windows[0].layoutRelative | ConvertTo-Json -Depth 10 -Compress
+
+        $noBaseline = Reset-DevWSLayoutsFromDefault -Config $config -Set "secondary" -DefaultConfig $default -DefaultSource "test default"
+        Assert-Equal $false $noBaseline.BaselineFound "no same-id baseline"
+        Assert-Equal 0 @($noBaseline.Matches).Count "nothing matched"
+        Assert-Equal 0 @($noBaseline.RelativeCleared).Count "nothing cleared"
+        Assert-Equal $secondaryBefore ($config.sets[1].windows[0].layoutRelative | ConvertTo-Json -Depth 10 -Compress) "no-baseline relative intent preserved"
+
+        $cancelConfig = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Relative $relative -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4))
+        )
+        $cancelDefault = ConvertTo-TestConfig -Windows @(
+            (New-TerminalDefinition -Id "term" -WindowId "DevWS-term" -Layout (New-P5Rect -X 50 -Y 51 -W 52 -H 53))
+        )
+        $cancelPath = Write-P5Config -Name "reset-cancel" -Config $cancelConfig
+        $before = Get-FileBase64 -Path $cancelPath
+        $state = @{ Saves = 0 }
+        $cancelContext = [pscustomobject]@{
+            Config   = $cancelConfig
+            Location = [pscustomobject]@{ Path = $cancelPath; IsWritable = $true }
+        }
+
+        function Get-DevWSContext { return $cancelContext }
+        function Find-DevWSBundledDefaultConfig { return "C:\fake\workspace.default.json" }
+        function Read-DevWSConfigFile { param([string]$Path) return $cancelDefault }
+        function Read-Host { param([string]$Prompt) return "n" }
+        function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+        $output = (& { Invoke-DevWSResetLayout -SetId "main" } *>&1 | Out-String)
+        Assert-Contains $output "Cancelled" "cancellation reported"
+        Assert-Equal 0 $state.Saves "cancelled reset never writes"
+        Assert-Equal $before (Get-FileBase64 -Path $cancelPath) "canonical bytes unchanged after cancellation"
+    }
+
+    Test-Case "clone-terminal and clone-app deep-copy relative fields" {
+        $termRelative = New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "monitor" -X -0.2 -Y 0.25 -W 1.2 -H 0.5
+        $appRelative = New-P5Relative -Identity "path:DELA1B2/5" -Basis "workArea" -X 0.1 -Y 0.2 -W 0.3 -H 0.4
+        $config = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Relative $termRelative -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4)),
+            (New-P5App -Id "app" -Relative $appRelative -Layout (New-P5Rect -X 5 -Y 6 -W 7 -H 8) -InstanceMode "shared"),
+            (New-P5Terminal -Id "abs" -Layout (New-P5Rect -X 9 -Y 10 -W 11 -H 12))
+        )
+        $termSource = Get-P5Item -Config $config -Id "term"
+        $appSource = Get-P5Item -Config $config -Id "app"
+
+        $termResult = Clone-DevWSTerminal -Config $config -SourceId "term" -NewId "term-copy" -CommandName "ws clone-terminal"
+        $appResult = Clone-DevWSApp -Config $config -SourceId "app" -NewId "app-copy" -CommandName "ws clone-app"
+
+        $termClone = $termResult.Clone
+        $appClone = $appResult.Clone
+
+        Assert-Equal $false ([object]::ReferenceEquals($termSource.layoutRelative, $termClone.layoutRelative)) "terminal relative object deep-copied"
+        Assert-Equal $false ([object]::ReferenceEquals($termSource.layoutRelative.monitor, $termClone.layoutRelative.monitor)) "terminal monitor deep-copied"
+        Assert-Equal $false ([object]::ReferenceEquals($termSource.layoutRelative.rect, $termClone.layoutRelative.rect)) "terminal rect deep-copied"
+        Assert-Equal "relative" ([string]$termClone.layoutMode) "terminal mode copied"
+        Assert-Equal "edid:ACME001|DELA1B2/5|monitor|-0.2,0.25,1.2,0.5" "$($termClone.layoutRelative.monitor.identity)|$($termClone.layoutRelative.monitor.instance)|$($termClone.layoutRelative.basis)|$($termClone.layoutRelative.rect.x),$($termClone.layoutRelative.rect.y),$($termClone.layoutRelative.rect.w),$($termClone.layoutRelative.rect.h)" "terminal relative values copied"
+        Assert-Equal "1,2,3,4" "$($termClone.layout.x),$($termClone.layout.y),$($termClone.layout.w),$($termClone.layout.h)" "terminal absolute fallback copied"
+
+        Assert-Equal "relative" ([string]$appClone.layoutMode) "app mode copied"
+        Assert-Equal "path:DELA1B2/5" ([string]$appClone.layoutRelative.monitor.identity) "app anchor copied"
+        Assert-True (-not (Test-DevWSProperty -Object $appClone.layoutRelative.monitor -Name "instance")) "app path anchor remains instance-free"
+        Assert-Equal $false $appClone.enabled "app clone still disabled"
+        Assert-Equal "dedicated" ([string]$appClone.instanceMode) "app clone still dedicated"
+        Assert-Equal "5,6,7,8" "$($appClone.layout.x),$($appClone.layout.y),$($appClone.layout.w),$($appClone.layout.h)" "app absolute fallback copied"
+
+        $absClone = (Clone-DevWSTerminal -Config $config -SourceId "abs" -NewId "abs-copy" -CommandName "ws clone-terminal").Clone
+        Assert-True (-not (Test-DevWSProperty -Object $absClone -Name "layoutMode")) "absolute clone has no mode"
+        Assert-True (-not (Test-DevWSProperty -Object $absClone -Name "layoutRelative")) "absolute clone has no relative fields"
+
+        $termClone.layoutRelative.rect.x = 9.9
+        $termClone.layoutRelative.monitor.identity = "edid:MUTATED"
+        $termClone.layoutRelative.monitor.instance = "MUTATED/1"
+        $termClone.layoutRelative.basis = "workArea"
+        $termClone.layout.x = 999
+        $appClone.layoutRelative.monitor.identity = "path:MUTATED/1"
+        $appClone.layoutRelative.rect.y = 8.8
+
+        Assert-Equal "-0.2,0.25,1.2,0.5" "$($termSource.layoutRelative.rect.x),$($termSource.layoutRelative.rect.y),$($termSource.layoutRelative.rect.w),$($termSource.layoutRelative.rect.h)" "source terminal rect unchanged"
+        Assert-Equal "edid:ACME001" ([string]$termSource.layoutRelative.monitor.identity) "source terminal anchor unchanged"
+        Assert-Equal "DELA1B2/5" ([string]$termSource.layoutRelative.monitor.instance) "source terminal instance unchanged"
+        Assert-Equal "monitor" ([string]$termSource.layoutRelative.basis) "source terminal basis unchanged"
+        Assert-Equal 1 ([int]$termSource.layout.x) "source terminal absolute fallback unchanged"
+        Assert-Equal "path:DELA1B2/5" ([string]$appSource.layoutRelative.monitor.identity) "source app anchor unchanged"
+        Assert-Equal 0.2 ([double]$appSource.layoutRelative.rect.y) "source app rect unchanged"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+    Test-Case "item-definition copy helpers deep-copy relative fields" {
+        $config = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Relative (New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "monitor" -W 0.75) -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4)),
+            (New-P5App -Id "app" -Relative (New-P5Relative -Identity "path:DELA1B2/5" -Basis "workArea" -X -0.1 -W 1.1) -Layout (New-P5Rect -X 5 -Y 6 -W 7 -H 8) -InstanceMode "shared")
+        )
+        $termSource = Get-P5Item -Config $config -Id "term"
+        $appSource = Get-P5Item -Config $config -Id "app"
+
+        $termCopy = Copy-DevWSTerminalDefinition -Terminal $termSource -WindowId "DevWS-copied"
+        $appCopy = Copy-DevWSAppDefinition -App $appSource
+
+        Assert-Equal "relative" ([string]$termCopy.layoutMode) "terminal definition mode copied"
+        Assert-Equal "edid:ACME001" ([string]$termCopy.layoutRelative.monitor.identity) "terminal definition anchor copied"
+        Assert-Equal "0.75" ([string]$termCopy.layoutRelative.rect.w) "terminal definition rectangle copied"
+        Assert-Equal "relative" ([string]$appCopy.layoutMode) "app definition mode copied"
+        Assert-Equal "path:DELA1B2/5" ([string]$appCopy.layoutRelative.monitor.identity) "app definition anchor copied"
+        Assert-Equal "shared" ([string]$appCopy.instanceMode) "app definition instance mode preserved"
+
+        $termCopy.layoutRelative.rect.w = 9.9
+        $termCopy.layoutRelative.monitor.identity = "edid:MUTATED"
+        $appCopy.layoutRelative.rect.x = 9.9
+        $appCopy.layoutRelative.basis = "monitor"
+
+        Assert-Equal 0.75 ([double]$termSource.layoutRelative.rect.w) "source terminal definition unchanged"
+        Assert-Equal "edid:ACME001" ([string]$termSource.layoutRelative.monitor.identity) "source terminal definition anchor unchanged"
+        Assert-Equal -0.1 ([double]$appSource.layoutRelative.rect.x) "source app definition unchanged"
+        Assert-Equal "workArea" ([string]$appSource.layoutRelative.basis) "source app definition basis unchanged"
+    }
+
+    Test-Case "clone-set deep-copies relative fields and preserves layout profiles" {
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:ACME001@0,0,1920x1080")
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "term" -Rect ([pscustomobject]@{ x = 40; y = 41; w = 42; h = 43 })
+        $config = New-P5Config -Profiles @($profile) -Items @(
+            (New-P5Terminal -Id "term" -Relative (New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "monitor" -X -0.2 -W 1.2) -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4)),
+            (New-P5App -Id "app" -Relative (New-P5Relative -Identity "path:DELA1B2/5" -Basis "workArea" -Y -0.3 -H 1.3) -Layout (New-P5Rect -X 5 -Y 6 -W 7 -H 8) -InstanceMode "shared")
+        )
+        $sourceTerm = Get-P5Item -Config $config -Id "term"
+        $sourceApp = Get-P5Item -Config $config -Id "app"
+
+        $result = Clone-DevWSSet -Config $config -SourceId "main" -NewId "staging"
+        $cloneSet = $result.Clone
+        $cloneTerm = @($cloneSet.windows | Where-Object { $_.id -eq "term" })[0]
+        $cloneApp = @($cloneSet.windows | Where-Object { $_.id -eq "app" })[0]
+
+        Assert-Equal "DevWS-staging-term" ([string]$cloneTerm.windowId) "fresh set-qualified terminal identity"
+        Assert-Equal "relative" ([string]$cloneTerm.layoutMode) "clone-set terminal mode copied"
+        Assert-Equal "edid:ACME001" ([string]$cloneTerm.layoutRelative.monitor.identity) "clone-set terminal anchor copied"
+        Assert-Equal "1.2" ([string]$cloneTerm.layoutRelative.rect.w) "clone-set terminal rectangle copied"
+        Assert-Equal "relative" ([string]$cloneApp.layoutMode) "clone-set app mode copied"
+        Assert-Equal "path:DELA1B2/5" ([string]$cloneApp.layoutRelative.monitor.identity) "clone-set app anchor copied"
+        Assert-Equal "shared" ([string]$cloneApp.instanceMode) "clone-set preserves app instance mode"
+        Assert-Equal 1 @($cloneSet.layoutProfiles).Count "clone-set copies profiles"
+        Assert-Equal 40 ([int](Get-DevWSLayoutProfileEntry -Profile @($cloneSet.layoutProfiles)[0] -ItemId "term").x) "clone-set profile entry copied"
+
+        $cloneTerm.layoutRelative.monitor.identity = "edid:MUTATED"
+        $cloneTerm.layoutRelative.rect.w = 9.9
+        $cloneApp.layoutRelative.rect.y = 9.9
+        $cloneApp.layoutRelative.basis = "monitor"
+
+        Assert-Equal "edid:ACME001" ([string]$sourceTerm.layoutRelative.monitor.identity) "source set terminal anchor unchanged"
+        Assert-Equal 1.2 ([double]$sourceTerm.layoutRelative.rect.w) "source set terminal rectangle unchanged"
+        Assert-Equal -0.3 ([double]$sourceApp.layoutRelative.rect.y) "source set app rectangle unchanged"
+        Assert-Equal "workArea" ([string]$sourceApp.layoutRelative.basis) "source set app basis unchanged"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+
+    Test-Case "reset-layout success performs one canonical save and reports clearing" {
+        $relative = New-P5Relative -Identity "edid:ACME001" -Basis "workArea" -W 0.5
+        $config = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Relative $relative -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4))
+        )
+        $default = ConvertTo-TestConfig -Windows @(
+            (New-TerminalDefinition -Id "term" -WindowId "DevWS-term")
+        )
+        Set-DevWSLayout -Item $default.sets[0].windows[0] -Rect ([pscustomobject]@{ x = 60; y = 61; w = 62; h = 63 })
+        $defaultPath = Write-P5Config -Name "reset-success-default" -Config $default
+        $configPath = Write-P5Config -Name "reset-success" -Config $config
+        $state = @{ Saves = 0 }
+        $context = [pscustomobject]@{
+            Config   = $config
+            Location = [pscustomobject]@{ Path = $configPath; IsWritable = $true }
+        }
+
+        function Get-DevWSContext { return $context }
+        function Find-DevWSBundledDefaultConfig { return $defaultPath }
+        function Read-Host { param([string]$Prompt) return "y" }
+        function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+        $output = (& { Invoke-DevWSResetLayout -SetId "main" } *>&1 | Out-String)
+
+        $term = Get-P5Item -Config $config -Id "term"
+        Assert-Equal 1 $state.Saves "confirmed reset has exactly one canonical write"
+        Assert-Contains $output "relative mode cleared" "reset reports the cleared item"
+        Assert-Contains $output "Cleared relative layout mode for 1 item" "reset reports the clearing count"
+        Assert-Equal "60,61,62,63" "$($term.layout.x),$($term.layout.y),$($term.layout.w),$($term.layout.h)" "reset restores baseline"
+        Assert-Equal "absolute" ([string]$term.layoutMode) "reset records absolute mode"
+        Assert-True (-not (Test-DevWSProperty -Object $term -Name "layoutRelative")) "reset removes relative object"
+        Assert-DevWSConfig -Config $config -Source "test"
+    }
+
+    Test-Case "add, rename, enable and path mutations preserve relative intent" {
+        $relative = New-P5Relative -Identity "edid:ACME001" -Instance "DELA1B2/5" -Basis "monitor" -X -0.2 -W 1.2
+        $config = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Relative $relative -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4)),
+            (New-P5App -Id "app" -Layout (New-P5Rect -X 5 -Y 6 -W 7 -H 8))
+        )
+        $term = Get-P5Item -Config $config -Id "term"
+        $before = $term.layoutRelative | ConvertTo-Json -Depth 10 -Compress
+
+        $newTerm = Add-DevWSTerminal -Config $config -Id "newterm" -Path $TestRoot -Command $null -Arguments @()
+        $newApp = Add-DevWSApp -Config $config -Id "newapp" -LaunchKind "exe" -LaunchValue "C:\newapp.exe" -MatchKind "exe" -MatchValue "newapp.exe" -InstanceMode "dedicated"
+        [void](Rename-DevWSItem -Config $config -Reference "term" -NewId "renamed" -CommandName "ws rename")
+        [void](Set-DevWSItemEnabled -Config $config -Reference "renamed" -Enabled $false -CommandName "ws disable")
+        [void](Set-DevWSTerminalPath -Config $config -Terminal (Get-P5Item -Config $config -Id "renamed") -Path "C:\changed")
+
+        $renamed = Get-P5Item -Config $config -Id "renamed"
+        Assert-Equal $before ($renamed.layoutRelative | ConvertTo-Json -Depth 10 -Compress) "rename/enable/path preserve relative object"
+        Assert-Equal "relative" ([string]$renamed.layoutMode) "mode preserved"
+        Assert-Equal "1,2,3,4" "$($renamed.layout.x),$($renamed.layout.y),$($renamed.layout.w),$($renamed.layout.h)" "absolute fallback preserved"
+        Assert-True (-not (Test-DevWSProperty -Object $newTerm -Name "layoutMode")) "add-terminal creates absolute mode"
+        Assert-True (-not (Test-DevWSProperty -Object $newTerm -Name "layoutRelative")) "add-terminal has no relative fields"
+        Assert-True (-not (Test-DevWSProperty -Object $newApp -Name "layoutMode")) "add-app creates absolute mode"
+        Assert-True (-not (Test-DevWSProperty -Object $newApp -Name "layoutRelative")) "add-app has no relative fields"
+
+        $path = Write-P5Config -Name "mutation-preservation" -Config $config
+        $reloaded = Read-DevWSConfigFile -Path $path
+        $reloadedTerm = @($reloaded.sets[0].windows | Where-Object { $_.id -eq "renamed" })[0]
+        Assert-Equal $before ($reloadedTerm.layoutRelative | ConvertTo-Json -Depth 10 -Compress) "relative fields survive serialization round-trip"
+        Assert-Equal "relative" ([string]$reloadedTerm.layoutMode) "mode survives serialization round-trip"
+        Assert-DevWSConfig -Config $reloaded -Source "round-trip"
+    }
+
+    Test-Case "installer historical-v3 enrichment preserves relative app fields" {
+        $template = Get-TestWorkspaceConfig
+        $preMode = [pscustomobject][ordered]@{
+            version    = 3
+            defaultSet = "main"
+            bindings   = @()
+            sets       = @(
+                [pscustomobject][ordered]@{
+                    id      = "main"
+                    windows = @(
+                        [pscustomobject][ordered]@{
+                            id           = "firefox"
+                            type         = "app"
+                            enabled      = $true
+                            match        = [pscustomobject]@{ kind = "exe"; value = "firefox.exe" }
+                            launch       = [pscustomobject]@{ kind = "exe"; value = "C:\Program Files\Mozilla Firefox\firefox.exe"; args = @() }
+                            layout       = [pscustomobject]@{ x = 1; y = 2; w = 3; h = 4 }
+                            layoutMode   = "relative"
+                            layoutRelative = [pscustomobject][ordered]@{
+                                monitor = [pscustomobject][ordered]@{ identity = "edid:ACME001"; instance = "DELA1B2/5" }
+                                basis   = "workArea"
+                                rect    = [pscustomobject][ordered]@{ x = -0.1; y = 0.2; w = 1.1; h = 0.8 }
+                            }
+                        }
+                    )
+                }
+            )
+        }
+        $sourceBefore = $preMode | ConvertTo-Json -Depth 20 -Compress
+
+        Assert-DevWSPreInstanceModeV3Config -Config $preMode -Source "phase5 test"
+        $enriched = ConvertTo-DevWSConfigWithExplicitInstanceModes -Config $preMode -BundledTemplate $template
+        $enrichedApp = @($enriched.sets[0].windows)[0]
+
+        Assert-Equal $sourceBefore ($preMode | ConvertTo-Json -Depth 20 -Compress) "installer enrichment never mutates its source"
+        Assert-Equal "dedicated" ([string]$enrichedApp.instanceMode) "instance mode still enriched"
+        Assert-Equal "relative" ([string]$enrichedApp.layoutMode) "relative mode preserved"
+        Assert-Equal "edid:ACME001" ([string]$enrichedApp.layoutRelative.monitor.identity) "relative anchor preserved"
+        Assert-Equal "DELA1B2/5" ([string]$enrichedApp.layoutRelative.monitor.instance) "relative instance preserved"
+        Assert-Equal "workArea" ([string]$enrichedApp.layoutRelative.basis) "relative basis preserved"
+        Assert-Equal "-0.1,0.2,1.1,0.8" "$($enrichedApp.layoutRelative.rect.x),$($enrichedApp.layoutRelative.rect.y),$($enrichedApp.layoutRelative.rect.w),$($enrichedApp.layoutRelative.rect.h)" "relative rectangle preserved"
+        Assert-Equal "1,2,3,4" "$($enrichedApp.layout.x),$($enrichedApp.layout.y),$($enrichedApp.layout.w),$($enrichedApp.layout.h)" "absolute fallback preserved"
+        Assert-DevWSConfig -Config $enriched -Source "enriched relative"
+    }
+
+    Test-Case "CLI authoring, refusal, and absolute conversion are atomic" {
+        $config = New-P5Config -Items @(
+            (New-P5Terminal -Id "term" -Layout (New-P5Rect -X 1 -Y 2 -W 3 -H 4))
+        )
+        $path = Write-P5Config -Name "cli-authoring" -Config $config
+
+        $author = Invoke-WsCli -ConfigPath $path -Arguments @(
+            "set-geometry", "term", "--relative", "--anchor", "edid:ACME001", "--instance", "DELA1B2/5",
+            "--basis", "workArea", "--x", "-0.2", "--y", "0", "--width", "1.2", "--height", "1"
+        )
+        Assert-Equal 0 $author.ExitCode "relative authoring CLI succeeds"
+        Assert-Contains $author.Output "fallback relative layout" "relative CLI scope reported"
+
+        $authored = Read-DevWSConfigFile -Path $path
+        $authoredTerm = @($authored.sets[0].windows | Where-Object { $_.id -eq "term" })[0]
+        Assert-Equal "relative" ([string]$authoredTerm.layoutMode) "CLI stores relative mode"
+        Assert-Equal -0.2 ([double]$authoredTerm.layoutRelative.rect.x) "CLI stores fraction"
+        Assert-Equal "1,2,3,4" "$($authoredTerm.layout.x),$($authoredTerm.layout.y),$($authoredTerm.layout.w),$($authoredTerm.layout.h)" "CLI preserves absolute fallback"
+        $afterAuthor = Get-FileBase64 -Path $path
+
+        $missingBasis = Invoke-WsCli -ConfigPath $path -Arguments @(
+            "set-geometry", "term", "--relative", "--anchor", "edid:ACME001",
+            "--x", "0", "--y", "0", "--width", "1", "--height", "1"
+        )
+        Assert-True ($missingBasis.ExitCode -ne 0) "missing basis exits nonzero"
+        Assert-Equal $afterAuthor (Get-FileBase64 -Path $path) "missing basis leaves bytes unchanged"
+
+        $plainFallback = Invoke-WsCli -ConfigPath $path -Arguments @(
+            "set-geometry", "term", "--x", "10", "--y", "20", "--width", "30", "--height", "40"
+        )
+        Assert-True ($plainFallback.ExitCode -ne 0) "plain fallback edit exits nonzero"
+        Assert-Contains $plainFallback.Output "uses relative layout mode" "plain fallback refusal is actionable"
+        Assert-Equal $afterAuthor (Get-FileBase64 -Path $path) "refused fallback leaves bytes unchanged"
+
+        $convert = Invoke-WsCli -ConfigPath $path -Arguments @("set-geometry", "term", "--mode", "absolute")
+        Assert-Equal 0 $convert.ExitCode "absolute conversion CLI succeeds"
+        $converted = Read-DevWSConfigFile -Path $path
+        $convertedTerm = @($converted.sets[0].windows | Where-Object { $_.id -eq "term" })[0]
+        Assert-Equal "absolute" ([string]$convertedTerm.layoutMode) "CLI records absolute mode"
+        Assert-True (-not (Test-DevWSProperty -Object $convertedTerm -Name "layoutRelative")) "CLI removes relative object"
+        Assert-Equal "1,2,3,4" "$($convertedTerm.layout.x),$($convertedTerm.layout.y),$($convertedTerm.layout.w),$($convertedTerm.layout.h)" "CLI conversion preserves fallback"
+    }
+
+
+    Write-Host ""
     Start-TestGroup -Name 'trace-temp-hardening' -Title 'Public Security Phase 2-E trace and temporary-file hardening'
 
     function New-P2EInstalledProbe {
@@ -39887,8 +40614,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 67 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 67 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 68 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 68 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

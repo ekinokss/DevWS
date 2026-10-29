@@ -260,6 +260,16 @@ information is never invented: a tab whose working directory cannot be establish
 its existing effective path. The whole save is one atomic canonical write preceded by a
 final revalidation.
 
+Relative layouts add an explicit per-item intent layer without changing that persistence
+model. `ws save-layout` / `ws save` in fallback scope re-anchor relative items and dual-write
+`layoutRelative` and the universal `item.layout`; profile-targeted saves write only profile
+entries. `ws set-geometry --relative` authors the fallback relative layer from validated
+syntax without reading topology or live windows. `--mode absolute` and `ws reset-layout` are
+the only intentional clearers. Clone operations deep-copy the mode and relative object, and
+the installer's historical-v3 instance-mode enrichment preserves both fields. Relative
+placement still resolves to absolute rectangles before any privileged worker or lifecycle
+side effect.
+
 ## 10. Trusted executable and package resolution
 
 A high-integrity process must not launch an executable chosen by a user-writable value or

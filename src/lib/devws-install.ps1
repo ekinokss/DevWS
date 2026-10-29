@@ -1453,7 +1453,9 @@ function Set-DevWSEnrichedAppDefinition {
     # Replace the app definition inside its set with a canonical-order object
     # (id, type, enabled, match, launch, instanceMode, layout) so enriched
     # configs are deterministic and match the bundled default ordering.
-    $rebuilt = [pscustomobject][ordered]@{
+    # Optional relative-layout fields are preserved after the canonical fields;
+    # enrichment must never silently turn a relative app absolute.
+    $fields = [ordered]@{
         id           = [string]$Item.id
         type         = "app"
         enabled      = [bool]$Item.enabled
@@ -1462,6 +1464,20 @@ function Set-DevWSEnrichedAppDefinition {
         instanceMode = $Mode
         layout       = $Item.layout
     }
+
+    if (Test-DevWSProperty -Object $Item -Name "layoutMode") {
+        $fields["layoutMode"] = [string](Get-DevWSProperty -Object $Item -Name "layoutMode")
+    }
+
+    if (Test-DevWSProperty -Object $Item -Name "layoutRelative") {
+        $relative = Get-DevWSProperty -Object $Item -Name "layoutRelative"
+
+        if ($null -ne $relative) {
+            $fields["layoutRelative"] = Copy-DevWSRelativeLayout -RelativeLayout $relative
+        }
+    }
+
+    $rebuilt = [pscustomobject]$fields
 
     $windows = @($Set.windows)
 
