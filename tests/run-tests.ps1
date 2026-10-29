@@ -124,6 +124,7 @@ $script:TestGroupCatalog = [ordered]@{
     'relative-lifecycle'  = 'Relative lifecycle placement (v0.3 Phase 3)'
     'relative-layouts'    = 'Relative layout schema and pure model (v0.3 Phase 1)'
     'relative-layout-display' = 'Relative layout display rendering (v0.3 Phase 2/3)'
+    'relative-save'       = 'Relative layout capture and save (v0.3 Phase 4)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
     'test-harness'        = 'Test harness'
@@ -37862,6 +37863,861 @@ Start-Sleep -Seconds 6
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'relative-save' -Title 'Relative layout capture and save (v0.3 Phase 4)'
+
+    function New-P4Rect {
+        param([int]$X = 0, [int]$Y = 0, [int]$W = 800, [int]$H = 600)
+        return [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+    }
+
+    function New-P4Monitor {
+        param(
+            [Parameter(Mandatory)][AllowEmptyString()][string]$Identity,
+            [string]$Instance = "",
+            [int]$X = 0,
+            [int]$Y = 0,
+            [int]$W = 1920,
+            [int]$H = 1080,
+            [int]$WorkX = 0,
+            [int]$WorkY = 0,
+            [int]$WorkW = 1920,
+            [int]$WorkH = 1040
+        )
+
+        return [pscustomobject][ordered]@{
+            IdentityToken      = $Identity
+            DevicePathInstance = if ([string]::IsNullOrWhiteSpace($Instance)) { $null } else { $Instance }
+            MonitorRect        = New-P4Rect -X $X -Y $Y -W $W -H $H
+            WorkRect           = New-P4Rect -X $WorkX -Y $WorkY -W $WorkW -H $WorkH
+        }
+    }
+
+    function New-P4Topology {
+        param(
+            [Parameter(Mandatory)][AllowEmptyString()][string]$Signature,
+            [object[]]$Monitors = @(),
+            [bool]$Available = $true,
+            [bool]$IdentityComplete = $true,
+            [bool]$CorrelationComplete = $true,
+            [bool]$Ambiguous = $false
+        )
+
+        return [pscustomobject][ordered]@{
+            Available           = $Available
+            Signature           = $Signature
+            Fingerprint         = if ($Available) { "P4-FP" } else { $null }
+            IdentityComplete    = $IdentityComplete
+            CorrelationComplete = $CorrelationComplete
+            IdentityAmbiguous   = $Ambiguous
+            Monitors            = @($Monitors)
+        }
+    }
+
+    function New-P4Relative {
+        param(
+            [Parameter(Mandatory)][string]$Identity,
+            [string]$Instance = "",
+            [string]$Basis = "workArea",
+            [double]$X = 0,
+            [double]$Y = 0,
+            [double]$W = 1,
+            [double]$H = 1
+        )
+
+        $monitorFields = [ordered]@{ identity = $Identity }
+
+        if (-not [string]::IsNullOrWhiteSpace($Instance)) {
+            $monitorFields["instance"] = $Instance
+        }
+
+        return [pscustomobject][ordered]@{
+            monitor = [pscustomobject]$monitorFields
+            basis   = $Basis
+            rect    = [pscustomobject][ordered]@{ x = $X; y = $Y; w = $W; h = $H }
+        }
+    }
+
+    function New-P4Terminal {
+        param(
+            [Parameter(Mandatory)][string]$Id,
+            [string]$Mode = "absolute",
+            $Relative = $null,
+            $Layout = $null,
+            [bool]$Enabled = $true
+        )
+
+        if ($null -eq $Layout) { $Layout = New-P4Rect }
+
+        $item = [pscustomobject][ordered]@{
+            id        = $Id
+            type      = "terminal"
+            enabled   = $Enabled
+            windowId  = "P4-$Id"
+            path      = 'C:\p4'
+            elevated  = $true
+            tabs      = @([pscustomobject][ordered]@{ command = $null; args = @() })
+            activeTab = 0
+            layout    = $Layout
+        }
+
+        if ($Mode -eq "relative") {
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutMode" -Value "relative"
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutRelative" -Value $Relative
+        }
+
+        return $item
+    }
+
+    function New-P4App {
+        param(
+            [Parameter(Mandatory)][string]$Id,
+            [string]$Mode = "absolute",
+            $Relative = $null,
+            $Layout = $null,
+            [bool]$Enabled = $true
+        )
+
+        if ($null -eq $Layout) { $Layout = New-P4Rect }
+
+        $item = [pscustomobject][ordered]@{
+            id           = $Id
+            type         = "app"
+            enabled      = $Enabled
+            match        = [pscustomobject][ordered]@{ kind = "exe"; value = "$Id.exe" }
+            launch       = [pscustomobject][ordered]@{ kind = "exe"; value = "C:\$Id.exe"; args = @() }
+            instanceMode = "dedicated"
+            layout       = $Layout
+        }
+
+        if ($Mode -eq "relative") {
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutMode" -Value "relative"
+            Add-Member -InputObject $item -MemberType NoteProperty -Name "layoutRelative" -Value $Relative
+        }
+
+        return $item
+    }
+
+    function New-P4Set {
+        param([object[]]$Items = @(), [object[]]$Profiles = @())
+
+        $set = [pscustomobject][ordered]@{ id = "main" }
+
+        if (@($Profiles).Count -gt 0) {
+            $set | Add-Member -NotePropertyName "layoutProfiles" -NotePropertyValue @($Profiles)
+        }
+
+        $set | Add-Member -NotePropertyName "windows" -NotePropertyValue @($Items)
+        return $set
+    }
+
+    function New-P4Config {
+        param($Set)
+
+        return [pscustomobject][ordered]@{
+            version    = 3
+            defaultSet = "main"
+            bindings   = @()
+            sets       = @($Set)
+        }
+    }
+
+    function Write-P4Config {
+        param([string]$Name, $Config)
+
+        $dir = Join-Path $TestRoot ("relative-save\$Name")
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $path = Join-Path $dir "workspace.json"
+        Save-DevWSConfig -Config $Config -Location (New-DevWSWritableConfigLocation -Path $path)
+        return $path
+    }
+
+    function Invoke-P4Fixture {
+        param(
+            [Parameter(Mandatory)][string]$ConfigPath,
+            [Parameter(Mandatory)][scriptblock]$Body
+        )
+
+        $saved = $env:DEVWS_CONFIG
+        $env:DEVWS_CONFIG = $ConfigPath
+
+        try {
+            & $Body
+        }
+        finally {
+            if ($null -ne $saved) { $env:DEVWS_CONFIG = $saved } else { Remove-Item Env:\DEVWS_CONFIG -ErrorAction SilentlyContinue }
+        }
+    }
+
+    function New-P4Capture {
+        param(
+            $Context,
+            [string]$SetId,
+            [hashtable]$Geometry = @{},
+            [object[]]$CaptureFiles = @()
+        )
+
+        $target = Resolve-DevWSLifecycleTarget -Config $Context.Config -SetId $SetId
+        $terminals = @($target.Set.windows | Where-Object { $_.type -eq 'terminal' -and $_.enabled })
+        $apps = @($target.Set.windows | Where-Object { $_.type -eq 'app' -and $_.enabled })
+        $terminalGeometry = @{}
+        $appGeometry = @{}
+
+        foreach ($terminal in $terminals) {
+            if ($Geometry.ContainsKey([string]$terminal.id)) {
+                $terminalGeometry[[string]$terminal.id] = $Geometry[[string]$terminal.id]
+            }
+        }
+
+        foreach ($app in $apps) {
+            if ($Geometry.ContainsKey([string]$app.id)) {
+                $appGeometry[[string]$app.id] = $Geometry[[string]$app.id]
+            }
+        }
+
+        return [pscustomobject]@{
+            Context              = $Context
+            Target               = $target
+            Terminals            = $terminals
+            Apps                 = $apps
+            AppGeometry          = $appGeometry
+            TerminalGeometry     = $terminalGeometry
+            TerminalTabSnapshots = $null
+            CaptureFiles         = @($CaptureFiles)
+        }
+    }
+
+    function Get-P4Item {
+        param($Config, [string]$Id)
+
+        return @($Config.sets[0].windows | Where-Object { [string]$_.id -eq $Id })[0]
+    }
+
+    Test-Case "relative save keeps the absolute-only profile-free fast path" {
+        $set = New-P4Set -Items @((New-P4Terminal -Id "abs" -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)))
+        $configPath = Write-P4Config -Name "absolute-fast" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0; Config = $null }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ abs = (New-P4Rect -X 11 -Y 12 -W 13 -H 14) }
+            }
+
+            function Get-DevWSMonitorTopology {
+                $state.TopologyCalls++
+                throw "topology must not be sampled for an absolute-only profile-free save"
+            }
+
+            function Save-DevWSConfig {
+                param($Config, $Location)
+                $state.Saves++
+                $state.Config = $Config
+            }
+
+            Save-DevWSLayout -SetId "main" -Layout fallback | Out-Null
+
+            Assert-Equal 0 $state.TopologyCalls "absolute-only explicit fallback keeps zero topology calls"
+            Assert-Equal 1 $state.Saves "one canonical save"
+            $item = Get-P4Item -Config $state.Config -Id "abs"
+            Assert-Equal 11 ([int]$item.layout.x) "fallback x updated"
+            Assert-True (-not (Test-DevWSProperty -Object $item -Name "layoutMode")) "absolute item remains absolute"
+        }
+    }
+
+    Test-Case "relative fallback save re-anchors and dual-writes" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "relative-fallback" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0; Config = $null }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040) }
+            }
+
+            function Get-DevWSMonitorTopology {
+                $state.TopologyCalls++
+                return $topology
+            }
+
+            function Save-DevWSConfig {
+                param($Config, $Location)
+                $state.Saves++
+                $state.Config = $Config
+            }
+
+            Save-DevWSLayout -SetId "main" | Out-Null
+
+            Assert-Equal 2 $state.TopologyCalls "topology A and B sampled exactly once"
+            Assert-Equal 1 $state.Saves "one canonical save"
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal 960 ([int]$saved.layout.x) "absolute fallback dual-write x"
+            Assert-Equal 1040 ([int]$saved.layout.h) "absolute fallback dual-write h"
+            Assert-Equal "relative" ([string]$saved.layoutMode) "layoutMode remains relative"
+            Assert-Equal "edid:MON-A" ([string]$saved.layoutRelative.monitor.identity) "durable anchor retained"
+            Assert-Equal "DELA/1" ([string]$saved.layoutRelative.monitor.instance) "instance retained"
+            Assert-Equal "workArea" ([string]$saved.layoutRelative.basis) "basis preserved"
+            Assert-Equal 0.5 ([double]$saved.layoutRelative.rect.x) "normalized x"
+            Assert-Equal 0.5 ([double]$saved.layoutRelative.rect.w) "normalized width"
+            Assert-Equal 1 ([double]$saved.layoutRelative.rect.h) "normalized height"
+        }
+    }
+
+    Test-Case "profile-targeted relative save leaves universal geometry byte-identical" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:MON-A@0,0,1920x1080")
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "rel" -Rect (New-P4Rect -X 5 -Y 6 -W 7 -H 8)
+        $set = New-P4Set -Items @($item) -Profiles @($profile)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "profile-relative" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0; Config = $null }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 100 -Y 100 -W 400 -H 300) }
+            }
+
+            function Get-DevWSMonitorTopology {
+                $state.TopologyCalls++
+                return $topology
+            }
+
+            function Save-DevWSConfig {
+                param($Config, $Location)
+                $state.Saves++
+                $state.Config = $Config
+            }
+
+            $beforeLayout = $item.layout | ConvertTo-Json -Depth 10 -Compress
+            $beforeRelative = $item.layoutRelative | ConvertTo-Json -Depth 10 -Compress
+
+            Save-DevWSLayout -SetId "main" -ProfileId docked | Out-Null
+
+            Assert-Equal 2 $state.TopologyCalls "profile save still samples A and B once"
+            Assert-Equal 1 $state.Saves "one canonical save"
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal $beforeLayout ($saved.layout | ConvertTo-Json -Depth 10 -Compress) "item.layout byte-identical"
+            Assert-Equal $beforeRelative ($saved.layoutRelative | ConvertTo-Json -Depth 10 -Compress) "layoutRelative byte-identical"
+            Assert-Equal "relative" ([string]$saved.layoutMode) "relative mode untouched"
+            Assert-Equal 100 ([int](Get-DevWSLayoutProfileEntry -Profile @($state.Config.sets[0].layoutProfiles)[0] -ItemId "rel").x) "profile entry uses captured geometry"
+        }
+    }
+
+    Test-Case "explicit fallback overrides a matched profile without touching it" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:MON-A@0,0,1920x1080")
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "rel" -Rect (New-P4Rect -X 50 -Y 60 -W 70 -H 80)
+        $set = New-P4Set -Items @($item) -Profiles @($profile)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "explicit-fallback" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0; Config = $null }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040) }
+            }
+
+            function Get-DevWSMonitorTopology {
+                $state.TopologyCalls++
+                return $topology
+            }
+
+            function Save-DevWSConfig {
+                param($Config, $Location)
+                $state.Saves++
+                $state.Config = $Config
+            }
+
+            Save-DevWSLayout -SetId "main" -Layout fallback | Out-Null
+
+            Assert-Equal 2 $state.TopologyCalls "profile-enabled fallback still validates A and B"
+            Assert-Equal 1 $state.Saves "one canonical save"
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal 960 ([int]$saved.layout.x) "fallback geometry updated"
+            Assert-Equal 50 ([int](Get-DevWSLayoutProfileEntry -Profile @($state.Config.sets[0].layoutProfiles)[0] -ItemId "rel").x) "profile entry untouched"
+        }
+    }
+
+    Test-Case "mixed absolute and relative fallback save updates both scopes" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $abs = New-P4Terminal -Id "abs" -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $rel = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 5 -Y 6 -W 7 -H 8)
+        $set = New-P4Set -Items @($abs, $rel)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "mixed" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0; Config = $null }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{
+                    abs = (New-P4Rect -X 10 -Y 20 -W 30 -H 40)
+                    rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040)
+                }
+            }
+
+            function Get-DevWSMonitorTopology {
+                $state.TopologyCalls++
+                return $topology
+            }
+
+            function Save-DevWSConfig {
+                param($Config, $Location)
+                $state.Saves++
+                $state.Config = $Config
+            }
+
+            Save-DevWSLayout -SetId "main" | Out-Null
+
+            Assert-Equal 2 $state.TopologyCalls "mixed relative set uses A and B"
+            Assert-Equal 1 $state.Saves "one canonical save"
+            $savedAbs = Get-P4Item -Config $state.Config -Id "abs"
+            $savedRel = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal 10 ([int]$savedAbs.layout.x) "absolute item updated"
+            Assert-Equal 960 ([int]$savedRel.layout.w) "relative absolute fallback updated"
+            Assert-Equal 0.5 ([double]$savedRel.layoutRelative.rect.x) "relative fractions updated"
+        }
+    }
+
+    Test-Case "relative save selects the greatest visible monitor across a span" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $a = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -W 1000 -H 1000 -WorkW 1000 -WorkH 1000
+        $b = New-P4Monitor -Identity "edid:MON-B" -Instance "DELB/1" -X 1000 -W 1000 -H 1000 -WorkX 1000 -WorkW 1000 -WorkH 1000
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1000x1000;edid:MON-B@1000,0,1000x1000" -Monitors @($a, $b)
+        $configPath = Write-P4Config -Name "spanning" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Config = $null }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 800 -Y 0 -W 600 -H 1000) }
+            }
+
+            function Get-DevWSMonitorTopology { return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++; $state.Config = $Config }
+
+            Save-DevWSLayout -SetId "main" | Out-Null
+
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal "edid:MON-B" ([string]$saved.layoutRelative.monitor.identity) "greatest visible monitor wins"
+            Assert-Equal -0.2 ([double]$saved.layoutRelative.rect.x) "negative fraction retained"
+            Assert-Equal 0.6 ([double]$saved.layoutRelative.rect.w) "spanning width retained"
+            Assert-Equal 1 $state.Saves "one canonical save"
+        }
+    }
+
+    Test-Case "relative save retains negative monitor origins and work areas" {
+        $relative = New-P4Relative -Identity "path:AAA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $monitor = New-P4Monitor -Identity "path:AAA/1" -X -1920 -Y -100 -W 1920 -H 1080 -WorkX -1920 -WorkY 0 -WorkW 1920 -WorkH 1040
+        $topology = New-P4Topology -Signature "path:AAA/1@-1920,-100,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "negative-origin" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Config = $null }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X -1920 -Y 0 -W 960 -H 1040) }
+            }
+
+            function Get-DevWSMonitorTopology { return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++; $state.Config = $Config }
+
+            Save-DevWSLayout -SetId "main" | Out-Null
+
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal -1920 ([int]$saved.layout.x) "negative absolute origin retained"
+            Assert-Equal 0 ([double]$saved.layoutRelative.rect.x) "normalized origin"
+            Assert-Equal 0.5 ([double]$saved.layoutRelative.rect.w) "normalized width"
+            Assert-Equal "path:AAA/1" ([string]$saved.layoutRelative.monitor.identity) "path anchor retained"
+            Assert-True (-not (Test-DevWSProperty -Object $saved.layoutRelative.monitor -Name "instance")) "path identity omits instance"
+        }
+    }
+
+    Test-Case "relative save refuses an equal visible-area tie" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $a = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -W 1000 -H 1000 -WorkW 1000 -WorkH 1000
+        $b = New-P4Monitor -Identity "edid:MON-B" -Instance "DELB/1" -X 1000 -W 1000 -H 1000 -WorkX 1000 -WorkW 1000 -WorkH 1000
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1000x1000;edid:MON-B@1000,0,1000x1000" -Monitors @($a, $b)
+        $configPath = Write-P4Config -Name "equal-tie" -Config (New-P4Config -Set $set)
+        $captureFile = Join-Path $TestRoot "relative-save\tie-capture.txt"
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            New-Item -ItemType Directory -Path (Split-Path $captureFile -Parent) -Force | Out-Null
+            Set-Content -LiteralPath $captureFile -Value "capture" -NoNewline
+            $state = @{ Saves = 0; TopologyCalls = 0 }
+
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 750 -Y 0 -W 500 -H 1000) } -CaptureFiles @($captureFile)
+            }
+
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "relative layout cannot be captured safely" "tie refusal is explicit"
+            Assert-Equal 1 $state.TopologyCalls "tie fails before topology B"
+            Assert-Equal 0 $state.Saves "tie writes nothing"
+            Assert-True (-not (Test-Path -LiteralPath $captureFile)) "capture temp file cleaned"
+        }
+    }
+
+    Test-Case "implicit matched profile save leaves relative universal geometry untouched" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:MON-A@0,0,1920x1080")
+        Set-DevWSLayoutProfileRect -Profile $profile -ItemId "rel" -Rect (New-P4Rect -X 5 -Y 6 -W 7 -H 8)
+        $set = New-P4Set -Items @($item) -Profiles @($profile)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "implicit-profile-relative" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Config = $null }
+            function Get-DevWSLiveLayoutCapture {
+                param([string]$SetId, $Context)
+                if ($null -eq $Context) { $Context = Get-DevWSContext }
+                New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 100 -Y 100 -W 400 -H 300) }
+            }
+            function Get-DevWSMonitorTopology { return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++; $state.Config = $Config }
+
+            $beforeLayout = $item.layout | ConvertTo-Json -Depth 10 -Compress
+            $beforeRelative = $item.layoutRelative | ConvertTo-Json -Depth 10 -Compress
+
+            $output = (& { Save-DevWSLayout -SetId "main" } *>&1 | Out-String)
+
+            Assert-Contains $output "Storage: profile 'docked'" "implicitly matched profile is the save target"
+            Assert-Equal 1 $state.Saves "one canonical save"
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal $beforeLayout ($saved.layout | ConvertTo-Json -Depth 10 -Compress) "implicit profile leaves item.layout byte-identical"
+            Assert-Equal $beforeRelative ($saved.layoutRelative | ConvertTo-Json -Depth 10 -Compress) "implicit profile leaves layoutRelative byte-identical"
+            Assert-Equal 100 ([int](Get-DevWSLayoutProfileEntry -Profile @($state.Config.sets[0].layoutProfiles)[0] -ItemId "rel").x) "profile entry updated from capture"
+        }
+    }
+
+    Test-Case "relative save refuses a monitor rectangle change across identical signatures" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative
+        $set = New-P4Set -Items @($item)
+        $a = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -W 1920 -H 1080 -WorkW 1920 -WorkH 1040
+        $b = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -W 2560 -H 1080 -WorkW 2560 -WorkH 1040
+        $configPath = Write-P4Config -Name "monitor-rect-change" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0 }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040) } }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; if ($state.TopologyCalls -eq 1) { New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($a) } else { New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($b) } }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "monitor/work-area topology changed" "monitor rectangle change refused despite stable signature"
+            Assert-Equal 2 $state.TopologyCalls "A and B sampled once"
+            Assert-Equal 0 $state.Saves "no canonical save"
+        }
+    }
+
+    Test-Case "relative save retains a resolvable existing anchor for a wholly off-screen capture" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "offscreen-anchor" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Config = $null }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 5000 -Y 0 -W 100 -H 100) } }
+            function Get-DevWSMonitorTopology { return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++; $state.Config = $Config }
+
+            Save-DevWSLayout -SetId "main" | Out-Null
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal 1 $state.Saves "off-screen save has one canonical write"
+            Assert-Equal "edid:MON-A" ([string]$saved.layoutRelative.monitor.identity) "resolvable existing anchor retained"
+            Assert-True ([double]$saved.layoutRelative.rect.x -gt 1) "off-screen fraction is not clamped"
+            Assert-Equal 5000 ([int]$saved.layout.x) "off-screen absolute capture retained"
+        }
+    }
+
+    Test-Case "relative save refuses a wholly off-screen capture without a resolvable anchor" {
+        $relative = New-P4Relative -Identity "edid:MISSING" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "offscreen-no-anchor" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0 }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 5000 -Y 0 -W 100 -H 100) } }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "relative layout cannot be captured safely" "missing anchor refusal"
+            Assert-Equal 1 $state.TopologyCalls "missing anchor fails before topology B"
+            Assert-Equal 0 $state.Saves "no canonical save"
+        }
+    }
+
+    Test-Case "relative save uses a uniquely visible replacement for a missing old anchor" {
+        $relative = New-P4Relative -Identity "edid:OLD" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "missing-old-anchor" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Config = $null }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040) } }
+            function Get-DevWSMonitorTopology { return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++; $state.Config = $Config }
+
+            Save-DevWSLayout -SetId "main" | Out-Null
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal "edid:MON-A" ([string]$saved.layoutRelative.monitor.identity) "visible replacement anchor selected"
+            Assert-Equal 0.5 ([double]$saved.layoutRelative.rect.x) "replacement normalized x"
+        }
+    }
+
+    Test-Case "relative save disambiguates duplicate identities by device-path instance" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELB/2" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $set = New-P4Set -Items @($item)
+        $a = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -W 1000 -H 1000 -WorkW 1000 -WorkH 1000
+        $b = New-P4Monitor -Identity "edid:MON-A" -Instance "DELB/2" -X 1000 -W 1000 -H 1000 -WorkX 1000 -WorkW 1000 -WorkH 1000
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1000x1000;edid:MON-A@1000,0,1000x1000" -Monitors @($a, $b)
+        $configPath = Write-P4Config -Name "duplicate-instance" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Config = $null }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 1000 -Y 0 -W 500 -H 1000) } }
+            function Get-DevWSMonitorTopology { return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++; $state.Config = $Config }
+
+            Save-DevWSLayout -SetId "main" | Out-Null
+            $saved = Get-P4Item -Config $state.Config -Id "rel"
+            Assert-Equal "DELB/2" ([string]$saved.layoutRelative.monitor.instance) "instance disambiguation retained"
+            Assert-Equal "edid:MON-A" ([string]$saved.layoutRelative.monitor.identity) "duplicate identity retained"
+        }
+    }
+
+    Test-Case "relative save refuses unavailable topology before capture" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative
+        $set = New-P4Set -Items @($item)
+        $configPath = Write-P4Config -Name "unavailable" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Captures = 0; TopologyCalls = 0; Config = $null }
+            function Get-DevWSLiveLayoutCapture { $state.Captures++; throw "capture must not run when topology is unavailable" }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; return New-P4Topology -Signature "" -Monitors @() -Available $false }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "not usable for relative capture" "unavailable topology refusal"
+            Assert-Equal 1 $state.TopologyCalls "one topology A sample"
+            Assert-Equal 0 $state.Captures "capture skipped"
+            Assert-Equal 0 $state.Saves "no canonical save"
+        }
+    }
+
+    Test-Case "relative save refuses work-area-only topology change" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative
+        $set = New-P4Set -Items @($item)
+        $a = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -WorkH 1040
+        $b = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -WorkH 1000
+        $configPath = Write-P4Config -Name "workarea-change" -Config (New-P4Config -Set $set)
+        $captureFile = Join-Path $TestRoot "relative-save\workarea-capture.txt"
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            New-Item -ItemType Directory -Path (Split-Path $captureFile -Parent) -Force | Out-Null
+            Set-Content -LiteralPath $captureFile -Value "capture" -NoNewline
+            $state = @{ Saves = 0; TopologyCalls = 0 }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040) } -CaptureFiles @($captureFile) }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; if ($state.TopologyCalls -eq 1) { New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($a) } else { New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($b) } }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "monitor/work-area topology changed" "work-area change refusal"
+            Assert-Equal 2 $state.TopologyCalls "A and B sampled once"
+            Assert-Equal 0 $state.Saves "no canonical save"
+            Assert-True (-not (Test-Path -LiteralPath $captureFile)) "capture file cleaned"
+        }
+    }
+
+    Test-Case "relative save refuses monitor identity/rectangle change" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative
+        $set = New-P4Set -Items @($item)
+        $a = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $b = New-P4Monitor -Identity "edid:MON-B" -Instance "DELB/1"
+        $configPath = Write-P4Config -Name "identity-change" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0 }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040) } }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; if ($state.TopologyCalls -eq 1) { New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($a) } else { New-P4Topology -Signature "edid:MON-B@0,0,1920x1080" -Monitors @($b) } }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "monitor/work-area topology changed" "identity change refusal"
+            Assert-Equal 2 $state.TopologyCalls "A and B sampled once"
+            Assert-Equal 0 $state.Saves "no canonical save"
+        }
+    }
+
+    Test-Case "relative target cannot bypass profile safety refusal" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative
+        $profile = New-DevWSLayoutProfile -Id "docked" -MonitorTokens @("edid:MON-A@0,0,1920x1080")
+        $set = New-P4Set -Items @($item) -Profiles @($profile)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor) -IdentityComplete $false
+        $configPath = Write-P4Config -Name "profile-safety-relative" -Config (New-P4Config -Set $set)
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; Captures = 0; TopologyCalls = 0 }
+            function Get-DevWSLiveLayoutCapture { $state.Captures++; throw "capture must not run" }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "cannot be determined safely" "profile refusal retained"
+            Assert-Equal 0 $state.Captures "capture skipped"
+            Assert-Equal 0 $state.Saves "no canonical save"
+        }
+    }
+
+    Test-Case "capture failure on the last item prevents every geometry mutation" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $abs = New-P4Terminal -Id "abs" -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)
+        $rel = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative -Layout (New-P4Rect -X 5 -Y 6 -W 7 -H 8)
+        $set = New-P4Set -Items @($abs, $rel)
+        $monitor = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1"
+        $topology = New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($monitor)
+        $configPath = Write-P4Config -Name "last-capture-failure" -Config (New-P4Config -Set $set)
+        $before = Get-FileBase64 -Path $configPath
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0 }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ abs = (New-P4Rect -X 10 -Y 20 -W 30 -H 40) } }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; return $topology }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSLayout -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "captured geometry is missing" "last-item capture failure refused"
+            Assert-Equal 1 $state.TopologyCalls "only topology A sampled"
+            Assert-Equal 0 $state.Saves "no canonical save"
+        }
+
+        Assert-Equal $before (Get-FileBase64 -Path $configPath) "canonical bytes unchanged"
+    }
+
+    Test-Case "ws save relative topology failure aborts before cwd or activeTab state" {
+        $relative = New-P4Relative -Identity "edid:MON-A" -Instance "DELA/1" -Basis "workArea"
+        $item = New-P4Terminal -Id "rel" -Mode "relative" -Relative $relative
+        $set = New-P4Set -Items @($item)
+        $a = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -WorkH 1040
+        $b = New-P4Monitor -Identity "edid:MON-A" -Instance "DELA/1" -WorkH 1000
+        $configPath = Write-P4Config -Name "workspace-relative-abort" -Config (New-P4Config -Set $set)
+        $before = Get-FileBase64 -Path $configPath
+
+        Invoke-P4Fixture -ConfigPath $configPath -Body {
+            $state = @{ Saves = 0; TopologyCalls = 0; CwdDecisions = 0; CwdGate = 0; CwdApply = 0; Startup = 0; ActiveTab = 0 }
+            function Get-DevWSLiveLayoutCapture { param([string]$SetId, $Context); if ($null -eq $Context) { $Context = Get-DevWSContext }; New-P4Capture -Context $Context -SetId $SetId -Geometry @{ rel = (New-P4Rect -X 960 -Y 0 -W 960 -H 1040) } }
+            function Get-DevWSTerminalSaveDecisions { param([string]$SetId, [object[]]$Terminals = @()); $state.CwdDecisions++; $decisions = [ordered]@{}; foreach ($terminal in $Terminals) { $decisions[[string]$terminal.id] = @([pscustomobject]@{ terminalId = $terminal.id; tabIndex = 0; hadOverride = $false; oldExplicitPath = $null; oldEffective = 'C:\p4'; status = 'unavailable'; reason = 'test'; newCwd = $null; sessionId = $null; windowId = $null }) }; return $decisions }
+            function Confirm-DevWSTerminalSaveDecisions { param([string]$SetId, $Decisions); $state.CwdGate++ }
+            function Invoke-DevWSTerminalSaveState { param($Terminal, $TabDecisions); $state.CwdApply++ }
+            function Invoke-DevWSTabStartupRetirement { param($Tab); $state.Startup++ }
+            function Get-DevWSTerminalActiveTabSaveDecision { param($Terminal, $SnapshotMap); $state.ActiveTab++; [pscustomobject]@{ Update = $false; Index = 0; Reason = 'test' } }
+            function Get-DevWSMonitorTopology { $state.TopologyCalls++; if ($state.TopologyCalls -eq 1) { New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($a) } else { New-P4Topology -Signature "edid:MON-A@0,0,1920x1080" -Monitors @($b) } }
+            function Save-DevWSConfig { param($Config, $Location) $state.Saves++ }
+
+            $thrown = Get-ThrownMessage { Save-DevWSWorkspace -SetId "main" | Out-Null }
+            Assert-Contains ([string]$thrown) "monitor/work-area topology changed" "relative ws save abort"
+            Assert-Equal 1 $state.CwdDecisions "cwd decisions read once before commit gate"
+            Assert-Equal 0 $state.CwdGate "generation/cwd gate not applied"
+            Assert-Equal 0 $state.CwdApply "terminal path state not applied"
+            Assert-Equal 0 $state.Startup "startup intent not retired"
+            Assert-Equal 0 $state.ActiveTab "activeTab not applied"
+            Assert-Equal 0 $state.Saves "canonical config not written"
+        }
+
+        Assert-Equal $before (Get-FileBase64 -Path $configPath) "canonical bytes unchanged"
+    }
+
+    Test-Case "save argument parser accepts fallback scope and rejects invalid combinations" {
+        $parsed = ConvertFrom-DevWSSaveArguments -Tokens @("secondary", "--layout", "fallback") -CommandName "save-layout" -Usage "ws save-layout [set] [--profile <id>] [--layout fallback]"
+        Assert-Equal "secondary" ([string]$parsed.SetId) "positional set parsed"
+        Assert-Equal $null $parsed.ProfileId "no profile selector"
+        Assert-Equal "fallback" ([string]$parsed.Layout) "fallback scope parsed"
+
+        $profileParsed = ConvertFrom-DevWSSaveArguments -Tokens @("--profile", "docked") -CommandName "save" -Usage "ws save [set] [--profile <id>] [--layout fallback]"
+        Assert-Equal "docked" ([string]$profileParsed.ProfileId) "profile selector parsed"
+        Assert-Equal $null $profileParsed.Layout "layout remains null"
+
+        foreach ($tokens in @(
+            @("--layout", "bogus"),
+            @("--layout"),
+            @("--layout", "fallback", "--layout", "fallback"),
+            @("--profile", "docked", "--layout", "fallback"),
+            @("--profile", "docked", "--profile", "other")
+        )) {
+            $thrown = Get-ThrownMessage {
+                ConvertFrom-DevWSSaveArguments -Tokens $tokens -CommandName "save-layout" -Usage "ws save-layout [set] [--profile <id>] [--layout fallback]" | Out-Null
+            }
+            Assert-True (-not [string]::IsNullOrWhiteSpace([string]$thrown)) ("invalid save arguments refused: " + ($tokens -join " "))
+        }
+    }
+
+    Test-Case "ws save-layout CLI rejects invalid layout before capture" {
+        $set = New-P4Set -Items @((New-P4Terminal -Id "abs" -Layout (New-P4Rect -X 1 -Y 2 -W 3 -H 4)))
+        $configPath = Write-P4Config -Name "cli-invalid-layout" -Config (New-P4Config -Set $set)
+        $before = Get-FileBase64 -Path $configPath
+
+        $result = Invoke-WsCli -ConfigPath $configPath -Arguments @("save-layout", "--layout", "bogus")
+        Assert-True ($result.ExitCode -ne 0) "invalid layout exits nonzero"
+        Assert-Contains ([string]$result.Output) "only 'fallback'" "invalid layout message"
+        Assert-Equal $before (Get-FileBase64 -Path $configPath) "invalid argument leaves config unchanged"
+    }
+
+    Write-Host ""
     Start-TestGroup -Name 'trace-temp-hardening' -Title 'Public Security Phase 2-E trace and temporary-file hardening'
 
     function New-P2EInstalledProbe {
@@ -39031,8 +39887,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 66 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 66 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 67 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 67 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

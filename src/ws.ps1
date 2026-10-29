@@ -878,17 +878,123 @@ function Get-DevWSLayoutSaveScopeText {
     return "fallback layout"
 }
 
+function Test-DevWSLayoutSetHasEnabledRelativeItems {
+    # Whether any enabled target item is explicitly relative. Used only by the
+    # save planner to decide whether a profile-free fallback write needs the
+    # relative topology gate.
+    param($Set)
+
+    foreach ($item in @($Set.windows)) {
+        if ($null -eq $item -or $item -isnot [System.Management.Automation.PSCustomObject]) { continue }
+        if (-not [bool](Get-DevWSProperty -Object $item -Name "enabled")) { continue }
+
+        if ([string](Get-DevWSProperty -Object $item -Name "layoutMode") -ceq "relative") {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-DevWSLayoutRelativeTopologyRefusal {
+    param($KeyResult, [string]$SetId)
+
+    return "Set '$SetId' has a relative item that must be re-anchored, but the current monitor topology is not usable for relative capture ($($KeyResult.Reason): $($KeyResult.Message)); nothing was saved."
+}
+
+function Get-DevWSLayoutSaveEntries {
+    # Compute every geometry mutation before applying any of them. Relative
+    # fallback items are re-anchored from the captured rectangle here; a
+    # failure for one item therefore prevents every geometry, cwd, activeTab,
+    # startup-intent and canonical write mutation.
+    param($Plan, $Capture)
+
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $items = @(@($Capture.Apps) + @($Capture.Terminals))
+
+    foreach ($item in $items) {
+        if ($null -eq $item) { continue }
+
+        $rect = if ([string]$item.type -ieq "app") {
+            $Capture.AppGeometry[[string]$item.id]
+        }
+        else {
+            $Capture.TerminalGeometry[[string]$item.id]
+        }
+
+        if ($null -eq $rect) {
+            return [pscustomobject]@{
+                Ok      = $false
+                Refusal = "Set '$($Plan.Set.id)/$([string]$item.id)': the captured geometry is missing; nothing was saved."
+                Entries = @()
+            }
+        }
+
+        $relativeLayout = $null
+
+        if ($Plan.Source -eq "fallback" -and
+            [string](Get-DevWSProperty -Object $item -Name "layoutMode") -ceq "relative") {
+            $relativeUpdate = Get-DevWSRelativeLayoutFromCapture `
+                -Rect $rect `
+                -Topology $Plan.TopologyA `
+                -ExistingRelativeLayout (Get-DevWSProperty -Object $item -Name "layoutRelative")
+
+            if (-not [bool]$relativeUpdate.Ok) {
+                return [pscustomobject]@{
+                    Ok      = $false
+                    Refusal = "Set '$($Plan.Set.id)/$([string]$item.id)': relative layout cannot be captured safely ($($relativeUpdate.Status): $($relativeUpdate.Reason)); nothing was saved."
+                    Entries = @()
+                }
+            }
+
+            $relativeLayout = $relativeUpdate.RelativeLayout
+        }
+
+        $entries.Add([pscustomobject]@{
+            Item           = $item
+            Rect           = $rect
+            RelativeLayout = $relativeLayout
+        }) | Out-Null
+    }
+
+    return [pscustomobject]@{
+        Ok      = $true
+        Refusal = $null
+        Entries = @($entries.ToArray())
+    }
+}
+
 function Set-DevWSLayoutSaveEntry {
     # Writes one captured rectangle into the resolved storage scope (in
-    # memory only; the caller owns the single canonical save).
-    param($Plan, $Item, $Rect)
+    # memory only; the caller owns the single canonical save). Profile scope
+    # never touches universal relative/fallback geometry. Fallback scope
+    # dual-writes a relative item only after Get-DevWSLayoutSaveEntries has
+    # selected a durable anchor for its captured rectangle.
+    param($Plan, $Item, $Rect, $RelativeLayout = $null)
 
     if ($Plan.Source -eq "profile") {
         Set-DevWSLayoutProfileRect -Profile $Plan.Profile -ItemId ([string]$Item.id) -Rect $Rect
+        return
     }
-    else {
-        Set-DevWSLayout -Item $Item -Rect $Rect
+
+    if ([string](Get-DevWSProperty -Object $Item -Name "layoutMode") -ceq "relative") {
+        if ($null -eq $RelativeLayout) {
+            $relativeUpdate = Get-DevWSRelativeLayoutFromCapture `
+                -Rect $Rect `
+                -Topology $Plan.TopologyA `
+                -ExistingRelativeLayout (Get-DevWSProperty -Object $Item -Name "layoutRelative")
+
+            if (-not [bool]$relativeUpdate.Ok) {
+                throw "Relative layout cannot be captured safely ($($relativeUpdate.Status): $($relativeUpdate.Reason)); nothing was saved."
+            }
+
+            $RelativeLayout = $relativeUpdate.RelativeLayout
+        }
+
+        $Item.layoutRelative = $RelativeLayout
     }
+
+    Set-DevWSLayout -Item $Item -Rect $Rect
 }
 
 function Get-DevWSLayoutSaveEffectiveRect {
@@ -904,15 +1010,129 @@ function Get-DevWSLayoutSaveEffectiveRect {
 }
 
 function Get-DevWSLayoutSavePlan {
-    # Pass 5C write-scope resolution for `ws save` / `ws save-layout`.
+    # Save write-scope + topology preflight for `ws save` / `ws save-layout`.
+    #
     # Topology A is sampled exactly once, and only when required:
     #   - an explicit --profile target (create-or-update),
-    #   - or the set has profiles and needs implicit routing.
-    # A profile-free implicit fallback write keeps the legacy path with no
-    # monitor dependency at all.
-    param($Context, $Target, [string]$ProfileId)
+    #   - an explicit --layout fallback on a profile-enabled set,
+    #   - a profile-enabled set needing implicit routing,
+    #   - or a profile-free set with an enabled relative target.
+    #
+    # A profile-free fallback write whose enabled targets are all absolute
+    # keeps the legacy zero-topology path. Fallback-scope relative writes add
+    # a relative topology key; profile-targeted writes never need relative
+    # re-anchoring.
+    param($Context, $Target, [string]$ProfileId, [string]$Layout)
 
     $set = $Target.Set
+    $explicitFallback = ($Layout -ieq "fallback")
+
+    if (-not [string]::IsNullOrWhiteSpace($Layout) -and -not $explicitFallback) {
+        return [pscustomobject]@{
+            Ok      = $false
+            Refusal = "Unsupported layout scope '$Layout'. Only 'fallback' is accepted; nothing was saved."
+        }
+    }
+
+    if ($explicitFallback -and -not [string]::IsNullOrWhiteSpace($ProfileId)) {
+        return [pscustomobject]@{
+            Ok      = $false
+            Refusal = "--profile cannot be combined with --layout fallback; nothing was saved."
+        }
+    }
+
+    $relativeEnabled = Test-DevWSLayoutSetHasEnabledRelativeItems -Set $set
+    $profileAware    = Test-DevWSSetHasLayoutProfiles -Set $set
+
+    if ($explicitFallback) {
+        if ($profileAware) {
+            $topologyA = Get-DevWSMonitorTopology
+            $eligibility = Test-DevWSLayoutTopologyMatchable -Topology $topologyA
+
+            if (-not $eligibility.Eligible) {
+                return [pscustomobject]@{
+                    Ok      = $false
+                    Refusal = (Get-DevWSLayoutWriteRefusalMessage -Reason $eligibility.Reason)
+                }
+            }
+
+            $relativeKey = $null
+
+            if ($relativeEnabled) {
+                $relativeKey = Get-DevWSRelativeTopologyStabilityKey -Topology $topologyA
+
+                if (-not [bool]$relativeKey.Ok) {
+                    return [pscustomobject]@{
+                        Ok      = $false
+                        Refusal = (Get-DevWSLayoutRelativeTopologyRefusal -KeyResult $relativeKey -SetId ([string]$set.id))
+                    }
+                }
+            }
+
+            return [pscustomobject]@{
+                Ok                          = $true
+                Refusal                     = $null
+                Set                         = $set
+                Source                      = "fallback"
+                Profile                     = $null
+                ProfileId                   = $null
+                Create                      = $false
+                TopologyA                   = $topologyA
+                TopologyB                   = $null
+                RequireTopologyRevalidation = $true
+                RelativeTopologyRequired    = $relativeEnabled
+                RelativeTopologyKeyA        = if ($relativeKey) { [string]$relativeKey.Key } else { $null }
+                ExplicitFallback            = $true
+                Reason                      = "explicit-fallback"
+            }
+        }
+
+        if (-not $relativeEnabled) {
+            return [pscustomobject]@{
+                Ok                          = $true
+                Refusal                     = $null
+                Set                         = $set
+                Source                      = "fallback"
+                Profile                     = $null
+                ProfileId                   = $null
+                Create                      = $false
+                TopologyA                   = $null
+                TopologyB                   = $null
+                RequireTopologyRevalidation = $false
+                RelativeTopologyRequired    = $false
+                RelativeTopologyKeyA        = $null
+                ExplicitFallback            = $true
+                Reason                      = "explicit-fallback-no-relative"
+            }
+        }
+
+        $topologyA = Get-DevWSMonitorTopology
+        $relativeKey = Get-DevWSRelativeTopologyStabilityKey -Topology $topologyA
+
+        if (-not [bool]$relativeKey.Ok) {
+            return [pscustomobject]@{
+                Ok      = $false
+                Refusal = (Get-DevWSLayoutRelativeTopologyRefusal -KeyResult $relativeKey -SetId ([string]$set.id))
+            }
+        }
+
+        return [pscustomobject]@{
+            Ok                          = $true
+            Refusal                     = $null
+            Set                         = $set
+            Source                      = "fallback"
+            Profile                     = $null
+            ProfileId                   = $null
+            Create                      = $false
+            TopologyA                   = $topologyA
+            TopologyB                   = $null
+            RequireTopologyRevalidation = $false
+            RelativeTopologyRequired    = $true
+            RelativeTopologyKeyA        = [string]$relativeKey.Key
+            ExplicitFallback            = $true
+            Reason                      = "explicit-fallback-relative"
+        }
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($ProfileId)) {
         $topologyA = Get-DevWSMonitorTopology
@@ -931,11 +1151,45 @@ function Get-DevWSLayoutSavePlan {
             ProfileId                   = $ProfileId
             Create                      = [bool]$decision.Create
             TopologyA                   = $topologyA
+            TopologyB                   = $null
             RequireTopologyRevalidation = $true
+            RelativeTopologyRequired    = $false
+            RelativeTopologyKeyA        = $null
+            ExplicitFallback            = $false
+            Reason                      = "explicit-profile"
         }
     }
 
-    if (-not (Test-DevWSSetHasLayoutProfiles -Set $set)) {
+    if (-not $profileAware) {
+        if (-not $relativeEnabled) {
+            return [pscustomobject]@{
+                Ok                          = $true
+                Refusal                     = $null
+                Set                         = $set
+                Source                      = "fallback"
+                Profile                     = $null
+                ProfileId                   = $null
+                Create                      = $false
+                TopologyA                   = $null
+                TopologyB                   = $null
+                RequireTopologyRevalidation = $false
+                RelativeTopologyRequired    = $false
+                RelativeTopologyKeyA        = $null
+                ExplicitFallback            = $false
+                Reason                      = "no-profiles"
+            }
+        }
+
+        $topologyA = Get-DevWSMonitorTopology
+        $relativeKey = Get-DevWSRelativeTopologyStabilityKey -Topology $topologyA
+
+        if (-not [bool]$relativeKey.Ok) {
+            return [pscustomobject]@{
+                Ok      = $false
+                Refusal = (Get-DevWSLayoutRelativeTopologyRefusal -KeyResult $relativeKey -SetId ([string]$set.id))
+            }
+        }
+
         return [pscustomobject]@{
             Ok                          = $true
             Refusal                     = $null
@@ -944,8 +1198,13 @@ function Get-DevWSLayoutSavePlan {
             Profile                     = $null
             ProfileId                   = $null
             Create                      = $false
-            TopologyA                   = $null
+            TopologyA                   = $topologyA
+            TopologyB                   = $null
             RequireTopologyRevalidation = $false
+            RelativeTopologyRequired    = $true
+            RelativeTopologyKeyA        = [string]$relativeKey.Key
+            ExplicitFallback            = $false
+            Reason                      = "relative-fallback"
         }
     }
 
@@ -954,6 +1213,20 @@ function Get-DevWSLayoutSavePlan {
 
     if (-not $scope.Ok) {
         return [pscustomobject]@{ Ok = $false; Refusal = $scope.Refusal }
+    }
+
+    $relativeRequired = ($scope.Source -eq "fallback" -and $relativeEnabled)
+    $relativeKey = $null
+
+    if ($relativeRequired) {
+        $relativeKey = Get-DevWSRelativeTopologyStabilityKey -Topology $topologyA
+
+        if (-not [bool]$relativeKey.Ok) {
+            return [pscustomobject]@{
+                Ok      = $false
+                Refusal = (Get-DevWSLayoutRelativeTopologyRefusal -KeyResult $relativeKey -SetId ([string]$set.id))
+            }
+        }
     }
 
     return [pscustomobject]@{
@@ -965,23 +1238,51 @@ function Get-DevWSLayoutSavePlan {
         ProfileId                   = $scope.ProfileId
         Create                      = $false
         TopologyA                   = $topologyA
+        TopologyB                   = $null
         RequireTopologyRevalidation = $true
+        RelativeTopologyRequired    = $relativeRequired
+        RelativeTopologyKeyA        = if ($relativeKey) { [string]$relativeKey.Key } else { $null }
+        ExplicitFallback            = $false
+        Reason                      = $scope.Reason
     }
 }
 
 function Confirm-DevWSLayoutSaveTopology {
     # Topology stability gate: re-sample immediately before the canonical
-    # commit and abort when the topology changed during capture. The caller's
-    # finally block cleans capture temp files on every failure path.
+    # commit and abort when the topology changed during capture. Profile-aware
+    # saves retain the existing matchable/signature/fingerprint gate; relative
+    # fallback saves additionally compare the monitor/work-area stability key.
+    # The caller's finally block cleans capture temp files on every failure.
     param($Plan)
 
-    if (-not [bool]$Plan.RequireTopologyRevalidation) { return }
+    $needsTopologyB = ([bool]$Plan.RequireTopologyRevalidation -or [bool]$Plan.RelativeTopologyRequired)
+
+    if (-not $needsTopologyB) { return }
 
     $topologyB = Get-DevWSMonitorTopology
-    $stability = Test-DevWSLayoutTopologyStable -First $Plan.TopologyA -Second $topologyB
+    $Plan.TopologyB = $topologyB
 
-    if (-not $stability.Stable) {
-        throw "The monitor topology changed while capturing geometry ($($stability.Reason)); nothing was saved. Wait for docking/undocking display changes to settle, then retry."
+    if ([bool]$Plan.RequireTopologyRevalidation) {
+        $stability = Test-DevWSLayoutTopologyStable -First $Plan.TopologyA -Second $topologyB
+
+        if (-not $stability.Stable) {
+            throw "The monitor topology changed while capturing geometry ($($stability.Reason)); nothing was saved. Wait for docking/undocking display changes to settle, then retry."
+        }
+    }
+
+    if ([bool]$Plan.RelativeTopologyRequired) {
+        $relativeStability = Test-DevWSRelativeTopologyStable -First $Plan.TopologyA -Second $topologyB
+
+        if (-not $relativeStability.Stable) {
+            throw "The monitor/work-area topology changed while capturing relative geometry ($($relativeStability.Reason)); nothing was saved. Wait for docking/undocking or taskbar/display changes to settle, then retry."
+        }
+
+        $relativeKeyB = Get-DevWSRelativeTopologyStabilityKey -Topology $topologyB
+
+        if (-not [bool]$relativeKeyB.Ok -or
+            -not [string]::Equals([string]$relativeKeyB.Key, [string]$Plan.RelativeTopologyKeyA, [System.StringComparison]::Ordinal)) {
+            throw "The monitor/work-area topology changed while capturing relative geometry (relative-topology-key-changed); nothing was saved. Wait for docking/undocking or taskbar/display changes to settle, then retry."
+        }
     }
 }
 
@@ -1002,13 +1303,13 @@ function Get-DevWSLayoutSaveTargetProfile {
 }
 
 function Save-DevWSLayout {
-    param([string]$SetId, [string]$ProfileId)
+    param([string]$SetId, [string]$ProfileId, [string]$Layout)
 
     $context = Get-DevWSContext
     Assert-DevWSConfigWritable -Location $context.Location
     $target = Resolve-DevWSLifecycleTarget -Config $context.Config -SetId $SetId
 
-    $plan = Get-DevWSLayoutSavePlan -Context $context -Target $target -ProfileId $ProfileId
+    $plan = Get-DevWSLayoutSavePlan -Context $context -Target $target -ProfileId $ProfileId -Layout $Layout
 
     if (-not $plan.Ok) { throw $plan.Refusal }
 
@@ -1023,15 +1324,15 @@ function Save-DevWSLayout {
     }
 
     try {
+        $entryPlan = Get-DevWSLayoutSaveEntries -Plan $plan -Capture $capture
+
+        if (-not [bool]$entryPlan.Ok) { throw $entryPlan.Refusal }
+
         Confirm-DevWSLayoutSaveTopology -Plan $plan
         $null = Get-DevWSLayoutSaveTargetProfile -Plan $plan
 
-        foreach ($app in $capture.Apps) {
-            Set-DevWSLayoutSaveEntry -Plan $plan -Item $app -Rect $capture.AppGeometry[$app.id]
-        }
-
-        foreach ($terminal in $capture.Terminals) {
-            Set-DevWSLayoutSaveEntry -Plan $plan -Item $terminal -Rect $capture.TerminalGeometry[$terminal.id]
+        foreach ($entry in @($entryPlan.Entries)) {
+            Set-DevWSLayoutSaveEntry -Plan $plan -Item $entry.Item -Rect $entry.Rect -RelativeLayout $entry.RelativeLayout
         }
 
         Save-DevWSConfig -Config $capture.Context.Config -Location $capture.Context.Location
@@ -1068,20 +1369,21 @@ function Save-DevWSWorkspace {
     # opportunistic and always GLOBAL (never per profile); unavailable
     # optional state preserves the existing canonical value.
     #
-    # Gate order: capture (with optional active-tab sidecar), per-tab cwd
-    # decisions, topology stability, per-tab expected-generation consistency,
-    # then in-memory geometry + per-tab cwd/path + startup-intent-retirement +
-    # activeTab apply and exactly one canonical save; any gate failure leaves
-    # the canonical file unchanged and cleanup still removes capture temp
-    # files. Startup retirement is optional state derived ONLY after the final
-    # generation gate; it never fails the save.
-    param([string]$SetId, [string]$ProfileId)
+    # Gate order: capture (with optional active-tab sidecar), geometry-entry
+    # preflight, per-tab cwd decisions, topology stability, per-tab
+    # expected-generation consistency, then in-memory geometry + per-tab
+    # cwd/path + startup-intent-retirement + activeTab apply and exactly one
+    # canonical save; any gate failure leaves the canonical file unchanged
+    # and cleanup still removes capture temp files. Startup retirement is
+    # optional state derived ONLY after the final generation gate; it never
+    # fails the save.
+    param([string]$SetId, [string]$ProfileId, [string]$Layout)
 
     $context = Get-DevWSContext
     Assert-DevWSConfigWritable -Location $context.Location
     $target = Resolve-DevWSLifecycleTarget -Config $context.Config -SetId $SetId
 
-    $plan = Get-DevWSLayoutSavePlan -Context $context -Target $target -ProfileId $ProfileId
+    $plan = Get-DevWSLayoutSavePlan -Context $context -Target $target -ProfileId $ProfileId -Layout $Layout
 
     if (-not $plan.Ok) { throw $plan.Refusal }
 
@@ -1099,8 +1401,14 @@ function Save-DevWSWorkspace {
     $activeTabDecisions  = [ordered]@{}
 
     try {
-        # Geometry is completely valid at this point. Only now resolve the
-        # per-tab tracked cwd for the enabled terminals of the target set.
+        # Geometry-entry preflight: every relative re-anchor is resolved
+        # before cwd/path/activeTab mutations or any canonical write.
+        $entryPlan = Get-DevWSLayoutSaveEntries -Plan $plan -Capture $capture
+
+        if (-not [bool]$entryPlan.Ok) { throw $entryPlan.Refusal }
+
+        # Only now resolve the per-tab tracked cwd for the enabled terminals
+        # of the target set.
         $saveDecisions = Get-DevWSTerminalSaveDecisions `
             -SetId $capture.Target.SetId `
             -Terminals $capture.Terminals
@@ -1116,12 +1424,8 @@ function Save-DevWSWorkspace {
 
         $null = Get-DevWSLayoutSaveTargetProfile -Plan $plan
 
-        foreach ($app in $capture.Apps) {
-            Set-DevWSLayoutSaveEntry -Plan $plan -Item $app -Rect $capture.AppGeometry[$app.id]
-        }
-
-        foreach ($terminal in $capture.Terminals) {
-            Set-DevWSLayoutSaveEntry -Plan $plan -Item $terminal -Rect $capture.TerminalGeometry[$terminal.id]
+        foreach ($entry in @($entryPlan.Entries)) {
+            Set-DevWSLayoutSaveEntry -Plan $plan -Item $entry.Item -Rect $entry.Rect -RelativeLayout $entry.RelativeLayout
         }
 
         # Pass 6D in-memory save-state plan: per-tab paths + terminal.path.
@@ -1285,10 +1589,12 @@ function Show-DevWSLayout {
 
 function ConvertFrom-DevWSSaveArguments {
     # Reconstructs and parses `ws save` / `ws save-layout` tokens (Arg1 plus
-    # the remaining literal arguments) into an optional set and an optional
-    # `--profile <id>` selector. Works whether --profile arrives as the first
-    # unbound switch-looking token or after an explicit set. Rejects duplicate
-    # --profile, a missing value, unknown options and extra positional values.
+    # the remaining literal arguments) into an optional set, an optional
+    # `--profile <id>` selector, and the optional `--layout fallback` scope.
+    # Works whether a switch arrives as the first unbound switch-looking token
+    # or after an explicit set. Rejects duplicate selectors, missing values,
+    # --profile combined with --layout fallback, unknown layout names, unknown
+    # options and extra positional values.
     param(
         [AllowEmptyCollection()]
         [object[]]$Tokens = @(),
@@ -1300,11 +1606,36 @@ function ConvertFrom-DevWSSaveArguments {
 
     $setId     = $null
     $profileId = $null
+    $layout    = $null
     $index     = 0
     $tokenList = @($Tokens)
 
     while ($index -lt $tokenList.Count) {
         $token = [string]$tokenList[$index]
+
+        if ($token -ieq "--layout") {
+            if ($null -ne $layout) {
+                throw "Duplicate --layout for $CommandName. Usage: $Usage"
+            }
+
+            if (($index + 1) -ge $tokenList.Count) {
+                throw "--layout requires 'fallback'. Usage: $Usage"
+            }
+
+            $candidate = [string]$tokenList[$index + 1]
+
+            if ([string]::IsNullOrWhiteSpace($candidate) -or $candidate.StartsWith('-')) {
+                throw "--layout requires 'fallback'. Usage: $Usage"
+            }
+
+            if ($candidate -ine "fallback") {
+                throw "Unsupported --layout value '$candidate' for $CommandName; only 'fallback' is accepted. Usage: $Usage"
+            }
+
+            $layout = "fallback"
+            $index += 2
+            continue
+        }
 
         if ($token -ieq "--profile") {
             if ($null -ne $profileId) {
@@ -1338,9 +1669,14 @@ function ConvertFrom-DevWSSaveArguments {
         $index += 1
     }
 
+    if ($null -ne $layout -and $null -ne $profileId) {
+        throw "--profile cannot be combined with --layout fallback for $CommandName. Usage: $Usage"
+    }
+
     return [pscustomobject]@{
         SetId     = $setId
         ProfileId = $profileId
+        Layout    = $layout
     }
 }
 
@@ -2989,9 +3325,9 @@ try {
             $parsed = ConvertFrom-DevWSSaveArguments `
                 -Tokens $saveLayoutTokens `
                 -CommandName "save-layout" `
-                -Usage "ws save-layout [set] [--profile <id>]"
+                -Usage "ws save-layout [set] [--profile <id>] [--layout fallback]"
 
-            Save-DevWSLayout -SetId $parsed.SetId -ProfileId $parsed.ProfileId
+            Save-DevWSLayout -SetId $parsed.SetId -ProfileId $parsed.ProfileId -Layout $parsed.Layout
         }
 
         "save" {
@@ -3006,9 +3342,9 @@ try {
             $parsed = ConvertFrom-DevWSSaveArguments `
                 -Tokens $saveTokens `
                 -CommandName "save" `
-                -Usage "ws save [set] [--profile <id>]"
+                -Usage "ws save [set] [--profile <id>] [--layout fallback]"
 
-            Save-DevWSWorkspace -SetId $parsed.SetId -ProfileId $parsed.ProfileId
+            Save-DevWSWorkspace -SetId $parsed.SetId -ProfileId $parsed.ProfileId -Layout $parsed.Layout
         }
 
         "show-layout" {

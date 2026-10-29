@@ -127,23 +127,26 @@ ws status
 ws status secondary
 ```
 
-### `ws save-layout [set] [--profile <id>]`
+### `ws save-layout [set] [--profile <id>] [--layout fallback]`
 
 Capture and persist geometry for all enabled items (all-or-nothing).
 
 - Geometry only; terminal cwd and the activeTab are not saved.
 - With no profiles the captured geometry updates the fallback item.layout.
 - With profiles the storage scope follows the current topology: the exactly matching profile, otherwise the fallback.
-- --profile <id> creates or updates that profile; creation requires a complete capture and a stable, safely matchable topology.
-- Fails without changing config if any enabled item cannot be captured or if the topology changes during capture.
+- `--profile <id>` creates or updates that profile; creation requires a complete capture and a stable, safely matchable topology.
+- `--layout fallback` forces fallback scope even when a profile matches. Relative items are re-anchored and dual-written to `layoutRelative` and `item.layout`; profile entries remain untouched.
+- A profile-targeted save writes absolute profile entries only and never changes `layoutRelative` or `item.layout`, even for relative items.
+- Fails without changing config if any enabled item cannot be captured, a relative anchor is ambiguous or unpersistable, or the topology changes during capture.
 
 ```powershell
 ws save-layout
 ws save-layout secondary
 ws save-layout --profile docked
+ws save-layout --layout fallback
 ```
 
-### `ws save [set] [--profile <id>]`
+### `ws save [set] [--profile <id>] [--layout fallback]`
 
 Save geometry plus reliable tracked per-tab cwd and the configured activeTab.
 
@@ -151,12 +154,15 @@ Save geometry plus reliable tracked per-tab cwd and the configured activeTab.
 - Every configured terminal tab resolves its own tracked cwd independently; reliable cwd is opportunistic and always global (terminal.path for tab 0, per-tab overrides only when required), never per profile.
 - Unavailable cwd keeps the existing effective path for that tab.
 - The configured activeTab is saved only from a reliable managed-tab observation; anything else keeps the existing value.
+- `--layout fallback` forces fallback scope; relative items are re-anchored and dual-written, while profile-targeted saves leave universal relative/fallback geometry untouched.
+- A relative capture or topology-stability failure aborts before cwd, path, activeTab, startup-intent, or geometry state is persisted.
 - Topology stability and per-tab generation both revalidate before one atomic canonical write.
 
 ```powershell
 ws save
 ws save secondary
 ws save --profile docked
+ws save --layout fallback
 ```
 
 ### `ws show-layout [set]`

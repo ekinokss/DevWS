@@ -610,6 +610,226 @@ function ConvertFrom-DevWSAbsoluteRectToRelative {
     }
 }
 
+function Get-DevWSRelativeTopologyStabilityKey {
+    # Canonical save-stability key for the monitor/work-area geometry that
+    # relative capture depends on. The topology signature excludes work-area
+    # changes, so this key includes both rectangles for every monitor plus the
+    # durable identity and any relevant device-path instance.
+    param($Topology)
+
+    if ($null -eq $Topology -or -not [bool](Get-DevWSProperty -Object $Topology -Name "Available")) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Reason  = "topology-unavailable"
+            Message = "The monitor topology is unavailable."
+            Key     = $null
+        }
+    }
+
+    $monitors = Get-DevWSProperty -Object $Topology -Name "Monitors"
+
+    if ($null -eq $monitors -or $monitors -isnot [array] -or @($monitors).Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Reason  = "no-monitors"
+            Message = "The monitor topology contains no monitor rectangles."
+            Key     = $null
+        }
+    }
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $identityCount = 0
+
+    foreach ($monitor in @($monitors)) {
+        if ($null -eq $monitor -or $monitor -isnot [System.Management.Automation.PSCustomObject]) {
+            continue
+        }
+
+        $identity = [string](Get-DevWSProperty -Object $monitor -Name "IdentityToken")
+        $instance = [string](Get-DevWSProperty -Object $monitor -Name "DevicePathInstance")
+
+        if ($identity.StartsWith("path:", [System.StringComparison]::Ordinal)) {
+            $instance = $null
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($identity)) {
+            $identityCount++
+        }
+
+        foreach ($rectName in @("MonitorRect", "WorkRect")) {
+            $rect = Get-DevWSProperty -Object $monitor -Name $rectName
+
+            if ($null -eq $rect -or $rect -isnot [System.Management.Automation.PSCustomObject]) {
+                return [pscustomobject][ordered]@{
+                    Ok      = $false
+                    Reason  = "$($rectName.ToLowerInvariant())-missing"
+                    Message = "The monitor topology is missing a required $rectName rectangle."
+                    Key     = $null
+                }
+            }
+
+            foreach ($field in @("x", "y", "w", "h")) {
+                if (-not (Test-DevWSFiniteNumber -Value (Get-DevWSProperty -Object $rect -Name $field))) {
+                    return [pscustomobject][ordered]@{
+                        Ok      = $false
+                        Reason  = "$($rectName.ToLowerInvariant())-$field-invalid"
+                        Message = "The monitor topology has an invalid $rectName.$field value."
+                        Key     = $null
+                    }
+                }
+            }
+        }
+
+        $monitorRect = Get-DevWSProperty -Object $monitor -Name "MonitorRect"
+        $workRect    = Get-DevWSProperty -Object $monitor -Name "WorkRect"
+        $parts.Add((
+            "{0}|{1}|{2},{3},{4},{5}|{6},{7},{8},{9}" -f
+            $identity,
+            ([string]$instance),
+            [int]$monitorRect.x, [int]$monitorRect.y, [int]$monitorRect.w, [int]$monitorRect.h,
+            [int]$workRect.x, [int]$workRect.y, [int]$workRect.w, [int]$workRect.h
+        )) | Out-Null
+    }
+
+    if ($parts.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Reason  = "no-monitors"
+            Message = "The monitor topology contains no usable monitor rectangles."
+            Key     = $null
+        }
+    }
+
+    if ($identityCount -eq 0) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Reason  = "identity-unavailable"
+            Message = "The monitor topology has no durable monitor identities for relative capture."
+            Key     = $null
+        }
+    }
+
+    $parts.Sort([System.StringComparer]::Ordinal)
+
+    return [pscustomobject][ordered]@{
+        Ok      = $true
+        Reason  = "stable-key"
+        Message = $null
+        Key     = ($parts -join ";")
+    }
+}
+
+function Test-DevWSRelativeTopologyStable {
+    # A/B stability for fallback-scope relative saves. The key deliberately
+    # includes work areas and monitor rectangles so work-area-only changes are
+    # refused even when the topology signature/fingerprint is unchanged.
+    param($First, $Second)
+
+    $firstKey = Get-DevWSRelativeTopologyStabilityKey -Topology $First
+
+    if (-not [bool]$firstKey.Ok) {
+        return [pscustomobject][ordered]@{ Stable = $false; Reason = $firstKey.Reason }
+    }
+
+    $secondKey = Get-DevWSRelativeTopologyStabilityKey -Topology $Second
+
+    if (-not [bool]$secondKey.Ok) {
+        return [pscustomobject][ordered]@{ Stable = $false; Reason = $secondKey.Reason }
+    }
+
+    if (-not [string]::Equals([string]$firstKey.Key, [string]$secondKey.Key, [System.StringComparison]::Ordinal)) {
+        return [pscustomobject][ordered]@{ Stable = $false; Reason = "relative-topology-key-changed" }
+    }
+
+    return [pscustomobject][ordered]@{ Stable = $true; Reason = "stable" }
+}
+
+function Get-DevWSRelativeLayoutFromCapture {
+    # Re-anchor one captured absolute rectangle for fallback-scope save.
+    # The configured basis is retained; anchor selection and persistence rules
+    # come from Select-DevWSRelativeAnchorFromRect / the Phase 1 model.
+    param(
+        $Rect,
+        $Topology,
+        $ExistingRelativeLayout
+    )
+
+    $selection = Select-DevWSRelativeAnchorFromRect `
+        -Rect $Rect `
+        -Topology $Topology `
+        -ExistingRelativeLayout $ExistingRelativeLayout
+
+    if (-not [bool]$selection.Ok) {
+        return [pscustomobject][ordered]@{
+            Ok             = $false
+            Status         = [string]$selection.Status
+            Reason         = [string]$selection.Reason
+            Message        = [string]$selection.Message
+            RelativeLayout = $null
+        }
+    }
+
+    $basis = [string](Get-DevWSProperty -Object $ExistingRelativeLayout -Name "basis")
+
+    if ($basis -cne "workArea" -and $basis -cne "monitor") {
+        return [pscustomobject][ordered]@{
+            Ok             = $false
+            Status         = "basis-invalid"
+            Reason         = "basis-missing-or-invalid"
+            Message        = "The existing relative layout does not carry a valid monitor or work-area basis."
+            RelativeLayout = $null
+        }
+    }
+
+    $basisResult = Get-DevWSRelativeLayoutBasisRect -Monitor $selection.Monitor -Basis $basis
+
+    if (-not [bool]$basisResult.Ok) {
+        return [pscustomobject][ordered]@{
+            Ok             = $false
+            Status         = [string]$basisResult.Status
+            Reason         = [string]$basisResult.Reason
+            Message        = [string]$basisResult.Message
+            RelativeLayout = $null
+        }
+    }
+
+    $converted = ConvertFrom-DevWSAbsoluteRectToRelative -Rect $Rect -BasisRect $basisResult.Rect
+
+    if (-not [bool]$converted.Ok) {
+        return [pscustomobject][ordered]@{
+            Ok             = $false
+            Status         = [string]$converted.Status
+            Reason         = [string]$converted.Reason
+            Message        = [string]$converted.Message
+            RelativeLayout = $null
+        }
+    }
+
+    $monitorFields = [ordered]@{ identity = [string]$selection.Identity }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$selection.Instance)) {
+        $monitorFields["instance"] = [string]$selection.Instance
+    }
+
+    $relativeLayout = [pscustomobject][ordered]@{
+        monitor = [pscustomobject]$monitorFields
+        basis   = $basis
+        rect    = $converted.Rect
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok             = $true
+        Status         = [string]$selection.Status
+        Reason         = [string]$selection.Reason
+        Message        = $null
+        RelativeLayout = $relativeLayout
+        Monitor        = $selection.Monitor
+        Basis          = $basis
+        BasisRect      = $basisResult.Rect
+        RelativeRect   = $converted.Rect
+    }
+}
+
 function Resolve-DevWSRelativeLayout {
     # Convenience composition: resolve the anchor and convert the normalized
     # rectangle to an absolute one. Failure objects retain the anchor details

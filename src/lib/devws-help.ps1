@@ -135,7 +135,7 @@ function Get-DevWSHelpCommandInfo {
 
         [pscustomobject]@{
             Name     = "save-layout"
-            Usage    = "ws save-layout [set] [--profile <id>]"
+            Usage    = "ws save-layout [set] [--profile <id>] [--layout fallback]"
             Summary  = "Capture and persist geometry for all enabled items (all-or-nothing)."
             Section  = "Workspace"
             Aliases  = @()
@@ -144,15 +144,16 @@ function Get-DevWSHelpCommandInfo {
                 "With no profiles the captured geometry updates the fallback item.layout.",
                 "With profiles the storage scope follows the current topology: the exactly matching profile, otherwise the fallback.",
                 "--profile <id> creates or updates that profile; creation requires a complete capture and a stable, safely matchable topology.",
-                "Fails without changing config if any enabled item cannot be captured or if the topology changes during capture."
+                "--layout fallback forces fallback scope even when a profile matches. Relative items are re-anchored and dual-written to layoutRelative and item.layout; profile-targeted saves never touch universal relative/fallback geometry.",
+                "Fails without changing config if any enabled item cannot be captured, a relative anchor is ambiguous or unpersistable, or the topology changes during capture."
             )
-            Examples = @("ws save-layout", "ws save-layout secondary", "ws save-layout --profile docked")
+            Examples = @("ws save-layout", "ws save-layout secondary", "ws save-layout --profile docked", "ws save-layout --layout fallback")
             Warning  = $null
         }
 
         [pscustomobject]@{
             Name     = "save"
-            Usage    = "ws save [set] [--profile <id>]"
+            Usage    = "ws save [set] [--profile <id>] [--layout fallback]"
             Summary  = "Save geometry plus reliable tracked per-tab cwd and the configured activeTab."
             Section  = "Workspace"
             Aliases  = @()
@@ -161,9 +162,11 @@ function Get-DevWSHelpCommandInfo {
                 "Every configured terminal tab resolves its own tracked cwd independently; reliable cwd is opportunistic and always global (terminal.path for tab 0, per-tab overrides only when required), never per profile.",
                 "Unavailable cwd keeps the existing effective path for that tab.",
                 "The configured activeTab is saved only from a reliable managed-tab observation; anything else keeps the existing value.",
+                "--layout fallback forces fallback scope; relative items are re-anchored and dual-written, while profile-targeted saves leave universal relative/fallback geometry untouched.",
+                "Relative capture/topology failure aborts before cwd, path, activeTab, startup-intent or geometry state is persisted.",
                 "Topology stability and per-tab generation both revalidate before one atomic canonical write."
             )
-            Examples = @("ws save", "ws save secondary", "ws save --profile docked")
+            Examples = @("ws save", "ws save secondary", "ws save --profile docked", "ws save --layout fallback")
             Warning  = $null
         }
 
