@@ -42,4 +42,20 @@ public static class DevWSTerminalNative
 
         return result.ToArray();
     }
+
+    // Exact-HWND class check used by terminal-presence observation when a
+    // state-associated HWND is not present in the enumerated candidate set.
+    // This never inspects UI Automation and never creates or mutates anything.
+    public static bool IsWindowsTerminalTopLevelHwnd(long hwnd)
+    {
+        if (hwnd == 0)
+        {
+            return false;
+        }
+
+        var className = new StringBuilder(256);
+
+        return GetClassName(new IntPtr(hwnd), className, className.Capacity) > 0 &&
+               string.Equals(className.ToString(), WindowsTerminalTopLevelClass, StringComparison.Ordinal);
+    }
 }

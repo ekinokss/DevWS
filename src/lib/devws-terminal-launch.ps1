@@ -9,6 +9,8 @@
 # Planning contract (side-effect free):
 #   - state-first validation: a validated set-scoped runtime-state HWND makes a
 #     terminal present/state and can never later be reclassified missing;
+#   - a live but unreadable state or candidate HWND is `inaccessible`, never
+#     `missing`, and the launch planner refuses creation for it;
 #   - one fast native CASCADIA_HOSTING_WINDOW_CLASS enumeration;
 #   - zero unmatched WT candidates => unresolved terminals are missing with no
 #     UI Automation traversal at all (fast-missing);
@@ -37,6 +39,19 @@ $script:DevWSTerminalLaunchPollMillisecondsDefault       = 250
 $script:DevWSTerminalEmptyTabRetryCountDefault           = 2
 $script:DevWSTerminalEmptyTabRetryDelayMilliseconds      = 250
 
+function Test-DevWSTerminalTopLevelHwnd {
+    # Exact-HWND class check for a state-associated window that was not in the
+    # class-scoped candidate enumeration. No UI Automation and no mutation.
+    param([Parameter(Mandatory)][long]$Hwnd)
+
+    if (-not (Test-DevWSWindowHwnd -Hwnd $Hwnd)) {
+        return $false
+    }
+
+    Initialize-DevWSNativeRuntime
+    return [bool][DevWSTerminalNative]::IsWindowsTerminalTopLevelHwnd([long]$Hwnd)
+}
+
 function Get-DevWSTerminalTopLevelHwnds {
     # Fast class-scoped enumeration; the filter runs in C#.
     Initialize-DevWSNativeRuntime
@@ -44,49 +59,62 @@ function Get-DevWSTerminalTopLevelHwnds {
 }
 
 function Read-DevWSTerminalHwndTabs {
-    # One managed per-HWND UI Automation read: tab-name set plus the raw
-    # (duplicate-preserving) tab count. A live WT window always exposes at
-    # least one TabItem; an empty read means the provider is still
-    # initializing, so retry boundedly instead of concluding absence.
+    # One managed per-HWND UI Automation read. The result distinguishes HWND
+    # liveness from successful tab observation and preserves bounded retries
+    # for genuine Windows Terminal initialization. A failed or still-empty read
+    # is not evidence of absence.
     param(
         [Parameter(Mandatory)][long]$Hwnd,
         [int]$EmptyRetryCount = $script:DevWSTerminalEmptyTabRetryCountDefault,
-        [int]$EmptyRetryDelayMilliseconds = $script:DevWSTerminalEmptyTabRetryDelayMilliseconds
+        [int]$EmptyRetryDelayMilliseconds = $script:DevWSTerminalEmptyTabRetryDelayMilliseconds,
+        [scriptblock]$TabReadProvider = $null
     )
 
-    Add-Type -AssemblyName UIAutomationClient
+    if ($null -eq $TabReadProvider) {
+        $TabReadProvider = { param([long]$ReadHwnd) Get-DevWSTabReadResultFromHwnd -Hwnd $ReadHwnd }
+    }
 
     $attempt = 0
 
     while ($true) {
-        $elements = @(Get-DevWSTabElementsFromHwnd -Hwnd $Hwnd)
+        $read = & $TabReadProvider $Hwnd
 
-        if ($elements.Count -gt 0) { break }
-        if (-not (Test-DevWSWindowHwnd -Hwnd $Hwnd)) { break }
+        $hasHwndPresent = $null -ne $read.PSObject.Properties["HwndPresent"]
+        $hasReadOk      = $null -ne $read.PSObject.Properties["ReadOk"]
+        $hasComplete    = $null -ne $read.PSObject.Properties["Complete"]
+
+        $hwndPresent = if ($hasHwndPresent) { [bool]$read.HwndPresent } else { [bool]$read.Ok }
+        $readOk      = if ($hasReadOk) { [bool]$read.ReadOk } else { [bool]$read.Ok }
+        $complete    = if ($hasComplete) { [bool]$read.Complete } else { $true }
+        $rawCount    = [int]$read.RawCount
+        $nameFailures = if ($null -ne $read.PSObject.Properties["NameReadFailures"]) { [int]$read.NameReadFailures } else { 0 }
+
+        if ($hwndPresent -and $readOk -and $rawCount -gt 0 -and $complete -and $nameFailures -eq 0) { break }
+        if (-not $hwndPresent) { break }
+        if (-not $readOk) { break }
         if ($attempt -ge $EmptyRetryCount) { break }
 
         $attempt++
         Start-Sleep -Milliseconds $EmptyRetryDelayMilliseconds
     }
 
-    $names = [System.Collections.Generic.List[string]]::new()
+    $tabNames = $read.TabNames
 
-    foreach ($element in $elements) {
-        try {
-            $name = [string]$element.Current.Name
-
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-                $names.Add($name)
-            }
-        }
-        catch { }
+    if ($null -eq $tabNames) {
+        $tabNames = New-DevWSPresentTabNameSet -Names @()
     }
 
     return [pscustomobject]@{
-        Ok           = (Test-DevWSWindowHwnd -Hwnd $Hwnd)
-        TabNames     = (New-DevWSPresentTabNameSet -Names $names.ToArray())
-        RawCount     = @($elements).Count
-        EmptyRetries = $attempt
+        Ok               = [bool]$hwndPresent
+        HwndPresent      = [bool]$hwndPresent
+        ReadOk           = [bool]$readOk
+        Complete         = [bool]$complete
+        TabNames         = $tabNames
+        RawCount         = [int]$rawCount
+        NameReadFailures = [int]$nameFailures
+        EmptyRetries     = $attempt
+        ErrorKind        = if ($null -ne $read.PSObject.Properties["ErrorKind"]) { [string]$read.ErrorKind } else { "none" }
+        Error            = if ($null -ne $read.PSObject.Properties["Error"]) { [string]$read.Error } else { $null }
     }
 }
 
@@ -390,7 +418,9 @@ function Get-DevWSTerminalPresenceSnapshot {
         [AllowNull()][object[]]$Terminals = $null,
         [long[]]$WtHwnds,
         [scriptblock]$CandidateReader = $null,
-        [scriptblock]$ProcessNameProvider = $null
+        [scriptblock]$ProcessNameProvider = $null,
+        [scriptblock]$HwndExistsProvider = $null,
+        [scriptblock]$HwndValidator = $null
     )
 
     $target = Resolve-DevWSLifecycleTarget -Config $Config -SetId $SetId
@@ -429,13 +459,23 @@ function Get-DevWSTerminalPresenceSnapshot {
         $ProcessNameProvider = { param([long]$Hwnd) Get-DevWSWindowHwndProcessName -Hwnd $Hwnd }
     }
 
+    if ($null -eq $HwndExistsProvider) {
+        $HwndExistsProvider = { param([long]$Hwnd) Test-DevWSWindowHwnd -Hwnd $Hwnd }
+    }
+
+    if ($null -eq $HwndValidator) {
+        $HwndValidator = { param([long]$Hwnd) Test-DevWSTerminalTopLevelHwnd -Hwnd $Hwnd }
+    }
+
     $readCache = @{}
     $readCount = 0
     $stateHits = 0
     $snapshotHits = 0
     $fastMissing = 0
     $ambiguousCount = 0
+    $inaccessibleCount = 0
     $failedCount = 0
+    $stateUncertainty = @{}
 
     # Final classification per configured index. Values are final once set:
     # this is a classification TABLE, not a mutable plan object, and the plan
@@ -462,13 +502,21 @@ function Get-DevWSTerminalPresenceSnapshot {
                     }
 
                     $read = $readCache[$hwnd]
+                    $hwndPresent = if ($null -ne $read.PSObject.Properties["HwndPresent"]) { [bool]$read.HwndPresent } else { [bool]$read.Ok }
+                    $readOk      = if ($null -ne $read.PSObject.Properties["ReadOk"]) { [bool]$read.ReadOk } else { [bool]$read.Ok }
+                    $complete    = if ($null -ne $read.PSObject.Properties["Complete"]) { [bool]$read.Complete } else { $true }
+                    $rawCount    = [int]$read.RawCount
+                    $tabNames    = $read.TabNames
+                    if ($null -eq $tabNames) { $tabNames = New-DevWSPresentTabNameSet -Names @() }
+                    $readKind    = if ($null -ne $read.PSObject.Properties["ErrorKind"]) { [string]$read.ErrorKind } else { "none" }
+                    $readError   = if ($null -ne $read.PSObject.Properties["Error"]) { [string]$read.Error } else { $null }
 
-                    if ($read.Ok) {
+                    if ($hwndPresent -and $readOk) {
                         $candidate = [pscustomobject]@{
                             Hwnd             = $hwnd
                             ExpectedWindowId = [string]$entry.windowId
                             ProcessName      = [string](& $ProcessNameProvider $hwnd)
-                            TabNames         = $read.TabNames
+                            TabNames         = $tabNames
                         }
 
                         $selected = Select-DevWSTerminalHwndCandidate -Candidates @($candidate) -WindowId $windowId -RequireProcess
@@ -477,6 +525,34 @@ function Get-DevWSTerminalPresenceSnapshot {
                             $classification = [pscustomobject]@{ State = "present"; Source = "state"; Hwnd = $hwnd; Diagnostic = $null }
                             $stateHits++
                             [void]$accounted.Add($hwnd)
+                        }
+                    }
+
+                    if ($null -eq $classification -and $hwndPresent -and (-not $readOk -or -not $complete -or $tabNames.Count -eq 0)) {
+                        $uncertainKind = if (-not $readOk) { $readKind } elseif ($rawCount -eq 0) { "empty-tab-observation" } elseif ($tabNames.Count -eq 0) { "unnamed-tab-observation" } else { "incomplete-tab-observation" }
+                        $uncertainDetail = if ([string]::IsNullOrWhiteSpace($readError)) { $uncertainKind } else { "$uncertainKind; $readError" }
+                        $stateUncertainty[$index] = [pscustomobject]@{
+                            Hwnd       = [long]$hwnd
+                            ErrorKind  = $uncertainKind
+                            Error      = $readError
+                            Diagnostic = "state HWND $hwnd exists but its managed tab identity could not be verified ($uncertainDetail)"
+                        }
+                    }
+                }
+                else {
+                    # The cached HWND was not in the class-scoped candidate
+                    # enumeration. A live, class-correct Windows Terminal HWND
+                    # is still relevant evidence and must not reach fast-missing.
+                    $procName = [string](& $ProcessNameProvider $hwnd)
+                    $exists   = [bool](& $HwndExistsProvider $hwnd)
+                    $classOk  = if ($exists) { [bool](& $HwndValidator $hwnd) } else { $false }
+
+                    if ($exists -and $classOk -and (Test-DevWSProcessNameIsWindowsTerminal -ProcessName $procName)) {
+                        $stateUncertainty[$index] = [pscustomobject]@{
+                            Hwnd       = [long]$hwnd
+                            ErrorKind  = "state-hwnd-not-enumerated"
+                            Error      = $null
+                            Diagnostic = "state HWND $hwnd is a live Windows Terminal window but was not present in the candidate enumeration"
                         }
                     }
                 }
@@ -502,11 +578,24 @@ function Get-DevWSTerminalPresenceSnapshot {
         }
 
         if ($candidateHwnds.Count -eq 0) {
-            # Zero unmatched WT top-level HWNDs: every unresolved managed
-            # terminal is necessarily missing, with no UIA traversal.
+            # Fast path: no unmatched class-scoped candidate. A cached live
+            # state HWND that was not enumerated remains uncertainty; only
+            # terminals with no such evidence are genuinely missing.
             foreach ($index in $unresolved) {
-                $classify[$index] = [pscustomobject]@{ State = "missing"; Source = "fast-missing"; Hwnd = [long]0; Diagnostic = $null }
-                $fastMissing++
+                if ($stateUncertainty.ContainsKey($index)) {
+                    $uncertainty = $stateUncertainty[$index]
+                    $classify[$index] = [pscustomobject]@{
+                        State      = "inaccessible"
+                        Source     = "state"
+                        Hwnd       = [long]$uncertainty.Hwnd
+                        Diagnostic = [string]$uncertainty.Diagnostic
+                    }
+                    $inaccessibleCount++
+                }
+                else {
+                    $classify[$index] = [pscustomobject]@{ State = "missing"; Source = "fast-missing"; Hwnd = [long]0; Diagnostic = $null }
+                    $fastMissing++
+                }
             }
         }
         else {
@@ -519,22 +608,41 @@ function Get-DevWSTerminalPresenceSnapshot {
                 }
 
                 $read = $readCache[$hwnd]
+                $hwndPresent = if ($null -ne $read.PSObject.Properties["HwndPresent"]) { [bool]$read.HwndPresent } else { [bool]$read.Ok }
+                $readOk      = if ($null -ne $read.PSObject.Properties["ReadOk"]) { [bool]$read.ReadOk } else { [bool]$read.Ok }
+                $complete    = if ($null -ne $read.PSObject.Properties["Complete"]) { [bool]$read.Complete } else { $true }
+                $tabNames    = $read.TabNames
+                if ($null -eq $tabNames) { $tabNames = New-DevWSPresentTabNameSet -Names @() }
+                $readKind    = if ($null -ne $read.PSObject.Properties["ErrorKind"]) { [string]$read.ErrorKind } else { "none" }
+                $readError   = if ($null -ne $read.PSObject.Properties["Error"]) { [string]$read.Error } else { $null }
 
                 $facts.Add([pscustomobject]@{
-                    Hwnd        = [long]$hwnd
-                    ProcessName = [string](& $ProcessNameProvider $hwnd)
-                    TabNames    = $read.TabNames
-                    RawCount    = [int]$read.RawCount
-                    Ok          = [bool]$read.Ok
+                    Hwnd           = [long]$hwnd
+                    HwndPresent    = [bool]$hwndPresent
+                    ProcessName    = [string](& $ProcessNameProvider $hwnd)
+                    TabNames       = $tabNames
+                    RawCount       = [int]$read.RawCount
+                    ReadOk         = [bool]$readOk
+                    Complete       = [bool]$complete
+                    NameReadFailures = if ($null -ne $read.PSObject.Properties["NameReadFailures"]) { [int]$read.NameReadFailures } else { 0 }
+                    ErrorKind      = $readKind
+                    Error          = $readError
                 }) | Out-Null
             }
+
+            $uncertainFacts = @($facts | Where-Object {
+                $_.HwndPresent -and
+                (Test-DevWSProcessNameIsWindowsTerminal -ProcessName $_.ProcessName) -and
+                ((-not $_.ReadOk) -or (-not $_.Complete) -or $_.TabNames.Count -eq 0)
+            })
 
             foreach ($index in $unresolved) {
                 $terminal = $terminalList[$index]
                 $windowId = [string]$terminal.windowId
 
                 $eligible = @($facts | Where-Object {
-                    $_.Ok -and
+                    $_.HwndPresent -and
+                    $_.ReadOk -and
                     (Test-DevWSProcessNameIsWindowsTerminal -ProcessName $_.ProcessName) -and
                     $_.TabNames.Contains($windowId)
                 })
@@ -554,7 +662,31 @@ function Get-DevWSTerminalPresenceSnapshot {
                     $ambiguousCount++
                 }
                 else {
-                    $classify[$index] = [pscustomobject]@{ State = "missing"; Source = "snapshot"; Hwnd = [long]0; Diagnostic = $null }
+                    $hasStateUncertainty = $stateUncertainty.ContainsKey($index)
+
+                    if ($hasStateUncertainty -or $uncertainFacts.Count -gt 0) {
+                        $details = [System.Collections.Generic.List[string]]::new()
+
+                        if ($hasStateUncertainty) {
+                            $details.Add([string]$stateUncertainty[$index].Diagnostic) | Out-Null
+                        }
+
+                        foreach ($uncertain in $uncertainFacts) {
+                            $detail = if ([string]::IsNullOrWhiteSpace([string]$uncertain.Error)) { [string]$uncertain.ErrorKind } else { "$($uncertain.ErrorKind); $($uncertain.Error)" }
+                            $details.Add("candidate HWND $($uncertain.Hwnd) could not be verified ($detail)") | Out-Null
+                        }
+
+                        $classify[$index] = [pscustomobject]@{
+                            State      = "inaccessible"
+                            Source     = if ($hasStateUncertainty) { "state" } else { "snapshot" }
+                            Hwnd       = if ($hasStateUncertainty) { [long]$stateUncertainty[$index].Hwnd } else { [long]0 }
+                            Diagnostic = "presence could not be verified: $($details -join '; ')"
+                        }
+                        $inaccessibleCount++
+                    }
+                    else {
+                        $classify[$index] = [pscustomobject]@{ State = "missing"; Source = "snapshot"; Hwnd = [long]0; Diagnostic = $null }
+                    }
                 }
             }
         }
@@ -607,16 +739,18 @@ function Get-DevWSTerminalPresenceSnapshot {
         WtHwnds   = $sorted
         Terminals = $records.ToArray()
         Counts    = [pscustomobject]@{
-            Present   = $stateHits + $snapshotHits
-            Missing   = $missingClassified
-            Ambiguous = $ambiguousCount
-            Failed    = $failedClassified
+            Present      = $stateHits + $snapshotHits
+            Missing      = $missingClassified
+            Ambiguous    = $ambiguousCount
+            Inaccessible = $inaccessibleCount
+            Failed       = $failedClassified
         }
         Stats     = [pscustomobject]@{
-            StateHits    = $stateHits
-            SnapshotHits = $snapshotHits
-            FastMissing  = $fastMissing
-            UiaReads     = $readCount
+            StateHits        = $stateHits
+            SnapshotHits     = $snapshotHits
+            FastMissing      = $fastMissing
+            InaccessibleHits = $inaccessibleCount
+            UiaReads         = $readCount
         }
     }
 }
@@ -635,6 +769,8 @@ function Get-DevWSTerminalLaunchPlan {
         [long[]]$WtHwnds,
         [scriptblock]$CandidateReader = $null,
         [scriptblock]$ProcessNameProvider = $null,
+        [scriptblock]$HwndExistsProvider = $null,
+        [scriptblock]$HwndValidator = $null,
         [scriptblock]$TrackingContextFactory = $null,
         [scriptblock]$CreateArgumentsFactory = $null,
         [AllowNull()][System.Collections.IDictionary]$Placements = $null
@@ -664,6 +800,8 @@ function Get-DevWSTerminalLaunchPlan {
     if ($PSBoundParameters.ContainsKey("WtHwnds")) { $snapshotArgs.WtHwnds = $WtHwnds }
     if ($null -ne $CandidateReader) { $snapshotArgs.CandidateReader = $CandidateReader }
     if ($null -ne $ProcessNameProvider) { $snapshotArgs.ProcessNameProvider = $ProcessNameProvider }
+    if ($null -ne $HwndExistsProvider) { $snapshotArgs.HwndExistsProvider = $HwndExistsProvider }
+    if ($null -ne $HwndValidator) { $snapshotArgs.HwndValidator = $HwndValidator }
 
     $snapshot = Get-DevWSTerminalPresenceSnapshot @snapshotArgs
 
@@ -713,6 +851,22 @@ function Get-DevWSTerminalLaunchPlan {
                 -Diagnostic $entry.Diagnostic `
                 -ApplyGeometry ([bool]$placement.ApplyGeometry) `
                 -Layout $placement.Layout)) | Out-Null
+            continue
+        }
+
+        if ($entry.State -eq "inaccessible") {
+            $errorText = if ([string]::IsNullOrWhiteSpace([string]$entry.Diagnostic)) { "terminal presence could not be verified" } else { [string]$entry.Diagnostic }
+            $records.Add((New-DevWSTerminalPlanRecord `
+                -Order ([int]$entry.Order) `
+                -Terminal $terminal `
+                -SetId $setIdValue `
+                -State "failed" `
+                -Source $entry.Source `
+                -Diagnostic $entry.Diagnostic `
+                -Error $errorText `
+                -ApplyGeometry ([bool]$placement.ApplyGeometry) `
+                -Layout $placement.Layout)) | Out-Null
+            $failedCount++
             continue
         }
 

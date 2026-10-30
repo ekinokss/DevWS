@@ -5405,6 +5405,277 @@ try {
     }
 
     Write-Host ""
+    function New-TerminalPresenceTestRead {
+        param(
+            [long]$Hwnd = 1001,
+            [bool]$HwndPresent = $true,
+            [bool]$ReadOk = $true,
+            [bool]$Complete = $true,
+            [string[]]$Names = @(),
+            [int]$RawCount = -1,
+            [string]$ErrorKind = "none",
+            [string]$Error = $null
+        )
+
+        if ($RawCount -lt 0) {
+            $RawCount = @($Names).Count
+        }
+
+        return [pscustomobject]@{
+            Hwnd             = $Hwnd
+            HwndPresent      = $HwndPresent
+            Ok               = $HwndPresent
+            ReadOk           = $ReadOk
+            Complete         = $Complete
+            TabNames         = (New-DevWSPresentTabNameSet -Names $Names)
+            RawCount         = $RawCount
+            NameReadFailures = if ($Complete) { 0 } else { 1 }
+            ErrorKind        = $ErrorKind
+            Error            = $Error
+        }
+    }
+
+    Test-Case "UIA read records FromHandle and FindAll failures as data" {
+        $from = Get-DevWSTabReadResultFromHwnd -Hwnd 101 -HwndExistsProvider { param($h) $true } -RootProvider {
+            param($h)
+            throw [System.UnauthorizedAccessException]::new('denied')
+        }
+
+        Assert-Equal $false $from.Ok "FromHandle failure is not a successful read"
+        Assert-Equal "uia-from-handle-failed" $from.ErrorKind "FromHandle error category"
+        Assert-Contains ([string]$from.Error) "denied" "FromHandle diagnostic is preserved"
+
+        $find = Get-DevWSTabReadResultFromHwnd -Hwnd 101 -HwndExistsProvider { param($h) $true } -RootProvider {
+            param($h)
+            [pscustomobject]@{}
+        } -TabProvider {
+            param($root)
+            throw [System.Runtime.InteropServices.COMException]::new('findall denied')
+        }
+
+        Assert-Equal $false $find.Ok "FindAll failure is not an empty successful observation"
+        Assert-Equal "uia-findall-failed" $find.ErrorKind "FindAll error category"
+        Assert-Contains ([string]$find.Error) "findall denied" "FindAll diagnostic is preserved"
+        Assert-Equal 0 $find.RawCount "FindAll failure returns no fabricated tab count"
+    }
+
+    Test-Case "terminal tab read distinguishes HWND liveness from read success" {
+        $script:presenceReadCalls = 0
+
+        $result = Read-DevWSTerminalHwndTabs -Hwnd 1001 -EmptyRetryCount 0 -TabReadProvider {
+            param($h)
+            $script:presenceReadCalls++
+            New-TerminalPresenceTestRead -Hwnd $h -HwndPresent $true -ReadOk $false -Complete $false -RawCount 0 -ErrorKind "uia-from-handle-failed" -Error "denied"
+        }
+
+        Assert-Equal 1 $script:presenceReadCalls "an access failure is not retried as initialization"
+        Assert-Equal $true $result.HwndPresent "HWND liveness remains true"
+        Assert-Equal $false $result.ReadOk "tab read success remains false"
+        Assert-Equal "uia-from-handle-failed" $result.ErrorKind "read error category is retained"
+        Assert-Equal 0 $result.RawCount "no fabricated tabs"
+    }
+
+    Test-Case "empty tab observations retry boundedly without proving absence" {
+        $script:presenceReadCalls = 0
+
+        $result = Read-DevWSTerminalHwndTabs -Hwnd 1001 -EmptyRetryCount 2 -EmptyRetryDelayMilliseconds 0 -TabReadProvider {
+            param($h)
+            $script:presenceReadCalls++
+            New-TerminalPresenceTestRead -Hwnd $h -HwndPresent $true -ReadOk $true -Complete $true -Names @() -RawCount 0
+        }
+
+        Assert-Equal 3 $script:presenceReadCalls "empty observations receive the configured bounded retries"
+        Assert-Equal $true $result.HwndPresent "HWND remains live"
+        Assert-Equal $true $result.ReadOk "empty observation is a successful read, not an access failure"
+        Assert-Equal 0 $result.RawCount "empty observation retains zero count"
+    }
+
+    Test-Case "live cached HWND with unreadable tabs is inaccessible, not missing" {
+        $terminal = New-TerminalDefinition -Id "obs-t1" -WindowId "OBS-W1" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $state    = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "obs-t1" -WindowId "OBS-W1" -Hwnd 5001
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $state -Terminals @($terminal) -WtHwnds @(5001) `
+            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -HwndPresent $true -ReadOk $false -Complete $false -RawCount 0 -ErrorKind "uia-from-handle-failed" -Error "denied" } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        Assert-Equal "inaccessible" $snapshot.Terminals[0].State "unreadable state HWND is inaccessible"
+        Assert-Equal "state" $snapshot.Terminals[0].Source "state uncertainty source"
+        Assert-Equal 5001 ([long]$snapshot.Terminals[0].Hwnd) "state HWND retained for diagnosis"
+        Assert-Contains ([string]$snapshot.Terminals[0].Diagnostic) "could not be verified" "diagnostic explains uncertainty"
+        Assert-Equal 1 ([int]$snapshot.Counts.Inaccessible) "inaccessible count"
+        Assert-Equal 0 ([int]$snapshot.Counts.Missing) "unreadable is never missing"
+    }
+
+    Test-Case "readable tab collection without usable names is inaccessible" {
+        $terminal = New-TerminalDefinition -Id "obs-t1b" -WindowId "OBS-W1B" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $state    = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "obs-t1b" -WindowId "OBS-W1B" -Hwnd 5011
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $state -Terminals @($terminal) -WtHwnds @(5011) `
+            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -HwndPresent $true -ReadOk $true -Complete $true -Names @() -RawCount 1 } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        Assert-Equal "inaccessible" $snapshot.Terminals[0].State "unnamed tab collection is not evidence of absence"
+        Assert-Contains ([string]$snapshot.Terminals[0].Diagnostic) "unnamed-tab-observation" "diagnostic categorizes unnamed tabs"
+    }
+
+    Test-Case "live cached HWND excluded from enumeration is not fast-missing" {
+        $terminal = New-TerminalDefinition -Id "obs-t2" -WindowId "OBS-W2" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $state    = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "obs-t2" -WindowId "OBS-W2" -Hwnd 5002
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $state -Terminals @($terminal) -WtHwnds @() `
+            -CandidateReader { param($h) throw "UIA must not run for an unenumerated state HWND" } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        Assert-Equal "inaccessible" $snapshot.Terminals[0].State "live unenumerated state HWND is inaccessible"
+        Assert-Equal "state" $snapshot.Terminals[0].Source "state source"
+        Assert-Equal 0 ([int]$snapshot.Stats.UiaReads) "no UIA scan on the fast uncertainty path"
+        Assert-Equal 0 ([int]$snapshot.Stats.FastMissing) "fast-missing is not applied"
+    }
+
+    Test-Case "genuinely missing terminal remains fast-missing" {
+        $terminal = New-TerminalDefinition -Id "obs-t3" -WindowId "OBS-W3" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $null -Terminals @($terminal) -WtHwnds @() `
+            -CandidateReader { param($h) throw "UIA must not run with no candidates" } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $false } `
+            -HwndValidator { param($h) $false }
+
+        Assert-Equal "missing" $snapshot.Terminals[0].State "no state and no candidates is missing"
+        Assert-Equal "fast-missing" $snapshot.Terminals[0].Source "fast-missing source"
+        Assert-Equal 1 ([int]$snapshot.Counts.Missing) "missing count"
+        Assert-Equal 0 ([int]$snapshot.Stats.UiaReads) "no UIA traversal"
+    }
+
+    Test-Case "dead cached HWND does not create permanent uncertainty" {
+        $terminal = New-TerminalDefinition -Id "obs-t4" -WindowId "OBS-W4" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $state    = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "obs-t4" -WindowId "OBS-W4" -Hwnd 5004
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $state -Terminals @($terminal) -WtHwnds @() `
+            -CandidateReader { param($h) throw "UIA must not run for a dead HWND" } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $false } `
+            -HwndValidator { param($h) $true }
+
+        Assert-Equal "missing" $snapshot.Terminals[0].State "dead state HWND is missing, not inaccessible"
+        Assert-Equal 0 ([int]$snapshot.Counts.Inaccessible) "no permanent inaccessible state"
+    }
+
+    Test-Case "HWND reused by the wrong process cannot establish association" {
+        $terminal = New-TerminalDefinition -Id "obs-t5" -WindowId "OBS-W5" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $state    = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "obs-t5" -WindowId "OBS-W5" -Hwnd 5005
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $state -Terminals @($terminal) -WtHwnds @(5005) `
+            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -Names @("OBS-W5") } `
+            -ProcessNameProvider { param($h) "notepad" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        Assert-Equal "missing" $snapshot.Terminals[0].State "wrong process is never present"
+        Assert-Equal 0 ([int]$snapshot.Counts.Present) "no positive association"
+    }
+
+    Test-Case "readable candidate wins over an unreadable candidate" {
+        $terminal = New-TerminalDefinition -Id "obs-t6" -WindowId "OBS-W6" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $state    = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "obs-t6" -WindowId "OBS-W6" -Hwnd 5006
+
+        $reads = @{
+            5006 = New-TerminalPresenceTestRead -Hwnd 5006 -HwndPresent $true -ReadOk $false -Complete $false -RawCount 0 -ErrorKind "uia-from-handle-failed" -Error "denied"
+            5007 = New-TerminalPresenceTestRead -Hwnd 5007 -HwndPresent $true -ReadOk $true -Complete $true -Names @("OBS-W6")
+        }
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $state -Terminals @($terminal) -WtHwnds @(5006, 5007) `
+            -CandidateReader { param($h) $reads[[int]$h] } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        Assert-Equal "present" $snapshot.Terminals[0].State "positive candidate wins"
+        Assert-Equal "snapshot" $snapshot.Terminals[0].Source "snapshot source"
+        Assert-Equal 5007 ([long]$snapshot.Terminals[0].Hwnd) "readable candidate HWND"
+    }
+
+    Test-Case "duplicate valid managed window identities remain ambiguous" {
+        $terminal = New-TerminalDefinition -Id "obs-t7" -WindowId "OBS-W7" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $config -SetId "main" -State $null -Terminals @($terminal) -WtHwnds @(5008, 5009) `
+            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -Names @("OBS-W7") } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        Assert-Equal "ambiguous" $snapshot.Terminals[0].State "duplicate identities refuse"
+        Assert-Equal 0 ([int]$snapshot.Counts.Present) "no first-match substitution"
+    }
+
+    Test-Case "inaccessible launch plan entry produces zero creation kicks" {
+        $terminal = New-TerminalDefinition -Id "obs-t8" -WindowId "OBS-W8" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $state    = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "obs-t8" -WindowId "OBS-W8" -Hwnd 5010
+
+        $script:obsKicks = 0
+        $script:obsTrackingCalls = 0
+
+        $plan = Get-DevWSTerminalLaunchPlan -Config $config -SetId "main" -State $state -Terminals @($terminal) -WtHwnds @(5010) `
+            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -HwndPresent $true -ReadOk $false -Complete $false -RawCount 0 -ErrorKind "uia-from-handle-failed" -Error "denied" } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true } `
+            -TrackingContextFactory { param($t) $script:obsTrackingCalls++; throw "tracking must not run for inaccessible" } `
+            -CreateArgumentsFactory { param($t, $k) throw "creation must not run for inaccessible" }
+
+        Assert-Equal "failed" $plan.Terminals[0].State "inaccessible maps to failed plan record"
+        Assert-Contains ([string]$plan.Terminals[0].Diagnostic) "could not be verified" "plan retains diagnostic"
+        Assert-Equal 1 ([int]$plan.Counts.Failed) "failed plan count"
+        Assert-Equal 0 $script:obsTrackingCalls "no tracking context"
+
+        $kick = Start-DevWSTerminalLaunchPlan -Plan $plan -WtPath "C:\Test\wt.exe" -ProcessStarter { param($record) $script:obsKicks++ }
+        Assert-Equal 0 $script:obsKicks "no process creation"
+        Assert-Equal 0 @($kick.Kicks).Count "no kick records"
+    }
+
+    Test-Case "genuinely missing plan entry still creates exact arguments" {
+        $terminal = New-TerminalDefinition -Id "obs-t9" -WindowId "OBS-W9" -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+
+        $plan = Get-DevWSTerminalLaunchPlan -Config $config -SetId "main" -State $null -Terminals @($terminal) -WtHwnds @() `
+            -CandidateReader { param($h) throw "UIA must not run" } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $false } `
+            -HwndValidator { param($h) $false } `
+            -TrackingContextFactory { param($t) $null } `
+            -CreateArgumentsFactory { param($t, $k) @("new-tab", [string]$t.windowId) }
+
+        Assert-Equal "missing" $plan.Terminals[0].State "genuine absence is launchable"
+        Assert-Equal "new-tab,OBS-W9" (@($plan.Terminals[0].CreateArguments) -join ",") "exact creation arguments"
+
+        $script:obsKicks = 0
+        $kick = Start-DevWSTerminalLaunchPlan -Plan $plan -WtPath "C:\Test\wt.exe" -ProcessStarter { param($record) $script:obsKicks++ }
+        Assert-Equal 1 $script:obsKicks "one creation kick"
+        Assert-Equal 1 @($kick.Kicks).Count "one kick record"
+    }
+
     Start-TestGroup -Name 'capture' -Title 'Capture handling'
 
     Test-Case "capture parser reads geometry and rejects bad lines" {
@@ -30581,11 +30852,16 @@ Start-Sleep -Seconds 6
             $script:s2ZtCalls = 0
             $script:s2ZtGive = 2   # first two reads return empty, third returns tabs
 
-            function Get-DevWSTabElementsFromHwnd {
+            function Get-DevWSTabReadResultFromHwnd {
                 param([long]$Hwnd)
+
                 $script:s2ZtCalls++
-                if ($script:s2ZtCalls -le $script:s2ZtGive) { return @() }
-                return @([pscustomobject]@{ Current = [pscustomobject]@{ Name = "S2-zt" } })
+
+                if ($script:s2ZtCalls -le $script:s2ZtGive) {
+                    return New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $true -Complete $true -Names @()
+                }
+
+                return New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $true -Complete $true -Elements @([pscustomobject]@{}) -Names @("S2-zt")
             }
 
             function Test-DevWSWindowHwnd { param([long]$Hwnd) return $true }
@@ -32338,7 +32614,7 @@ Start-Sleep -Seconds 6
     function New-StatusSyntheticModel {
         param($Terminals, $Apps, $Broker, $Coordinator, [bool]$IsDefault = $true)
 
-        $summary = [ordered]@{ Present = 0; Missing = 0; Ambiguous = 0; Mismatch = 0; Unowned = 0; Disabled = 0; Error = 0 }
+        $summary = [ordered]@{ Present = 0; Missing = 0; Inaccessible = 0; Ambiguous = 0; Mismatch = 0; Unowned = 0; Disabled = 0; Error = 0 }
 
         foreach ($row in @($Terminals) + @($Apps)) {
             $key = [string]$row.State
@@ -33114,6 +33390,71 @@ Start-Sleep -Seconds 6
     }
 
     Write-Host ""
+    Test-Case "status exposes inaccessible terminals distinctly in model and rendering" {
+        $terminal = New-StatusTerminalRow -Id "obs-status" -State "inaccessible" -Diagnostic "presence could not be verified: denied"
+        $model    = New-StatusSyntheticModel `
+            -Terminals @($terminal) `
+            -Apps @() `
+            -Broker (New-StatusHostInfo -State "ready" -HostPid 100 -Generation "A" -CurrentGeneration "A" -GenerationCurrent $true) `
+            -Coordinator (New-StatusHostInfo -State "unavailable")
+
+        Assert-Equal 1 ([int]$model.Summary.Inaccessible) "inaccessible summary count"
+        Assert-Equal 0 ([int]$model.Summary.Missing) "inaccessible is not missing"
+
+        $text = (@(Get-DevWSStatusLines -Model $model) -join "`n")
+        Assert-Contains $text "inaccessible" "state is visibly distinct"
+        Assert-Contains $text "presence unverified" "diagnostic is rendered"
+        Assert-Contains $text "1 inaccessible " "summary displays inaccessible count"
+        Assert-Contains $text "0 missing " "summary does not call it missing"
+    }
+
+    Test-Case "status model maps inaccessible snapshot rows without touching runtime files" {
+        $configPath = New-StatusConfigPath -Name "inaccessible-model" -Terminals @(
+            (New-StatusTerminalDefinition -Id "obs-model" -WindowId "DevWS-obs-model")
+        )
+        $config = Read-DevWSConfigFile -Path $configPath
+
+        $savedRoot = $env:DEVWS_STATE_ROOT
+        $stateRoot = New-StatusStateRoot "inaccessible-model"
+        $env:DEVWS_STATE_ROOT = $stateRoot
+
+        try {
+            $provider = {
+                param($Config, $SetId, $State, $Terminals)
+                return [pscustomobject]@{
+                    SetId     = "main"
+                    Terminals = @([pscustomobject]@{
+                        Order      = 0
+                        Terminal   = $Terminals[0]
+                        TerminalId = "obs-model"
+                        WindowId   = "DevWS-obs-model"
+                        State      = "inaccessible"
+                        Source     = "state"
+                        Hwnd       = [long]123
+                        Diagnostic = "presence could not be verified: denied"
+                    })
+                    Counts    = [pscustomobject]@{ Present = 0; Missing = 0; Ambiguous = 0; Inaccessible = 1; Failed = 0 }
+                    Stats     = [pscustomobject]@{ StateHits = 0; SnapshotHits = 0; FastMissing = 0; UiaReads = 0; InaccessibleHits = 1 }
+                }
+            }
+
+            $before = @(Get-ChildItem -LiteralPath $stateRoot -Recurse -File -ErrorAction SilentlyContinue).Count
+            $model  = Get-DevWSStatusModel -Config $config -TerminalSnapshotProvider $provider
+            $after  = @(Get-ChildItem -LiteralPath $stateRoot -Recurse -File -ErrorAction SilentlyContinue).Count
+
+            Assert-Equal "inaccessible" $model.Terminals[0].State "model state"
+            Assert-Equal "state" $model.Terminals[0].Source "model source"
+            Assert-Equal 123 ([long]$model.Terminals[0].Hwnd) "model hwnd retained"
+            Assert-Contains ([string]$model.Terminals[0].Diagnostic) "could not be verified" "model diagnostic"
+            Assert-Equal 1 ([int]$model.Summary.Inaccessible) "model summary count"
+            Assert-Equal 0 ([int]$model.Summary.Missing) "model does not count missing"
+            Assert-Equal $before $after "status does not write runtime files"
+        }
+        finally {
+            $env:DEVWS_STATE_ROOT = $savedRoot
+        }
+    }
+
     Start-TestGroup -Name 'monitors' -Title 'Read-only monitor diagnostics'
 
     function New-MonitorTestGdiRow {

@@ -120,6 +120,13 @@ must belong to Windows Terminal, and must be associated with the configured `win
 through UI Automation. A foreign application that happens to expose a same-named tab is
 never accepted.
 
+Presence is `inaccessible` when a live state-associated or candidate Windows Terminal
+window exists but its tab identity cannot be read reliably. UI Automation access failures,
+partial tab-name reads, and bounded empty-tab reads retain uncertainty instead of becoming
+`missing`; launch planning refuses creation for that terminal. Absence is established only
+when the relevant observation completed and no matching identity exists. A cached handle
+alone is never treated as `present`.
+
 Runtime state is keyed by the scoped identity `<set-id>/<terminal-id>`, so the same item
 id in two sets can never share a cached handle. Runtime state is disposable: losing it
 costs a discovery pass, never correctness.

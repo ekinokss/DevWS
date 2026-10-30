@@ -170,6 +170,9 @@ function Get-DevWSStatusLines {
         elseif ($t.State -eq "missing") {
             $detail = "path $($t.ConfiguredPath)"
         }
+        elseif ($t.State -eq "inaccessible") {
+            $detail = if ([string]::IsNullOrWhiteSpace([string]$t.Diagnostic)) { "presence unverified" } else { "presence unverified: $($t.Diagnostic)" }
+        }
         elseif ($t.State -eq "ambiguous") {
             $detail = [string]$t.Diagnostic
         }
@@ -251,8 +254,8 @@ function Get-DevWSStatusLines {
     $lines += ("  {0,-10}{1}" -f "hosts", ($hostParts -join " · "))
 
     $summary = $Model.Summary
-    $lines += ("  {0} present · {1} missing · {2} ambiguous · {3} mismatch · {4} unowned · {5} disabled · {6} error" -f `
-        $summary.Present, $summary.Missing, $summary.Ambiguous, $summary.Mismatch, $summary.Unowned, $summary.Disabled, $summary.Error)
+    $lines += ("  {0} present · {1} missing · {2} inaccessible · {3} ambiguous · {4} mismatch · {5} unowned · {6} disabled · {7} error" -f `
+        $summary.Present, $summary.Missing, $summary.Inaccessible, $summary.Ambiguous, $summary.Mismatch, $summary.Unowned, $summary.Disabled, $summary.Error)
     $lines += ""
 
     return $lines

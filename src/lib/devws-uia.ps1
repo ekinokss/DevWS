@@ -101,34 +101,204 @@ function Get-DevWSPresentTabNamesFromHwnd {
     return ,(Get-DevWSPresentTabNamesFromElement -Element $element)
 }
 
-function Get-DevWSTabElementsFromHwnd {
-    param([Parameter(Mandatory)][long]$Hwnd)
+function Get-DevWSUiaErrorText {
+    # Safe, bounded diagnostic text. Never expose a raw exception object or a
+    # multi-line stack trace to status/plan output.
+    param([AllowNull()]$Error)
 
-    Add-Type -AssemblyName UIAutomationClient
+    if ($null -eq $Error) {
+        return $null
+    }
+
+    $typeName = $null
+    $message = $null
+
+    if ($Error -is [System.Management.Automation.ErrorRecord]) {
+        $typeName = [string]$Error.Exception.GetType().Name
+        $message = [string]$Error.Exception.Message
+    }
+    elseif ($Error -is [Exception]) {
+        $typeName = [string]$Error.GetType().Name
+        $message = [string]$Error.Message
+    }
+    else {
+        $message = [string]$Error
+    }
+
+    $message = ($message -replace '\s+', ' ').Trim()
+
+    if ([string]::IsNullOrWhiteSpace($message)) {
+        return $typeName
+    }
+
+    if ($message.Length -gt 240) {
+        $message = $message.Substring(0, 240)
+    }
+
+    if ([string]::IsNullOrWhiteSpace($typeName)) {
+        return $message
+    }
+
+    return "${typeName}: $message"
+}
+
+function New-DevWSTabReadResult {
+    # Structured per-HWND observation. HwndPresent is a separate fact from Ok:
+    # a live HWND can have an unsuccessful tab read, and a successful empty
+    # tab read is not evidence that a managed terminal is absent.
+    param(
+        [Parameter(Mandatory)][long]$Hwnd,
+        [bool]$HwndPresent = $false,
+        [bool]$Ok = $false,
+        [bool]$Complete = $false,
+        [AllowEmptyCollection()][object[]]$Elements = @(),
+        [AllowEmptyCollection()][string[]]$Names = @(),
+        [int]$NameReadFailures = 0,
+        [string]$ErrorKind = "none",
+        [AllowNull()][string]$Error = $null
+    )
+
+    $elementList = @($Elements)
+
+    return [pscustomobject][ordered]@{
+        Hwnd             = [long]$Hwnd
+        HwndPresent      = [bool]$HwndPresent
+        Ok               = [bool]$Ok
+        Complete         = [bool]$Complete
+        Elements         = $elementList
+        TabNames         = (New-DevWSPresentTabNameSet -Names $Names)
+        RawCount         = [int]$elementList.Count
+        NameReadFailures = [int]$NameReadFailures
+        ErrorKind        = [string]$ErrorKind
+        Error            = $Error
+    }
+}
+
+function Get-DevWSTabReadResultFromHwnd {
+    # One bounded, non-mutating UI Automation observation for an exact HWND.
+    # RootProvider/TabProvider are test seams only; production callers use the
+    # real AutomationElement APIs. Every failure is returned as data.
+    param(
+        [Parameter(Mandatory)][long]$Hwnd,
+        [scriptblock]$RootProvider = $null,
+        [scriptblock]$TabProvider = $null,
+        [scriptblock]$HwndExistsProvider = $null
+    )
+
+    if ($null -eq $HwndExistsProvider) {
+        $HwndExistsProvider = { param([long]$ProbeHwnd) Test-DevWSWindowHwnd -Hwnd $ProbeHwnd }
+    }
+
+    $hwndPresent = [bool](& $HwndExistsProvider $Hwnd)
+
+    if (-not $hwndPresent) {
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $false -Ok $false -Complete $false -ErrorKind "hwnd-gone")
+    }
 
     try {
-        $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)
+        Add-Type -AssemblyName UIAutomationClient
     }
     catch {
-        return @()
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $false -Complete $false -ErrorKind "uia-assembly-unavailable" -Error (Get-DevWSUiaErrorText -Error $_))
+    }
+
+    try {
+        if ($null -ne $RootProvider) {
+            $root = & $RootProvider $Hwnd
+        }
+        else {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)
+        }
+    }
+    catch {
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $false -Complete $false -ErrorKind "uia-from-handle-failed" -Error (Get-DevWSUiaErrorText -Error $_))
     }
 
     if ($null -eq $root) {
-        return @()
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $false -Complete $false -ErrorKind "uia-null-element")
     }
 
-    $tabs = $root.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-DevWSTabItemCondition)
-    )
+    try {
+        if ($null -ne $TabProvider) {
+            $tabs = & $TabProvider $root
+        }
+        else {
+            $tabs = $root.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants,
+                (New-DevWSTabItemCondition)
+            )
+        }
+    }
+    catch {
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $false -Complete $false -ErrorKind "uia-findall-failed" -Error (Get-DevWSUiaErrorText -Error $_))
+    }
+
+    if ($null -eq $tabs) {
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $false -Complete $false -ErrorKind "uia-findall-null")
+    }
+
+    try {
+        $tabCount = [int]$tabs.Count
+    }
+    catch {
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $false -Complete $false -ErrorKind "uia-collection-failed" -Error (Get-DevWSUiaErrorText -Error $_))
+    }
 
     $elements = [System.Collections.Generic.List[object]]::new()
+    $names = [System.Collections.Generic.List[string]]::new()
+    $nameFailures = 0
+    $firstNameError = $null
 
-    foreach ($tab in $tabs) {
-        $elements.Add($tab)
+    for ($i = 0; $i -lt $tabCount; $i++) {
+        $tab = $null
+
+        try {
+            $tab = $tabs.Item($i)
+        }
+        catch {
+            $nameFailures++
+            if ($null -eq $firstNameError) { $firstNameError = $_ }
+            continue
+        }
+
+        if ($null -eq $tab) {
+            $nameFailures++
+            continue
+        }
+
+        $elements.Add($tab) | Out-Null
+
+        try {
+            $name = [string]$tab.Current.Name
+
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                $names.Add($name) | Out-Null
+            }
+        }
+        catch {
+            $nameFailures++
+            if ($null -eq $firstNameError) { $firstNameError = $_ }
+        }
     }
 
-    return $elements.ToArray()
+    $complete = ($nameFailures -eq 0)
+    $finalHwndPresent = [bool](& $HwndExistsProvider $Hwnd)
+
+    if (-not $finalHwndPresent) {
+        return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $false -Ok $true -Complete $false -Elements $elements.ToArray() -Names $names.ToArray() -NameReadFailures $nameFailures -ErrorKind "hwnd-gone" -Error (Get-DevWSUiaErrorText -Error $firstNameError))
+    }
+
+    return (New-DevWSTabReadResult -Hwnd $Hwnd -HwndPresent $true -Ok $true -Complete $complete -Elements $elements.ToArray() -Names $names.ToArray() -NameReadFailures $nameFailures -ErrorKind $(if ($complete) { "none" } else { "tab-name-read-failed" }) -Error (Get-DevWSUiaErrorText -Error $firstNameError))
+}
+
+function Get-DevWSTabElementsFromHwnd {
+    # Compatibility wrapper for callers that only need the element array.
+    # Structured presence callers use Get-DevWSTabReadResultFromHwnd so that an
+    # access failure is never confused with a successful empty tab observation.
+    param([Parameter(Mandatory)][long]$Hwnd)
+
+    $result = Get-DevWSTabReadResultFromHwnd -Hwnd $Hwnd
+    return @($result.Elements)
 }
 
 function Get-DevWSTabCountFromElements {

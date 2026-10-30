@@ -119,6 +119,7 @@ ws show secondary
 Show the current configured and live state of a workspace set.
 
 - Reports terminals and apps with live presence, ambiguity and ownership observations, plus tracked cwd where available.
+- Reports `inaccessible` when a live terminal exists but its tab identity cannot be verified. This is distinct from `missing` and is counted separately; a cached HWND alone is never reported as present.
 - Reports broker/coordinator liveness and deployed-generation currency; a stale host is reported, never restarted.
 - Strictly observational: never launches, focuses, repairs, or writes anything.
 

@@ -122,7 +122,8 @@ function Get-DevWSStatusModel {
     # config/set resolution errors propagate as command-level failures.
     param(
         [Parameter(Mandatory)]$Config,
-        [string]$SetId
+        [string]$SetId,
+        [scriptblock]$TerminalSnapshotProvider = $null
     )
 
     $target     = Resolve-DevWSLifecycleTarget -Config $Config -SetId $SetId
@@ -139,7 +140,12 @@ function Get-DevWSStatusModel {
     $snapshot = $null
 
     if ($enabledTerminals.Count -gt 0) {
-        $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $Config -SetId $target.SetId -State $state -Terminals $enabledTerminals
+        if ($null -ne $TerminalSnapshotProvider) {
+            $snapshot = & $TerminalSnapshotProvider -Config $Config -SetId $target.SetId -State $state -Terminals $enabledTerminals
+        }
+        else {
+            $snapshot = Get-DevWSTerminalPresenceSnapshot -Config $Config -SetId $target.SetId -State $state -Terminals $enabledTerminals
+        }
     }
 
     $terminals = [System.Collections.Generic.List[object]]::new()
@@ -268,13 +274,14 @@ function Get-DevWSStatusModel {
 
     # ---- summary (workspace items only; hosts are reported separately) ------
     $summary = [ordered]@{
-        Present   = 0
-        Missing   = 0
-        Ambiguous = 0
-        Mismatch  = 0
-        Unowned   = 0
-        Disabled  = 0
-        Error     = 0
+        Present      = 0
+        Missing      = 0
+        Inaccessible = 0
+        Ambiguous    = 0
+        Mismatch     = 0
+        Unowned      = 0
+        Disabled     = 0
+        Error        = 0
     }
 
     foreach ($row in @($terminals) + @($apps)) {
