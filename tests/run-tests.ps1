@@ -22476,6 +22476,7 @@ public static class DevWSNativeWindowTestWindow
             "devws-terminal-candidates.cs" = @(
                 "public static class DevWSTerminalNative",
                 "public static long[] GetWindowsTerminalTopLevelHwnds()",
+                "public static bool IsWindowsTerminalTopLevelHwnd(long hwnd)",
                 "CASCADIA_HOSTING_WINDOW_CLASS"
             )
             "devws-broker-pipe.cs" = @(
@@ -22667,6 +22668,33 @@ Write-Output "REPOSITORY-COMPILE-OK"
         Assert-NotContains $probe.Output "invoked Add-Type" "installed mode never invoked the compiler"
     }
 
+    Test-Case "generated native DLL exposes the terminal class method in both copies" {
+        $fixture = New-InstallFixture "native-method-both"
+        $privileged = Initialize-TestPrivilegedFixture -Fixture $fixture
+
+        $paths = @(
+            (Get-DevWSInstalledNativeDllPath -InstallRoot $fixture.Root),
+            (Join-Path $privileged "native\DevWS.Native.dll")
+        )
+
+        foreach ($path in $paths) {
+            Assert-True (Test-Path -LiteralPath $path -PathType Leaf) "native DLL exists: $path"
+
+            $assembly = [System.Reflection.Assembly]::Load([System.IO.File]::ReadAllBytes($path))
+            $type = $assembly.GetType("DevWSTerminalNative", $false)
+
+            Assert-True ($null -ne $type) "DevWSTerminalNative exists: $path"
+
+            $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static
+            $method = $type.GetMethod("IsWindowsTerminalTopLevelHwnd", $flags)
+
+            Assert-True ($null -ne $method) "terminal class method exists: $path"
+            Assert-Equal 1 @($method.GetParameters()).Count "terminal class method parameter count: $path"
+            Assert-True ($method.GetParameters()[0].ParameterType -eq [long]) "terminal class method parameter type: $path"
+            Assert-True ($method.ReturnType -eq [bool]) "terminal class method return type: $path"
+        }
+    }
+
     Test-Case "installed native mode fails actionably without the generated DLL" {
         $fixture = New-InstallFixture "native-missing"
         $null = Install-DevWSApplicationFiles -RepoRoot $RepoRoot -InstallRoot $fixture.Root
@@ -22716,6 +22744,45 @@ Write-Output "REPOSITORY-COMPILE-OK"
         Assert-Contains $probe.Output "DevWSAppWindowNative" "incomplete DLL names a missing type"
         Assert-Contains $probe.Output "install.ps1" "incomplete DLL names the recovery action"
         Assert-NotContains $probe.Output "invoked Add-Type" "incomplete DLL never falls back to compilation"
+    }
+
+    Test-Case "installed native mode rejects a stale terminal method surface" {
+        $fixture = New-InstallFixture "native-stale-terminal"
+        $null = Install-DevWSApplicationFiles -RepoRoot $RepoRoot -InstallRoot $fixture.Root
+
+        $decoySource = Join-Path $fixture.Root "terminal-method-decoy.cs"
+        Set-Content -LiteralPath $decoySource -Value @'
+using System;
+
+public static class DevWSTerminalNative
+{
+    public static long[] GetWindowsTerminalTopLevelHwnds() { return new long[0]; }
+}
+'@ -NoNewline
+
+        $decoyDll = Join-Path $fixture.Root "terminal-method-decoy.dll"
+        $null = Invoke-TestNativeCompile -SourcePath @(
+            (Join-Path $RepoRoot "src\native\devws-window-ops.cs"),
+            (Join-Path $RepoRoot "src\native\devws-app-window.cs"),
+            (Join-Path $RepoRoot "src\native\devws-app-ownership.cs"),
+            (Join-Path $RepoRoot "src\native\devws-app-candidates.cs"),
+            $decoySource,
+            (Join-Path $RepoRoot "src\native\devws-broker-pipe.cs"),
+            (Join-Path $RepoRoot "src\native\devws-monitor.cs"),
+            (Join-Path $RepoRoot "src\native\devws-privilege-identity.cs"),
+            (Join-Path $RepoRoot "src\native\devws-worker-pipe-identity.cs")
+        ) -OutputPath $decoyDll -Label "stale-terminal"
+
+        $dllPath = Get-DevWSInstalledNativeDllPath -InstallRoot $fixture.Root
+        New-Item -ItemType Directory -Path (Split-Path -Parent $dllPath) -Force | Out-Null
+        [System.IO.File]::Copy($decoyDll, $dllPath, $true)
+
+        $probe = Invoke-InstalledNativeProbe -NativeLibPath (Join-Path $fixture.Root "app\lib\devws-native.ps1") -Label "stale-terminal"
+
+        Assert-Contains $probe.Output "INSTALLED-NATIVE-ERROR" "stale terminal method surface fails"
+        Assert-Contains $probe.Output "IsWindowsTerminalTopLevelHwnd" "stale method is named"
+        Assert-Contains $probe.Output "install.ps1" "stale method names the recovery action"
+        Assert-NotContains $probe.Output "invoked Add-Type" "stale DLL never falls back to compilation"
     }
 
     Test-Case "native assembly validation rejects wrong type and missing surface" {
@@ -22861,6 +22928,33 @@ public sealed class DevWSMonitorPathSnapshot { }
         $monitorDecoy = Test-DevWSNativeAssemblyBytes -Bytes ([System.IO.File]::ReadAllBytes($monitorDecoyDll))
         Assert-Equal $false $monitorDecoy.Ok "missing monitor surface rejected"
         Assert-Contains $monitorDecoy.Message "DevWSMonitorNative.GetGdiMonitorRows" "missing monitor surface is named"
+
+        # Terminal type present but missing the exact-HWND class method. The
+        # installer must reject this before promoting the assembly.
+        $terminalDecoySource = Join-Path $decoyRoot "terminal-method-decoy.cs"
+        Set-Content -LiteralPath $terminalDecoySource -Value @'
+using System;
+
+public static class DevWSTerminalNative
+{
+    public static long[] GetWindowsTerminalTopLevelHwnds() { return new long[0]; }
+}
+'@ -NoNewline
+        $terminalDecoyDll = Join-Path $decoyRoot "terminal-method-decoy.dll"
+        $null = Invoke-TestNativeCompile -SourcePath @(
+            $realOps,
+            $realAw,
+            $realAo,
+            (Join-Path $RepoRoot "src\native\devws-app-candidates.cs"),
+            $terminalDecoySource,
+            (Join-Path $RepoRoot "src\native\devws-broker-pipe.cs"),
+            (Join-Path $RepoRoot "src\native\devws-monitor.cs"),
+            (Join-Path $RepoRoot "src\native\devws-privilege-identity.cs"),
+            (Join-Path $RepoRoot "src\native\devws-worker-pipe-identity.cs")
+        ) -OutputPath $terminalDecoyDll -Label "terminal-method-decoy"
+        $terminalDecoy = Test-DevWSNativeAssemblyBytes -Bytes ([System.IO.File]::ReadAllBytes($terminalDecoyDll))
+        Assert-Equal $false $terminalDecoy.Ok "missing terminal class method rejected"
+        Assert-Contains $terminalDecoy.Message "DevWSTerminalNative.IsWindowsTerminalTopLevelHwnd" "missing terminal method is named"
 
         # Validated candidate bytes are never file-locked: the source file can
         # still be replaced after validation.

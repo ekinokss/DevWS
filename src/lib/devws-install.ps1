@@ -592,6 +592,16 @@ function Test-DevWSNativeAssemblyBytes {
         return [pscustomobject]@{ Ok = $false; Message = "method DevWSTerminalNative.GetWindowsTerminalTopLevelHwnds is missing or has an unexpected signature" }
     }
 
+    $terminalPresenceMethod = $terminalType.GetMethod("IsWindowsTerminalTopLevelHwnd")
+    $terminalPresenceParameters = if ($null -ne $terminalPresenceMethod) { @($terminalPresenceMethod.GetParameters()) } else { @() }
+
+    if ($null -eq $terminalPresenceMethod -or
+        $terminalPresenceParameters.Count -ne 1 -or
+        $terminalPresenceParameters[0].ParameterType -ne [long] -or
+        $terminalPresenceMethod.ReturnType -ne [bool]) {
+        return [pscustomobject]@{ Ok = $false; Message = "method DevWSTerminalNative.IsWindowsTerminalTopLevelHwnd is missing or has an unexpected signature" }
+    }
+
     # Secure elevated broker pipe creation surface.
     $pipeType = $assembly.GetType("DevWSBrokerPipeNative", $false)
 

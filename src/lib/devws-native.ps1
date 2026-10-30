@@ -78,6 +78,34 @@ function Get-DevWSNativeRequiredTypeNames {
     )
 }
 
+function Test-DevWSTerminalNativeMethodSurface {
+    # The exact-HWND terminal class check is part of the generated native
+    # contract. A type-only check would let an older assembly load and fail
+    # later with a missing-method error at the first presence observation.
+    param([AllowNull()]$Type = $null)
+
+    if ($null -eq $Type) {
+        $Type = ([System.Management.Automation.PSTypeName]'DevWSTerminalNative').Type
+    }
+
+    if ($null -eq $Type) {
+        return $false
+    }
+
+    $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static
+    $method = $Type.GetMethod('IsWindowsTerminalTopLevelHwnd', $flags)
+
+    if ($null -eq $method) {
+        return $false
+    }
+
+    $parameters = @($method.GetParameters())
+
+    return ($parameters.Count -eq 1 -and
+        $parameters[0].ParameterType -eq [long] -and
+        $method.ReturnType -eq [bool])
+}
+
 function Test-DevWSNativeRuntimeLoaded {
     foreach ($typeName in @(Get-DevWSNativeRequiredTypeNames)) {
         if ($null -eq ([System.Management.Automation.PSTypeName]$typeName).Type) {
@@ -85,7 +113,7 @@ function Test-DevWSNativeRuntimeLoaded {
         }
     }
 
-    return $true
+    return (Test-DevWSTerminalNativeMethodSurface)
 }
 
 function Get-DevWSNativeRuntimeLayout {
@@ -187,12 +215,23 @@ function Initialize-DevWSNativeRuntime {
         if ($missingTypes.Count -gt 0) {
             throw "The generated DevWS native runtime is incomplete ($($layout.DllPath)): missing $($missingTypes -join ', '). Run install.ps1 to regenerate it."
         }
+
+        $terminalType = $assembly.GetType("DevWSTerminalNative", $false)
+
+        if (-not (Test-DevWSTerminalNativeMethodSurface -Type $terminalType)) {
+            throw "The generated DevWS native runtime is stale ($($layout.DllPath)): DevWSTerminalNative.IsWindowsTerminalTopLevelHwnd is missing or has an unexpected signature. Run install.ps1 to regenerate it."
+        }
     }
 
-    # Post-condition: every required type must resolve through PowerShell.
+    # Post-condition: every required type and the terminal method surface must
+    # resolve through PowerShell.
     $stillMissing = @(Get-DevWSNativeRequiredTypeNames | Where-Object { $null -eq ([System.Management.Automation.PSTypeName]$_).Type })
 
     if ($stillMissing.Count -gt 0) {
         throw "DevWS native runtime initialization did not expose: $($stillMissing -join ', ')."
+    }
+
+    if (-not (Test-DevWSTerminalNativeMethodSurface)) {
+        throw "DevWS native runtime is stale or incomplete: DevWSTerminalNative.IsWindowsTerminalTopLevelHwnd is missing or has an unexpected signature. Run install.ps1 to regenerate it."
     }
 }
