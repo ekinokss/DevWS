@@ -10,16 +10,19 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-1.0, with an unsigned stable Windows binary release.**
+> **Status: pre-1.0, with an unsigned stable Windows binary release and a v0.3.0
+> release candidate under acceptance.**
 >
 > The current stable binary is **v0.2.0**, an unsigned Windows x64 setup:
 > [GitHub stable release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0).
 > The earlier `v0.2.0-rc.1` pre-release remains available:
 > [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
-> The stable **v0.2.0** GitHub release is published. No WinGet catalog package exists; the
-> prepared WinGet submission is blocked by the installer's same-account elevation requirement.
-> Verify the published SHA-256 before running the installer. The frozen v0.1.0 source release
-> remains available, and source installation remains supported.
+> The stable **v0.2.0** GitHub release is published. **v0.3.0 is a release candidate under
+> acceptance and is not published**; no v0.3.0 download is available.
+> No WinGet catalog package exists; the prepared WinGet submission is blocked by the
+> installer's same-account elevation requirement. Verify the published SHA-256 before running
+> the installer. The frozen v0.1.0 source release remains available, and source installation
+> remains supported.
 >
 > [Code signing policy](CODE_SIGNING_POLICY.md) · [Privacy information](PRIVACY.md)
 
@@ -45,13 +48,17 @@ tedious and error-prone. DevWS replaces the manual work with configuration:
   separate project), each a complete definition, each launchable on its own.
 - **Managed terminals** — Windows Terminal windows and tabs created from configuration,
   with per-tab working directories and startup commands, and a stable named-window
-  identity so live windows are recognised rather than duplicated.
+  identity so live windows are recognised rather than duplicated. Presence observation
+  distinguishes an inaccessible elevated window from a genuinely missing one, so an
+  inconclusive read does not create a duplicate.
 - **Managed applications** — desktop applications matched by executable or process path,
   launched when missing, and placed at their saved geometry.
 - **Layout capture** — save the real on-screen rectangles after arranging windows by
   hand, then restore them later.
 - **Topology layout profiles** — optional per-set layouts keyed to an exact monitor
   topology, with a universal fallback layout for everything else.
+- **Monitor-relative layouts** — optional normalized geometry anchored to a durable monitor
+  identity, with exact topology profiles and a mandatory absolute fallback.
 - **Live-state saving** — persist window geometry plus the reliable tracked working
   directory and active tab of each managed terminal.
 - **Global hotkeys** — a managed AutoHotkey host plus generated per-set launch hotkeys.
@@ -84,9 +91,14 @@ The strict local release gate is stronger: it must pass with zero failures, zero
 skips and zero filter exclusions on a UAC-enabled, elevated Windows environment, where the
 positive linked-Medium path executes.
 
-The installer lifecycle was acceptance-tested on a disposable Windows 11 VM: clean install,
-25/25 installed health, genuine linked-Medium protected-state validation, the exact five-task
-topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall and purge.
+For v0.2.0, the installer lifecycle was acceptance-tested on a disposable Windows 11 VM: clean
+install, 25/25 installed health, genuine linked-Medium protected-state validation, the exact
+five-task topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall and
+purge.
+
+The v0.3.0 release candidate is being prepared on `release/v0.3.0-preparation`. Its guest
+cross-version upgrade, live Medium/High terminal-presence, elevated-reset and lifecycle
+acceptance are separate release gates and have not yet been declared complete.
 
 ## Prerequisites
 
@@ -121,6 +133,9 @@ Microsoft Defender SmartScreen. Installation requires administrator elevation un
 Windows account that starts setup; UAC elevation using a different administrator account is
 intentionally rejected. The packaged setup can acquire a trusted machine-wide AutoHotkey v2
 installation through WinGet when it is missing, which requires network connectivity.
+
+The v0.3.0 release candidate is not published. Do not substitute a v0.3.0 candidate build for
+the stable v0.2.0 release or obtain one from an unofficial source.
 
 See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
 
@@ -367,6 +382,21 @@ backups, the legacy `%USERPROFILE%\.ws` directory and unrelated integrations:
 Add `-Purge` to remove the canonical configuration and disposable state/backups as well.
 Both forms require elevation, and `-Force` skips the confirmation prompt. See
 [docs/installer.md](docs/installer.md) §10.
+
+## Compatibility and acceptance limits
+
+- Schema version 3 remains the only runtime schema. Relative layout fields are additive; an
+  existing absolute configuration needs no migration.
+- v0.2 binaries do not understand relative-layout semantics. They may preserve the fields as
+  opaque data or drop them on clone/save, so relative intent is not downgrade-safe.
+- v0.3.0 remains Windows 11 x64 only, unsigned, and dependent on same-account administrator
+  elevation for installation. There is no WinGet catalog package, MSI/MSIX identity,
+  self-update or attestation.
+- The v0.3.0 candidate still requires guest cross-version upgrade, live Medium/High
+  terminal-presence, elevated-reset and installer-lifecycle acceptance.
+- Hardware scenarios RH-03 (mixed 150%/100% scaling) and RH-05 (primary-monitor change) remain
+  outstanding release-review items. Durable path identities are validated; physical EDID
+  behavior is not claimed from path-only evidence.
 
 ## Documentation
 

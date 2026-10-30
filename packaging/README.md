@@ -1,9 +1,10 @@
 # DevWS Setup Bootstrapper and Release Candidate
 
 This directory contains the source for the Windows x64 setup lifecycle used to build the
-public `v0.2.0-rc.1` pre-release and the published stable unsigned `v0.2.0` GitHub release.
-The setup executable is published only through official GitHub Releases, not from this
-directory.
+public `v0.2.0-rc.1` pre-release, the published stable unsigned `v0.2.0` GitHub release and
+the unpublished `v0.3.0` release candidate. The setup executable is published only through
+official GitHub Releases, not from this directory. The v0.3.0 candidate is not uploaded or
+published.
 
 The bootstrapper embeds the tracked DevWS installation payload and invokes the accepted
 Phase-1 contracts:
@@ -24,7 +25,7 @@ rollback remain owned by the existing PowerShell installer.
 | Product ID / ARP key | `ekinokss.DevWS` |
 | Display name | `DevWS` |
 | Publisher | `ekinokss` |
-| Current source version | `0.2.0` |
+| Current source version | `0.3.0` |
 | ARP hive/view | `HKCU` 64-bit uninstall view |
 | Persisted setup | `%ProgramFiles%\DevWS\setup\<current-user-SID>\DevWS-Setup.exe` |
 
@@ -143,8 +144,9 @@ source bytes.
 
 The verified bundle is retained only as a GitHub Actions artifact on a manually dispatched
 run of the bootstrapper workflow. Ordinary feature-branch pushes run the fixture lifecycle
-only and do not upload a production candidate. No GitHub Release, tag, WinGet submission,
-attestation or binary publication is produced by this pipeline.
+only and do not upload a production candidate. The v0.3.0 candidate is built and verified
+locally outside the repository; it is not uploaded, tagged or published. No GitHub Release,
+tag, WinGet submission, attestation or binary publication is produced by this pipeline.
 
 The candidate is unsigned by default; Authenticode status is reported by the verifier and
 must not be treated as signed. Native AOT output is not claimed to be byte-reproducible.
@@ -182,10 +184,11 @@ source-commit check still requires the executable's embedded source SHA to match
 ## WinGet submission preparation
 
 The prepared three-file package manifest and the finalization/submission checklist are in
-[`winget/README.md`](winget/README.md). The committed manifest is a template: the final
-`v0.2.0` asset URL is expected, while the installer hash and release metadata must be
-updated after publication. The public `v0.2.0-rc.1` binary is used only as a local
-validation reference, not as the final package.
+[`winget/README.md`](winget/README.md). The committed manifest is a historical v0.2.0
+template: the final `v0.2.0` asset URL is expected, while the installer hash and release
+metadata must be updated after publication. The public `v0.2.0-rc.1` binary is used only as a
+local validation reference, not as the final package. No v0.3.0 WinGet manifest is prepared,
+and the v0.2.0 template must not be reused for v0.3.0.
 
 **The template is not submitted and is not ready for submission.** WinGet's unattended
 validation runs the installer without elevation and rejects blocking UAC prompts. DevWS
@@ -201,8 +204,9 @@ per-user package lifecycle paths, under build-time-only fixture identities):
 pwsh -NoLogo -NoProfile -File packaging\test-bootstrapper.ps1
 ```
 
-The test builds disposable Native AOT executables for fixture versions `0.2.0` and `0.2.1`.
-It proves fresh install, same-version reinstall, upgrade, downgrade refusal, install and
+The test builds disposable Native AOT executables for fixture identity versions `0.2.0` and
+`0.2.1`; those are test fixtures, not the product version. It proves fresh install,
+same-version reinstall, upgrade, downgrade refusal, install and
 uninstall failure preservation, ARP registration, protected SID-qualified setup persistence,
 ACL semantics, successful self-removing uninstall, user-data preservation and final residue
 cleanup. It also runs the pure archive/trust/version/ARP checks. It never invokes the real
@@ -221,6 +225,8 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
   `v0.2.0-rc.1` setup pre-release and the stable `v0.2.0` GitHub release are public.
 - The release-candidate Actions artifact is retained for verification. The stable `v0.2.0`
   release is the current published binary; the `v0.2.0-rc.1` pre-release remains available.
+- The `v0.3.0` candidate is a local, unpublished release candidate. It is not tagged,
+  uploaded or offered for installation, and its guest acceptance is still pending.
 
 ## Security boundaries
 

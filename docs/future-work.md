@@ -183,8 +183,9 @@ without an explicit design decision.
 
 > Status: v0.3 Phases 1-5 implemented the relative-layout schema, `ws show-layout` reporting,
 > lifecycle placement, capture/save, explicit authoring, reset clearing and clone preservation.
-> Release hardening and acceptance remain later phases. The questions below record the original
-> design discussion; see `docs/monitor-relative-layout-design.md` for the approved model.
+> The v0.3.0 release-candidate preparation adds release hardening; guest and hardware acceptance
+> remain outstanding. The questions below record the original design discussion; see
+> `docs/monitor-relative-layout-design.md` for the approved model.
 
 Today's geometry is an absolute rectangle, captured by arranging windows and running
 `ws save-layout`. Topology profiles already make a set carry several layouts, but each one is

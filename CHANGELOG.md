@@ -5,7 +5,56 @@ All notable changes to DevWS are recorded here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions and
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-10-30
+
+### Added
+
+- **Monitor-relative layouts** — schema-v3 items may set `layoutMode: "relative"` and
+  `layoutRelative` with a durable monitor identity (`edid:` or `path:`), an optional instance
+  tie-breaker, a `workArea` or `monitor` basis, and nontrivial normalized `x`/`y`/`w`/`h`
+  fractions. Exact topology profiles still win; otherwise a relative item resolves its anchor
+  and falls back to the mandatory absolute `item.layout` when the anchor is absent or
+  unreachable. `ws set-geometry --relative`, `ws show-layout`, fallback-scope save, targeted
+  reset and clone operations preserve the relative intent. The schema version remains 3.
+- **Terminal presence observability** — structured UI Automation reads retain the raw tab
+  element count (including duplicate names), report per-tab name-read failures, and distinguish
+  missing, inaccessible, ambiguous and failed observations. A present-but-inaccessible window
+  is no longer treated as missing, and an inconclusive observation does not trigger a duplicate
+  creation kick. `ws status` and launch planning expose the source, diagnostic and counts.
+- **Native terminal method-surface validation** — generated native assemblies must expose
+  `DevWSTerminalNative.IsWindowsTerminalTopLevelHwnd(long)`. Installer candidate validation and
+  installed-runtime loading fail closed with `install.ps1` guidance when an older or partial
+  assembly is present.
+
+### Changed
+
+- **Presence source reporting** — state, snapshot and UIA associations carry their actual source
+  and structured diagnostics; an empty successful UIA read remains distinct from an access
+  failure.
+- **Configuration compatibility** — relative layout fields are additive to schema version 3.
+  Existing absolute configurations remain valid without migration. v0.2 binaries treat the new
+  fields as opaque and can drop or ignore relative intent on clone or save; relative semantics
+  are not downgrade-safe.
+
+### Fixed
+
+- The presence model now distinguishes an inaccessible elevated Windows Terminal from a missing
+  window; `ws status` reports `inaccessible` and the launch plan does not create a duplicate
+  window when observation is inconclusive.
+- A failed per-tab `Current.Name` getter is counted as an incomplete read instead of being
+  silently converted to an empty name.
+
+### Notes
+
+- This is a v0.3.0 release candidate prepared from the approved terminal-presence reliability
+  fix. It is not tagged or published. The stable binary remains v0.2.0.
+- Guest upgrade/repair/uninstall acceptance, live Medium/High terminal observation and the
+  hardware scenarios RH-03 (mixed scaling) and RH-05 (primary-monitor change) remain release
+  gates. Path identities are validated; physical EDID behavior is not claimed.
+- Windows 11 x64 only; unsigned; same-account administrator elevation required. No WinGet
+  catalog package, MSI/MSIX identity, self-update or attestation is available.
+
+## [0.2.0] - 2026-10-27
 
 ### Added
 
