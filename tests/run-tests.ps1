@@ -5459,6 +5459,16 @@ try {
         Assert-Equal 0 $find.RawCount "FindAll failure returns no fabricated tab count"
     }
 
+    Test-Case "legacy tab-name read degrades a FindAll failure to an empty name set" {
+        $fakeElement = [pscustomobject]@{}
+        $fakeElement | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
+            throw [System.Runtime.InteropServices.COMException]::new('findall-catastrophic')
+        }
+
+        $names = Get-DevWSPresentTabNamesFromElement -Element $fakeElement
+        Assert-Equal 0 @($names).Count "transient FindAll failure does not escape the legacy name read"
+    }
+
     Test-Case "per-tab name-read failure is incomplete, not an access failure" {
         if (-not ([System.Management.Automation.PSTypeName]'DevWSPhase61BFakeTab').Type) {
             Add-Type @'

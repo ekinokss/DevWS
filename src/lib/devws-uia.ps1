@@ -108,10 +108,18 @@ function Get-DevWSPresentTabNamesFromElement {
         $Element
     )
 
-    $tabs = $Element.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-DevWSTabItemCondition)
-    )
+    try {
+        $tabs = $Element.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            (New-DevWSTabItemCondition)
+        )
+    }
+    catch {
+        # A transient UIA failure while a window is materializing must degrade
+        # to an empty name set. Callers that need the failure category use the
+        # structured read path; identity readiness callers retry.
+        return ,(New-DevWSPresentTabNameSet -Names @())
+    }
 
     $names = [System.Collections.Generic.List[string]]::new()
 
