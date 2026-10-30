@@ -484,23 +484,33 @@ function Find-DevWSTerminalTopLevelHwnd {
     # (zero) -- never first-match guessing.
     param(
         [Parameter(Mandatory)]
-        [string]$WindowId
+        [string]$WindowId,
+        [scriptblock]$RootProvider = $null
     )
 
     Add-Type -AssemblyName UIAutomationClient
 
-    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $root = if ($null -ne $RootProvider) { & $RootProvider } else { [System.Windows.Automation.AutomationElement]::RootElement }
 
     if ($null -eq $root) {
         return 0
     }
 
+    try {
+        $tabs = $root.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            (New-DevWSTabItemCondition)
+        )
+    }
+    catch {
+        # A transient root UIA failure means discovery is unavailable right
+        # now, not that a managed terminal was found. Identity waiters retry.
+        return 0
+    }
+
     $hwnds = [System.Collections.Generic.HashSet[long]]::new()
 
-    foreach ($tab in $root.FindAll(
-        [System.Windows.Automation.TreeScope]::Descendants,
-        (New-DevWSTabItemCondition)
-    )) {
+    foreach ($tab in $tabs) {
         try {
             $name = [string]$tab.Current.Name
         }

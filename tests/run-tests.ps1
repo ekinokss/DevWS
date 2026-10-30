@@ -5469,6 +5469,16 @@ try {
         Assert-Equal 0 @($names).Count "transient FindAll failure does not escape the legacy name read"
     }
 
+    Test-Case "terminal discovery treats a root FindAll failure as temporarily absent" {
+        $fakeRoot = [pscustomobject]@{}
+        $fakeRoot | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
+            throw [System.Runtime.InteropServices.COMException]::new('root-findall-catastrophic')
+        }
+
+        $hwnd = Find-DevWSTerminalTopLevelHwnd -WindowId 'DevWS-root-failure' -RootProvider { $fakeRoot }
+        Assert-Equal 0 $hwnd "root FindAll failure does not escape terminal discovery"
+    }
+
     Test-Case "per-tab name-read failure is incomplete, not an access failure" {
         if (-not ([System.Management.Automation.PSTypeName]'DevWSPhase61BFakeTab').Type) {
             Add-Type @'
