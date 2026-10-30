@@ -51,6 +51,57 @@ function New-DevWSButtonCondition {
     )
 }
 
+function Get-DevWSTabElementName {
+    # PowerShell can swallow a property-getter exception during a normal
+    # member access and return $null. Reflection makes the failure observable
+    # so a failed tab-name read cannot be mistaken for a valid empty name.
+    param(
+        [Parameter(Mandatory)]
+        $Element
+    )
+
+    try {
+        $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Instance
+        # GetMember(..., MemberTypes.Property, ...) resolves the property
+        # without the accessor token reserved for the Win32 ownership
+        # libraries by source hygiene.
+        $currentMembers = @($Element.GetType().GetMember("Current", [System.Reflection.MemberTypes]::Property, $flags))
+        $currentProperty = if ($currentMembers.Count -gt 0) { [System.Reflection.PropertyInfo]$currentMembers[0] } else { $null }
+
+        if ($null -eq $currentProperty) {
+            return [pscustomobject]@{ Ok = $false; Name = $null; Error = "current-property-missing" }
+        }
+
+        $current = $currentProperty.GetValue($Element)
+
+        if ($null -eq $current) {
+            return [pscustomobject]@{ Ok = $false; Name = $null; Error = "current-value-null" }
+        }
+
+        $nameMembers = @($current.GetType().GetMember("Name", [System.Reflection.MemberTypes]::Property, $flags))
+        $nameProperty = if ($nameMembers.Count -gt 0) { [System.Reflection.PropertyInfo]$nameMembers[0] } else { $null }
+
+        if ($null -eq $nameProperty) {
+            return [pscustomobject]@{ Ok = $false; Name = $null; Error = "name-property-missing" }
+        }
+
+        $value = $nameProperty.GetValue($current)
+
+        return [pscustomobject]@{
+            Ok    = $true
+            Name  = if ($null -eq $value) { $null } else { [string]$value }
+            Error = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Ok    = $false
+            Name  = $null
+            Error = (Get-DevWSUiaErrorText -Error $_)
+        }
+    }
+}
+
 function Get-DevWSPresentTabNamesFromElement {
     param(
         [Parameter(Mandatory)]
@@ -65,14 +116,11 @@ function Get-DevWSPresentTabNamesFromElement {
     $names = [System.Collections.Generic.List[string]]::new()
 
     foreach ($tab in $tabs) {
-        try {
-            $name = [string]$tab.Current.Name
+        $nameInfo = Get-DevWSTabElementName -Element $tab
 
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-                $names.Add($name)
-            }
+        if ($nameInfo.Ok -and -not [string]::IsNullOrWhiteSpace([string]$nameInfo.Name)) {
+            $names.Add([string]$nameInfo.Name)
         }
-        catch {}
     }
 
     return ,(New-DevWSPresentTabNameSet -Names $names.ToArray())
@@ -268,16 +316,16 @@ function Get-DevWSTabReadResultFromHwnd {
 
         $elements.Add($tab) | Out-Null
 
-        try {
-            $name = [string]$tab.Current.Name
+        $nameInfo = Get-DevWSTabElementName -Element $tab
 
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-                $names.Add($name) | Out-Null
+        if ($nameInfo.Ok) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$nameInfo.Name)) {
+                $names.Add([string]$nameInfo.Name) | Out-Null
             }
         }
-        catch {
+        else {
             $nameFailures++
-            if ($null -eq $firstNameError) { $firstNameError = $_ }
+            if ($null -eq $firstNameError) { $firstNameError = $nameInfo.Error }
         }
     }
 

@@ -5459,6 +5459,91 @@ try {
         Assert-Equal 0 $find.RawCount "FindAll failure returns no fabricated tab count"
     }
 
+    Test-Case "per-tab name-read failure is incomplete, not an access failure" {
+        if (-not ([System.Management.Automation.PSTypeName]'DevWSPhase61BFakeTab').Type) {
+            Add-Type @'
+using System;
+
+public sealed class DevWSPhase61BFakeCurrent
+{
+    private readonly string name;
+    private readonly bool fail;
+
+    public DevWSPhase61BFakeCurrent(string name, bool fail)
+    {
+        this.name = name;
+        this.fail = fail;
+    }
+
+    public string Name
+    {
+        get
+        {
+            if (fail) throw new InvalidOperationException("tab-name-read-failed");
+            return name;
+        }
+    }
+}
+
+public sealed class DevWSPhase61BFakeTab
+{
+    public DevWSPhase61BFakeTab(string name, bool fail)
+    {
+        Current = new DevWSPhase61BFakeCurrent(name, fail);
+    }
+
+    public DevWSPhase61BFakeCurrent Current { get; private set; }
+}
+
+public sealed class DevWSPhase61BFakeTabCollection
+{
+    private readonly object[] items;
+
+    private DevWSPhase61BFakeTabCollection(object[] items) { this.items = items; }
+
+    public int Count { get { return items.Length; } }
+
+    public object Item(int index) { return items[index]; }
+
+    public static DevWSPhase61BFakeTabCollection Create(params object[] items)
+    {
+        return new DevWSPhase61BFakeTabCollection(items);
+    }
+}
+'@
+        }
+
+        $good = [DevWSPhase61BFakeTab]::new("GoodTab", $false)
+        $bad  = [DevWSPhase61BFakeTab]::new("BadTab", $true)
+
+        $result = Get-DevWSTabReadResultFromHwnd -Hwnd 123 -HwndExistsProvider { param($h) $true } `
+            -RootProvider { [pscustomobject]@{} } `
+            -TabProvider { param($root) [DevWSPhase61BFakeTabCollection]::Create($good, $bad) }
+
+        Assert-Equal $true $result.Ok "root and FindAll completed"
+        Assert-Equal $false $result.Complete "one tab name failed"
+        Assert-Equal 2 $result.RawCount "both elements retained"
+        Assert-Equal 1 $result.NameReadFailures "one name-read failure"
+        Assert-Equal "tab-name-read-failed" $result.ErrorKind "name failure category"
+        Assert-True ($result.TabNames.Contains("GoodTab")) "readable name retained"
+        Assert-True (-not $result.TabNames.Contains("BadTab")) "unreadable name not fabricated"
+    }
+
+    Test-Case "HWND disappearance during observation fabricates no presence" {
+        $script:disappearProbe = 0
+        $probe = { param($h) $script:disappearProbe++; return ($script:disappearProbe -eq 1) }
+
+        $result = Get-DevWSTabReadResultFromHwnd -Hwnd 124 -HwndExistsProvider $probe `
+            -RootProvider { [pscustomobject]@{} } `
+            -TabProvider { param($root) [DevWSPhase61BFakeTabCollection]::Create([DevWSPhase61BFakeTab]::new("GoneTab", $false)) }
+
+        Assert-Equal 2 $script:disappearProbe "initial and final liveness checks both ran"
+        Assert-Equal $false $result.HwndPresent "final HWND liveness is false"
+        Assert-Equal $true $result.Ok "UIA read itself completed"
+        Assert-Equal "hwnd-gone" $result.ErrorKind "disappearance category"
+        Assert-Equal 1 $result.RawCount "observation is retained for diagnosis"
+    }
+
     Test-Case "terminal tab read distinguishes HWND liveness from read success" {
         $script:presenceReadCalls = 0
 
