@@ -2,8 +2,9 @@
 #
 # Discovery is either
 #   A. non-creating: validated runtime state, then UI Automation tab names; or
-#   B. locator-assisted (see devws-locator.ps1), used by destructive reset and
+#   B. locator-assisted (see devws-locator.ps1), used by elevated capture and
 #      as a fallback where a present window must still be attached to.
+# Destructive reset never uses a locator HWND as managed-terminal identity.
 #
 # A stored HWND is valid only when it still exists, belongs to
 # WindowsTerminal, and is associated with the configured windowId tab.
@@ -229,7 +230,7 @@ function Get-DevWSResetIdentityConflict {
 
         $names = if ($null -ne $read.PSObject.Properties["TabNames"]) { @($read.TabNames) } else { @() }
 
-        if ($names -contains $WindowId) {
+        if (Test-DevWSTerminalTitleFamily -WindowId $WindowId -TabNames $names) {
             $conflicts.Add([long]$hwnd) | Out-Null
         }
     }
@@ -246,6 +247,98 @@ function Get-DevWSResetIdentityConflict {
         Conflict   = ($conflictList.Count -gt 0)
         Hwnds      = $conflictList
         Diagnostic = $diagnostic
+    }
+}
+
+function Test-DevWSResetTargetIdentity {
+    # Narrow TOCTOU revalidation run immediately before the destructive close.
+    # It re-observes the EXACT selected HWND and requires that it still exists,
+    # still belongs to WindowsTerminal, and still exposes the canonical managed
+    # title family for the configured windowId. A gone, foreign, unreadable, or
+    # mismatched target refuses the close. There is no fallback identity guess.
+    param(
+        [Parameter(Mandatory)][long]$Hwnd,
+        [Parameter(Mandatory)][string]$WindowId,
+        [scriptblock]$HwndExistsProvider = $null,
+        [scriptblock]$ProcessNameProvider = $null,
+        [scriptblock]$TabReadProvider = $null
+    )
+
+    if ($null -eq $HwndExistsProvider) {
+        $HwndExistsProvider = { param([long]$Target) Test-DevWSWindowHwnd -Hwnd $Target }
+    }
+
+    if ($null -eq $ProcessNameProvider) {
+        $ProcessNameProvider = { param([long]$Target) Get-DevWSWindowHwndProcessName -Hwnd $Target }
+    }
+
+    if ($null -eq $TabReadProvider) {
+        $TabReadProvider = { param([long]$Target) Read-DevWSTerminalHwndTabs -Hwnd $Target }
+    }
+
+    if (-not (& $HwndExistsProvider $Hwnd)) {
+        return [pscustomobject]@{
+            Ok         = $false
+            Reason     = "hwnd-gone"
+            Diagnostic = "HWND $Hwnd no longer exists immediately before the destructive close"
+        }
+    }
+
+    $processName = [string](& $ProcessNameProvider $Hwnd)
+
+    if (-not (Test-DevWSProcessNameIsWindowsTerminal -ProcessName $processName)) {
+        return [pscustomobject]@{
+            Ok         = $false
+            Reason     = "process-mismatch"
+            Diagnostic = "HWND $Hwnd is owned by '$processName', not WindowsTerminal"
+        }
+    }
+
+    $read = & $TabReadProvider $Hwnd
+
+    if ($null -eq $read) {
+        return [pscustomobject]@{
+            Ok         = $false
+            Reason     = "unreadable"
+            Diagnostic = "HWND $Hwnd tab observation returned no result"
+        }
+    }
+
+    $present = if ($null -ne $read.PSObject.Properties["HwndPresent"]) { [bool]$read.HwndPresent } else { [bool]$read.Ok }
+    $readOk = if ($null -ne $read.PSObject.Properties["ReadOk"]) { [bool]$read.ReadOk } else { [bool]$read.Ok }
+
+    if (-not $present) {
+        return [pscustomobject]@{
+            Ok         = $false
+            Reason     = "hwnd-gone"
+            Diagnostic = "HWND $Hwnd disappeared during the destructive-close revalidation"
+        }
+    }
+
+    if (-not $readOk) {
+        $kind = if ($null -ne $read.PSObject.Properties["ErrorKind"]) { [string]$read.ErrorKind } else { "unreadable" }
+        $errorText = if ($null -ne $read.PSObject.Properties["Error"]) { [string]$read.Error } else { "" }
+        return [pscustomobject]@{
+            Ok         = $false
+            Reason     = "unreadable"
+            Diagnostic = "HWND $Hwnd tab observation failed ($kind; $errorText)"
+        }
+    }
+
+    $names = if ($null -ne $read.PSObject.Properties["TabNames"]) { @($read.TabNames) } else { @() }
+
+    if (-not (Test-DevWSTerminalTitleFamily -WindowId $WindowId -TabNames $names)) {
+        return [pscustomobject]@{
+            Ok         = $false
+            Reason     = "title-family-mismatch"
+            Diagnostic = "HWND $Hwnd no longer exposes the canonical managed title family for '$WindowId'"
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok         = $true
+        Reason     = "verified"
+        Diagnostic = $null
     }
 }
 

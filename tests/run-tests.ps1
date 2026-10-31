@@ -738,6 +738,43 @@ function Get-SourceOf {
     return (Get-Content -LiteralPath (Join-Path $RepoRoot $RelativePath) -Raw)
 }
 
+function Import-DevWSWorkerFunction {
+    # Loads ONE production function definition from a worker script without
+    # executing the worker's top-level pipe code. The suite uses this to run
+    # the REAL reset execution path with injected side-effect providers. The
+    # definition is installed under a TEST-ONLY name so it cannot shadow an
+    # identically named CLI orchestration function.
+    param(
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$As
+    )
+
+    $source = Get-SourceOf $RelativePath
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+
+    if ($errors.Count -gt 0) {
+        throw "Worker source '$RelativePath' does not parse: $($errors[0].Message)"
+    }
+
+    $definitions = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+    }, $true))
+
+    if ($definitions.Count -ne 1) {
+        throw "Expected exactly one '$Name' definition in '$RelativePath', found $($definitions.Count)."
+    }
+
+    # Install at script scope so test cases (and nested helper functions) see
+    # the real production body for the rest of the suite. The body AST is
+    # compiled directly: a full `function Name { ... }` text would become a
+    # nested declaration instead of the function body.
+    Set-Item -Path ("function:script:" + $As) -Value $definitions[0].Body.GetScriptBlock()
+}
+
 function New-WritableConfigCopy {
     param([Parameter(Mandatory)][string]$Name)
 
@@ -5294,19 +5331,22 @@ try {
 
         $decisionIndex = $source.IndexOf("Get-DevWSResetPreflightDecision")
         $refuseIndex   = $source.IndexOf('if ($decision.Action -eq "refuse")')
-        $conflictIndex = $source.IndexOf("Get-DevWSResetIdentityConflict")
-        $closeIndex    = $source.IndexOf("Close-DevWSWindowHwnd")
-        $recreateIndex = $source.IndexOf("& `$Wt @createArguments")
-        $recoveryIndex = $source.IndexOf("Wait-DevWSResetTerminalPresence")
-        $updateIndex   = $source.IndexOf("Update-DevWSRuntimeTerminal")
+        $conflictIndex = $source.IndexOf('& $ConflictProvider')
+        $identityIndex = $source.IndexOf('& $IdentityProvider')
+        $closeIndex    = $source.IndexOf('& $CloseProvider')
+        $createIndex   = $source.IndexOf('& $CreateProvider')
+        $recoveryIndex = $source.IndexOf('& $RecoveryProvider')
+        $updateIndex   = $source.IndexOf('& $StatePublisher')
 
         Assert-True ($decisionIndex -ge 0 -and $refuseIndex -gt $decisionIndex) "refusal is checked immediately after the decision"
         Assert-True ($conflictIndex -gt $refuseIndex) "duplicate-identity check follows the refusal gate"
-        Assert-True ($closeIndex -gt $conflictIndex) "the destructive close is after both pre-close gates"
-        Assert-True ($recreateIndex -ge 0 -and $recoveryIndex -gt $recreateIndex) "identity recovery follows recreation"
-        Assert-Equal 1 ([regex]::Matches($source, 'Close-DevWSWindowHwnd').Count) "there is exactly one destructive close site"
-        Assert-True ($closeIndex -lt $recoveryIndex) "no destructive close occurs after recreation"
+        Assert-True ($identityIndex -gt $conflictIndex) "TOCTOU revalidation follows the duplicate check"
+        Assert-True ($closeIndex -gt $identityIndex) "the destructive close follows every pre-close gate"
+        Assert-True ($createIndex -gt $closeIndex) "recreation follows the close decision"
+        Assert-True ($recoveryIndex -gt $createIndex) "identity recovery follows recreation"
         Assert-True ($updateIndex -gt $recoveryIndex) "runtime state is published only after identity recovery"
+        Assert-Equal 1 ([regex]::Matches($source, 'Close-DevWSWindowHwnd').Count) "there is exactly one destructive close primitive"
+        Assert-Equal 1 ([regex]::Matches($source, '& \$CloseProvider').Count) "there is exactly one destructive close call site"
     }
 
     Test-Case "reset preflight accepts only verified present or genuine missing" {
@@ -5550,6 +5590,123 @@ try {
             NameReadFailures = if ($Complete) { 0 } else { 1 }
             ErrorKind        = $ErrorKind
             Error            = $Error
+        }
+    }
+
+    function New-DevWSResetHarness {
+        # Real Reset-DevWSTerminal from the elevated worker, with recording
+        # providers for every side effect. Run(State, Hwnd, Diagnostic,
+        # Overrides) returns Threw/Message plus the recorded close, creation,
+        # revalidation and runtime-publication calls.
+        param(
+            [Parameter(Mandatory)]$Terminal,
+            [Parameter(Mandatory)]$Config,
+            [Parameter(Mandatory)][object[]]$Tracking
+        )
+
+        Import-DevWSWorkerFunction -RelativePath "src\workers\elevated-reset.ps1" -Name "Reset-DevWSTerminal" -As "ResetWorker-DevWSTestTerminal"
+
+        $script:resetHarnessCloseCalls = [System.Collections.Generic.List[long]]::new()
+        $script:resetHarnessPublishedHwnds = [System.Collections.Generic.List[long]]::new()
+        $script:resetHarnessCreateCalls = 0
+        $script:resetHarnessStateCalls = 0
+        $script:resetHarnessIdentityCalls = 0
+        $script:resetHarnessScenarioState = $null
+        $script:resetHarnessScenarioHwnd = 0
+        $script:resetHarnessScenarioDiagnostic = $null
+        $script:resetHarnessTracking = @($Tracking)
+
+        $script:resetHarnessBase = @{
+            Config = $Config
+            Terminal = $Terminal
+            State = $null
+            SetId = "main"
+            ApplyGeometry = $false
+            PresenceProvider = {
+                param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+                [pscustomobject]@{
+                    Terminals = @([pscustomobject]@{
+                        TerminalId = [string]$TargetTerminal.id
+                        WindowId = [string]$TargetTerminal.windowId
+                        State = [string]$script:resetHarnessScenarioState
+                        Source = "snapshot"
+                        Hwnd = [long]$script:resetHarnessScenarioHwnd
+                        Diagnostic = $script:resetHarnessScenarioDiagnostic
+                    })
+                    WtHwnds = @([long]700001, [long]700002)
+                }
+            }
+            ConflictProvider = {
+                param([long]$SelectedHwnd, $WtHwnds, [string]$TargetWindowId)
+                [pscustomobject]@{ Conflict = $false; Hwnds = @(); Diagnostic = $null }
+            }
+            IdentityProvider = {
+                param([long]$TargetHwnd, [string]$TargetWindowId)
+                $script:resetHarnessIdentityCalls++
+                [pscustomobject]@{ Ok = $true; Reason = "verified"; Diagnostic = $null }
+            }
+            CloseProvider = {
+                param([long]$TargetHwnd, [string]$TargetContext)
+                $script:resetHarnessCloseCalls.Add([long]$TargetHwnd) | Out-Null
+            }
+            WaitGoneProvider = { param([long]$TargetHwnd) $true }
+            TrackingProvider = {
+                param($TargetSetId, $TargetTerminalId, $TargetWindowId, $TargetTerminal, $TargetBootstrapPath)
+                $script:resetHarnessTracking
+            }
+            CreateProvider = {
+                param([string[]]$CreateArguments)
+                $script:resetHarnessCreateCalls++
+            }
+            RecoveryProvider = {
+                param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+                [pscustomobject]@{ Ok = $true; Hwnd = [long]900001; State = "present"; Source = "snapshot"; Diagnostic = $null; Attempts = 1 }
+            }
+            TabCountProvider = { param([long]$TargetHwnd, [int]$MinimumCount) 2 }
+            StatePublisher = {
+                param($TargetSetId, $TargetTerminalId, $TargetWindowId, [long]$TargetHwnd)
+                $script:resetHarnessStateCalls++
+                $script:resetHarnessPublishedHwnds.Add([long]$TargetHwnd) | Out-Null
+            }
+        }
+
+        return {
+            param($State, $Hwnd, $Diagnostic, [hashtable]$Overrides = @{})
+
+            $script:resetHarnessCloseCalls.Clear()
+            $script:resetHarnessPublishedHwnds.Clear()
+            $script:resetHarnessCreateCalls = 0
+            $script:resetHarnessStateCalls = 0
+            $script:resetHarnessIdentityCalls = 0
+            $script:resetHarnessScenarioState = [string]$State
+            $script:resetHarnessScenarioHwnd = [long]$Hwnd
+            $script:resetHarnessScenarioDiagnostic = $Diagnostic
+
+            $providers = $script:resetHarnessBase.Clone()
+
+            foreach ($key in $Overrides.Keys) {
+                $providers[$key] = $Overrides[$key]
+            }
+
+            try {
+                ResetWorker-DevWSTestTerminal @providers
+                $threw = $false
+                $message = $null
+            }
+            catch {
+                $threw = $true
+                $message = $_.Exception.Message
+            }
+
+            return [pscustomobject]@{
+                Threw          = $threw
+                Message        = $message
+                CloseCalls     = @($script:resetHarnessCloseCalls)
+                CreateCalls    = $script:resetHarnessCreateCalls
+                StateCalls     = $script:resetHarnessStateCalls
+                IdentityCalls  = $script:resetHarnessIdentityCalls
+                PublishedHwnds = @($script:resetHarnessPublishedHwnds)
+            }
         }
     }
 
@@ -5851,46 +6008,215 @@ public sealed class DevWSPhase61BFakeTabCollection
         Assert-Equal 0 ([int]$snapshot.Counts.Present) "no first-match substitution"
     }
 
-    Test-Case "reset duplicate-identity preflight refuses a positive conflict" {
+    Test-Case "reset duplicate-identity preflight uses the canonical title family" {
         $reader = {
             param($h)
-            if ($h -eq 200) {
-                New-TerminalPresenceTestRead -Hwnd $h -Names @("W1")
+            if ($script:conflictUnreadable) {
+                New-TerminalPresenceTestRead -Hwnd $h -ReadOk $false -Names @()
             }
             else {
-                New-TerminalPresenceTestRead -Hwnd $h -Names @("W2")
+                New-TerminalPresenceTestRead -Hwnd $h -Names @($script:conflictNames[[int]$h])
             }
         }
 
-        $conflict = Get-DevWSResetIdentityConflict `
+        $probe = {
+            param($names, $hwnds = @(100, 200))
+            $script:conflictUnreadable = $false
+            $script:conflictNames = @{ 200 = @($names) }
+            Get-DevWSResetIdentityConflict `
+                -SelectedHwnd 100 `
+                -WtHwnds $hwnds `
+                -WindowId "W1" `
+                -CandidateReader $reader `
+                -ProcessNameProvider { param($h) "WindowsTerminal" }
+        }
+
+        Assert-True (& $probe @("W1")).Conflict "exact base title conflicts"
+        Assert-True (& $probe @("W1#DevWS:1")).Conflict "number 1 family member conflicts"
+        Assert-True (& $probe @("W1#DevWS:2")).Conflict "number 2 family member conflicts"
+        Assert-True (& $probe @("W1#devws:7")).Conflict "family matching is case-insensitive"
+
+        Assert-Equal $false (& $probe @("W2")).Conflict "different base windowId does not conflict"
+        Assert-Equal $false (& $probe @("W2#DevWS:1")).Conflict "different numbered family does not conflict"
+        Assert-Equal $false (& $probe @("W1#DevWS:01")).Conflict "leading-zero suffix is not canonical"
+        Assert-Equal $false (& $probe @("W1#DevWS:0")).Conflict "zero suffix is not canonical"
+        Assert-Equal $false (& $probe @("W1#DevWS:")).Conflict "empty suffix is not canonical"
+        Assert-Equal $false (& $probe @("W1#DevWS:1x")).Conflict "trailing text is not canonical"
+        Assert-Equal $false (& $probe @("W1-extra", "W10#DevWS:1", "XW1", "W1#DevWS:1#DevWS:2")).Conflict "lookalikes and prefix collisions do not conflict"
+
+        $script:conflictUnreadable = $false
+        $script:conflictNames = @{
+            200 = @("W1#DevWS:2")
+            300 = @("W1#DevWS:1")
+        }
+        $multiple = Get-DevWSResetIdentityConflict `
             -SelectedHwnd 100 `
             -WtHwnds @(100, 200, 300) `
             -WindowId "W1" `
             -CandidateReader $reader `
             -ProcessNameProvider { param($h) "WindowsTerminal" }
+        Assert-True $multiple.Conflict "multiple family members conflict"
+        Assert-Equal 2 @($multiple.Hwnds).Count "both conflicting HWNDs are reported"
+        Assert-Equal 200 ([long]$multiple.Hwnds[0]) "conflicting HWNDs are sorted: first"
+        Assert-Equal 300 ([long]$multiple.Hwnds[1]) "conflicting HWNDs are sorted: second"
 
-        Assert-True $conflict.Conflict "same managed windowId on another candidate is a conflict"
-        Assert-Equal 1 @($conflict.Hwnds).Count "one conflicting candidate"
-        Assert-Equal 200 ([long]$conflict.Hwnds[0]) "conflicting HWND is named"
-        Assert-Contains ([string]$conflict.Diagnostic) "W1" "conflict diagnostic names the windowId"
-
-        $noConflict = Get-DevWSResetIdentityConflict `
-            -SelectedHwnd 100 `
-            -WtHwnds @(100, 200) `
-            -WindowId "W1" `
-            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -Names @("W2") } `
-            -ProcessNameProvider { param($h) "WindowsTerminal" }
-
-        Assert-Equal $false $noConflict.Conflict "different managed tab names do not conflict"
-
+        $script:conflictUnreadable = $true
+        $script:conflictNames = @{ 200 = @("W1#DevWS:1") }
         $unreadable = Get-DevWSResetIdentityConflict `
             -SelectedHwnd 100 `
             -WtHwnds @(100, 200) `
             -WindowId "W1" `
-            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -ReadOk $false -Names @() } `
+            -CandidateReader $reader `
             -ProcessNameProvider { param($h) "WindowsTerminal" }
-
         Assert-Equal $false $unreadable.Conflict "an unreadable other candidate is not positive conflict"
+    }
+
+    Test-Case "reset execution refuses before close for unverified identity states" {
+        $terminal  = New-TerminalDefinition -Id "reset-guard" -WindowId "RESET-W1" -Path $TestRoot
+        $config    = ConvertTo-TestConfig -Windows @($terminal)
+        $bootstrap = Get-DevWSCwdBootstrapPath
+        $tracking  = @(
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-guard"; WindowId = "RESET-W1"; SessionId = "s0"; PublicationPath = (Join-Path $TestRoot "reset-pub-0"); ChildSpecBase64 = "e30="; TabIndex = 0 }
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-guard"; WindowId = "RESET-W1"; SessionId = "s1"; PublicationPath = (Join-Path $TestRoot "reset-pub-1"); ChildSpecBase64 = "e30="; TabIndex = 1 }
+        )
+        $run = New-DevWSResetHarness -Terminal $terminal -Config $config -Tracking $tracking
+
+        foreach ($refusal in @(
+            @{ State = "inaccessible"; Hwnd = 700001; Diagnostic = "empty-tab-observation" },
+            @{ State = "ambiguous"; Hwnd = 0; Diagnostic = "two candidate windows" },
+            @{ State = "failed"; Hwnd = 0; Diagnostic = "uia-findall-failed" }
+        )) {
+            $result = & $run $refusal.State $refusal.Hwnd $refusal.Diagnostic
+
+            Assert-True $result.Threw "$($refusal.State) observation refuses the reset"
+            Assert-Equal 0 $result.CloseCalls.Count "$($refusal.State) performs zero close calls"
+            Assert-Equal 0 $result.CreateCalls "$($refusal.State) performs zero creation calls"
+            Assert-Equal 0 $result.StateCalls "$($refusal.State) publishes no runtime state"
+            Assert-Equal 0 $result.IdentityCalls "$($refusal.State) never reaches target revalidation"
+        }
+
+        $duplicate = & $run "present" 700001 $null @{
+            ConflictProvider = {
+                param([long]$SelectedHwnd, $WtHwnds, [string]$TargetWindowId)
+                [pscustomobject]@{ Conflict = $true; Hwnds = @([long]700002); Diagnostic = "duplicate managed identity" }
+            }
+        }
+
+        Assert-True $duplicate.Threw "positive duplicate identity refuses the reset"
+        Assert-Contains ([string]$duplicate.Message) "duplicate managed identity" "duplicate diagnostic is reported"
+        Assert-Equal 0 $duplicate.CloseCalls.Count "duplicate conflict performs zero close calls"
+        Assert-Equal 0 $duplicate.CreateCalls "duplicate conflict performs zero creation calls"
+        Assert-Equal 0 $duplicate.StateCalls "duplicate conflict publishes no runtime state"
+        Assert-Equal 0 $duplicate.IdentityCalls "duplicate conflict never reaches target revalidation"
+
+        $changed = & $run "present" 700001 $null @{
+            IdentityProvider = {
+                param([long]$TargetHwnd, [string]$TargetWindowId)
+                $script:resetHarnessIdentityCalls++
+                [pscustomobject]@{ Ok = $false; Reason = "title-family-mismatch"; Diagnostic = "identity changed" }
+            }
+        }
+
+        Assert-True $changed.Threw "identity change immediately before close refuses"
+        Assert-Contains ([string]$changed.Message) "title-family-mismatch" "TOCTOU reason is reported"
+        Assert-Equal 1 $changed.IdentityCalls "the exact target is revalidated once"
+        Assert-Equal 0 $changed.CloseCalls.Count "identity change performs zero close calls"
+        Assert-Equal 0 $changed.CreateCalls "identity change performs zero creation calls"
+        Assert-Equal 0 $changed.StateCalls "identity change publishes no runtime state"
+
+        $notGone = & $run "present" 700001 $null @{
+            WaitGoneProvider = { param([long]$TargetHwnd) $false }
+        }
+
+        Assert-True $notGone.Threw "an unconfirmed close fails the reset"
+        Assert-Equal 1 $notGone.CloseCalls.Count "the close was attempted once"
+        Assert-Equal 700001 ([long]$notGone.CloseCalls[0]) "the close targeted the verified HWND"
+        Assert-Equal 0 $notGone.CreateCalls "no recreation follows an unconfirmed close"
+        Assert-Equal 0 $notGone.StateCalls "no runtime state follows an unconfirmed close"
+    }
+
+    Test-Case "reset execution closes only verified present targets and recreates missing ones" {
+        $terminal  = New-TerminalDefinition -Id "reset-run" -WindowId "RESET-W2" -Path $TestRoot
+        $config    = ConvertTo-TestConfig -Windows @($terminal)
+        $bootstrap = Get-DevWSCwdBootstrapPath
+        $tracking  = @(
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-run"; WindowId = "RESET-W2"; SessionId = "s0"; PublicationPath = (Join-Path $TestRoot "reset-run-pub-0"); ChildSpecBase64 = "e30="; TabIndex = 0 }
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-run"; WindowId = "RESET-W2"; SessionId = "s1"; PublicationPath = (Join-Path $TestRoot "reset-run-pub-1"); ChildSpecBase64 = "e30="; TabIndex = 1 }
+        )
+        $run = New-DevWSResetHarness -Terminal $terminal -Config $config -Tracking $tracking
+
+        $present = & $run "present" 700001 $null
+
+        Assert-Equal $false $present.Threw "verified present reset succeeds"
+        Assert-Equal 1 $present.CloseCalls.Count "verified present performs exactly one close"
+        Assert-Equal 700001 ([long]$present.CloseCalls[0]) "the verified HWND is the one closed"
+        Assert-Equal 1 $present.IdentityCalls "verified present is revalidated once"
+        Assert-Equal 1 $present.CreateCalls "verified present recreates once"
+        Assert-Equal 1 $present.StateCalls "verified present publishes runtime state once"
+        Assert-Equal 900001 ([long]$present.PublishedHwnds[0]) "runtime state publishes the recreated HWND"
+
+        $missing = & $run "missing" 0 $null
+
+        Assert-Equal $false $missing.Threw "genuine missing reset succeeds"
+        Assert-Equal 0 $missing.CloseCalls.Count "genuine missing performs zero close calls"
+        Assert-Equal 0 $missing.IdentityCalls "genuine missing never revalidates a close target"
+        Assert-Equal 1 $missing.CreateCalls "genuine missing recreates once"
+        Assert-Equal 1 $missing.StateCalls "genuine missing publishes runtime state"
+
+        $recoveryFailure = & $run "present" 700001 $null @{
+            RecoveryProvider = {
+                param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+                [pscustomobject]@{ Ok = $false; Hwnd = [long]0; State = "inaccessible"; Source = "snapshot"; Diagnostic = "empty-tab-observation"; Attempts = 3 }
+            }
+        }
+
+        Assert-True $recoveryFailure.Threw "post-recreation identity failure fails the reset"
+        Assert-Contains ([string]$recoveryFailure.Message) "empty-tab-observation" "post-recreation diagnostic is reported"
+        Assert-Equal 1 $recoveryFailure.CloseCalls.Count "no second destructive close after recreation"
+        Assert-Equal 1 $recoveryFailure.CreateCalls "recreation is not retried automatically"
+        Assert-Equal 0 $recoveryFailure.StateCalls "an unverified replacement publishes no runtime state"
+    }
+
+    Test-Case "reset target revalidation preserves strict HWND process and title identity" {
+        $exists    = { param([long]$Target) $true }
+        $wtProcess = { param([long]$Target) "WindowsTerminal" }
+        $read      = {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -Names @("RESET-W3#DevWS:2")
+        }
+
+        $verified = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider $read
+        Assert-Equal $true $verified.Ok "canonical family member revalidates the exact HWND"
+        Assert-Equal "verified" $verified.Reason "verified reason is returned"
+
+        $gone = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider { param([long]$Target) $false } -ProcessNameProvider $wtProcess -TabReadProvider $read
+        Assert-Equal $false $gone.Ok "a disappeared HWND refuses the close"
+        Assert-Equal "hwnd-gone" $gone.Reason "disappearance reason is returned"
+
+        $foreign = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider { param([long]$Target) "Notepad" } -TabReadProvider $read
+        Assert-Equal $false $foreign.Ok "a foreign process refuses the close"
+        Assert-Equal "process-mismatch" $foreign.Reason "process mismatch reason is returned"
+
+        $unreadable = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -ReadOk $false -ErrorKind "uia-findall-failed" -Error "denied"
+        }
+        Assert-Equal $false $unreadable.Ok "an unreadable tab list refuses the close"
+        Assert-Equal "unreadable" $unreadable.Reason "unreadable reason is returned"
+        Assert-Contains ([string]$unreadable.Diagnostic) "uia-findall-failed" "UIA failure category is preserved"
+
+        $vanished = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -HwndPresent $false -ReadOk $false
+        }
+        Assert-Equal "hwnd-gone" $vanished.Reason "an HWND that disappears during the read is gone"
+
+        $lookalike = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -Names @("RESET-W3#DevWS:01", "RESET-W30#DevWS:1")
+        }
+        Assert-Equal $false $lookalike.Ok "malformed and prefix lookalikes never revalidate"
+        Assert-Equal "title-family-mismatch" $lookalike.Reason "title family mismatch reason is returned"
     }
 
     Test-Case "inaccessible launch plan entry produces zero creation kicks" {
@@ -24929,12 +25255,14 @@ $stream.Close()
         Assert-True ($completeIndex -gt $kickIndex) "completion follows kickoff in the canonical library"
 
         # Reset: bootstrap checked before the close, generation written only
-        # after the old window is confirmed gone, recreation follows.
+        # after the old window is confirmed gone, recreation follows. The
+        # destructive/creation primitives are invoked through the injectable
+        # provider call sites, which are the production execution path.
         $bootstrapIndex = $reset.IndexOf('Get-DevWSCwdBootstrapPath')
-        $closeIndex     = $reset.IndexOf('Close-DevWSWindowHwnd')
-        $goneIndex      = $reset.IndexOf('Wait-DevWSWindowHwndGone')
-        $resetTracking  = $reset.IndexOf('New-DevWSCwdTrackingContext')
-        $resetLaunch    = $reset.IndexOf('& $Wt @createArguments')
+        $closeIndex     = $reset.IndexOf('& $CloseProvider')
+        $goneIndex      = $reset.IndexOf('& $WaitGoneProvider')
+        $resetTracking  = $reset.IndexOf('& $TrackingProvider')
+        $resetLaunch    = $reset.IndexOf('& $CreateProvider')
 
         Assert-True ($bootstrapIndex -ge 0) "reset resolves the bootstrap helper"
         Assert-True ($bootstrapIndex -lt $closeIndex) "reset refuses before closing when the bootstrap is missing"

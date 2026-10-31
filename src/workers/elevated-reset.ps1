@@ -42,8 +42,92 @@ function Reset-DevWSTerminal {
         [Parameter(Mandatory)]
         [string]$SetId,
         [bool]$ApplyGeometry = $true,
-        [AllowNull()]$Layout = $null
+        [AllowNull()]$Layout = $null,
+        # Injectable side-effect seam. Production callers pass none of these and
+        # get the real observation/close/creation/publication primitives; the
+        # deterministic suite injects recording providers to prove the
+        # destructive boundary behaviorally.
+        [scriptblock]$PresenceProvider = $null,
+        [scriptblock]$ConflictProvider = $null,
+        [scriptblock]$IdentityProvider = $null,
+        [scriptblock]$CloseProvider = $null,
+        [scriptblock]$WaitGoneProvider = $null,
+        [scriptblock]$TrackingProvider = $null,
+        [scriptblock]$CreateProvider = $null,
+        [scriptblock]$RecoveryProvider = $null,
+        [scriptblock]$TabCountProvider = $null,
+        [scriptblock]$StatePublisher = $null
     )
+
+    if ($null -eq $PresenceProvider) {
+        $PresenceProvider = {
+            param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+            Get-DevWSTerminalPresenceSnapshot -Config $TargetConfig -SetId $TargetSetId -State $TargetState -Terminals @($TargetTerminal)
+        }
+    }
+
+    if ($null -eq $ConflictProvider) {
+        $ConflictProvider = {
+            param([long]$SelectedHwnd, $WtHwnds, [string]$TargetWindowId)
+            Get-DevWSResetIdentityConflict -SelectedHwnd $SelectedHwnd -WtHwnds @($WtHwnds) -WindowId $TargetWindowId
+        }
+    }
+
+    if ($null -eq $IdentityProvider) {
+        $IdentityProvider = {
+            param([long]$TargetHwnd, [string]$TargetWindowId)
+            Test-DevWSResetTargetIdentity -Hwnd $TargetHwnd -WindowId $TargetWindowId
+        }
+    }
+
+    if ($null -eq $CloseProvider) {
+        $CloseProvider = {
+            param([long]$TargetHwnd, [string]$TargetContext)
+            Close-DevWSWindowHwnd -Hwnd $TargetHwnd -Context $TargetContext
+        }
+    }
+
+    if ($null -eq $WaitGoneProvider) {
+        $WaitGoneProvider = {
+            param([long]$TargetHwnd)
+            Wait-DevWSWindowHwndGone -Hwnd $TargetHwnd -TimeoutSeconds 10
+        }
+    }
+
+    if ($null -eq $TrackingProvider) {
+        $TrackingProvider = {
+            param([string]$TargetSetId, [string]$TargetTerminalId, [string]$TargetWindowId, $TargetTerminal, [string]$TargetBootstrapPath)
+            New-DevWSCwdTrackingContexts -SetId $TargetSetId -TerminalId $TargetTerminalId -WindowId $TargetWindowId -Terminal $TargetTerminal -BootstrapPath $TargetBootstrapPath
+        }
+    }
+
+    if ($null -eq $CreateProvider) {
+        $CreateProvider = {
+            param([string[]]$CreateArguments)
+            & $Wt @CreateArguments
+        }
+    }
+
+    if ($null -eq $RecoveryProvider) {
+        $RecoveryProvider = {
+            param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+            Wait-DevWSResetTerminalPresence -Config $TargetConfig -SetId $TargetSetId -State $TargetState -Terminal $TargetTerminal -TimeoutSeconds 15
+        }
+    }
+
+    if ($null -eq $TabCountProvider) {
+        $TabCountProvider = {
+            param([long]$TargetHwnd, [int]$MinimumCount)
+            Wait-DevWSTabCountFromHwnd -Hwnd $TargetHwnd -MinimumCount $MinimumCount -TimeoutSeconds 5
+        }
+    }
+
+    if ($null -eq $StatePublisher) {
+        $StatePublisher = {
+            param([string]$TargetSetId, [string]$TargetTerminalId, [string]$TargetWindowId, [long]$TargetHwnd)
+            Update-DevWSRuntimeTerminal -SetId $TargetSetId -Id $TargetTerminalId -WindowId $TargetWindowId -Hwnd $TargetHwnd
+        }
+    }
 
     $terminalId = [string]$Terminal.id
     $windowId   = [string]$Terminal.windowId
@@ -79,11 +163,7 @@ function Reset-DevWSTerminal {
     # correlated-to-another terminal all refuse before any destructive call.
     # A locator HWND or Win32 title match is never sufficient by itself.
     try {
-        $preflight = Get-DevWSTerminalPresenceSnapshot `
-            -Config $Config `
-            -SetId $SetId `
-            -State $State `
-            -Terminals @($Terminal)
+        $preflight = & $PresenceProvider $Config $SetId $State $Terminal
     }
     catch {
         throw "Refusing to reset terminal '$terminalId' ($windowId): presence preflight failed before the destructive close: $($_.Exception.Message)"
@@ -110,10 +190,7 @@ function Reset-DevWSTerminal {
         # Only a positively verified present identity with no conflicting
         # managed window identity may reach this close.
         try {
-            $conflict = Get-DevWSResetIdentityConflict `
-                -SelectedHwnd ([long]$decision.Hwnd) `
-                -WtHwnds @($preflight.WtHwnds) `
-                -WindowId $windowId
+            $conflict = & $ConflictProvider ([long]$decision.Hwnd) @($preflight.WtHwnds) $windowId
         }
         catch {
             throw "Refusing to reset terminal '$terminalId' ($windowId): duplicate-identity preflight failed before the destructive close: $($_.Exception.Message)"
@@ -123,9 +200,24 @@ function Reset-DevWSTerminal {
             throw "Refusing to reset terminal '$terminalId' ($windowId): $($conflict.Diagnostic)."
         }
 
-        Close-DevWSWindowHwnd -Hwnd ([long]$decision.Hwnd) -Context "terminal '$terminalId' ($windowId)"
+        # Time-of-check/time-of-use: the presence snapshot, duplicate check and
+        # close are separate reads. Re-observe the EXACT selected HWND directly
+        # before the destructive call; a gone, foreign, unreadable, or
+        # title-family-mismatched target refuses instead of guessing identity.
+        try {
+            $revalidation = & $IdentityProvider ([long]$decision.Hwnd) $windowId
+        }
+        catch {
+            throw "Refusing to reset terminal '$terminalId' ($windowId): target identity revalidation failed immediately before the destructive close: $($_.Exception.Message)"
+        }
 
-        if (-not (Wait-DevWSWindowHwndGone -Hwnd ([long]$decision.Hwnd) -TimeoutSeconds 10)) {
+        if (-not [bool]$revalidation.Ok) {
+            throw "Refusing to reset terminal '$terminalId' ($windowId): the verified target changed immediately before the destructive close ($($revalidation.Reason)); $($revalidation.Diagnostic)."
+        }
+
+        & $CloseProvider ([long]$decision.Hwnd) "terminal '$terminalId' ($windowId)"
+
+        if (-not (& $WaitGoneProvider ([long]$decision.Hwnd))) {
             throw "Terminal '$terminalId' ($windowId) did not close."
         }
     }
@@ -138,24 +230,14 @@ function Reset-DevWSTerminal {
     # still-running old shells. If recreation later fails, the new expected
     # generations simply have no valid publication (resolver: unavailable) and
     # a future reset overwrites them. One tracking context per configured tab.
-    $trackingContexts = New-DevWSCwdTrackingContexts `
-        -SetId $SetId `
-        -TerminalId $terminalId `
-        -WindowId $windowId `
-        -Terminal $Terminal `
-        -BootstrapPath $bootstrapPath
+    $trackingContexts = & $TrackingProvider $SetId $terminalId $windowId $Terminal $bootstrapPath
 
     # Recreate exactly the configured tab set (any count, command-only
     # terminals included), then restore geometry and the configured activeTab.
     [string[]]$createArguments = @(New-DevWSTerminalCreateArguments -Terminal $Terminal -TrackingContexts $trackingContexts)
-    & $Wt @createArguments
+    & $CreateProvider ([string[]]$createArguments)
 
-    $recovery = Wait-DevWSResetTerminalPresence `
-        -Config $Config `
-        -SetId $SetId `
-        -State $State `
-        -Terminal $Terminal `
-        -TimeoutSeconds 15
+    $recovery = & $RecoveryProvider $Config $SetId $State $Terminal
 
     if (-not $recovery.Ok) {
         $detail = if ([string]::IsNullOrWhiteSpace([string]$recovery.Diagnostic)) {
@@ -174,10 +256,7 @@ function Reset-DevWSTerminal {
     # (raw, duplicate-preserving) TabItems means `wt -w` attached to an
     # existing window.
     $configuredCount = @($Terminal.tabs).Count
-    $actualCount = Wait-DevWSTabCountFromHwnd `
-        -Hwnd $hwnd `
-        -MinimumCount $configuredCount `
-        -TimeoutSeconds 5
+    $actualCount = & $TabCountProvider $hwnd $configuredCount
 
     if (-not (Test-DevWSCreatedTabCount -ActualCount $actualCount -ConfiguredCount $configuredCount)) {
         throw "Terminal '$terminalId' ($windowId): the recreated window reports $actualCount tabs for $configuredCount configured tabs."
@@ -193,7 +272,7 @@ function Reset-DevWSTerminal {
 
     # New-DevWSTerminalCreateArguments already selected activeTab via the
     # creation argument list; no post-create `wt` selection is needed.
-    Update-DevWSRuntimeTerminal -SetId $SetId -Id $terminalId -WindowId $windowId -Hwnd $hwnd
+    & $StatePublisher $SetId $terminalId $windowId $hwnd
 }
 
 # One-shot authenticated pipe transport (Public Security Phase 2-D): exactly
