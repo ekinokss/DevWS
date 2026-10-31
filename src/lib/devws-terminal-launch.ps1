@@ -644,7 +644,7 @@ function Get-DevWSTerminalPresenceSnapshot {
                     $_.HwndPresent -and
                     $_.ReadOk -and
                     (Test-DevWSProcessNameIsWindowsTerminal -ProcessName $_.ProcessName) -and
-                    $_.TabNames.Contains($windowId)
+                    (Test-DevWSTerminalTitleFamily -WindowId $windowId -TabNames $_.TabNames)
                 })
 
                 if ($eligible.Count -eq 1) {
@@ -1289,7 +1289,7 @@ function Complete-DevWSTerminalLaunchPlan {
 
             $matches = @($snapshot | Where-Object {
                 (Test-DevWSProcessNameIsWindowsTerminal -ProcessName $_.ProcessName) -and
-                $_.TabNames.Contains($windowId)
+                (Test-DevWSTerminalTitleFamily -WindowId $windowId -TabNames $_.TabNames)
             })
 
             if ($matches.Count -gt 1) {

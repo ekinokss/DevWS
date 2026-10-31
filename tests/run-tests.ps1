@@ -2147,6 +2147,27 @@ function Get-DevWSWindows {
     param($Config, [string]$Type, [switch]$EnabledOnly, $Set)
     return @($Set.windows | Where-Object { $_.type -eq $Type -and $_.enabled -ne $false })
 }
+function Resolve-DevWSTerminalTabTitle {
+    param([string]$WindowId, [AllowNull()][AllowEmptyString()][string]$Title)
+    $unmanaged = [pscustomobject]@{ IsManaged = $false; TabIndex = $null }
+    if ([string]::IsNullOrWhiteSpace($WindowId) -or [string]::IsNullOrWhiteSpace($Title)) { return $unmanaged }
+    if ($Title -ieq $WindowId) { return [pscustomobject]@{ IsManaged = $true; TabIndex = 0 } }
+    $prefix = $WindowId + '#DevWS:'
+    if ($Title.Length -le $prefix.Length -or -not $Title.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $unmanaged }
+    $suffix = $Title.Substring($prefix.Length)
+    if ($suffix -notmatch '^[1-9][0-9]*$') { return $unmanaged }
+    $tabIndex = 0
+    if (-not [int]::TryParse($suffix, [ref]$tabIndex)) { return $unmanaged }
+    return [pscustomobject]@{ IsManaged = $true; TabIndex = $tabIndex }
+}
+function Test-DevWSTerminalTitleFamily {
+    param([string]$WindowId, $TabNames)
+    if ($null -eq $TabNames) { return $false }
+    foreach ($name in @($TabNames)) {
+        if ([bool](Resolve-DevWSTerminalTabTitle -WindowId $WindowId -Title ([string]$name)).IsManaged) { return $true }
+    }
+    return $false
+}
 function Test-DevWSProperty {
     param($Object, [string]$Name)
     if ($null -eq $Object) { return $false }
@@ -2367,7 +2388,7 @@ function Select-DevWSTerminalHwndCandidate {
         if ($null -eq $candidate) { continue }
         if (-not [string]::IsNullOrWhiteSpace([string]$candidate.ExpectedWindowId) -and ([string]$candidate.ExpectedWindowId -ine $WindowId)) { continue }
         if ($RequireProcess -and -not (Test-DevWSProcessNameIsWindowsTerminal -ProcessName ([string]$candidate.ProcessName))) { continue }
-        if ($null -ne $candidate.TabNames -and $candidate.TabNames.Contains($WindowId)) {
+        if ($null -ne $candidate.TabNames -and (Test-DevWSTerminalTitleFamily -WindowId $WindowId -TabNames $candidate.TabNames)) {
             return [pscustomobject]@{ Hwnd = [long]$candidate.Hwnd; ProcessName = [string]$candidate.ProcessName }
         }
     }
@@ -5593,6 +5614,40 @@ try {
         }
     }
 
+    function New-DevWSFamilyPresenceFixture {
+        # Production presence classifier over an injected exact-HWND read map.
+        # The reader is closed over the supplied map so the test controls every
+        # candidate result without touching a real window.
+        param(
+            [Parameter(Mandatory)][string]$WindowId,
+            [long[]]$WtHwnds = @(),
+            [hashtable]$Reads = @{},
+            $State = $null,
+            [string]$TerminalId = 'family-term'
+        )
+
+        $terminal = New-TerminalDefinition -Id $TerminalId -WindowId $WindowId -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $reader   = { param($h) $Reads[[int]$h] }.GetNewClosure()
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot `
+            -Config $config `
+            -SetId 'main' `
+            -State $State `
+            -Terminals @($terminal) `
+            -WtHwnds $WtHwnds `
+            -CandidateReader $reader `
+            -ProcessNameProvider { param($h) 'WindowsTerminal' } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        return [pscustomobject]@{
+            Snapshot = $snapshot
+            Terminal = $terminal
+            Config   = $config
+        }
+    }
+
     function New-DevWSResetHarness {
         # Real Reset-DevWSTerminal from the elevated worker, with recording
         # providers for every side effect. Run(State, Hwnd, Diagnostic,
@@ -6006,6 +6061,232 @@ public sealed class DevWSPhase61BFakeTabCollection
 
         Assert-Equal "ambiguous" $snapshot.Terminals[0].State "duplicate identities refuse"
         Assert-Equal 0 ([int]$snapshot.Counts.Present) "no first-match substitution"
+    }
+
+    Test-Case "presence accepts the canonical managed title family without cached state" {
+        $windowId = "OBS-FAM"
+
+        foreach ($case in @(
+            @{ Label = "base"; Hwnd = 6101; Names = @($windowId) },
+            @{ Label = "number 1"; Hwnd = 6102; Names = @("$windowId#DevWS:1") },
+            @{ Label = "number 2"; Hwnd = 6103; Names = @("$windowId#DevWS:2") },
+            @{ Label = "case-insensitive"; Hwnd = 6104; Names = @("obs-fam#DevWS:7") }
+        )) {
+            $reads = @{}
+            $reads[[int]$case.Hwnd] = New-TerminalPresenceTestRead -Hwnd $case.Hwnd -Names $case.Names
+            $fixture = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @($case.Hwnd) -Reads $reads
+
+            Assert-Equal "present" $fixture.Snapshot.Terminals[0].State "$($case.Label) family member is present"
+            Assert-Equal ([long]$case.Hwnd) ([long]$fixture.Snapshot.Terminals[0].Hwnd) "$($case.Label) family member keeps its HWND"
+            Assert-Equal "snapshot" $fixture.Snapshot.Terminals[0].Source "$($case.Label) family member is snapshot-sourced"
+        }
+
+        $ambiguousReads = @{
+            6110 = New-TerminalPresenceTestRead -Hwnd 6110 -Names @("$windowId#DevWS:1")
+            6111 = New-TerminalPresenceTestRead -Hwnd 6111 -Names @("$windowId#DevWS:2")
+        }
+        $ambiguous = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6110, 6111) -Reads $ambiguousReads
+
+        Assert-Equal "ambiguous" $ambiguous.Snapshot.Terminals[0].State "two family members on different HWNDs are ambiguous"
+        Assert-Equal 0 ([int]$ambiguous.Snapshot.Counts.Present) "ambiguous family members are never a first-match present"
+        Assert-Equal 1 ([int]$ambiguous.Snapshot.Counts.Ambiguous) "ambiguous family count"
+
+        $uniqueReads = @{
+            6112 = New-TerminalPresenceTestRead -Hwnd 6112 -Names @("OBS-OTHER")
+            6113 = New-TerminalPresenceTestRead -Hwnd 6113 -Names @("$windowId#DevWS:2")
+        }
+        $unique = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6112, 6113) -Reads $uniqueReads
+
+        Assert-Equal "present" $unique.Snapshot.Terminals[0].State "unrelated readable candidate does not block unique association"
+        Assert-Equal 6113 ([long]$unique.Snapshot.Terminals[0].Hwnd) "the canonical family candidate is selected"
+
+        $state = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "family-state" -WindowId $windowId -Hwnd 6114
+        $stateReads = @{
+            6114 = New-TerminalPresenceTestRead -Hwnd 6114 -Names @("$windowId#DevWS:1")
+        }
+        $cached = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6114) -Reads $stateReads -State $state -TerminalId "family-state"
+
+        Assert-Equal "present" $cached.Snapshot.Terminals[0].State "valid cached state with a numbered member is present"
+        Assert-Equal "state" $cached.Snapshot.Terminals[0].Source "cached state source"
+        Assert-Equal 6114 ([long]$cached.Snapshot.Terminals[0].Hwnd) "cached state HWND retained"
+
+        $missing = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @() -Reads @{}
+
+        Assert-Equal "missing" $missing.Snapshot.Terminals[0].State "no cached state and no matching candidate is missing"
+        Assert-Equal "fast-missing" $missing.Snapshot.Terminals[0].Source "genuine absence keeps the fast-missing source"
+    }
+
+    Test-Case "presence rejects malformed managed titles and keeps unreadable candidates uncertain" {
+        $windowId = "OBS-FAM2"
+        $badNames = @(
+            "$windowId#DevWS:01",
+            "$windowId#DevWS:0",
+            "$windowId-extra",
+            "X$windowId",
+            "$windowId#DevWS:1x",
+            "$windowId#DevWS:1#DevWS:2"
+        )
+
+        foreach ($name in $badNames) {
+            $reads = @{}
+            $reads[6121] = New-TerminalPresenceTestRead -Hwnd 6121 -Names @($name)
+            $fixture = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6121) -Reads $reads
+
+            Assert-Equal "missing" $fixture.Snapshot.Terminals[0].State "malformed/lookalike '$name' is not a positive match"
+            Assert-Equal 0 ([int]$fixture.Snapshot.Counts.Present) "malformed/lookalike '$name' is never present"
+        }
+
+        $unreadableReads = @{
+            6122 = New-TerminalPresenceTestRead -Hwnd 6122 -HwndPresent $true -ReadOk $false -Complete $false -RawCount 0 -ErrorKind "uia-from-handle-failed" -Error "denied"
+        }
+        $unreadable = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6122) -Reads $unreadableReads
+
+        Assert-Equal "inaccessible" $unreadable.Snapshot.Terminals[0].State "live unreadable candidate is inaccessible, not missing"
+        Assert-Equal 0 ([int]$unreadable.Snapshot.Counts.Missing) "unreadable candidate is never genuinely missing"
+        Assert-Contains ([string]$unreadable.Snapshot.Terminals[0].Diagnostic) "could not be verified" "unreadable diagnostic is retained"
+    }
+
+    Test-Case "numbered-only managed window is present for launch and reset preflight" {
+        $windowId = "OBS-FAM3"
+        $terminal = New-TerminalDefinition -Id "family-launch" -WindowId $windowId -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+
+        $script:familyTrackingCalls = 0
+        $script:familyCreateCalls = 0
+        $script:familyKicks = 0
+        $reader = { param($h) New-TerminalPresenceTestRead -Hwnd $h -Names @("$windowId#DevWS:1") }.GetNewClosure()
+
+        $plan = Get-DevWSTerminalLaunchPlan `
+            -Config $config `
+            -SetId "main" `
+            -Terminals @($terminal) `
+            -WtHwnds @(6201) `
+            -CandidateReader $reader `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true } `
+            -TrackingContextFactory { param($t) $script:familyTrackingCalls++; throw "tracking must not run for a present numbered-only window" } `
+            -CreateArgumentsFactory { param($t, $c) $script:familyCreateCalls++; throw "creation arguments must not run for a present numbered-only window" }
+
+        Assert-Equal "present" $plan.Terminals[0].State "numbered-only plan entry is present"
+        Assert-Equal 0 ([int]$plan.Counts.Missing) "numbered-only plan does not count as missing"
+        Assert-Equal 0 $script:familyTrackingCalls "no tracking context for a present numbered-only window"
+        Assert-Equal 0 $script:familyCreateCalls "no creation arguments for a present numbered-only window"
+
+        $kick = Start-DevWSTerminalLaunchPlan -Plan $plan -WtPath "C:\Test\wt.exe" -ProcessStarter { param($record) $script:familyKicks++ }
+
+        Assert-Equal 0 $script:familyKicks "numbered-only present window produces zero creation kicks"
+        Assert-Equal 0 @($kick.Kicks).Count "numbered-only present window has no kick records"
+
+        $decision = Get-DevWSResetPreflightDecision -Observation $plan.Terminals[0] -TerminalId $terminal.id -WindowId $windowId
+
+        Assert-Equal "close-recreate" $decision.Action "numbered-only present window enters the verified close/recreate path"
+        Assert-True ($decision.Action -ne "recreate") "numbered-only present window never enters the missing direct-recreation path"
+    }
+
+    Test-Case "post-launch completion uses the canonical family and refuses ambiguous or wrong names" {
+        $windowId = "OBS-COMPLETE"
+        $terminal = New-TerminalDefinition -Id "family-complete" -WindowId $windowId -Path $TestRoot
+        $script:familyPublished = [System.Collections.Generic.List[long]]::new()
+
+        function Update-DevWSRuntimeTerminal {
+            param($SetId, $Id, $WindowId, [long]$Hwnd)
+            $script:familyPublished.Add([long]$Hwnd) | Out-Null
+        }
+
+        $record = New-DevWSTerminalPlanRecord `
+            -Order 0 `
+            -Terminal $terminal `
+            -SetId "main" `
+            -State "missing" `
+            -Source "fast-missing" `
+            -CreateArguments ([string[]]@("x")) `
+            -ApplyGeometry $false
+
+        $plan = [pscustomobject]@{
+            PlanId    = "family-completion"
+            SetId     = "main"
+            WtHwnds   = @()
+            WtToken   = ""
+            Terminals = @($record)
+        }
+
+        $kick = [pscustomobject]@{
+            Kicks = @([pscustomobject]@{
+                Order           = 0
+                TerminalId      = $terminal.id
+                WindowId        = $windowId
+                CreateArguments = @("x")
+                StartedAtUtc    = [DateTimeOffset]::UtcNow
+                DeadlineUtc     = [DateTimeOffset]::UtcNow.AddSeconds(30)
+            })
+            Failures = @()
+        }
+
+        $numbered = @([pscustomobject]@{
+            Hwnd        = [long]6301
+            ProcessName = "WindowsTerminal"
+            TabNames    = (New-DevWSPresentTabNameSet -Names @("$windowId#DevWS:1"))
+            RawCount    = 2
+        })
+
+        $completed = Complete-DevWSTerminalLaunchPlan `
+            -Plan $plan `
+            -KickResult $kick `
+            -SnapshotProvider ({ $numbered }.GetNewClosure()) `
+            -PollMilliseconds 1
+
+        Assert-Equal 1 @($completed.Finalized).Count "numbered-only completion finalizes"
+        Assert-Equal 0 @($completed.Failures).Count "numbered-only completion has no failure"
+        Assert-Equal 1 $script:familyPublished.Count "numbered-only completion publishes runtime state"
+        Assert-Equal 6301 ([long]$script:familyPublished[0]) "completion publishes the canonical family HWND"
+
+        $ambiguous = @(
+            [pscustomobject]@{ Hwnd = [long]6302; ProcessName = "WindowsTerminal"; TabNames = (New-DevWSPresentTabNameSet -Names @($windowId)); RawCount = 1 },
+            [pscustomobject]@{ Hwnd = [long]6303; ProcessName = "WindowsTerminal"; TabNames = (New-DevWSPresentTabNameSet -Names @("$windowId#DevWS:1")); RawCount = 1 }
+        )
+
+        $beforeAmbiguous = $script:familyPublished.Count
+        $ambiguousResult = Complete-DevWSTerminalLaunchPlan `
+            -Plan $plan `
+            -KickResult $kick `
+            -SnapshotProvider ({ $ambiguous }.GetNewClosure()) `
+            -PollMilliseconds 1
+
+        Assert-Equal 0 @($ambiguousResult.Finalized).Count "ambiguous completion refuses to finalize"
+        Assert-Equal $beforeAmbiguous $script:familyPublished.Count "ambiguous completion publishes nothing"
+        Assert-Contains ([string]$ambiguousResult.Failures[0]) "exposed by 2" "ambiguous completion reports both candidates"
+
+        $wrong = @([pscustomobject]@{
+            Hwnd        = [long]6304
+            ProcessName = "WindowsTerminal"
+            TabNames    = (New-DevWSPresentTabNameSet -Names @("OBS-OTHER"))
+            RawCount    = 1
+        })
+
+        $pastKick = [pscustomobject]@{
+            Kicks = @([pscustomobject]@{
+                Order           = 0
+                TerminalId      = $terminal.id
+                WindowId        = $windowId
+                CreateArguments = @("x")
+                StartedAtUtc    = [DateTimeOffset]::UtcNow
+                DeadlineUtc     = [DateTimeOffset]::UtcNow.AddSeconds(-1)
+            })
+            Failures = @()
+        }
+
+        $beforeWrong = $script:familyPublished.Count
+        $wrongResult = Complete-DevWSTerminalLaunchPlan `
+            -Plan $plan `
+            -KickResult $pastKick `
+            -SnapshotProvider ({ $wrong }.GetNewClosure()) `
+            -PollMilliseconds 1
+
+        Assert-Equal 0 @($wrongResult.Finalized).Count "wrong-named completion refuses to finalize"
+        Assert-Equal $beforeWrong $script:familyPublished.Count "wrong-named completion publishes nothing"
+        Assert-Contains ([string]$wrongResult.Failures[0]) "could not be identified" "wrong-named completion reports non-identification"
     }
 
     Test-Case "reset duplicate-identity preflight uses the canonical title family" {
