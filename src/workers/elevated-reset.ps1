@@ -36,6 +36,7 @@ $Wt = $null
 
 function Reset-DevWSTerminal {
     param(
+        [Parameter(Mandatory)]$Config,
         $Terminal,
         $State,
         [Parameter(Mandatory)]
@@ -71,36 +72,65 @@ function Reset-DevWSTerminal {
         throw "DevWS cwd tracking bootstrap helper is missing: $bootstrapPath. Refusing to reset terminal '$terminalId'."
     }
 
-    $identity = Resolve-DevWSTerminalHwnd -WindowId $windowId -SetId $SetId -State $State -TerminalId $terminalId
-    $locator  = $null
-
-    if ($identity.Status -ne "present") {
-        # Locator-assisted attach: works whether the window already exists but
-        # was not discoverable, or is actually missing (creates a locator-only
-        # window that is closed again below).
-        $locator  = Start-DevWSLocator -WindowId $windowId
-        $identity = [pscustomobject]@{
-            Status = "present"
-            Hwnd   = [long]$locator.Hwnd
-            Source = "locator"
-        }
+    # Mandatory pre-close identity gate. Only the shared structured presence
+    # snapshot may authorize closure: present means the exact managed window
+    # identity was observed; missing means no existing managed window was
+    # observed and no parent may be closed; inaccessible, ambiguous, failed or
+    # correlated-to-another terminal all refuse before any destructive call.
+    # A locator HWND or Win32 title match is never sufficient by itself.
+    try {
+        $preflight = Get-DevWSTerminalPresenceSnapshot `
+            -Config $Config `
+            -SetId $SetId `
+            -State $State `
+            -Terminals @($Terminal)
+    }
+    catch {
+        throw "Refusing to reset terminal '$terminalId' ($windowId): presence preflight failed before the destructive close: $($_.Exception.Message)"
     }
 
-    try {
-        # Close the whole managed Windows Terminal window using the proven
-        # close-all flow (Alt+F4 then confirm).
-        Close-DevWSWindowHwnd -Hwnd $identity.Hwnd -Context "terminal '$terminalId' ($windowId)"
+    $observations = @($preflight.Terminals | Where-Object {
+        [string]$_.TerminalId -ceq $terminalId -and [string]$_.WindowId -ceq $windowId
+    })
 
-        if (-not (Wait-DevWSWindowHwndGone -Hwnd $identity.Hwnd -TimeoutSeconds 10)) {
+    if ($observations.Count -ne 1) {
+        throw "Refusing to reset terminal '$terminalId' ($windowId): presence preflight returned $($observations.Count) observations for this terminal."
+    }
+
+    $decision = Get-DevWSResetPreflightDecision `
+        -Observation $observations[0] `
+        -TerminalId $terminalId `
+        -WindowId $windowId
+
+    if ($decision.Action -eq "refuse") {
+        throw $decision.Message
+    }
+
+    if ($decision.Action -eq "close-recreate") {
+        # Only a positively verified present identity with no conflicting
+        # managed window identity may reach this close.
+        try {
+            $conflict = Get-DevWSResetIdentityConflict `
+                -SelectedHwnd ([long]$decision.Hwnd) `
+                -WtHwnds @($preflight.WtHwnds) `
+                -WindowId $windowId
+        }
+        catch {
+            throw "Refusing to reset terminal '$terminalId' ($windowId): duplicate-identity preflight failed before the destructive close: $($_.Exception.Message)"
+        }
+
+        if ($conflict.Conflict) {
+            throw "Refusing to reset terminal '$terminalId' ($windowId): $($conflict.Diagnostic)."
+        }
+
+        Close-DevWSWindowHwnd -Hwnd ([long]$decision.Hwnd) -Context "terminal '$terminalId' ($windowId)"
+
+        if (-not (Wait-DevWSWindowHwndGone -Hwnd ([long]$decision.Hwnd) -TimeoutSeconds 10)) {
             throw "Terminal '$terminalId' ($windowId) did not close."
         }
     }
-    finally {
-        # If the window survived (close failed), remove the locator tab so the
-        # user's window is left as configured.
-        if ($null -ne $locator -and (Test-DevWSWindowHwnd -Hwnd $locator.Hwnd)) {
-            [void](Remove-DevWSLocator -Locator $locator)
-        }
+    elseif ($decision.Action -ne "recreate") {
+        throw "Refusing to reset terminal '$terminalId' ($windowId): unsupported preflight action '$($decision.Action)'."
     }
 
     # The old window is confirmed gone. ONLY NOW create the new generation: a
@@ -120,11 +150,25 @@ function Reset-DevWSTerminal {
     [string[]]$createArguments = @(New-DevWSTerminalCreateArguments -Terminal $Terminal -TrackingContexts $trackingContexts)
     & $Wt @createArguments
 
-    $hwnd = Wait-DevWSTerminalHwnd -WindowId $windowId -TimeoutSeconds 15
+    $recovery = Wait-DevWSResetTerminalPresence `
+        -Config $Config `
+        -SetId $SetId `
+        -State $State `
+        -Terminal $Terminal `
+        -TimeoutSeconds 15
 
-    if (-not $hwnd) {
-        throw "Terminal '$terminalId' ($windowId) was recreated but could not be identified."
+    if (-not $recovery.Ok) {
+        $detail = if ([string]::IsNullOrWhiteSpace([string]$recovery.Diagnostic)) {
+            [string]$recovery.State
+        }
+        else {
+            "$($recovery.State); $($recovery.Diagnostic)"
+        }
+
+        throw "Terminal '$terminalId' ($windowId) was recreated but could not be identified after $($recovery.Attempts) observation attempt(s): $detail"
     }
+
+    $hwnd = [long]$recovery.Hwnd
 
     # Safety net: a recreated window holds exactly the configured tabs. More
     # (raw, duplicate-preserving) TabItems means `wt -w` attached to an
@@ -154,9 +198,9 @@ function Reset-DevWSTerminal {
 
 # One-shot authenticated pipe transport (Public Security Phase 2-D): exactly
 # one connection, one request, ACCEPTED after complete placement validation
-# and before the first destructive side effect (locator creation, close or
-# recreation), FINAL with the outcome, then exit. There are no request/result
-# files; a lost ACCEPTED or FINAL never causes automatic Reset repetition.
+# and before the first destructive side effect (any close or recreation),
+# FINAL with the outcome, then exit. There are no request/result files; a lost
+# ACCEPTED or FINAL never causes automatic Reset repetition.
 $kind = "reset"
 
 $server = New-DevWSWorkerPipeServer -Kind $kind
@@ -226,7 +270,7 @@ try {
     }
 
     # ---- ACCEPTED boundary: after complete request/policy validation and
-    # before locator creation, close or recreation -----------------------
+    # before any close or recreation --------------------------------------
     [void](Send-DevWSWorkerAccepted -Server $server -Kind $kind -RequestId $requestId)
 
     try {
@@ -234,6 +278,7 @@ try {
             $placement = $placementPayload.Placements[[string]$terminal.id]
 
             Reset-DevWSTerminal `
+                -Config $config `
                 -Terminal $terminal `
                 -State $state `
                 -SetId $target.SetId `

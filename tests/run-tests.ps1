@@ -5269,20 +5269,138 @@ try {
         Assert-NotContains $focusSource "Get-DevWSWindowsTerminalPath" "focus must not even resolve wt"
     }
 
-    Test-Case "reset recreates configured tabs and cleans up locators" {
+    Test-Case "reset verifies managed identity before close and recreates configured tabs" {
         $source = Get-SourceOf "src\workers\elevated-reset.ps1"
 
+        Assert-Contains $source "Get-DevWSTerminalPresenceSnapshot" "pre-close structured presence snapshot"
+        Assert-Contains $source "Get-DevWSResetPreflightDecision" "pre-close identity decision"
+        Assert-Contains $source "Get-DevWSResetIdentityConflict" "pre-close duplicate-identity check"
         Assert-Contains $source "New-DevWSTerminalCreateArguments" "recreate from config"
         Assert-Contains $source "Close-DevWSWindowHwnd" "proven close-all flow"
         Assert-Contains $source "Wait-DevWSWindowHwndGone" "close is confirmed"
-        Assert-Contains $source "Start-DevWSLocator" "locator-assisted attach"
-        Assert-Contains $source "Remove-DevWSLocator" "locator cleanup"
-        Assert-Contains $source "finally" "cleanup in finally path"
+        Assert-Contains $source "Wait-DevWSResetTerminalPresence" "structured post-recreation identity wait"
         Assert-Contains $source "Update-DevWSRuntimeTerminal" "runtime state updated"
         Assert-Contains $source "Wait-DevWSTabCountFromHwnd" "reset waits for the raw tab count"
         Assert-Contains $source "Test-DevWSCreatedTabCount -ActualCount" "reset guard uses raw counts"
+        Assert-NotContains $source "Start-DevWSLocator" "reset never attaches a locator before close"
+        Assert-NotContains $source "Remove-DevWSLocator" "reset never cleans up a locator by closing a parent"
+        Assert-NotContains $source "OwnsWindow" "verified multi-tab presence does not depend on locator ownership"
+        Assert-NotContains $source "Resolve-DevWSTerminalHwnd" "reset uses the structured presence decision"
         Assert-NotContains $source "Get-DevWSPresentTabNamesFromHwnd" "reset must not count tabs from a deduplicated name set"
         Assert-NotContains $source "focus-tab" "no redundant post-create wt focus-tab"
+        Assert-Contains $source 'if ($decision.Action -eq "close-recreate")' "only verified present enters the close branch"
+        Assert-Contains $source 'Send-DevWSWorkerAccepted' "ACCEPTED boundary remains"
+        Assert-Contains $source '-Ok $false' "post-ACCEPTED refusal sends an unsuccessful FINAL"
+
+        $decisionIndex = $source.IndexOf("Get-DevWSResetPreflightDecision")
+        $refuseIndex   = $source.IndexOf('if ($decision.Action -eq "refuse")')
+        $conflictIndex = $source.IndexOf("Get-DevWSResetIdentityConflict")
+        $closeIndex    = $source.IndexOf("Close-DevWSWindowHwnd")
+        $recreateIndex = $source.IndexOf("& `$Wt @createArguments")
+        $recoveryIndex = $source.IndexOf("Wait-DevWSResetTerminalPresence")
+        $updateIndex   = $source.IndexOf("Update-DevWSRuntimeTerminal")
+
+        Assert-True ($decisionIndex -ge 0 -and $refuseIndex -gt $decisionIndex) "refusal is checked immediately after the decision"
+        Assert-True ($conflictIndex -gt $refuseIndex) "duplicate-identity check follows the refusal gate"
+        Assert-True ($closeIndex -gt $conflictIndex) "the destructive close is after both pre-close gates"
+        Assert-True ($recreateIndex -ge 0 -and $recoveryIndex -gt $recreateIndex) "identity recovery follows recreation"
+        Assert-Equal 1 ([regex]::Matches($source, 'Close-DevWSWindowHwnd').Count) "there is exactly one destructive close site"
+        Assert-True ($closeIndex -lt $recoveryIndex) "no destructive close occurs after recreation"
+        Assert-True ($updateIndex -gt $recoveryIndex) "runtime state is published only after identity recovery"
+    }
+
+    Test-Case "reset preflight accepts only verified present or genuine missing" {
+        $present = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'state'; Hwnd = 123; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "close-recreate" $present.Action "verified present may close and recreate"
+        Assert-Equal 123 $present.Hwnd "verified present keeps its exact HWND"
+
+        $missing = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'missing'; Source = 'fast-missing'; Hwnd = 0; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "recreate" $missing.Action "genuine missing may recreate without a close"
+
+        $inaccessible = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'inaccessible'; Source = 'state'; Hwnd = 123; Diagnostic = 'empty-tab-observation'
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $inaccessible.Action "inaccessible refuses before close"
+        Assert-Contains $inaccessible.Message "empty-tab-observation" "inaccessible diagnostic is preserved"
+
+        $ambiguous = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'ambiguous'; Source = 'snapshot'; Hwnd = 0; Diagnostic = 'two candidate windows'
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $ambiguous.Action "ambiguous refuses before close"
+
+        $failed = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'failed'; Source = $null; Hwnd = 0; Diagnostic = 'uia-findall-failed'
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $failed.Action "failed observation refuses before close"
+
+        $noHwnd = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'state'; Hwnd = 0; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $noHwnd.Action "present without an HWND refuses"
+
+        $mismatch = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 'other'; WindowId = 'w1'; State = 'present'; Source = 'state'; Hwnd = 123; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $mismatch.Action "correlation mismatch refuses"
+
+        $none = Get-DevWSResetPreflightDecision -Observation $null -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $none.Action "missing observation refuses"
+    }
+
+    Test-Case "reset presence wait distinguishes retry, timeout, zero-tab and exception" {
+        $terminal = [pscustomobject]@{ id = 't1'; windowId = 'w1' }
+        $baseArgs = @{
+            Config = [pscustomobject]@{}
+            SetId = 'main'
+            State = $null
+            Terminal = $terminal
+            TimeoutSeconds = 1
+        }
+
+        $script:presenceCalls = 0
+        $retryProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            $script:presenceCalls++
+            $state = if ($script:presenceCalls -lt 2) { 'inaccessible' } else { 'present' }
+            $hwnd = if ($state -eq 'present') { 456 } else { 0 }
+            [pscustomobject]@{ Terminals = @([pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = $state; Source = 'snapshot'; Hwnd = $hwnd; Diagnostic = $(if ($state -eq 'inaccessible') { 'empty-tab-observation' } else { $null }) }) }
+        }
+        $retry = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $retryProvider
+        Assert-True $retry.Ok "transient inaccessible observation retries to present"
+        Assert-Equal 456 $retry.Hwnd "retry returns the verified HWND"
+
+        $zeroProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            [pscustomobject]@{ Terminals = @([pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = 'inaccessible'; Source = 'snapshot'; Hwnd = 0; Diagnostic = 'empty-tab-observation' }) }
+        }
+        $zero = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $zeroProvider
+        Assert-Equal $false $zero.Ok "zero-tab observation times out"
+        Assert-Equal "inaccessible" $zero.State "zero-tab state is retained"
+        Assert-Contains ([string]$zero.Diagnostic) "empty-tab-observation" "zero-tab diagnostic is retained"
+
+        $exceptionProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            throw [System.Runtime.InteropServices.COMException]::new('findall-failed')
+        }
+        $exception = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $exceptionProvider
+        Assert-Equal $false $exception.Ok "FindAll exception times out"
+        Assert-Equal "failed" $exception.State "FindAll exception state is failed"
+        Assert-Contains ([string]$exception.Diagnostic) "findall-failed" "FindAll diagnostic is retained"
+
+        $duplicateProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            [pscustomobject]@{ Terminals = @(
+                [pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'snapshot'; Hwnd = 1; Diagnostic = $null },
+                [pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'snapshot'; Hwnd = 2; Diagnostic = $null }
+            ) }
+        }
+        $duplicate = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $duplicateProvider
+        Assert-Equal $false $duplicate.Ok "duplicate observations time out"
+        Assert-Contains ([string]$duplicate.Diagnostic) "returned 2 records" "duplicate observation diagnostic is retained"
     }
 
     Test-Case "lifecycle no longer uses a permanent stable tab index" {
@@ -5731,6 +5849,48 @@ public sealed class DevWSPhase61BFakeTabCollection
 
         Assert-Equal "ambiguous" $snapshot.Terminals[0].State "duplicate identities refuse"
         Assert-Equal 0 ([int]$snapshot.Counts.Present) "no first-match substitution"
+    }
+
+    Test-Case "reset duplicate-identity preflight refuses a positive conflict" {
+        $reader = {
+            param($h)
+            if ($h -eq 200) {
+                New-TerminalPresenceTestRead -Hwnd $h -Names @("W1")
+            }
+            else {
+                New-TerminalPresenceTestRead -Hwnd $h -Names @("W2")
+            }
+        }
+
+        $conflict = Get-DevWSResetIdentityConflict `
+            -SelectedHwnd 100 `
+            -WtHwnds @(100, 200, 300) `
+            -WindowId "W1" `
+            -CandidateReader $reader `
+            -ProcessNameProvider { param($h) "WindowsTerminal" }
+
+        Assert-True $conflict.Conflict "same managed windowId on another candidate is a conflict"
+        Assert-Equal 1 @($conflict.Hwnds).Count "one conflicting candidate"
+        Assert-Equal 200 ([long]$conflict.Hwnds[0]) "conflicting HWND is named"
+        Assert-Contains ([string]$conflict.Diagnostic) "W1" "conflict diagnostic names the windowId"
+
+        $noConflict = Get-DevWSResetIdentityConflict `
+            -SelectedHwnd 100 `
+            -WtHwnds @(100, 200) `
+            -WindowId "W1" `
+            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -Names @("W2") } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" }
+
+        Assert-Equal $false $noConflict.Conflict "different managed tab names do not conflict"
+
+        $unreadable = Get-DevWSResetIdentityConflict `
+            -SelectedHwnd 100 `
+            -WtHwnds @(100, 200) `
+            -WindowId "W1" `
+            -CandidateReader { param($h) New-TerminalPresenceTestRead -Hwnd $h -ReadOk $false -Names @() } `
+            -ProcessNameProvider { param($h) "WindowsTerminal" }
+
+        Assert-Equal $false $unreadable.Conflict "an unreadable other candidate is not positive conflict"
     }
 
     Test-Case "inaccessible launch plan entry produces zero creation kicks" {

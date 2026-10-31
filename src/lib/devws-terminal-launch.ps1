@@ -755,6 +755,97 @@ function Get-DevWSTerminalPresenceSnapshot {
     }
 }
 
+function Wait-DevWSResetTerminalPresence {
+    # Bounded, read-only post-recreation identity wait. It reuses the shared
+    # structured presence snapshot so the reset worker can report why a new
+    # HWND could not be verified instead of returning a bare zero.
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$SetId,
+        $State = $null,
+        [Parameter(Mandatory)]$Terminal,
+        [int]$TimeoutSeconds = 15,
+        [scriptblock]$PresenceProvider = $null
+    )
+
+    $terminalId = [string]$Terminal.id
+    $windowId   = [string]$Terminal.windowId
+
+    if ($null -eq $PresenceProvider) {
+        $PresenceProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            Get-DevWSTerminalPresenceSnapshot -Config $Config -SetId $SetId -State $State -Terminals @($Terminal)
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    $attempts = 0
+    $last = $null
+
+    while ($true) {
+        $attempts++
+        $snapshot = $null
+
+        try {
+            $snapshot = & $PresenceProvider $Config $SetId $State $Terminal
+        }
+        catch {
+            $last = [pscustomobject]@{
+                State      = "failed"
+                Source     = "snapshot"
+                Hwnd       = [long]0
+                Diagnostic = (Get-DevWSUiaErrorText -Error $_)
+            }
+        }
+
+        if ($null -ne $snapshot) {
+            $records = @($snapshot.Terminals | Where-Object {
+                [string]$_.TerminalId -ceq $terminalId -and [string]$_.WindowId -ceq $windowId
+            })
+
+            if ($records.Count -eq 1) {
+                $last = $records[0]
+            }
+            else {
+                $last = [pscustomobject]@{
+                    State      = "failed"
+                    Source     = "snapshot"
+                    Hwnd       = [long]0
+                    Diagnostic = "presence observation returned $($records.Count) records for terminal '$terminalId' ($windowId)"
+                }
+            }
+        }
+
+        if ($null -ne $last -and [string]$last.State -eq "present" -and [long]$last.Hwnd -gt 0) {
+            return [pscustomobject]@{
+                Ok         = $true
+                Hwnd       = [long]$last.Hwnd
+                State      = "present"
+                Source     = [string]$last.Source
+                Diagnostic = $null
+                Attempts   = $attempts
+            }
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            $state = if ($null -eq $last) { "failed" } else { [string]$last.State }
+            $source = if ($null -eq $last) { "snapshot" } else { [string]$last.Source }
+            $diagnostic = if ($null -eq $last) { "no presence observation was returned" } else { [string]$last.Diagnostic }
+
+            return [pscustomobject]@{
+                Ok         = $false
+                Hwnd       = [long]0
+                State      = $state
+                Source     = $source
+                Diagnostic = $diagnostic
+                Attempts   = $attempts
+            }
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 function Get-DevWSTerminalLaunchPlan {
     # Side-effect-free terminal launch plan for one resolved set.
     #

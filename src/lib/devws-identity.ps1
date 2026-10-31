@@ -180,6 +180,217 @@ function Wait-DevWSTerminalHwnd {
     return 0
 }
 
+function Get-DevWSResetIdentityConflict {
+    # Read-only duplicate-identity check for a positively present reset target.
+    # The shared presence snapshot validates the selected state HWND; this
+    # additionally refuses if another live Windows Terminal candidate exposes
+    # the same managed windowId. It never selects or closes anything.
+    param(
+        [Parameter(Mandatory)][long]$SelectedHwnd,
+        [AllowEmptyCollection()][long[]]$WtHwnds = @(),
+        [Parameter(Mandatory)][string]$WindowId,
+        [scriptblock]$CandidateReader = $null,
+        [scriptblock]$ProcessNameProvider = $null
+    )
+
+    if ($null -eq $CandidateReader) {
+        $CandidateReader = { param([long]$Hwnd) Read-DevWSTerminalHwndTabs -Hwnd $Hwnd }
+    }
+
+    if ($null -eq $ProcessNameProvider) {
+        $ProcessNameProvider = { param([long]$Hwnd) Get-DevWSWindowHwndProcessName -Hwnd $Hwnd }
+    }
+
+    $conflicts = [System.Collections.Generic.List[long]]::new()
+
+    foreach ($hwnd in @($WtHwnds)) {
+        if ([long]$hwnd -eq $SelectedHwnd) {
+            continue
+        }
+
+        $processName = [string](& $ProcessNameProvider ([long]$hwnd))
+
+        if (-not (Test-DevWSProcessNameIsWindowsTerminal -ProcessName $processName)) {
+            continue
+        }
+
+        $read = & $CandidateReader ([long]$hwnd)
+
+        if ($null -eq $read) {
+            continue
+        }
+
+        $present = if ($null -ne $read.PSObject.Properties["HwndPresent"]) { [bool]$read.HwndPresent } else { [bool]$read.Ok }
+        $readOk = if ($null -ne $read.PSObject.Properties["ReadOk"]) { [bool]$read.ReadOk } else { [bool]$read.Ok }
+
+        if (-not $present -or -not $readOk) {
+            continue
+        }
+
+        $names = if ($null -ne $read.PSObject.Properties["TabNames"]) { @($read.TabNames) } else { @() }
+
+        if ($names -contains $WindowId) {
+            $conflicts.Add([long]$hwnd) | Out-Null
+        }
+    }
+
+    $conflictList = @($conflicts | Sort-Object)
+    $diagnostic = if ($conflictList.Count -eq 0) {
+        $null
+    }
+    else {
+        "managed windowId '$WindowId' is exposed by the selected HWND $SelectedHwnd and conflicting HWND(s) $($conflictList -join ', ')"
+    }
+
+    return [pscustomobject]@{
+        Conflict   = ($conflictList.Count -gt 0)
+        Hwnds      = $conflictList
+        Diagnostic = $diagnostic
+    }
+}
+
+function Get-DevWSResetPreflightDecision {
+    # Pure decision used by the elevated reset worker BEFORE any destructive
+    # close. The observation must come from the structured presence snapshot;
+    # a locator HWND or a Win32 title match is never sufficient identity.
+    param(
+        [AllowNull()]$Observation,
+        [string]$TerminalId = '',
+        [string]$WindowId = ''
+    )
+
+    $label = if ([string]::IsNullOrWhiteSpace($TerminalId) -and [string]::IsNullOrWhiteSpace($WindowId)) {
+        "terminal"
+    }
+    elseif ([string]::IsNullOrWhiteSpace($TerminalId)) {
+        "terminal '$WindowId'"
+    }
+    elseif ([string]::IsNullOrWhiteSpace($WindowId)) {
+        "terminal '$TerminalId'"
+    }
+    else {
+        "terminal '$TerminalId' ($WindowId)"
+    }
+
+    if ($null -eq $Observation) {
+        return [pscustomobject]@{
+            Action     = "refuse"
+            Hwnd       = [long]0
+            State      = "failed"
+            Reason     = "observation-missing"
+            Diagnostic = "no structured presence observation was available"
+            Message    = "Refusing to reset ${label}: no structured presence observation was available before the destructive close."
+        }
+    }
+
+    $state = [string]$Observation.State
+    $diagnostic = if ($null -ne $Observation.PSObject.Properties["Diagnostic"]) { [string]$Observation.Diagnostic } else { "" }
+
+    if (-not [string]::IsNullOrWhiteSpace($TerminalId) -and
+        $null -ne $Observation.PSObject.Properties["TerminalId"] -and
+        [string]$Observation.TerminalId -cne $TerminalId) {
+        return [pscustomobject]@{
+            Action     = "refuse"
+            Hwnd       = [long]0
+            State      = $state
+            Reason     = "observation-correlation-mismatch"
+            Diagnostic = $diagnostic
+            Message    = "Refusing to reset ${label}: the presence observation names terminal '$($Observation.TerminalId)'."
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($WindowId) -and
+        $null -ne $Observation.PSObject.Properties["WindowId"] -and
+        [string]$Observation.WindowId -cne $WindowId) {
+        return [pscustomobject]@{
+            Action     = "refuse"
+            Hwnd       = [long]0
+            State      = $state
+            Reason     = "observation-correlation-mismatch"
+            Diagnostic = $diagnostic
+            Message    = "Refusing to reset ${label}: the presence observation names windowId '$($Observation.WindowId)'."
+        }
+    }
+
+    $detail = if ([string]::IsNullOrWhiteSpace($diagnostic)) { "" } else { " $diagnostic" }
+
+    switch ($state) {
+        "present" {
+            $hwnd = [long]$Observation.Hwnd
+
+            if ($hwnd -le 0) {
+                return [pscustomobject]@{
+                    Action     = "refuse"
+                    Hwnd       = [long]0
+                    State      = $state
+                    Reason     = "present-without-hwnd"
+                    Diagnostic = $diagnostic
+                    Message    = "Refusing to reset ${label}: the terminal was classified present without a live HWND."
+                }
+            }
+
+            return [pscustomobject]@{
+                Action     = "close-recreate"
+                Hwnd       = $hwnd
+                State      = $state
+                Reason     = "verified-present"
+                Diagnostic = $diagnostic
+                Message    = $null
+            }
+        }
+        "missing" {
+            return [pscustomobject]@{
+                Action     = "recreate"
+                Hwnd       = [long]0
+                State      = $state
+                Reason     = "missing"
+                Diagnostic = $diagnostic
+                Message    = $null
+            }
+        }
+        "inaccessible" {
+            return [pscustomobject]@{
+                Action     = "refuse"
+                Hwnd       = [long]0
+                State      = $state
+                Reason     = "inaccessible"
+                Diagnostic = $diagnostic
+                Message    = "Refusing to reset ${label}: the terminal is inaccessible and its managed identity could not be verified before the destructive close.$detail"
+            }
+        }
+        "ambiguous" {
+            return [pscustomobject]@{
+                Action     = "refuse"
+                Hwnd       = [long]0
+                State      = $state
+                Reason     = "ambiguous"
+                Diagnostic = $diagnostic
+                Message    = "Refusing to reset ${label}: the terminal identity is ambiguous.$detail"
+            }
+        }
+        "failed" {
+            return [pscustomobject]@{
+                Action     = "refuse"
+                Hwnd       = [long]0
+                State      = $state
+                Reason     = "failed"
+                Diagnostic = $diagnostic
+                Message    = "Refusing to reset ${label}: terminal presence observation failed.$detail"
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Action     = "refuse"
+                Hwnd       = [long]0
+                State      = $state
+                Reason     = "unknown-observation-state"
+                Diagnostic = $diagnostic
+                Message    = "Refusing to reset ${label}: the presence observation state '$state' is not a verified present or genuinely missing terminal.$detail"
+            }
+        }
+    }
+}
+
 function Resolve-DevWSTerminalHwnd {
     param(
         [Parameter(Mandatory)]
