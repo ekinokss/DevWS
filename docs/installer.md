@@ -58,10 +58,11 @@ with `-Purge` or `-Force`, before any machine mutation.
 
 Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
 unchanged. The v0.2 source and the public `v0.2.0-rc.1` pre-release contain a
-`DevWS-Setup.exe` build. The unsigned stable `v0.2.0` GitHub release is published. The v0.3.0
-release candidate uses the same package-mode contract and is not published. A WinGet
-submission template exists under `packaging/winget`, but no WinGet catalog package exists and
-the template is not submitted. This contract fixes the arguments,
+`DevWS-Setup.exe` build. The unsigned stable `v0.2.0` GitHub release is published, and the
+unsigned `v0.3.0` GitHub pre-release is published at
+https://github.com/ekinokss/DevWS/releases/tag/v0.3.0. A WinGet submission template exists
+under `packaging/winget`, but no WinGet catalog package exists and the template is not
+submitted. This contract fixes the arguments,
 non-interactive behavior and exit status the setup wrapper uses. Exit code `0` means the
 requested package-mode operation completed; any nonzero exit means it did not.
 
@@ -79,9 +80,10 @@ x64-only.
 
 The unsigned Windows x64 setup is published as the stable `v0.2.0` GitHub release:
 https://github.com/ekinokss/DevWS/releases/tag/v0.2.0. The `v0.2.0-rc.1` pre-release remains
-available. The v0.3.0 candidate is prepared from the same source and is not published. No
-WinGet catalog package is available; the prepared WinGet template is blocked by WinGet's
-unattended validation and is not submitted. See
+available. The unsigned `v0.3.0` pre-release is published at
+https://github.com/ekinokss/DevWS/releases/tag/v0.3.0; the stable public binary remains
+`v0.2.0`. No WinGet catalog package is available; the prepared WinGet template is blocked by
+WinGet's unattended validation and is not submitted. See
 [`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
 
 The setup requests elevation itself. It captures the caller SID before elevation and the
@@ -109,9 +111,9 @@ as executable authority.
 protected post-exit helper to remove the per-SID setup directory without a reboot. Package
 uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` and unrelated
 resources exactly as the frozen Phase-1 contract requires. The unsigned v0.2.0 setup is
-publicly available as the stable GitHub release; the v0.2.0-rc.1 pre-release remains
-available. The v0.3.0 candidate is not published. No WinGet catalog package is available.
-Self-update and MSI/MSIX/Windows Installer identity are not implemented.
+publicly available as the stable GitHub release; the v0.2.0-rc.1 and v0.3.0 pre-releases
+remain available. No WinGet catalog package is available. Self-update and MSI/MSIX/Windows
+Installer identity are not implemented.
 
 ### Release-candidate artifact pipeline
 
@@ -126,20 +128,26 @@ A manually dispatched bootstrapper workflow validates and retains this candidate
 artifact for 30 days, then downloads and re-verifies the exact artifact in a separate job.
 Normal feature-branch pushes run only fixture lifecycle validation. The candidate is unsigned
 and no Native AOT reproducibility is claimed. The workflow produced the unsigned
-`v0.2.0-rc.1` pre-release and the stable unsigned `v0.2.0` GitHub release. The v0.3.0 candidate
-is built and verified locally but is not uploaded or published. No `v0.3.0` GitHub Release,
-Windows Installer identity, attestation or WinGet catalog package exists.
+`v0.2.0-rc.1` pre-release, the stable unsigned `v0.2.0` GitHub release and the unsigned
+`v0.3.0` GitHub pre-release. The v0.3.0 bundle was published from the verified frozen
+candidate after an independent uploaded-asset verification. No Windows Installer identity,
+attestation or WinGet catalog package exists.
 
 ### Release state
 
-**CURRENT v0.3.0 RELEASE CANDIDATE (UNPUBLISHED):**
+**PUBLISHED v0.3.0 GITHUB PRE-RELEASE:**
 
-- local four-file release candidate containing `DevWS-Setup.exe`, `LICENSE`,
-  `provenance.json` and `SHA256SUMS.txt`
+- https://github.com/ekinokss/DevWS/releases/tag/v0.3.0, annotated tag `v0.3.0` at source
+  commit `5b5d8f67191ed2f61bacbb76e6803f0e6b958f38`
+- four-file bundle containing `DevWS-Setup.exe`, `LICENSE`, `provenance.json` and
+  `SHA256SUMS.txt`
 - product version `0.3.0`, Native AOT Windows x64, commit-bound provenance
-- not tagged, not uploaded, not published and not installed on the development host
-- guest cross-version upgrade, live Medium/High terminal-presence, elevated-reset and
-  installer-lifecycle acceptance remain release gates
+- unsigned; verify `DevWS-Setup.exe` SHA-256
+  `c0fdff83f9ecac2d1963aa4f289a4454e91588e32dab565c8959afcd3a6a135a`
+  against `SHA256SUMS.txt` before running it
+- accepted for release under CONDITIONAL GO; installed-lifecycle relative placement and
+  advanced multi-monitor, mixed-DPI and physical-EDID qualification are deferred backlog
+  items
 
 **PUBLIC v0.2.0-rc.1 PRE-RELEASE:**
 
@@ -162,7 +170,8 @@ Windows Installer identity, attestation or WinGet catalog package exists.
 
 **NOT PUBLISHED OR NOT AVAILABLE:**
 
-- `v0.3.0` tag, GitHub Release, release asset or published installer
+- stable `v0.3.0` release: `v0.3.0` is published as a pre-release, not as the latest stable
+  release
 - signed `v0.2.0` or `v0.3.0` installer
 - WinGet catalog package: the submission template is prepared but blocked by WinGet's
   unattended-elevation validation and is not submitted
@@ -173,8 +182,8 @@ Windows Installer identity, attestation or WinGet catalog package exists.
 - MSI/MSIX or Windows Installer identity
 
 The published v0.1.0 remains a historical source release. The unsigned `v0.2.0` GitHub release
-is the current stable public binary; the `v0.2.0-rc.1` pre-release remains available. The
-v0.3.0 candidate is not published.
+is the current stable public binary; the `v0.2.0-rc.1` and `v0.3.0` pre-releases remain
+available.
 
 ## 2. Prerequisites
 
@@ -506,10 +515,13 @@ exact five-task topology, idempotent update, real `-RepairTasks`, default uninst
 purge, and a final residue/ownership audit. The optional real-window lifecycle smoke was
 **not observed** in that environment and is not claimed as passed.
 
-The v0.3.0 candidate has not yet completed its guest cross-version upgrade, live Medium/High
-terminal-presence, elevated-reset or lifecycle acceptance. Hardware scenarios RH-03 (mixed
-150%/100% scaling) and RH-05 (primary-monitor change) remain outstanding. Durable path
-identities are validated; physical EDID behavior is not claimed from path-only evidence.
+The v0.3.0 candidate completed its guest cross-version upgrade, live Medium/High
+terminal-presence, elevated-reset and installer-lifecycle acceptance, plus a runtime
+relative-placement probe on a matching `path:` anchor. The release decision was CONDITIONAL
+GO. Installed-lifecycle relative-placement qualification, multi-monitor selection and negative
+origins, mixed-DPI, physical EDID and monitor-topology-change scenarios remain deferred
+backlog items; they are not claimed as passed. See the v0.3.0 release notes for the full
+known-limitations list.
 
 Behaviour that cannot be covered by automated tests — real windows, real tasks, real
 monitor topologies — is listed in

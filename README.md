@@ -134,8 +134,10 @@ Windows account that starts setup; UAC elevation using a different administrator
 intentionally rejected. The packaged setup can acquire a trusted machine-wide AutoHotkey v2
 installation through WinGet when it is missing, which requires network connectivity.
 
-The v0.3.0 release candidate is not published. Do not substitute a v0.3.0 candidate build for
-the stable v0.2.0 release or obtain one from an unofficial source.
+The unsigned `v0.3.0` pre-release is published at
+[GitHub v0.3.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.3.0). It does
+not replace `v0.2.0` as the latest stable release. Download only from the official release
+and verify the published SHA-256; do not obtain DevWS from an unofficial source.
 
 See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
 
