@@ -1,0 +1,49 @@
+{
+  "method": "PowerShell 7 + UI Automation (UIAutomationClient/UIAutomationTypes)",
+  "fixture": "eight-monitors-200-items.json",
+  "windowName": "DevWS v0.4 WPF Spike - Experimental",
+  "descendantCount": 88,
+  "namedControls": [
+    "Fixture selector",
+    "Load fixture",
+    "Fit canvas",
+    "Zoom out",
+    "Zoom in",
+    "Reset canvas view",
+    "Monitor list",
+    "Configured item list",
+    "Selected item X coordinate",
+    "Selected item Y coordinate",
+    "Selected item width",
+    "Selected item height",
+    "Apply numeric geometry",
+    "Workspace monitor canvas. Use the monitor and item lists for keyboard selection."
+  ],
+  "canvas": {
+    "controlType": "ControlType.Custom",
+    "automationId": "Canvas",
+    "isKeyboardFocusable": true,
+    "exposesPerShapePeers": false
+  },
+  "nonMouseSelection": {
+    "method": "SelectionItemPattern.Select on the second item-list entry",
+    "before": "item-001  [app]  -1884,-1404 360x184",
+    "after": "item-002  [terminal]  -1512,-1404 360x184",
+    "passed": true
+  },
+  "numericEditing": {
+    "method": "ValuePattern.SetValue on the X coordinate editor",
+    "before": "-1512",
+    "after": "123",
+    "passed": true
+  },
+  "keyboardKeystrokeTest": {
+    "status": "NOT EXECUTED",
+    "reason": "Synthetic keystrokes from the elevated automation shell were not reliably delivered to the medium-integrity WPF window. Standard WPF ListBox/TextBox/Button controls are keyboard-focusable; UIA reports HasKeyboardFocus=true for the item list."
+  },
+  "limitations": [
+    "The custom canvas exposes one named automation pane, not per-monitor or per-item automation peers.",
+    "The production accessibility design must add per-shape peers or an equivalent accessible object model.",
+    "Visible focus styling was not screenshot-verified; default WPF focus visuals are used."
+  ]
+}

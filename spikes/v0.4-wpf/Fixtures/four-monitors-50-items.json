@@ -1,0 +1,685 @@
+{
+  "name": "four-monitors-50-items",
+  "virtualScreenRect": {
+    "x": -1920,
+    "y": -1080,
+    "w": 4480,
+    "h": 2520
+  },
+  "monitors": [
+    {
+      "id": "top-left",
+      "name": "Top Left",
+      "primary": false,
+      "monitorRect": {
+        "x": -1920,
+        "y": -1080,
+        "w": 1920,
+        "h": 1080
+      },
+      "workRect": {
+        "x": -1920,
+        "y": -1080,
+        "w": 1920,
+        "h": 1040
+      },
+      "scalePercent": 100
+    },
+    {
+      "id": "top-right",
+      "name": "Top Right",
+      "primary": false,
+      "monitorRect": {
+        "x": 0,
+        "y": -1080,
+        "w": 2560,
+        "h": 1440
+      },
+      "workRect": {
+        "x": 0,
+        "y": -1080,
+        "w": 2560,
+        "h": 1400
+      },
+      "scalePercent": 125
+    },
+    {
+      "id": "bottom-left",
+      "name": "Bottom Left",
+      "primary": false,
+      "monitorRect": {
+        "x": -1920,
+        "y": 0,
+        "w": 1920,
+        "h": 1080
+      },
+      "workRect": {
+        "x": -1920,
+        "y": 0,
+        "w": 1920,
+        "h": 1040
+      },
+      "scalePercent": 100
+    },
+    {
+      "id": "bottom-right",
+      "name": "Bottom Right",
+      "primary": true,
+      "monitorRect": {
+        "x": 0,
+        "y": 0,
+        "w": 2560,
+        "h": 1440
+      },
+      "workRect": {
+        "x": 0,
+        "y": 0,
+        "w": 2560,
+        "h": 1400
+      },
+      "scalePercent": 150
+    }
+  ],
+  "items": [
+    {
+      "id": "item-001",
+      "kind": "app",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": -1044,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-002",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -1419,
+        "y": -1044,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-003",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -954,
+        "y": -1044,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-004",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -489,
+        "y": -1044,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-005",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": -718,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-006",
+      "kind": "app",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -1419,
+        "y": -718,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-007",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -954,
+        "y": -718,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-008",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -489,
+        "y": -718,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-009",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": -392,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-010",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -1419,
+        "y": -392,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-011",
+      "kind": "app",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -954,
+        "y": -392,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-012",
+      "kind": "terminal",
+      "monitorId": "top-left",
+      "enabled": true,
+      "rect": {
+        "x": -489,
+        "y": -392,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-013",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": -1044,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-014",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 661,
+        "y": -1044,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-015",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 1286,
+        "y": -1044,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-016",
+      "kind": "app",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 1911,
+        "y": -1044,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-017",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": -709,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-018",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 661,
+        "y": -709,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-019",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 1286,
+        "y": -709,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-020",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 1911,
+        "y": -709,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-021",
+      "kind": "app",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": -374,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-022",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 661,
+        "y": -374,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-023",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 1286,
+        "y": -374,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-024",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 1911,
+        "y": -374,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-025",
+      "kind": "terminal",
+      "monitorId": "top-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": -39,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-026",
+      "kind": "app",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": 36,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-027",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -1419,
+        "y": 36,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-028",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -954,
+        "y": 36,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-029",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -489,
+        "y": 36,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-030",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": 362,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-031",
+      "kind": "app",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -1419,
+        "y": 362,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-032",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -954,
+        "y": 362,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-033",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -489,
+        "y": 362,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-034",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": 688,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-035",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -1419,
+        "y": 688,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-036",
+      "kind": "app",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -954,
+        "y": 688,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-037",
+      "kind": "terminal",
+      "monitorId": "bottom-left",
+      "enabled": true,
+      "rect": {
+        "x": -489,
+        "y": 688,
+        "w": 453,
+        "h": 314
+      }
+    },
+    {
+      "id": "item-038",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": 36,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-039",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 661,
+        "y": 36,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-040",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 1286,
+        "y": 36,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-041",
+      "kind": "app",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 1911,
+        "y": 36,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-042",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": 371,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-043",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 661,
+        "y": 371,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-044",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 1286,
+        "y": 371,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-045",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 1911,
+        "y": 371,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-046",
+      "kind": "app",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": 706,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-047",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 661,
+        "y": 706,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-048",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 1286,
+        "y": 706,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-049",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 1911,
+        "y": 706,
+        "w": 613,
+        "h": 323
+      }
+    },
+    {
+      "id": "item-050",
+      "kind": "terminal",
+      "monitorId": "bottom-right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": 1041,
+        "w": 613,
+        "h": 323
+      }
+    }
+  ]
+}
