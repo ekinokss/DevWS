@@ -128,6 +128,7 @@ $script:TestGroupCatalog = [ordered]@{
     'relative-authoring'  = 'Relative layout authoring and mutation (v0.3 Phase 5)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
+    'editor-backend'      = 'Read-only editor backend (v0.4 P3)'
     'test-harness'        = 'Test harness'
 }
 
@@ -8107,6 +8108,37 @@ function Find-DevWSReversiblyEncodedPrintableContent {
 
     return $null
 }
+
+    Test-Case "editor backend loads only the approved six libraries and no privileged symbols" {
+        $editorRoot = Join-Path $RepoRoot 'src\editor'
+        $backend = Get-Content -LiteralPath (Join-Path $editorRoot 'ws-editor-backend.ps1') -Raw
+        $projection = Get-Content -LiteralPath (Join-Path $editorRoot 'editor-projection.ps1') -Raw
+        $allowlist = @(
+            'devws-paths.ps1',
+            'devws-config.ps1',
+            'devws-native.ps1',
+            'devws-monitor.ps1',
+            'devws-relative-layout.ps1',
+            'devws-layout-profile.ps1'
+        )
+        $libraryBlock = [regex]::Match($backend, '(?s)foreach \(\$library in @\((.*?)\)\) \{').Groups[1].Value
+        $loadedLibraries = @([regex]::Matches($libraryBlock, "'([^']+\.ps1)'") | ForEach-Object { $_.Groups[1].Value })
+        Assert-Equal ($allowlist -join ',') ($loadedLibraries -join ',') "the editor backend dot-sources exactly the approved six libraries"
+
+        foreach ($forbidden in @(
+            'NamedPipeClientStream',
+            'DevWorkspace-Elevated',
+            'DevWS.Coordinator',
+            'Invoke-DevWSWorkerRequest',
+            'Start-Process',
+            'SetWindowPos',
+            'GetWindowRect',
+            'Invoke-Expression'
+        )) {
+            Assert-NotContains $backend $forbidden "the editor backend does not reference $forbidden"
+            Assert-NotContains $projection $forbidden "the editor projection helper does not reference $forbidden"
+        }
+    }
 
     Test-Case "repository artifacts carry no publication-forbidden content" {
         # GENERIC publication invariants. These forbid content CLASSES, never a
@@ -41949,6 +41981,22 @@ exit 0
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'editor-backend' -Title 'Read-only editor backend (v0.4 P3)'
+
+    Test-Case "read-only editor backend protocol suite passes end to end" {
+        $focused = Join-Path $RepoRoot 'tests\editor-backend.tests.ps1'
+        Assert-True (Test-Path -LiteralPath $focused -PathType Leaf) "the focused P3 suite exists"
+
+        # The focused suite owns its process fixtures and assertion accounting;
+        # the canonical harness requires a clean exit and no reported failures.
+        $output = & pwsh -NoLogo -NoProfile -File $focused -RepoRoot $RepoRoot 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+
+        Assert-Equal 0 $exitCode "the focused P3 suite exits successfully`n$output"
+        Assert-Contains $output 'failed: 0' "the focused P3 suite reports no failures`n$output"
+    }
+
+    Write-Host ""
     Start-TestGroup -Name 'test-harness' -Title 'Test harness'
 
     Test-Case "suite broker isolation is installed and never connects to the production broker pipe" {
@@ -41962,8 +42010,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 68 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 68 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 69 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 69 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 
