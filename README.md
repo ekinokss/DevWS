@@ -10,19 +10,20 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-1.0, with an unsigned stable Windows binary release and a v0.3.0
-> release candidate under acceptance.**
+> **Status: pre-1.0, with an unsigned stable Windows binary release and a published
+> v0.3.0 pre-release.**
 >
 > The current stable binary is **v0.2.0**, an unsigned Windows x64 setup:
 > [GitHub stable release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0).
-> The earlier `v0.2.0-rc.1` pre-release remains available:
+> The unsigned **v0.3.0** pre-release is published at
+> [GitHub v0.3.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.3.0);
+> it does not replace `v0.2.0` as the latest stable release. The earlier
+> `v0.2.0-rc.1` pre-release remains available:
 > [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
-> The stable **v0.2.0** GitHub release is published. **v0.3.0 is a release candidate under
-> acceptance and is not published**; no v0.3.0 download is available.
-> No WinGet catalog package exists; the prepared WinGet submission is blocked by the
-> installer's same-account elevation requirement. Verify the published SHA-256 before running
-> the installer. The frozen v0.1.0 source release remains available, and source installation
-> remains supported.
+> Verify the published SHA-256 before running any installer. No WinGet catalog package
+> exists; the prepared WinGet submission is blocked by the installer's same-account
+> elevation requirement. The frozen v0.1.0 source release remains available, and source
+> installation remains supported.
 >
 > [Code signing policy](CODE_SIGNING_POLICY.md) · [Privacy information](PRIVACY.md)
 
@@ -96,9 +97,14 @@ install, 25/25 installed health, genuine linked-Medium protected-state validatio
 five-task topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall and
 purge.
 
-The v0.3.0 release candidate is being prepared on `release/v0.3.0-preparation`. Its guest
-cross-version upgrade, live Medium/High terminal-presence, elevated-reset and lifecycle
-acceptance are separate release gates and have not yet been declared complete.
+For v0.3.0, the guest cross-version upgrade, live Medium/High terminal-presence,
+elevated-reset and installer-lifecycle acceptance completed, plus a runtime
+relative-placement probe on a matching `path:` anchor. The release decision was
+CONDITIONAL GO. Installed-lifecycle relative placement, multi-monitor selection and
+negative monitor origins, mixed-DPI, physical EDID, primary-monitor changes, and monitor
+disconnect/reconnect or other topology-change scenarios remain deferred backlog items; they
+are not claimed as passed. See [docs/installer.md](docs/installer.md) §13 and the v0.3.0
+release notes for the full record.
 
 ## Prerequisites
 
@@ -394,11 +400,14 @@ Both forms require elevation, and `-Force` skips the confirmation prompt. See
 - v0.3.0 remains Windows 11 x64 only, unsigned, and dependent on same-account administrator
   elevation for installation. There is no WinGet catalog package, MSI/MSIX identity,
   self-update or attestation.
-- The v0.3.0 candidate still requires guest cross-version upgrade, live Medium/High
-  terminal-presence, elevated-reset and installer-lifecycle acceptance.
-- Hardware scenarios RH-03 (mixed 150%/100% scaling) and RH-05 (primary-monitor change) remain
-  outstanding release-review items. Durable path identities are validated; physical EDID
-  behavior is not claimed from path-only evidence.
+- The v0.3.0 pre-release was accepted for release under CONDITIONAL GO. The following
+  qualifications remain deferred and are not claimed as passed: installed-lifecycle relative
+  placement; multi-monitor selection and negative monitor origins; mixed-DPI configurations
+  (including RH-03, mixed 150%/100% scaling); physical EDID-based monitor identity;
+  primary-monitor changes (RH-05); and monitor disconnect/reconnect or other topology changes.
+- Durable `path:` identities and a runtime relative-placement probe on a matching anchor are
+  validated. Physical EDID behavior is not claimed from path-only evidence, and the deferred
+  scenarios above still require real-host or guest qualification before any broader claim.
 
 ## Documentation
 
