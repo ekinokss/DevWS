@@ -1,5 +1,6 @@
 param(
-    [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent)
+    [string]$RepoRoot = (Split-Path $PSScriptRoot -Parent),
+    [switch]$IsolatedBundledDefault
 )
 
 $ErrorActionPreference = 'Stop'
@@ -188,6 +189,26 @@ function Send-Raw {
     return ($line | ConvertFrom-Json -Depth 32 -ErrorAction Stop)
 }
 
+function Send-RawLine {
+    # Returns both the exact response line and its parsed object. Used by the
+    # isolated CI case so the hosted log carries the actual protocol exchange.
+    param($Process, [string]$Raw)
+
+    $Process.StandardInput.WriteLine($Raw)
+    $Process.StandardInput.Flush()
+    $line = $Process.StandardOutput.ReadLine()
+
+    if ($null -eq $line) {
+        $stderr = $Process.StandardError.ReadToEnd()
+        throw "Backend returned no response. stderr: $stderr"
+    }
+
+    return [pscustomobject]@{
+        Raw    = $line
+        Object = ($line | ConvertFrom-Json -Depth 32 -ErrorAction Stop)
+    }
+}
+
 function Send-Request {
     param($Process, [string]$Id, [string]$Op, $Params = @{})
 
@@ -287,6 +308,243 @@ function New-SyntheticMonitor {
         ScalePercent = 100
         OutputTechnology = 'Synthetic'
     }
+}
+
+function Invoke-IsolatedBundledDefaultTest {
+    # Hosted-only acceptance case. It must run on a fresh Windows runner where
+    # the real canonical path is absent. It never deletes or modifies a
+    # canonical file; an existing file is an environmental conflict that fails
+    # the test closed.
+    Write-Host 'P3-R isolated bundled-default end-to-end test' -ForegroundColor Cyan
+
+    if (-not [string]::IsNullOrWhiteSpace($env:DEVWS_CONFIG)) {
+        throw "Refusing to run: DEVWS_CONFIG is set to '$($env:DEVWS_CONFIG)'. The isolated case requires the real canonical/bundled resolver path."
+    }
+
+    $canonicalPath = Get-DevWSCanonicalConfigPath
+
+    if ([string]::IsNullOrWhiteSpace($canonicalPath)) {
+        throw 'Refusing to run: the canonical configuration path could not be resolved.'
+    }
+
+    $canonicalExistsBefore = Test-Path -LiteralPath $canonicalPath -PathType Leaf
+
+    if ($canonicalExistsBefore) {
+        throw "Refusing to run: canonical configuration already exists at '$canonicalPath'. No file was deleted, renamed, overwritten, or modified."
+    }
+
+    $canonicalDirectory = Split-Path -Parent $canonicalPath
+    $canonicalDirectoryExistedBefore = Test-Path -LiteralPath $canonicalDirectory -PathType Container
+    $canonicalDirectoryBefore = @(
+        if ($canonicalDirectoryExistedBefore) {
+            Get-ChildItem -LiteralPath $canonicalDirectory -Force |
+                ForEach-Object {
+                    if ($_.PSIsContainer) { $_.Name + '|dir' }
+                    else { $_.Name + '|' + (Get-FileSha $_.FullName) }
+                } |
+                Sort-Object
+        }
+    )
+
+    $bundledPath = Find-DevWSBundledDefaultConfig -StartPath $RepoRoot
+
+    if ([string]::IsNullOrWhiteSpace($bundledPath) -or -not (Test-Path -LiteralPath $bundledPath -PathType Leaf)) {
+        throw "Refusing to run: the repository bundled default was not found from '$RepoRoot'."
+    }
+
+    $location = Resolve-DevWSConfigLocation -StartPath $RepoRoot
+    $bundledResolved = (Resolve-Path -LiteralPath $bundledPath).Path
+    $locationResolved = (Resolve-Path -LiteralPath $location.Path).Path
+
+    Write-Host "canonicalPath=$canonicalPath"
+    Write-Host 'canonicalPathCategory=user-profile'
+    Write-Host "canonicalExistsBefore=$canonicalExistsBefore"
+    Write-Host "canonicalDirectoryExistsBefore=$canonicalDirectoryExistedBefore"
+    Write-Host "bundledPath=$bundledResolved"
+    Write-Host "configSource=$($location.Source)"
+    Write-Host "locationWritable=$($location.IsWritable)"
+
+    Assert-Equal 'default' ([string]$location.Source) 'the real resolver selects the bundled default'
+    Assert-Equal $bundledResolved $locationResolved 'the resolver returns the repository bundled default'
+    Assert-Equal $false ([bool]$location.IsWritable) 'the bundled default is not writable'
+
+    $bundledBefore = Get-FileSha $bundledPath
+    $bundledSize = (Get-Item -LiteralPath $bundledPath).Length
+    $expectedDocument = Get-Content -LiteralPath $bundledPath -Raw | ConvertFrom-Json -Depth 20
+    $expectedDocumentJson = $expectedDocument | ConvertTo-Json -Depth 20 -Compress
+    $configDirectory = Join-Path $RepoRoot 'config'
+    $configSnapshotBefore = @(
+        Get-ChildItem -LiteralPath $configDirectory -File |
+            ForEach-Object { $_.Name + '=' + (Get-FileSha $_.FullName) } |
+            Sort-Object
+    )
+
+    Write-Host "bundledSha256Before=$bundledBefore"
+    Write-Host "bundledSizeBytes=$bundledSize"
+
+    $resolverTopology = $null
+    try { $resolverTopology = Get-DevWSMonitorTopology } catch { $resolverTopology = $null }
+
+    $process = Start-Backend -ConfigPath $null
+    $shutdownSeen = $false
+
+    try {
+        $helloRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-hello'; op = 'hello'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
+        $helloExchange = Send-RawLine -Process $process -Raw $helloRaw
+        Write-Host "REQUEST $helloRaw"
+        Write-Host "RESPONSE $($helloExchange.Raw)"
+        $hello = $helloExchange.Object
+
+        Assert-True $hello.ok 'hello succeeds'
+        Assert-Equal 'devws-editor/1' $hello.protocol 'hello protocol'
+        Assert-Equal 5 @($hello.result.supportedOps).Count 'hello advertises five operations'
+        Assert-True (-not ($hello.result.supportedOps -contains 'save')) 'hello does not advertise save'
+        Assert-Equal $false $hello.result.capabilities.saveSupported 'hello reports save unsupported'
+        Assert-Equal $null $hello.result.limits.saveTimeoutMs 'hello reports no save timeout'
+
+        $inspectRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-inspect'; op = 'inspect'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
+        $inspectExchange = Send-RawLine -Process $process -Raw $inspectRaw
+        Write-Host "REQUEST $inspectRaw"
+        Write-Host "RESPONSE $($inspectExchange.Raw)"
+        $inspect = $inspectExchange.Object
+
+        Assert-True $inspect.ok 'inspect succeeds with the bundled default'
+        Assert-Equal 'default' $inspect.result.config.source 'inspect source is default'
+        Assert-Equal $canonicalPath $inspect.result.config.canonicalPath 'inspect reports the real canonical path'
+        Assert-Equal $false $inspect.result.config.canonicalExists 'inspect reports canonical absent'
+        Assert-Equal $false $inspect.result.config.writable 'inspect reports the bundled default not writable'
+        Assert-Equal $false $inspect.result.capabilities.canSave 'inspect does not advertise save'
+        Assert-Equal $true $inspect.result.capabilities.canProject 'inspect advertises projection'
+        Assert-Equal $bundledResolved $inspect.result.config.effectivePath 'inspect effective path is the bundled default'
+        Assert-Equal $bundledBefore $inspect.result.config.sha256 'inspect hash matches the bundled bytes'
+        Assert-Equal $bundledSize $inspect.result.config.sizeBytes 'inspect size matches the bundled bytes'
+        Assert-Equal 3 $inspect.result.config.version 'inspect reports schema v3'
+        Assert-Equal 'main' $inspect.result.config.defaultSet 'inspect reports main as default'
+        Assert-Equal $true $inspect.result.config.valid 'inspect reports a valid bundled default'
+        Assert-Equal 1 @($inspect.result.sets).Count 'inspect reports one set'
+        Assert-Equal 'main' $inspect.result.sets[0].id 'inspect reports main'
+        Assert-Equal 0 $inspect.result.sets[0].itemCount 'inspect reports an empty main set'
+        Assert-Equal 0 @($inspect.result.sets[0].profileIds).Count 'inspect reports no profiles'
+        Assert-True ($null -ne $inspect.result.topology.PSObject.Properties['available']) 'inspect reports topology availability'
+        Assert-Equal $false (Test-Path -LiteralPath $canonicalPath -PathType Leaf) 'inspect did not create the canonical file'
+
+        $readRaw = ([ordered]@{
+            protocol = 'devws-editor/1'
+            id = 'iso-read'
+            op = 'read-config'
+            params = @{ expectedSha256 = [string]$inspect.result.config.sha256 }
+        } | ConvertTo-Json -Compress -Depth 20)
+        $readExchange = Send-RawLine -Process $process -Raw $readRaw
+        Write-Host "REQUEST $readRaw"
+        Write-Host "RESPONSE $($readExchange.Raw)"
+        $read = $readExchange.Object
+
+        Assert-True $read.ok 'read-config succeeds with the bundled default'
+        Assert-Equal $inspect.result.config.sha256 $read.result.sha256 'read-config returns the inspected hash'
+        Assert-Equal $bundledSize $read.result.sizeBytes 'read-config returns the bundled size'
+        Assert-Equal $expectedDocumentJson ($read.result.document | ConvertTo-Json -Depth 20 -Compress) 'read-config returns the complete bundled document'
+        Assert-Equal $false (Test-Path -LiteralPath $canonicalPath -PathType Leaf) 'read-config did not create the canonical file'
+
+        $projectRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-project'; op = 'project'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
+        $projectExchange = Send-RawLine -Process $process -Raw $projectRaw
+        Write-Host "REQUEST $projectRaw"
+        Write-Host "RESPONSE $($projectExchange.Raw)"
+        $project = $projectExchange.Object
+
+        Assert-True $project.ok 'project succeeds with the bundled default'
+        Assert-Equal $inspect.result.config.sha256 $project.result.configRevision 'project uses the inspected revision'
+        Assert-Equal 'main' $project.result.setId 'project selects main'
+        Assert-Equal 'main' $project.result.set.id 'project set id is main'
+        Assert-Equal $true $project.result.set.isDefault 'project marks main as default'
+        Assert-Equal 0 @($project.result.set.items).Count 'project returns the empty bundled set'
+        Assert-Equal 0 @($project.warnings).Count 'project has no warnings for the empty set'
+
+        $expectedModel = Get-DevWSEffectiveLayout -SetId 'main' -Set $expectedDocument.sets[0] -Topology $resolverTopology
+        Assert-Equal ([string]$expectedModel.Status) ([string]$project.result.set.profileMatch.status) 'project profile status matches the resolver'
+        Assert-Equal ([string]$expectedModel.ProfileId) ([string]$project.result.set.profileMatch.profileId) 'project profile id matches the resolver'
+        Assert-Equal ([bool]$expectedModel.ProfileAware) ([bool]$project.result.set.profileAware) 'project profile awareness matches the resolver'
+        Assert-Equal @($expectedModel.Items).Count @($project.result.set.items).Count 'project item count matches the resolver'
+        Assert-Equal $false (Test-Path -LiteralPath $canonicalPath -PathType Leaf) 'project did not create the canonical file'
+
+        $saveRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-save'; op = 'save'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
+        $saveExchange = Send-RawLine -Process $process -Raw $saveRaw
+        Write-Host "REQUEST $saveRaw"
+        Write-Host "RESPONSE $($saveExchange.Raw)"
+        $save = $saveExchange.Object
+
+        Assert-Equal $false $save.ok 'save is refused'
+        Assert-Equal 'unsupported-operation' $save.error.code 'save is unsupported'
+        Assert-Equal $null $save.result 'save returns no result'
+        Assert-True (-not ($save.error.details.supportedOps -contains 'save')) 'save refusal does not advertise save'
+        Assert-Equal $false (Test-Path -LiteralPath $canonicalPath -PathType Leaf) 'save did not create the canonical file'
+
+        $shutdownRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-shutdown'; op = 'shutdown'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
+        $shutdownExchange = Send-RawLine -Process $process -Raw $shutdownRaw
+        Write-Host "REQUEST $shutdownRaw"
+        Write-Host "RESPONSE $($shutdownExchange.Raw)"
+        $shutdown = $shutdownExchange.Object
+
+        Assert-True $shutdown.ok 'shutdown succeeds'
+        Assert-Equal $true $shutdown.result.stopped 'shutdown reports stopped'
+        $shutdownSeen = $true
+        $exited = $process.WaitForExit(10000)
+        Assert-True $exited 'shutdown exits the backend'
+
+        if ($exited) {
+            Assert-Equal 0 $process.ExitCode 'backend exit code is zero'
+            Assert-Equal '' $process.StandardOutput.ReadToEnd().Trim() 'stdout contains no extra output'
+            Assert-Equal '' $process.StandardError.ReadToEnd().Trim() 'stderr is empty'
+        }
+    }
+    finally {
+        Stop-Backend -Process $process
+    }
+
+    Assert-True $shutdownSeen 'shutdown was exercised'
+    Assert-Equal $false (Test-Path -LiteralPath $canonicalPath -PathType Leaf) 'canonical file is still absent after shutdown'
+    $canonicalDirectoryExistedAfter = Test-Path -LiteralPath $canonicalDirectory -PathType Container
+    $canonicalDirectoryAfter = @(
+        if ($canonicalDirectoryExistedAfter) {
+            Get-ChildItem -LiteralPath $canonicalDirectory -Force |
+                ForEach-Object {
+                    if ($_.PSIsContainer) { $_.Name + '|dir' }
+                    else { $_.Name + '|' + (Get-FileSha $_.FullName) }
+                } |
+                Sort-Object
+        }
+    )
+    $configSnapshotAfter = @(
+        Get-ChildItem -LiteralPath $configDirectory -File |
+            ForEach-Object { $_.Name + '=' + (Get-FileSha $_.FullName) } |
+            Sort-Object
+    )
+
+    Assert-Equal $canonicalDirectoryExistedBefore $canonicalDirectoryExistedAfter 'canonical directory existence is unchanged'
+    Assert-Equal ($canonicalDirectoryBefore -join '|') ($canonicalDirectoryAfter -join '|') 'canonical directory contents are unchanged'
+    Assert-Equal $bundledBefore (Get-FileSha $bundledPath) 'bundled default bytes are unchanged'
+    Assert-Equal ($configSnapshotBefore -join '|') ($configSnapshotAfter -join '|') 'repository config files are unchanged'
+
+    Write-Host "canonicalExistsAfter=$(Test-Path -LiteralPath $canonicalPath -PathType Leaf)"
+    Write-Host "bundledSha256After=$(Get-FileSha $bundledPath)"
+
+    if ($script:Failures.Count -gt 0) {
+        $script:Failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+        throw "P3-R isolated bundled-default test failed with $($script:Failures.Count) failure(s)."
+    }
+
+    Write-Host ("P3-R bundled-default assertions passed: {0}; failed: 0; skipped: 0" -f $script:Passed) -ForegroundColor Cyan
+}
+
+if ($IsolatedBundledDefault) {
+    try {
+        Invoke-IsolatedBundledDefaultTest
+    }
+    catch {
+        Write-Host "P3-R isolated bundled-default test FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        exit 1
+    }
+
+    exit 0
 }
 
 try {
@@ -450,15 +708,16 @@ try {
 
     # 6. Missing canonical config with bundled default.
     #
-    # NOT EXECUTED (environment limitation): Get-DevWSCanonicalConfigPath uses
-    # [Environment]::GetFolderPath('UserProfile'), which resolves from the
+    # NOT EXECUTED on an ordinary developer machine: Get-DevWSCanonicalConfigPath
+    # uses [Environment]::GetFolderPath('UserProfile'), which resolves from the
     # Windows shell profile and ignores a child-process USERPROFILE override.
-    # Isolating this case would require touching the real canonical config,
-    # which P3 forbids. The bundled-default path is exercised by the resolver
-    # unit coverage in the canonical suite; this specific end-to-end case is
-    # recorded as skipped rather than silently asserted.
+    # Isolating this case here would require touching the real canonical config,
+    # which P3 forbids. The dedicated hosted CI job runs this same file with
+    # -IsolatedBundledDefault on a fresh windows-latest runner; that mode fails
+    # closed if the canonical file already exists. The developer-machine case
+    # remains an explicit skip rather than a false pass.
     $script:Skipped++
-    Write-Host '  [SKIP] bundled-default end-to-end case: child USERPROFILE is not honored by GetFolderPath; real canonical config must not be touched' -ForegroundColor Yellow
+    Write-Host '  [SKIP] bundled-default end-to-end case on this developer machine: child USERPROFILE is not honored by GetFolderPath; see the isolated hosted CI job' -ForegroundColor Yellow
 
     # 7. Missing config path.
     $missingPath = Join-Path $root 'missing.json'

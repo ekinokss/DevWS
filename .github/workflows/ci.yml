@@ -36,8 +36,39 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  bundled-default:
+    name: Bundled-default isolation on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # This job runs on a fresh hosted runner before any suite step that can
+      # create a canonical configuration. The test itself refuses to run if the
+      # canonical file already exists, and never deletes or modifies one.
+      - name: Run isolated bundled-default protocol test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not [string]::IsNullOrWhiteSpace($env:DEVWS_CONFIG)) {
+              throw 'DEVWS_CONFIG must be absent on the isolated bundled-default runner'
+          }
+
+          $repoRoot = (Get-Location).Path
+          & pwsh -NoLogo -NoProfile -File tests/editor-backend.tests.ps1 -RepoRoot $repoRoot -IsolatedBundledDefault
+          if ($LASTEXITCODE -ne 0) {
+              throw "isolated bundled-default test exited with $LASTEXITCODE"
+          }
+
   test:
     name: Canonical suite on windows-latest
+    needs: bundled-default
     runs-on: windows-latest
     timeout-minutes: 35
 
