@@ -419,6 +419,7 @@ Both forms require elevation, and `-Force` skips the confirmation prompt. See
 | [docs/installer.md](docs/installer.md) | Installer and uninstaller contract |
 | [docs/workspace-sets-design.md](docs/workspace-sets-design.md) | The workspace-set product model |
 | [docs/future-work.md](docs/future-work.md) | Known limitations and deliberately deferred work |
+| [docs/roadmap.md](docs/roadmap.md) | Proposed long-term product direction, release sequence and acceptance gates |
 | [docs/windows-integration-checklist.md](docs/windows-integration-checklist.md) | Manual validation checklist for behaviour that cannot be unit-tested |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development environment, tests and contribution guidance |
 | [SECURITY.md](SECURITY.md) | Security model summary and how to report a problem |
