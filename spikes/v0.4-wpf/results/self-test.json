@@ -1,0 +1,62 @@
+{
+  "mode": "self-test",
+  "passed": true,
+  "resultCount": 10,
+  "failedCount": 0,
+  "integrity": "Medium",
+  "processArchitecture": "X64",
+  "osDescription": "Microsoft Windows 10.0.26200",
+  "runtimeVersion": "8.0.33",
+  "results": [
+    {
+      "Name": "fit-negative-origin",
+      "Passed": true,
+      "Details": "all virtual-screen corners fit inside the viewport"
+    },
+    {
+      "Name": "world-screen-roundtrip",
+      "Passed": true,
+      "Details": "world -\u003E screen -\u003E world is stable within 1e-6"
+    },
+    {
+      "Name": "zoom-anchor-roundtrip",
+      "Passed": true,
+      "Details": "zoom at a pointer anchor keeps the world point under the pointer"
+    },
+    {
+      "Name": "pan-roundtrip",
+      "Passed": true,
+      "Details": "pan shifts the screen origin without changing world geometry"
+    },
+    {
+      "Name": "item-rect-roundtrip",
+      "Passed": true,
+      "Details": "configured item rectangles survive the canvas transform"
+    },
+    {
+      "Name": "zoom-clamp",
+      "Passed": true,
+      "Details": "zoom remains inside configured bounds"
+    },
+    {
+      "Name": "fixture-fit:eight-monitors-200-items.json",
+      "Passed": true,
+      "Details": "8 monitors, 200 items"
+    },
+    {
+      "Name": "fixture-fit:four-monitors-50-items.json",
+      "Passed": true,
+      "Details": "4 monitors, 50 items"
+    },
+    {
+      "Name": "fixture-fit:host-topology.json",
+      "Passed": true,
+      "Details": "2 monitors, 4 items"
+    },
+    {
+      "Name": "fixture-fit:two-monitors-10-items.json",
+      "Passed": true,
+      "Details": "2 monitors, 10 items"
+    }
+  ]
+}

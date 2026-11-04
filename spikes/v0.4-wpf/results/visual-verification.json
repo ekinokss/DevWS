@@ -1,0 +1,16 @@
+{
+  "method": "WPF RenderTargetBitmap canvas snapshot",
+  "fixture": "four-monitors-50-items.json",
+  "monitors": 4,
+  "items": 50,
+  "virtualScreenRect": { "x": -1920, "y": -1080, "w": 4480, "h": 2520 },
+  "observed": {
+    "monitorRectangles": true,
+    "workAreaDashedBoundaries": true,
+    "negativeOrigins": true,
+    "itemRectangles": true,
+    "selectedItemHighlight": true
+  },
+  "snapshotBytes": 75739,
+  "note": "The snapshot was rendered in-app, not captured from the desktop; it is not committed."
+}

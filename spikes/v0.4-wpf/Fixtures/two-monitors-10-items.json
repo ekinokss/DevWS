@@ -1,0 +1,169 @@
+{
+  "name": "two-monitors-10-items",
+  "virtualScreenRect": {
+    "x": -1920,
+    "y": 0,
+    "w": 4480,
+    "h": 1440
+  },
+  "monitors": [
+    {
+      "id": "left",
+      "name": "Left (synthetic)",
+      "primary": false,
+      "monitorRect": {
+        "x": -1920,
+        "y": 0,
+        "w": 1920,
+        "h": 1080
+      },
+      "workRect": {
+        "x": -1920,
+        "y": 0,
+        "w": 1920,
+        "h": 1040
+      },
+      "scalePercent": 100
+    },
+    {
+      "id": "right",
+      "name": "Right (synthetic)",
+      "primary": true,
+      "monitorRect": {
+        "x": 0,
+        "y": 0,
+        "w": 2560,
+        "h": 1440
+      },
+      "workRect": {
+        "x": 0,
+        "y": 0,
+        "w": 2560,
+        "h": 1400
+      },
+      "scalePercent": 150
+    }
+  ],
+  "items": [
+    {
+      "id": "item-001",
+      "kind": "app",
+      "monitorId": "left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": 36,
+        "w": 608,
+        "h": 478
+      }
+    },
+    {
+      "id": "item-002",
+      "kind": "terminal",
+      "monitorId": "left",
+      "enabled": true,
+      "rect": {
+        "x": -1264,
+        "y": 36,
+        "w": 608,
+        "h": 478
+      }
+    },
+    {
+      "id": "item-003",
+      "kind": "terminal",
+      "monitorId": "left",
+      "enabled": true,
+      "rect": {
+        "x": -644,
+        "y": 36,
+        "w": 608,
+        "h": 478
+      }
+    },
+    {
+      "id": "item-004",
+      "kind": "terminal",
+      "monitorId": "left",
+      "enabled": true,
+      "rect": {
+        "x": -1884,
+        "y": 526,
+        "w": 608,
+        "h": 478
+      }
+    },
+    {
+      "id": "item-005",
+      "kind": "terminal",
+      "monitorId": "left",
+      "enabled": true,
+      "rect": {
+        "x": -1264,
+        "y": 526,
+        "w": 608,
+        "h": 478
+      }
+    },
+    {
+      "id": "item-006",
+      "kind": "app",
+      "monitorId": "right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": 36,
+        "w": 821,
+        "h": 658
+      }
+    },
+    {
+      "id": "item-007",
+      "kind": "terminal",
+      "monitorId": "right",
+      "enabled": true,
+      "rect": {
+        "x": 869,
+        "y": 36,
+        "w": 821,
+        "h": 658
+      }
+    },
+    {
+      "id": "item-008",
+      "kind": "terminal",
+      "monitorId": "right",
+      "enabled": true,
+      "rect": {
+        "x": 1702,
+        "y": 36,
+        "w": 821,
+        "h": 658
+      }
+    },
+    {
+      "id": "item-009",
+      "kind": "terminal",
+      "monitorId": "right",
+      "enabled": true,
+      "rect": {
+        "x": 36,
+        "y": 706,
+        "w": 821,
+        "h": 658
+      }
+    },
+    {
+      "id": "item-010",
+      "kind": "terminal",
+      "monitorId": "right",
+      "enabled": true,
+      "rect": {
+        "x": 869,
+        "y": 706,
+        "w": 821,
+        "h": 658
+      }
+    }
+  ]
+}
