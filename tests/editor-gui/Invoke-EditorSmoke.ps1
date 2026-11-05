@@ -249,7 +249,7 @@ for ($run = 1; $run -le $Repeat; $run++) {
         HandshakeMs = $evidence.handshakeMs
         LoadMs = $evidence.loadMs
         RefreshMs = $evidence.refreshMs
-        AppStartupMs = $evidence.appStartupMs
+        SmokeElapsedMs = $evidence.SmokeElapsedMs
         WorkingSetMB = $evidence.workingSetMB
         BackendPid = $evidence.backendPid
         BackendExited = $evidence.backendExited
@@ -272,8 +272,9 @@ $summary = [ordered]@{
     medianHandshakeMs = (@($results | ForEach-Object { $_.HandshakeMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianLoadMs = (@($results | ForEach-Object { $_.LoadMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianRefreshMs = (@($results | ForEach-Object { $_.RefreshMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
-    medianAppStartupMs = (@($results | ForEach-Object { $_.AppStartupMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianSmokeElapsedMs = (@($results | ForEach-Object { $_.SmokeElapsedMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianWorkingSetMB = (@($results | ForEach-Object { $_.WorkingSetMB }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
 }
 
 $summary | ConvertTo-Json -Depth 10
+
