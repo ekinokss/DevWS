@@ -1548,6 +1548,8 @@ try {
     Assert-True $confirmationNew.Ok 'changed post-save revision is confirmed'
     Assert-Equal ('b' * 64) ([string]$confirmationNew.Result.newSha256) 'confirmation returns the observed revision'
     Assert-Equal 'C:\fixture\workspace.json' ([string]$confirmationNew.Result.canonicalPath) 'confirmation returns the effective path'
+    $confirmationMismatch = Get-EditorSaveConfirmation -Snapshot $confirmationBase -AfterSnapshot ([pscustomobject]@{ Ok = $true; Valid = $true; Sha256 = ('c' * 64) }) -WrittenSha256 ('b' * 64)
+    Assert-Equal 'save-outcome-uncertain' ([string]$confirmationMismatch.Code) 'persisted bytes different from the written revision are uncertain'
 
     # ExpectedSha256 / mutex primitive tests.
     $mutexRoot = New-TempRoot
@@ -1558,8 +1560,10 @@ try {
     $mutexHash = Get-FileSha $mutexPath
     $mutexLocation = [pscustomobject]@{ Path = $mutexPath; IsWritable = $true; IsBundledDefault = $false; Source = 'env' }
     $mutexConfig.sets[0].windows[0].layout.x = 25
-    Save-DevWSConfig -Config $mutexConfig -Location $mutexLocation -ExpectedSha256 $mutexHash
+    $writtenHash = $null
+    Save-DevWSConfig -Config $mutexConfig -Location $mutexLocation -ExpectedSha256 $mutexHash -WrittenSha256 ([ref]$writtenHash)
     Assert-Equal 25 ([int](Read-DevWSConfigFile -Path $mutexPath).sets[0].windows[0].layout.x) 'Save-DevWSConfig accepted the matching revision'
+    Assert-Equal (Get-FileSha $mutexPath) ([string]$writtenHash) 'Save-DevWSConfig returns the written revision'
     $mutexAfter = Get-FileSha $mutexPath
     try {
         $mutexConfig.sets[0].windows[0].layout.x = 99

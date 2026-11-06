@@ -925,8 +925,10 @@ function Invoke-EditorOperation {
                 }
             }
 
+            $writtenSha256 = $null
+
             try {
-                Save-DevWSConfig -Config $Params.draft -Location $snapshot.Location -ExpectedSha256 ([string]$Params.baseSha256)
+                Save-DevWSConfig -Config $Params.draft -Location $snapshot.Location -ExpectedSha256 ([string]$Params.baseSha256) -WrittenSha256 ([ref]$writtenSha256)
             }
             catch {
                 $saveCode = if ($null -ne $_.Exception.Data -and $_.Exception.Data.Contains('DevWSCode')) {
@@ -944,7 +946,7 @@ function Invoke-EditorOperation {
             }
 
             $after = Read-EditorConfigSnapshot -StartPath $editorRoot -MaxBytes $script:MaxConfigBytes
-            $confirmation = Get-EditorSaveConfirmation -Snapshot $snapshot -AfterSnapshot $after -Changed $true
+            $confirmation = Get-EditorSaveConfirmation -Snapshot $snapshot -AfterSnapshot $after -Changed $true -WrittenSha256 ([string]$writtenSha256)
 
             if (-not [bool]$confirmation.Ok) {
                 return [pscustomobject]@{

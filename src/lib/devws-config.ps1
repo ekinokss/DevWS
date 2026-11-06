@@ -2035,7 +2035,8 @@ function Save-DevWSConfig {
         $Config,
         [Parameter(Mandatory)]
         $Location,
-        [string]$ExpectedSha256 = $null
+        [string]$ExpectedSha256 = $null,
+        $WrittenSha256 = $null
     )
 
     Assert-DevWSConfigWritable -Location $Location
@@ -2087,8 +2088,13 @@ function Save-DevWSConfig {
             # Serialize/validate before replacing the canonical file.
             $reloaded = Read-DevWSConfigFile -Path $tempPath
             Assert-DevWSConfig -Config $reloaded -Source $tempPath
+            $persistedSha256 = Get-DevWSFileSha256 -Path $tempPath
 
             [System.IO.File]::Move($tempPath, $Location.Path, $true)
+
+            if ($null -ne $WrittenSha256 -and $WrittenSha256 -is [System.Management.Automation.PSReference]) {
+                $WrittenSha256.Value = $persistedSha256
+            }
         }
         finally {
             if (Test-Path -LiteralPath $tempPath) {
