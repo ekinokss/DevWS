@@ -376,6 +376,29 @@ function Invoke-DevWSHealthCheck {
             }
         },
         @{
+            Id          = "editor-payload"
+            Description = "Installed visual editor payload"
+            Test        = {
+                $editorRoot = Join-Path $Context.InstallRoot "app\editor"
+
+                if (-not (Test-Path -LiteralPath $editorRoot -PathType Container)) {
+                    # Source-mode installations do not carry a published editor.
+                    return $true
+                }
+
+                $manifest = Join-Path $editorRoot "editor-payload.json"
+                if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
+                    throw "the installed editor payload manifest is missing; run install.ps1"
+                }
+
+                if (-not (Test-DevWSEditorPayloadIntegrity -EditorRoot $editorRoot -ManifestPath $manifest)) {
+                    throw "the installed editor payload failed its size/hash verification; run install.ps1 -HealthCheck or reinstall"
+                }
+
+                return $true
+            }
+        },
+        @{
             Id          = "app-libs"
             Description = "Installed app libraries and native runtime"
             Test        = {

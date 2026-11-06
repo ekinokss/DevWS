@@ -137,7 +137,178 @@ function Get-DevWSInstallManifest {
         $entries.Add([pscustomobject]@{ Source = $file.FullName; Target = "helpers\$($file.Name)" })
     }
 
+    $editorRoot = Join-Path $RepoRoot "editor"
+    $editorManifestPath = Join-Path $editorRoot "editor-payload.json"
+
+    if (Test-Path -LiteralPath $editorRoot -PathType Container) {
+        if (-not (Test-Path -LiteralPath $editorManifestPath -PathType Leaf)) {
+            throw "The editor payload is present but editor-payload.json is missing: $editorRoot"
+        }
+
+        $editorManifest = Get-Content -LiteralPath $editorManifestPath -Raw | ConvertFrom-Json
+        $manifestFiles = @($editorManifest.files)
+
+        if ($manifestFiles.Count -eq 0) {
+            throw "The editor payload manifest contains no files: $editorManifestPath"
+        }
+
+        $expected = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in $manifestFiles) {
+            $relative = [string]$file.path
+            if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Contains('..') -or $relative.Contains(':') -or $relative.StartsWith('/') -or $relative.StartsWith('\')) {
+                throw "The editor payload manifest contains an unsafe path: '$relative'"
+            }
+            $expected.Add($relative.Replace('/', '\')) | Out-Null
+            $entries.Add([pscustomobject]@{
+                Source = (Join-Path $editorRoot $relative.Replace('/', '\'))
+                Target = "app\editor\$($relative.Replace('/', '\'))"
+                Sha256 = [string]$file.sha256
+                Size   = [long]$file.size
+            })
+        }
+
+        foreach ($file in @(Get-ChildItem -LiteralPath $editorRoot -Recurse -File | Sort-Object FullName)) {
+            $relative = $file.FullName.Substring($editorRoot.Length + 1)
+            if ($relative -ieq 'editor-payload.json') { continue }
+            if (-not $expected.Contains($relative)) {
+                throw "The editor payload contains a file not present in editor-payload.json: $relative"
+            }
+        }
+
+        $entries.Add([pscustomobject]@{
+            Source = $editorManifestPath
+            Target = "app\editor\editor-payload.json"
+            Sha256 = (Get-FileHash -LiteralPath $editorManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Size   = (Get-Item -LiteralPath $editorManifestPath).Length
+        })
+    }
+
     return $entries.ToArray()
+}
+
+function Get-DevWSManagedEditorProcesses {
+    param([Parameter(Mandatory)][string]$InstallRoot)
+
+    $editorRoot = [IO.Path]::GetFullPath((Join-Path $InstallRoot 'app\editor')).TrimEnd('\') + '\'
+    $result = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($process in @(Get-Process -Name 'DevWS.Editor' -ErrorAction SilentlyContinue)) {
+        try {
+            $path = [IO.Path]::GetFullPath([string]$process.Path)
+            if ($path.StartsWith($editorRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $result.Add($process) | Out-Null
+            }
+        }
+        catch {
+            # A process whose path cannot be read is not assumed to be the
+            # managed installed editor.
+        }
+    }
+
+    return $result.ToArray()
+}
+
+function Test-DevWSEditorPayloadIntegrity {
+    param(
+        [Parameter(Mandatory)][string]$EditorRoot,
+        [string]$ManifestPath = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ManifestPath)) {
+        $ManifestPath = Join-Path $EditorRoot 'editor-payload.json'
+    }
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+        foreach ($file in @($manifest.files)) {
+            $relative = [string]$file.path
+            $path = Join-Path $EditorRoot $relative.Replace('/', '\')
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+            if ((Get-Item -LiteralPath $path).Length -ne [long]$file.size) { return $false }
+            if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$file.sha256) { return $false }
+        }
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Install-DevWSEditorFiles {
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$InstallRoot
+    )
+
+    $sourceRoot = Join-Path $RepoRoot 'editor'
+    if (-not (Test-Path -LiteralPath $sourceRoot -PathType Container)) {
+        return @()
+    }
+
+    $running = @(Get-DevWSManagedEditorProcesses -InstallRoot $InstallRoot)
+    if ($running.Count -gt 0) {
+        throw "The installed DevWS editor is running (PID $($running[0].Id)). Close it before installing or repairing the editor payload."
+    }
+
+    $manifestPath = Join-Path $sourceRoot 'editor-payload.json'
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "The editor payload manifest is missing: $manifestPath"
+    }
+
+    if (-not (Test-DevWSEditorPayloadIntegrity -EditorRoot $sourceRoot -ManifestPath $manifestPath)) {
+        throw "The editor payload failed its manifest size/hash verification before installation."
+    }
+
+    $appRoot = Join-Path $InstallRoot 'app'
+    New-Item -ItemType Directory -Path $appRoot -Force | Out-Null
+    $staging = Join-Path $appRoot ('.editor-staging-' + [guid]::NewGuid().ToString('N'))
+    $target = Join-Path $appRoot 'editor'
+    $backup = Join-Path $appRoot ('.editor-backup-' + [guid]::NewGuid().ToString('N'))
+    $promoted = $false
+
+    try {
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        foreach ($file in @(Get-ChildItem -LiteralPath $sourceRoot -Recurse -File | Sort-Object FullName)) {
+            $relative = $file.FullName.Substring($sourceRoot.Length + 1)
+            $destination = Join-Path $staging $relative
+            $parent = Split-Path -Parent $destination
+            if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+            Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+        }
+
+        if (-not (Test-DevWSEditorPayloadIntegrity -EditorRoot $staging -ManifestPath (Join-Path $staging 'editor-payload.json'))) {
+            throw "The staged editor payload failed its manifest size/hash verification."
+        }
+
+        if (Test-Path -LiteralPath $target -PathType Container) {
+            Move-Item -LiteralPath $target -Destination $backup
+        }
+
+        try {
+            Move-Item -LiteralPath $staging -Destination $target
+            $promoted = $true
+        }
+        catch {
+            if (Test-Path -LiteralPath $backup -PathType Container -and -not (Test-Path -LiteralPath $target -PathType Container)) {
+                Move-Item -LiteralPath $backup -Destination $target
+            }
+            throw
+        }
+
+        if (Test-Path -LiteralPath $backup -PathType Container) {
+            Remove-Item -LiteralPath $backup -Recurse -Force
+        }
+
+        return @(Get-ChildItem -LiteralPath $target -Recurse -File | ForEach-Object { $_.FullName })
+    }
+    finally {
+        if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
+        if ($promoted -and (Test-Path -LiteralPath $backup)) { Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 function Get-DevWSPrivilegedInstallManifest {
@@ -188,7 +359,14 @@ function Install-DevWSApplicationFiles {
         }
     }
 
+    $editorEntries = [System.Collections.Generic.List[object]]::new()
+
     foreach ($entry in @(Get-DevWSInstallManifest -RepoRoot $RepoRoot)) {
+        if ([string]$entry.Target -like 'app\editor\*') {
+            $editorEntries.Add($entry) | Out-Null
+            continue
+        }
+
         if (-not (Test-Path -LiteralPath $entry.Source -PathType Leaf)) {
             throw "Install source is missing: $($entry.Source)"
         }
@@ -205,6 +383,11 @@ function Install-DevWSApplicationFiles {
         }
 
         $installed.Add($target)
+    }
+
+    if ($editorEntries.Count -gt 0) {
+        $editorInstalled = @(Install-DevWSEditorFiles -RepoRoot $RepoRoot -InstallRoot $InstallRoot)
+        foreach ($path in $editorInstalled) { $installed.Add([string]$path) | Out-Null }
     }
 
     return $installed.ToArray()
@@ -225,6 +408,15 @@ function Get-DevWSMissingInstalledFiles {
 
         if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
             $missing.Add($target)
+            continue
+        }
+
+        if ($null -ne $entry.PSObject.Properties['Sha256'] -and -not [string]::IsNullOrWhiteSpace([string]$entry.Sha256)) {
+            $file = Get-Item -LiteralPath $target
+            if ($file.Length -ne [long]$entry.Size -or
+                (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -cne [string]$entry.Sha256) {
+                $missing.Add($target)
+            }
         }
     }
 
@@ -4652,6 +4844,11 @@ function Invoke-DevWSUninstall {
     )
 
     $actions = [System.Collections.Generic.List[string]]::new()
+
+    $runningEditors = @(Get-DevWSManagedEditorProcesses -InstallRoot ([string]$Plan.InstallRoot))
+    if ($runningEditors.Count -gt 0) {
+        throw "The installed DevWS editor is running (PID $($runningEditors[0].Id)). Close it, then rerun the uninstall."
+    }
 
     # Stop the DevWS-owned user-session processes before removing any runtime
     # file they are executing. The managed hotkey launcher goes first so it

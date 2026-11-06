@@ -24059,7 +24059,7 @@ Write-Output "REPLACEMENT-LOADED"
         $summary = Invoke-DevWSHealthCheck -Context $context
         $byId = Get-NativeHealthById $summary
 
-        Assert-Equal 25 @($summary.Results).Count "health keeps exactly 25 checks"
+        Assert-Equal 26 @($summary.Results).Count "health keeps exactly 26 checks"
         Assert-Equal $true $byId["app-libs"].Ok "valid native runtime passes app-libs"
 
         # Missing DLL fails app-libs with the installer guidance.
@@ -24313,7 +24313,7 @@ Write-Output "REPLACEMENT-LOADED"
             $byId[$result.Id] = $result
         }
 
-        Assert-Equal 25 @($summary.Results).Count "health check count includes the privileged-runtime checks"
+        Assert-Equal 26 @($summary.Results).Count "health check count includes the editor and privileged-runtime checks"
 
         foreach ($id in @(
             "os-windows", "powershell-7", "windows-terminal", "autohotkey",
@@ -24431,7 +24431,7 @@ Write-Output "REPLACEMENT-LOADED"
         $byId = @{}
         foreach ($result in @($summary.Results)) { $byId[$result.Id] = $result }
 
-        Assert-Equal 25 @($summary.Results).Count "the whole health run still completes"
+        Assert-Equal 26 @($summary.Results).Count "the whole health run still completes"
         Assert-Equal $false $byId["autohotkey"].Ok "the AutoHotkey check fails"
         Assert-Contains $byId["autohotkey"].Message "machine-wide AutoHotkey v2 installation" "the reason is actionable"
 
@@ -41145,7 +41145,7 @@ exit 0
         $context = New-P2EHealthStubContext -Name "flood" -ChildBody $floodBody
         $run = Invoke-P2EHealthRun -Context $context -TempDir $tempDir
 
-        Assert-Equal 25 @($run.Summary.Results).Count "health check count is unchanged"
+        Assert-Equal 26 @($run.Summary.Results).Count "health check count includes the editor payload check"
         Assert-Equal $true $run.ById["ws-list"].Ok "a flooding ws list still passes"
         Assert-Equal (Join-Path (Split-Path -Parent $context.CanonicalPath) "sentinel-config.json") $run.ConfigAfter "DEVWS_CONFIG is restored"
         Assert-Equal 0 @(Get-ChildItem -LiteralPath $tempDir -Recurse -File -ErrorAction SilentlyContinue).Count "no temporary files are created by the health check"
@@ -41404,7 +41404,9 @@ exit 0
         Assert-Contains $product '"programFilesRootLeaf": "DevWS"' "the production Program Files root is fixed"
 
         $build = Get-SourceOf "packaging\build-setup.ps1"
-        Assert-Contains $build 'git -C $RepoRoot archive --format=zip --output=$payloadFile HEAD -- install.ps1 uninstall.ps1 LICENSE src config' "the payload is generated from tracked source"
+        Assert-Contains $build 'build-editor-payload.ps1' "the production payload uses the editor payload builder"
+        $payloadBuilder = Get-SourceOf "packaging\build-editor-payload.ps1"
+        Assert-Contains $payloadBuilder 'git -C $repo archive --format=zip --output=$baseZip HEAD -- install.ps1 uninstall.ps1 LICENSE src config' "the payload is generated from tracked source"
         Assert-Contains $build "'-p:PublishAot=true'" "the build publishes Native AOT"
         Assert-Contains $build 'Get-FileHash -LiteralPath $artifact -Algorithm SHA256' "the artifact hash is reported"
         Assert-Contains $build 'source commit' "the source commit is reported"

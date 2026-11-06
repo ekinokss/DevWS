@@ -5,7 +5,7 @@ namespace DevWS.Setup;
 
 internal static class ProcessRunner
 {
-    internal static int RunInstaller(string powerShellPath, string installScriptPath, string workingDirectory)
+    internal static int RunInstaller(string powerShellPath, string installScriptPath, string workingDirectory, string installRoot)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -23,11 +23,12 @@ internal static class ProcessRunner
         startInfo.ArgumentList.Add("-File");
         startInfo.ArgumentList.Add(installScriptPath);
         startInfo.ArgumentList.Add("-PackageMode");
+        startInfo.Environment["DEVWS_INSTALL_ROOT"] = installRoot;
 
         return Run(startInfo, "installer");
     }
 
-    internal static int RunUninstaller(string powerShellPath, string uninstallScriptPath, string workingDirectory)
+    internal static int RunUninstaller(string powerShellPath, string uninstallScriptPath, string workingDirectory, string installRoot)
     {
         var startInfo = new ProcessStartInfo
         {
@@ -45,6 +46,7 @@ internal static class ProcessRunner
         startInfo.ArgumentList.Add("-File");
         startInfo.ArgumentList.Add(uninstallScriptPath);
         startInfo.ArgumentList.Add("-PackageMode");
+        startInfo.Environment["DEVWS_INSTALL_ROOT"] = installRoot;
 
         return Run(startInfo, "uninstaller");
     }
