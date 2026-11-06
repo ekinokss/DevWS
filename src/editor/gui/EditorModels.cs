@@ -289,7 +289,10 @@ public sealed class WarningDetails
 {
     public string? SetId { get; init; }
     public string? ItemId { get; init; }
+    public string? ProfileId { get; init; }
     public string? Identity { get; init; }
+    public string? Instance { get; init; }
+    public string? Reason { get; init; }
     public string? RelativeStatus { get; init; }
     public string? PlacementStatus { get; init; }
     public string? PlacementReason { get; init; }
@@ -300,7 +303,9 @@ public sealed class WarningDetails
         {
             var parts = new List<string>();
             if (!string.IsNullOrWhiteSpace(ItemId)) parts.Add($"item {ItemId}");
+            if (!string.IsNullOrWhiteSpace(ProfileId)) parts.Add($"profile {ProfileId}");
             if (!string.IsNullOrWhiteSpace(Identity)) parts.Add($"identity {Identity}");
+            if (!string.IsNullOrWhiteSpace(Instance)) parts.Add($"instance {Instance}");
             if (!string.IsNullOrWhiteSpace(RelativeStatus)) parts.Add($"relative {RelativeStatus}");
             if (!string.IsNullOrWhiteSpace(PlacementStatus)) parts.Add($"placement {PlacementStatus}");
             return string.Join("; ", parts);
@@ -313,7 +318,10 @@ public sealed class WarningDetails
         {
             SetId = JsonText.NullableString(element, "setId"),
             ItemId = JsonText.NullableString(element, "itemId"),
+            ProfileId = JsonText.NullableString(element, "profileId"),
             Identity = JsonText.NullableString(element, "identity"),
+            Instance = JsonText.NullableString(element, "instance"),
+            Reason = JsonText.NullableString(element, "reason"),
             RelativeStatus = JsonText.NullableString(element, "relativeStatus"),
             PlacementStatus = JsonText.NullableString(element, "placementStatus"),
             PlacementReason = JsonText.NullableString(element, "placementReason")

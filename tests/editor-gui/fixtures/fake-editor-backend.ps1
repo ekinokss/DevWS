@@ -123,6 +123,22 @@ while ($true) {
                 Write-Envelope -Request $request -Result ([ordered]@{ valid = $true; saveEligible = $false; errors = @() }) -Warnings @() -ErrorObject $null
             }
         }
+        'preview' {
+            if ($null -ne $scenario.previewError) {
+                Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject $scenario.previewError
+            }
+            elseif ($null -ne $scenario.preview) {
+                $previewWarnings = if ($null -ne $scenario.PSObject.Properties['previewWarnings']) {
+                    @($scenario.previewWarnings)
+                } else {
+                    @()
+                }
+                Write-Envelope -Request $request -Result $scenario.preview -Warnings $previewWarnings -ErrorObject $null
+            }
+            else {
+                Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject (New-ProtocolError -Code 'backend-internal' -Message 'No fake preview result configured.')
+            }
+        }
         'convert' {
             if ($null -ne $scenario.convertError) {
                 Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject $scenario.convertError

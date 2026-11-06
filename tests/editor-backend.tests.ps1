@@ -397,7 +397,7 @@ function Invoke-IsolatedBundledDefaultTest {
 
         Assert-True $hello.ok 'hello succeeds'
         Assert-Equal 'devws-editor/1' $hello.protocol 'hello protocol'
-        Assert-Equal 7 @($hello.result.supportedOps).Count 'hello advertises seven operations'
+        Assert-Equal 8 @($hello.result.supportedOps).Count 'hello advertises eight operations'
         Assert-True (-not ($hello.result.supportedOps -contains 'save')) 'hello does not advertise save'
         Assert-Equal $false $hello.result.capabilities.saveSupported 'hello reports save unsupported'
         Assert-Equal $null $hello.result.limits.saveTimeoutMs 'hello reports no save timeout'
@@ -548,7 +548,7 @@ if ($IsolatedBundledDefault) {
 }
 
 try {
-    Write-Host 'P5 editor backend focused tests' -ForegroundColor Cyan
+    Write-Host 'P6 editor backend focused tests' -ForegroundColor Cyan
 
     # 1. Handshake and truthful capabilities.
     $root = New-TempRoot
@@ -559,13 +559,13 @@ try {
     $hello = Invoke-One -ConfigPath $configPath -Id 'hello' -Op 'hello'
     Assert-True $hello.ok 'hello succeeds'
     Assert-Equal 'devws-editor/1' $hello.protocol 'hello protocol'
-    Assert-Equal 7 @($hello.result.supportedOps).Count 'hello advertises exactly seven operations'
+    Assert-Equal 8 @($hello.result.supportedOps).Count 'hello advertises exactly eight operations'
     Assert-True ($hello.result.supportedOps -contains 'read-config') 'hello advertises read-config'
     Assert-True (-not ($hello.result.supportedOps -contains 'save')) 'hello does not advertise save'
     Assert-Equal $false $hello.result.capabilities.saveSupported 'hello says save is unsupported'
     Assert-Equal $true $hello.result.capabilities.validateSupported 'hello says validate is supported'
     Assert-Equal $true $hello.result.capabilities.convertSupported 'hello says convert is supported'
-    Assert-Equal $false $hello.result.capabilities.previewSupported 'hello says preview is unsupported'
+    Assert-Equal $true $hello.result.capabilities.previewSupported 'hello says preview is supported'
     Assert-Equal $true $hello.result.capabilities.readOnly 'hello says read-only'
 
     # 2. inspect metadata and physical-writable vs backend-save distinction.
@@ -635,7 +635,7 @@ try {
         Assert-Equal 'request-invalid' $duplicateId.error.code 'duplicate id refused'
         Assert-Equal 'duplicate-request-id' $duplicateId.error.details.reason 'duplicate id reason'
 
-        foreach ($op in @('preview', 'save')) {
+        foreach ($op in @('save')) {
             $refused = Send-Request -Process $process -Id $op -Op $op
             Assert-Equal 'unsupported-operation' $refused.error.code "$op refused"
         }
@@ -861,10 +861,10 @@ try {
         Assert-True ($validateHello.result.supportedOps -contains 'validate') 'hello advertises validate'
         Assert-True ($validateHello.result.supportedOps -contains 'convert') 'hello advertises convert'
         Assert-True (-not ($validateHello.result.supportedOps -contains 'save')) 'hello still omits save'
-        Assert-True (-not ($validateHello.result.supportedOps -contains 'preview')) 'hello still omits preview'
+        Assert-True ($validateHello.result.supportedOps -contains 'preview') 'hello advertises preview'
         Assert-Equal $true $validateHello.result.capabilities.validateSupported 'hello advertises validate capability'
         Assert-Equal $true $validateHello.result.capabilities.convertSupported 'hello advertises convert capability'
-        Assert-Equal $false $validateHello.result.capabilities.previewSupported 'hello omits preview capability'
+        Assert-Equal $true $validateHello.result.capabilities.previewSupported 'hello advertises preview capability'
 
         $validateInspect = Send-Request -Process $validateProcess -Id 'vi' -Op 'inspect'
         $validDraft = ($config | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
@@ -935,8 +935,8 @@ try {
             Write-Host '  [SKIP] convert requires a host monitor topology' -ForegroundColor Yellow
         }
 
-        $previewRefusal = Send-Request -Process $validateProcess -Id 'p1' -Op 'preview'
-        Assert-Equal 'unsupported-operation' $previewRefusal.error.code 'preview remains unimplemented'
+        $previewMissing = Send-Request -Process $validateProcess -Id 'p1' -Op 'preview'
+        Assert-Equal 'request-invalid' $previewMissing.error.code 'preview requires draft and baseSha256'
         $saveRefusal = Send-Request -Process $validateProcess -Id 's1' -Op 'save'
         Assert-Equal 'unsupported-operation' $saveRefusal.error.code 'save remains unimplemented'
         Send-Request -Process $validateProcess -Id 'vz' -Op 'shutdown' | Out-Null
@@ -946,6 +946,59 @@ try {
         Stop-Backend -Process $validateProcess
     }
     Assert-Equal $validateHashBefore (Get-FileSha $configPath) 'validate/convert did not change the config bytes'
+
+    # 12b-preview. Direct protocol preview and server-side allowlist.
+    $previewHashBefore = Get-FileSha $configPath
+    $previewProcess = Start-Backend -ConfigPath $configPath
+    try {
+        $previewInspect = Send-Request -Process $previewProcess -Id 'pi' -Op 'inspect'
+        $previewRead = Send-Request -Process $previewProcess -Id 'pr' -Op 'read-config' -Params @{ expectedSha256 = $previewInspect.result.config.sha256 }
+        $previewBase = [string]$previewInspect.result.config.sha256
+        $previewDraft = ($previewRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $previewDraft.sets[0].windows[0].layout.x = 25
+        $previewResponse = Send-Request -Process $previewProcess -Id 'p1' -Op 'preview' -Params @{ draft = $previewDraft; baseSha256 = $previewBase }
+        Assert-True $previewResponse.ok 'preview succeeds for an absolute draft'
+        Assert-Equal 1 @($previewResponse.result.diff).Count 'preview reports one fallback change'
+        Assert-Equal 'fallback' ([string]$previewResponse.result.diff[0].scope) 'preview diff scope'
+        Assert-Equal 0 ([int]$previewResponse.result.savedSet.items[0].rect.x) 'preview saved effective x'
+        Assert-Equal 25 ([int]$previewResponse.result.draftSet.items[0].rect.x) 'preview draft effective x'
+        Assert-Equal $false ([bool]$previewResponse.result.review.requiresAcknowledgement) 'absolute-only preview with no warnings needs no acknowledgement'
+        Assert-Equal $null $previewResponse.result.review.reviewToken 'absolute-only preview has no review token'
+
+        $noopDraft = ($previewRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $noopResponse = Send-Request -Process $previewProcess -Id 'p2' -Op 'preview' -Params @{ draft = $noopDraft; baseSha256 = $previewBase }
+        Assert-True $noopResponse.ok 'no-op preview succeeds'
+        Assert-Equal 0 @($noopResponse.result.diff).Count 'no-op preview has an empty diff'
+        Assert-Equal $false ([bool]$noopResponse.result.review.requiresAcknowledgement) 'no-op preview needs no acknowledgement'
+
+        $invalidDraft = ($previewRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $invalidDraft.sets[0].windows[0].layout.w = 0
+        $invalidPreview = Send-Request -Process $previewProcess -Id 'p2b' -Op 'preview' -Params @{ draft = $invalidDraft; baseSha256 = $previewBase }
+        Assert-Equal 'config-invalid' $invalidPreview.error.code 'preview rejects a structurally invalid draft'
+
+        $unauthorizedDraft = ($previewRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $unauthorizedDraft.sets[0].windows[0].path = 'C:\Windows\System32'
+        $unauthorizedResponse = Send-Request -Process $previewProcess -Id 'p3' -Op 'preview' -Params @{ draft = $unauthorizedDraft; baseSha256 = $previewBase }
+        Assert-Equal 'unsupported-mutation' $unauthorizedResponse.error.code 'backend independently rejects an unauthorized path mutation'
+        Assert-Contains ([string]$unauthorizedResponse.error.details.path) '/path' 'unauthorized error names the offending path'
+
+        $externalResponse = Send-Request -Process $previewProcess -Id 'p4' -Op 'preview' -Params @{ draft = $noopDraft; baseSha256 = ('A' * 64) }
+        Assert-Equal 'external-change' $externalResponse.error.code 'preview rejects a stale base revision'
+
+        $fingerprintResponse = Send-Request -Process $previewProcess -Id 'p5' -Op 'preview' -Params @{ draft = $previewDraft; baseSha256 = $previewBase; baseTopologyFingerprint = ('A' * 64) }
+        if ([bool]$previewInspect.result.topology.available) {
+            Assert-Equal 'topology-changed' $fingerprintResponse.error.code 'preview rejects a supplied topology mismatch'
+        }
+
+        $saveResponse = Send-Request -Process $previewProcess -Id 'p6' -Op 'save'
+        Assert-Equal 'unsupported-operation' $saveResponse.error.code 'save remains unsupported in P6'
+        Send-Request -Process $previewProcess -Id 'p7' -Op 'shutdown' | Out-Null
+        $previewProcess.WaitForExit(10000) | Out-Null
+    }
+    finally {
+        Stop-Backend -Process $previewProcess
+    }
+    Assert-Equal $previewHashBefore (Get-FileSha $configPath) 'preview did not change the config bytes'
 
     # 12c. Synthetic convert math and anchor refusals (no host topology needed).
     $convLeft = New-SyntheticMonitor -Identity 'path:TEST/LEFT' -X -1920 -Y 0 -W 1920 -H 1080 -WorkH 1040 -Primary $false
@@ -1024,6 +1077,211 @@ try {
         -Topology $convTopology
     Assert-Equal 'topology-changed' ([string]$staleConvert.Code) 'synthetic topology drift refused'
 
+    # 12d. Pure preview composition, semantic diff, and review binding.
+    $previewConfig = New-Config -Windows @(
+        (New-Terminal -Id 'abs' -WindowId 'DEVWS-P6-ABS' -Layout ([pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 })),
+        (New-RelativeTerminal -Id 'rel' -WindowId 'DEVWS-P6-REL' -Fallback ([pscustomobject][ordered]@{ x = 0; y = 0; w = 500; h = 400 }) -Identity 'path:TEST/MISSING' -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 0.5; h = 1 }))
+    )
+    $previewDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $previewDraft.sets[0].windows[0].layout.x = 25
+    $previewCore = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $previewDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-True $previewCore.Ok 'pure preview succeeds'
+    Assert-Equal 1 @($previewCore.Result.diff).Count 'pure preview diff count'
+    Assert-Equal 'fallback' ([string]$previewCore.Result.diff[0].scope) 'pure preview fallback scope'
+    Assert-Equal 1 @($previewCore.Warnings).Count 'pure preview warning count'
+    Assert-Equal $true ([bool]$previewCore.Result.review.requiresAcknowledgement) 'pure preview requires acknowledgement for anchor warning'
+    Assert-Equal 64 ([string]$previewCore.Result.review.warningDigest).Length 'pure preview warning digest length'
+    Assert-Equal 64 ([string]$previewCore.Result.review.reviewToken).Length 'pure preview review token length'
+
+    $previewCoreAgain = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $previewDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal ([string]$previewCore.Result.review.warningDigest) ([string]$previewCoreAgain.Result.review.warningDigest) 'warning digest is stable'
+    Assert-Equal ([string]$previewCore.Result.review.reviewToken) ([string]$previewCoreAgain.Result.review.reviewToken) 'review token is stable'
+
+    Assert-Equal ((@($previewCore.Result.review.warningIds) -join '|')) ((@($previewCoreAgain.Result.review.warningIds) -join '|')) 'warning ids are stable'
+    $altTopology = ($convTopology | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+    $altTopology.Fingerprint = ('F' * 64)
+    $altTopologyPreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $previewDraft -SetId 'main' -Topology $altTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64) -BaseTopologyFingerprint $altTopology.Fingerprint
+    Assert-True ([string]$previewCore.Result.review.reviewToken -cne [string]$altTopologyPreview.Result.review.reviewToken) 'review token changes with topology fingerprint'
+    Assert-Equal ([string]$previewCore.Result.review.warningDigest) ([string]$altTopologyPreview.Result.review.warningDigest) 'topology-only change leaves warning digest stable'
+
+    $noopWithWarnings = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json) -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-True $noopWithWarnings.Ok 'no-op preview with saved warnings succeeds'
+    Assert-Equal 0 @($noopWithWarnings.Result.diff).Count 'no-op preview with warnings has no diff'
+    Assert-Equal $false ([bool]$noopWithWarnings.Result.review.requiresAcknowledgement) 'no-op preview does not require acknowledgement for saved warnings'
+
+    $previewCoreNewBase = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $previewDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('b' * 64) -CurrentSha256 ('b' * 64)
+    Assert-True ([string]$previewCore.Result.review.reviewToken -cne [string]$previewCoreNewBase.Result.review.reviewToken) 'review token changes with revision'
+
+    $noTopologyAbsolute = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $previewDraft -SetId 'main' -Topology $null -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-True $noTopologyAbsolute.Ok 'absolute-only preview succeeds without topology'
+    Assert-Equal $null $noTopologyAbsolute.Result.topologyFingerprint 'absolute-only unavailable topology reports null fingerprint'
+
+    $relativeDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $relativeDraft.sets[0].windows[1].layoutRelative.rect.x = 0.25
+    $noTopologyRelative = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $relativeDraft -SetId 'main' -Topology $null -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal 'topology-unavailable' ([string]$noTopologyRelative.Code) 'relative preview without topology refused'
+
+    $relativePreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $relativeDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64) -BaseTopologyFingerprint $convTopology.Fingerprint
+    Assert-True $relativePreview.Ok 'relative preview succeeds with topology'
+    Assert-Equal 'relative' ([string]$relativePreview.Result.diff[0].scope) 'relative preview diff scope'
+
+    $incompleteTopology = ($convTopology | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+    $incompleteTopology.IdentityComplete = $false
+    $incompleteTopology.CorrelationComplete = $false
+    $incompleteRelative = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $relativeDraft -SetId 'main' -Topology $incompleteTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64) -BaseTopologyFingerprint $incompleteTopology.Fingerprint
+    Assert-Equal 'topology-incomplete' ([string]$incompleteRelative.Code) 'relative preview with incomplete topology refused'
+
+    $missingFingerprint = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $relativeDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal 'request-invalid' ([string]$missingFingerprint.Code) 'relative preview requires a base topology fingerprint'
+
+    $profileConfig = New-Config -Windows @(
+        (New-Terminal -Id 'abs' -WindowId 'DEVWS-P6-PROFILE' -Layout ([pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 }))
+    ) -Profiles @(
+        (New-Profile -Id 'docked' -Tokens @($convTopology.Signature -split ';') -Layouts @{ abs = [pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 } })
+    )
+    $profileFallbackDraft = ($profileConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $profileFallbackDraft.sets[0].windows[0].layout.x = 25
+    $profileFallbackPreview = Get-EditorPreviewCore -CanonicalConfig $profileConfig -DraftConfig $profileFallbackDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-True $profileFallbackPreview.Ok 'profile fallback preview succeeds'
+    Assert-Equal 'fallback' ([string]$profileFallbackPreview.Result.diff[0].scope) 'inactive fallback diff scope'
+    Assert-Equal ([int]$profileFallbackPreview.Result.savedSet.items[0].rect.x) ([int]$profileFallbackPreview.Result.draftSet.items[0].rect.x) 'inactive fallback leaves effective rect unchanged'
+
+    $profileEntryDraft = ($profileConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $profileEntryDraft.sets[0].layoutProfiles[0].layouts.abs.x = 10
+    $profileEntryPreview = Get-EditorPreviewCore -CanonicalConfig $profileConfig -DraftConfig $profileEntryDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64) -BaseTopologyFingerprint $convTopology.Fingerprint
+    Assert-True $profileEntryPreview.Ok 'profile entry preview succeeds'
+    Assert-Equal 'profile:docked' ([string]$profileEntryPreview.Result.diff[0].scope) 'profile entry diff scope'
+    Assert-Equal 10 ([int]$profileEntryPreview.Result.draftSet.items[0].rect.x) 'profile entry changes effective rect'
+
+    $sparseConfig = New-Config -Windows @(
+        (New-Terminal -Id 'abs' -WindowId 'DEVWS-P6-SPARSE' -Layout ([pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 })),
+        (New-RelativeTerminal -Id 'rel' -WindowId 'DEVWS-P6-SPARSE-REL' -Fallback ([pscustomobject][ordered]@{ x = 0; y = 0; w = 500; h = 400 }) -Identity 'path:TEST/RIGHT' -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 0.5; h = 1 }))
+    ) -Profiles @(
+        (New-Profile -Id 'docked' -Tokens @($convTopology.Signature -split ';') -Layouts @{ abs = [pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 } })
+    )
+    $sparseDraft = ($sparseConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $sparseDraft.sets[0].windows[1].layout.x = 25
+    $sparsePreview = Get-EditorPreviewCore -CanonicalConfig $sparseConfig -DraftConfig $sparseDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-True $sparsePreview.Ok 'sparse-profile fallback preview succeeds'
+    Assert-Equal 'fallback' ([string]$sparsePreview.Result.diff[0].scope) 'sparse-profile fallback scope'
+    Assert-Equal ([int]$sparsePreview.Result.savedSet.items[1].rect.x) ([int]$sparsePreview.Result.draftSet.items[1].rect.x) 'sparse-profile omission leaves effective relative rect unchanged'
+
+    $modeDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $modeDraft.sets[0].windows[0] | Add-Member -NotePropertyName layoutMode -NotePropertyValue 'relative' -Force
+    $modeDraft.sets[0].windows[0] | Add-Member -NotePropertyName layoutRelative -NotePropertyValue ([pscustomobject][ordered]@{
+        monitor = [pscustomobject][ordered]@{ identity = 'path:TEST/RIGHT' }
+        basis = 'workArea'
+        rect = [pscustomobject][ordered]@{ x = 0; y = 0; w = 0.5; h = 1 }
+    }) -Force
+    $modePreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $modeDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64) -BaseTopologyFingerprint $convTopology.Fingerprint
+    Assert-True $modePreview.Ok 'mode conversion preview succeeds'
+    Assert-True (@($modePreview.Result.diff | Where-Object { $_.scope -eq 'mode' }).Count -eq 1) 'mode conversion diff includes mode'
+    Assert-True (@($modePreview.Result.diff | Where-Object { $_.scope -eq 'relative' }).Count -eq 1) 'mode conversion diff includes relative object'
+
+    $unauthorizedPreviewDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $unauthorizedPreviewDraft.sets[0].windows[0].tabs[0].args = @('/c', 'calc')
+    $unauthorizedPreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $unauthorizedPreviewDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal 'unsupported-mutation' ([string]$unauthorizedPreview.Code) 'pure preview rejects tab changes'
+
+    $negativeDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $negativeDraft.sets[0].windows[0].layout.x = -2500
+    $negativePreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $negativeDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-True $negativePreview.Ok 'negative-coordinate preview succeeds'
+    Assert-Equal -2500 ([int]$negativePreview.Result.diff[0].after.x) 'negative-coordinate diff preserves x'
+
+    $duplicateTopology = New-SyntheticTopology -Monitors @(
+        (New-SyntheticMonitor -Identity 'path:TEST/DUP' -X -1000 -Y 0 -W 1000 -H 800),
+        (New-SyntheticMonitor -Identity 'path:TEST/DUP' -X 0 -Y 0 -W 1000 -H 800)
+    )
+    $ambiguousConfig = New-Config -Windows @(
+        (New-RelativeTerminal -Id 'amb' -WindowId 'DEVWS-P6-AMB' -Fallback ([pscustomobject][ordered]@{ x = 10; y = 20; w = 300; h = 400 }) -Identity 'path:TEST/DUP' -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 0.5; h = 1 }))
+    )
+    $ambiguousDraft = ($ambiguousConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $ambiguousDraft.sets[0].windows[0].layoutRelative.rect.x = 0.25
+    $ambiguousPreview = Get-EditorPreviewCore -CanonicalConfig $ambiguousConfig -DraftConfig $ambiguousDraft -SetId 'main' -Topology $duplicateTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64) -BaseTopologyFingerprint $duplicateTopology.Fingerprint
+    Assert-True $ambiguousPreview.Ok 'ambiguous-anchor preview still returns a structural result'
+    Assert-True (@($ambiguousPreview.Warnings | Where-Object { $_.code -eq 'anchor-ambiguous' }).Count -ge 1) 'ambiguous anchor warning emitted'
+    Assert-Equal $true ([bool]$ambiguousPreview.Result.review.requiresAcknowledgement) 'ambiguous anchor requires acknowledgement'
+    Assert-True ([string]$previewCore.Result.review.warningDigest -cne [string]$ambiguousPreview.Result.review.warningDigest) 'warning digest changes with warning context'
+
+    $unreachableConfig = New-Config -Windows @(
+        (New-RelativeTerminal -Id 'unreach' -WindowId 'DEVWS-P6-UNREACH' -Fallback ([pscustomobject][ordered]@{ x = 10000; y = 10000; w = 300; h = 400 }) -Identity 'path:TEST/LEFT' -Rect ([pscustomobject][ordered]@{ x = 2; y = 2; w = 0.5; h = 0.5 }))
+    )
+    $unreachableDraft = ($unreachableConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $unreachableDraft.sets[0].windows[0].layoutRelative.rect.x = 2.1
+    $unreachablePreview = Get-EditorPreviewCore -CanonicalConfig $unreachableConfig -DraftConfig $unreachableDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64) -BaseTopologyFingerprint $convTopology.Fingerprint
+    Assert-True $unreachablePreview.Ok 'unreachable placement preview still returns a structural result'
+    Assert-True (@($unreachablePreview.Warnings | Where-Object { $_.code -eq 'relative-unreachable' }).Count -ge 1) 'unreachable placement warning emitted'
+
+    $fallbackWarningConfig = New-Config -Windows @(
+        (New-Terminal -Id 'offscreen' -WindowId 'DEVWS-P6-FB-UNREACH' -Layout ([pscustomobject][ordered]@{ x = 10000; y = 10000; w = 300; h = 400 })),
+        (New-Terminal -Id 'docked' -WindowId 'DEVWS-P6-FB-DOCKED' -Layout ([pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 }))
+    ) -Profiles @(
+        (New-Profile -Id 'docked' -Tokens @($convTopology.Signature -split ';') -Layouts @{ docked = [pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 600 } })
+    )
+    $fallbackWarningDraft = ($fallbackWarningConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $fallbackWarningDraft.sets[0].windows[0].layout.x = 10010
+    $fallbackWarningPreview = Get-EditorPreviewCore -CanonicalConfig $fallbackWarningConfig -DraftConfig $fallbackWarningDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-True $fallbackWarningPreview.Ok 'unreachable fallback preview still returns a structural result'
+    Assert-True (@($fallbackWarningPreview.Warnings | Where-Object { $_.code -eq 'fallback-unreachable' }).Count -ge 1) 'unreachable absolute fallback warning emitted'
+    Assert-Equal $true ([bool]$fallbackWarningPreview.Result.review.requiresAcknowledgement) 'unreachable fallback requires acknowledgement'
+
+    $crossSetCanonical = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $crossSetCanonical.sets += [pscustomobject][ordered]@{
+        id = 'other'
+        windows = @([pscustomobject][ordered]@{
+            id = 'other-item'
+            type = 'terminal'
+            enabled = $true
+            windowId = 'DEVWS-P6-OTHER'
+            path = 'C:\Windows'
+            elevated = $true
+            tabs = @([pscustomobject][ordered]@{ command = $null; args = @() })
+            activeTab = 0
+            layout = [pscustomobject][ordered]@{ x = 0; y = 0; w = 100; h = 100 }
+        })
+    }
+    $crossSetDraft = ($crossSetCanonical | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $crossSetDraft.sets[1].windows[0].layout.x = 50
+    $crossSetPreview = Get-EditorPreviewCore -CanonicalConfig $crossSetCanonical -DraftConfig $crossSetDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal 'unsupported-mutation' ([string]$crossSetPreview.Code) 'cross-set geometry change rejected'
+    Assert-Contains ([string]$crossSetPreview.Details.path) '/sets/1/' 'cross-set error names the other set'
+
+    $unknownDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $unknownDraft | Add-Member -NotePropertyName 'x-unknown' -NotePropertyValue $true
+    $unknownPreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $unknownDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal 'unsupported-mutation' ([string]$unknownPreview.Code) 'new unknown property rejected'
+
+    $typeDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $typeDraft.sets[0].windows[0].type = 'app'
+    $typePreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $typeDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal 'unsupported-mutation' ([string]$typePreview.Code) 'structural item type change rejected'
+
+    Assert-True (Test-EditorJsonEqual -Left 0 -Right 0.0) 'numeric zero equivalence'
+    Assert-True (Test-EditorJsonEqual -Left ([pscustomobject][ordered]@{ a = 1; b = 2 }) -Right ([pscustomobject][ordered]@{ b = 2; a = 1 })) 'object key order is not semantic'
+    $explicitAbsoluteDraft = ($previewConfig | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+    $explicitAbsoluteDraft.sets[0].windows[0] | Add-Member -NotePropertyName layoutMode -NotePropertyValue 'absolute' -Force
+    $explicitAbsolutePreview = Get-EditorPreviewCore -CanonicalConfig $previewConfig -DraftConfig $explicitAbsoluteDraft -SetId 'main' -Topology $convTopology -BaseSha256 ('a' * 64) -CurrentSha256 ('a' * 64)
+    Assert-Equal 0 @($explicitAbsolutePreview.Result.diff).Count 'explicit absolute is equivalent to absent layoutMode'
+
+    $informationalReview = Get-EditorWarningReview -Warnings @(
+        [pscustomobject]@{ id = 'deferred|1'; code = 'deferred-qualification'; requiresAcknowledgement = $true; details = [pscustomobject]@{ setId = 'main' } }
+    ) -BaseSha256 ('a' * 64) -TopologyFingerprint $convTopology.Fingerprint -HasChanges $true
+    Assert-Equal $false ([bool]$informationalReview.requiresAcknowledgement) 'informational warning excluded from acknowledgement'
+    Assert-Equal $null $informationalReview.warningDigest 'informational warning excluded from digest'
+
+    $warningA = [pscustomobject][ordered]@{ id = 'b-warning'; code = 'anchor-missing'; message = 'human message one'; requiresAcknowledgement = $true; details = [pscustomobject][ordered]@{ setId = 'main'; itemId = 'x'; reason = 'missing'; relativeStatus = 'anchor-missing'; placementStatus = 'anchor-missing'; placementReason = 'missing' } }
+    $warningB = [pscustomobject][ordered]@{ id = 'a-warning'; code = 'anchor-missing'; message = 'human message two'; requiresAcknowledgement = $true; details = [pscustomobject][ordered]@{ setId = 'main'; itemId = 'y'; reason = 'missing'; relativeStatus = 'anchor-missing'; placementStatus = 'anchor-missing'; placementReason = 'missing' } }
+    $warningReviewOne = Get-EditorWarningReview -Warnings @($warningA, $warningB) -BaseSha256 ('a' * 64) -TopologyFingerprint $convTopology.Fingerprint -HasChanges $true
+    $warningReviewTwo = Get-EditorWarningReview -Warnings @($warningA, $warningB) -BaseSha256 ('a' * 64) -TopologyFingerprint $convTopology.Fingerprint -HasChanges $true
+    Assert-Equal 'a-warning|b-warning' ((@($warningReviewOne.warningIds) -join '|')) 'warning ids are sorted ordinally'
+    Assert-Equal ([string]$warningReviewOne.warningDigest) ([string]$warningReviewTwo.warningDigest) 'warning digest is deterministic for identical contexts'
+
+    $warningAMessageChanged = [pscustomobject][ordered]@{ id = 'b-warning'; code = 'anchor-missing'; message = 'completely different human wording'; requiresAcknowledgement = $true; details = [pscustomobject][ordered]@{ setId = 'main'; itemId = 'x'; reason = 'missing'; relativeStatus = 'anchor-missing'; placementStatus = 'anchor-missing'; placementReason = 'missing' } }
+    $warningMessageReview = Get-EditorWarningReview -Warnings @($warningAMessageChanged) -BaseSha256 ('a' * 64) -TopologyFingerprint $convTopology.Fingerprint -HasChanges $true
+    $warningNoMessageReview = Get-EditorWarningReview -Warnings @($warningA) -BaseSha256 ('a' * 64) -TopologyFingerprint $convTopology.Fingerprint -HasChanges $true
+    Assert-Equal ([string]$warningMessageReview.warningDigest) ([string]$warningNoMessageReview.warningDigest) 'human warning message does not affect digest'
+
     # 13. Non-mutation and static isolation.
     $beforeHash = Get-FileSha $parityPath
     $process = Start-Backend -ConfigPath $parityPath
@@ -1070,7 +1328,7 @@ finally {
 }
 
 Write-Host ""
-Write-Host ("P5 focused assertions passed: {0}; failed: {1}; skipped: {2}" -f $script:Passed, $script:Failures.Count, $script:Skipped) -ForegroundColor Cyan
+Write-Host ("P6 focused assertions passed: {0}; failed: {1}; skipped: {2}" -f $script:Passed, $script:Failures.Count, $script:Skipped) -ForegroundColor Cyan
 if ($script:Failures.Count -gt 0) {
     $script:Failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
     exit 1

@@ -57,6 +57,7 @@ public sealed class DraftDocument
     public string? BaseTopologyFingerprint { get; }
     public string SetId => _setId;
     public bool IsDirty => !JsonEquals(_root, _baseline);
+    public bool MatchesSnapshot(JsonObject snapshot) => JsonEquals(_root, snapshot);
 
     public static DraftDocument Create(
         JsonElement document,

@@ -31,6 +31,31 @@
             <Setter Property="BorderBrush" Value="#3A3A42" />
             <Setter Property="BorderThickness" Value="1" />
         </Style>
+        <Style TargetType="TabControl">
+            <Setter Property="Background" Value="#202026" />
+            <Setter Property="Foreground" Value="#EBEBF0" />
+            <Setter Property="BorderBrush" Value="#3A3A42" />
+        </Style>
+        <Style TargetType="TabItem">
+            <Setter Property="Background" Value="#202026" />
+            <Setter Property="Foreground" Value="#EBEBF0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="TabBorder" Background="{TemplateBinding Background}"
+                                BorderBrush="#3A3A42" BorderThickness="0,0,1,1" Padding="9,4">
+                            <ContentPresenter ContentSource="Header" TextElement.Foreground="#EBEBF0" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#243434" />
+                                <Setter TargetName="TabBorder" Property="BorderBrush" Value="#80DCD7" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
         <Style TargetType="TextBox">
             <Setter Property="Background" Value="#202026" />
             <Setter Property="Foreground" Value="#EBEBF0" />
@@ -139,9 +164,11 @@
             </StackPanel>
 
             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-                <Button Content="Save (P5 unavailable)" IsEnabled="False"
+                <Button Content="Save (P6 unavailable)" IsEnabled="False"
                         ToolTip="{Binding SaveUnavailableText}"
-                        AutomationProperties.Name="Save unavailable in P5" />
+                        AutomationProperties.Name="Save unavailable in P6" />
+                <Button Content="_Preview" Click="PreviewButton_Click" IsEnabled="{Binding CanPreview}"
+                        AutomationProperties.Name="Request authoritative preview" />
                 <Button Content="_Refresh" Click="RefreshButton_Click" IsEnabled="{Binding IsNotBusy}"
                         AutomationProperties.Name="Refresh saved projection" />
                 <Button Content="_Fit" Click="FitButton_Click" AutomationProperties.Name="Fit canvas to view" />
@@ -149,6 +176,7 @@
                 <Button Content="+" Width="34" Click="ZoomInButton_Click" AutomationProperties.Name="Zoom in" />
                 <Button Content="Reset _view" Click="ResetViewButton_Click" AutomationProperties.Name="Reset canvas view" />
                 <TextBlock x:Name="ZoomText" VerticalAlignment="Center" Foreground="#A5AAB4" Margin="8,0,12,0" />
+                <TextBlock Text="{Binding PreviewSummaryText}" VerticalAlignment="Center" Foreground="#80DCD7" Margin="0,0,12,0" />
                 <TextBlock Text="{Binding IntegrityText}" VerticalAlignment="Center" Foreground="#A5AAB4" />
                 <ProgressBar Width="80" Height="6" IsIndeterminate="{Binding IsBusy}" Margin="12,0,0,0"
                              Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}" />
@@ -292,6 +320,8 @@
                                    Foreground="#A5AAB4" TextWrapping="Wrap" FontSize="11" Margin="0,0,0,4" />
 
                         <TextBlock Text="{Binding DraftValidationText}" Foreground="#A5AAB4" TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding PreviewErrorText}" Foreground="#FF9A9A" TextWrapping="Wrap"
+                                   Visibility="{Binding HasPreviewError, Converter={StaticResource BoolToVisibility}}" />
                         <TextBlock Text="{Binding EditErrorText}" Foreground="#FF9A9A" TextWrapping="Wrap"
                                    Visibility="{Binding HasEditError, Converter={StaticResource BoolToVisibility}}" />
                         <ScrollViewer MaxHeight="54" VerticalScrollBarVisibility="Auto" Margin="0,4,0,0">
@@ -330,26 +360,70 @@
             <Grid Grid.Column="2">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*" />
-                    <RowDefinition Height="170" />
+                    <RowDefinition Height="238" />
                 </Grid.RowDefinitions>
 
                 <Border Grid.Row="0" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="3">
                     <local:WorkspaceCanvas x:Name="Canvas" />
                 </Border>
 
-                <GroupBox Grid.Row="1" Header="Projection warnings (saved configuration)"
-                          Margin="0,8,0,0" Foreground="#EBEBF0" BorderBrush="#3A3A42">
-                    <ListBox x:Name="WarningList" ItemsSource="{Binding Warnings}"
-                             AutomationProperties.Name="Projection warnings"
-                             AutomationProperties.HelpText="Warnings reported by the saved projection; draft geometry is not semantically previewed in P5."
-                             ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-                        <ListBox.ItemTemplate>
-                            <DataTemplate>
-                                <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#FFC457" />
-                            </DataTemplate>
-                        </ListBox.ItemTemplate>
-                    </ListBox>
-                </GroupBox>
+                <TabControl x:Name="PreviewTabControl" Grid.Row="1" Margin="0,8,0,0"
+                            Background="#202026" Foreground="#EBEBF0" BorderBrush="#3A3A42">
+                    <TabItem Header="Saved warnings">
+                        <ListBox x:Name="WarningList" ItemsSource="{Binding Warnings}"
+                                 AutomationProperties.Name="Saved projection warnings"
+                                 AutomationProperties.HelpText="Warnings reported by the saved projection."
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#FFC457" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </TabItem>
+
+                    <TabItem Header="Preview diff">
+                        <ListBox x:Name="PreviewDiffList" ItemsSource="{Binding PreviewDiffs}"
+                                 AutomationProperties.Name="Semantic preview diff"
+                                 AutomationProperties.HelpText="Stored configuration changes between the saved and proposed documents."
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#80DCD7" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </TabItem>
+
+                    <TabItem Header="Preview warnings &amp; review">
+                        <DockPanel LastChildFill="True">
+                            <Border DockPanel.Dock="Bottom" Background="#202026" BorderBrush="#3A3A42"
+                                    BorderThickness="0,1,0,0" Padding="6">
+                                <StackPanel>
+                                    <TextBlock Text="{Binding ReviewStatusText}" TextWrapping="Wrap" Foreground="#EBEBF0" />
+                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                        <Button Content="Review warnings" Click="ReviewWarningsButton_Click"
+                                                IsEnabled="{Binding CanAcknowledgePreview}"
+                                                AutomationProperties.Name="Acknowledge displayed preview warnings" />
+                                        <TextBlock Text="Save is unavailable in P6." VerticalAlignment="Center"
+                                                   Foreground="#A5AAB4" Margin="8,0,0,0" />
+                                    </StackPanel>
+                                    <TextBlock Text="{Binding PreviewSummaryText}" Foreground="#80DCD7" Margin="0,3,0,0" />
+                                </StackPanel>
+                            </Border>
+                            <ListBox x:Name="PreviewWarningList" ItemsSource="{Binding PreviewWarnings}"
+                                     AutomationProperties.Name="Preview warnings"
+                                     AutomationProperties.HelpText="Warnings and consequences reported by the authoritative preview. Acknowledgement requires the explicit review action."
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#FFC457" />
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </DockPanel>
+                    </TabItem>
+                </TabControl>
             </Grid>
         </Grid>
 
