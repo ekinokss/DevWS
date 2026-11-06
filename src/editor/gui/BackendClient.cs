@@ -134,6 +134,9 @@ public sealed class BackendClient : IDisposable
     public bool HasExited => _process is null || _process.HasExited;
     public int? ExitCode => _lastExitCode;
     public double LastConnectMs { get; private set; }
+    public long LastResponseBytes { get; private set; }
+    public double LastReadMs { get; private set; }
+    public double LastParseMs { get; private set; }
     public string LastStderr
     {
         get
@@ -375,13 +378,18 @@ public sealed class BackendClient : IDisposable
                 isTransportFailure: true);
         }
 
+        LastResponseBytes = Encoding.UTF8.GetByteCount(line);
+
         JsonDocument document;
+        var parseWatch = Stopwatch.StartNew();
         try
         {
             document = JsonDocument.Parse(line);
         }
         catch (Exception ex)
         {
+            parseWatch.Stop();
+            LastParseMs = parseWatch.Elapsed.TotalMilliseconds;
             StopProcessCore();
             throw new BackendException(
                 "protocol-error",
@@ -389,6 +397,9 @@ public sealed class BackendClient : IDisposable
                 isProtocolError: true,
                 inner: ex);
         }
+
+        parseWatch.Stop();
+        LastParseMs = parseWatch.Elapsed.TotalMilliseconds;
 
         using (document)
         {
@@ -463,7 +474,7 @@ public sealed class BackendClient : IDisposable
         }
 
         var supportedOps = JsonText.StringArray(result, "supportedOps");
-        foreach (var required in new[] { "inspect", "read-config", "project" })
+        foreach (var required in new[] { "inspect", "read-config", "project", "validate", "convert" })
         {
             if (!supportedOps.Contains(required, StringComparer.Ordinal))
             {
@@ -503,13 +514,19 @@ public sealed class BackendClient : IDisposable
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(_options.RequestTimeout);
+        var readWatch = Stopwatch.StartNew();
 
         try
         {
-            return await _stdout.ReadLineAsync(timeout.Token).ConfigureAwait(false);
+            var line = await _stdout.ReadLineAsync(timeout.Token).ConfigureAwait(false);
+            readWatch.Stop();
+            LastReadMs = readWatch.Elapsed.TotalMilliseconds;
+            return line;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            readWatch.Stop();
+            LastReadMs = readWatch.Elapsed.TotalMilliseconds;
             StopProcessCore();
             throw new BackendException(
                 "timeout",

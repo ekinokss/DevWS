@@ -413,6 +413,110 @@ public sealed record EditorSnapshot(
     string ReadConfigSha256,
     JsonElement Document);
 
+public sealed class DraftErrorInfo
+{
+    public string Code { get; init; } = "";
+    public string Message { get; init; } = "";
+    public string? SetId { get; init; }
+    public string? ItemId { get; init; }
+    public string? Field { get; init; }
+
+    public string Display
+    {
+        get
+        {
+            var context = new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(SetId)) context.Add($"set {SetId}");
+            if (!string.IsNullOrWhiteSpace(ItemId)) context.Add($"item {ItemId}");
+            if (!string.IsNullOrWhiteSpace(Field)) context.Add(Field!);
+
+            return context.Count == 0
+                ? $"[{Code}] {Message}"
+                : $"[{Code}] {Message}  ({string.Join("; ", context)})";
+        }
+    }
+
+    public override string ToString() => Display;
+
+    public static DraftErrorInfo Parse(JsonElement element)
+    {
+        return new DraftErrorInfo
+        {
+            Code = JsonText.String(element, "code"),
+            Message = JsonText.String(element, "message"),
+            SetId = JsonText.NullableString(element, "setId"),
+            ItemId = JsonText.NullableString(element, "itemId"),
+            Field = JsonText.NullableString(element, "field")
+        };
+    }
+}
+
+public sealed class DraftValidationResult
+{
+    public bool Valid { get; init; }
+    public bool SaveEligible { get; init; }
+    public IReadOnlyList<DraftErrorInfo> Errors { get; init; } = Array.Empty<DraftErrorInfo>();
+
+    public static DraftValidationResult Parse(JsonElement result)
+    {
+        var errors = new List<DraftErrorInfo>();
+
+        if (result.ValueKind == JsonValueKind.Object &&
+            result.TryGetProperty("errors", out var errorElements) &&
+            errorElements.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var error in errorElements.EnumerateArray())
+            {
+                errors.Add(DraftErrorInfo.Parse(error));
+            }
+        }
+
+        return new DraftValidationResult
+        {
+            Valid = JsonText.Bool(result, "valid"),
+            SaveEligible = JsonText.Bool(result, "saveEligible"),
+            Errors = errors
+        };
+    }
+}
+
+public sealed class RelativeConversionResult
+{
+    public string Identity { get; init; } = "";
+    public string? Instance { get; init; }
+    public string Basis { get; init; } = "";
+    public RectInfo BasisRect { get; init; } = new(0, 0, 1, 1);
+    public RelativeRectValues Normalized { get; init; } = new(0, 0, 1, 1);
+    public RectInfo RoundTripRect { get; init; } = new(0, 0, 1, 1);
+    public bool Reachable { get; init; }
+    public double? VisibleRatio { get; init; }
+
+    public static RelativeConversionResult Parse(JsonElement result)
+    {
+        var anchor = JsonText.Object(result, "anchor");
+        var basisRect = JsonText.Rect(result, "basisRect") ?? new RectInfo(0, 0, 1, 1);
+        var normalized = JsonText.Object(result, "normalized");
+        var roundTrip = JsonText.Rect(result, "roundTripRect") ?? new RectInfo(0, 0, 1, 1);
+
+        return new RelativeConversionResult
+        {
+            Identity = JsonText.String(anchor, "identity"),
+            Instance = JsonText.NullableString(anchor, "instance"),
+            Basis = JsonText.String(result, "basis"),
+            BasisRect = basisRect,
+            Normalized = new RelativeRectValues(
+                JsonText.Double(normalized, "x"),
+                JsonText.Double(normalized, "y"),
+                JsonText.Double(normalized, "w"),
+                JsonText.Double(normalized, "h")),
+            RoundTripRect = roundTrip,
+            Reachable = JsonText.Bool(result, "reachable"),
+            VisibleRatio = JsonText.NullableDouble(result, "visibleRatio")
+        };
+    }
+}
+
 public sealed class EditorException : Exception
 {
     public EditorException(

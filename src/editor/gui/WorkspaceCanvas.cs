@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Automation;
@@ -17,9 +18,11 @@ public sealed class WorkspaceCanvas : FrameworkElement
     private static readonly Brush ItemFallbackBrush = Freeze(new SolidColorBrush(Color.FromRgb(116, 84, 28)));
     private static readonly Brush ItemUnavailableBrush = Freeze(new SolidColorBrush(Color.FromRgb(58, 58, 62)));
     private static readonly Brush ItemSelectedBrush = Freeze(new SolidColorBrush(Color.FromRgb(120, 90, 30)));
+    private static readonly Brush DraftOverlayBrush = Freeze(new SolidColorBrush(Color.FromArgb(70, 255, 196, 87)));
     private static readonly Brush TextBrush = Freeze(new SolidColorBrush(Color.FromRgb(235, 235, 240)));
     private static readonly Brush MutedTextBrush = Freeze(new SolidColorBrush(Color.FromRgb(165, 170, 180)));
     private static readonly Brush WarningBrush = Freeze(new SolidColorBrush(Color.FromRgb(255, 196, 87)));
+    private static readonly Brush HandleBrush = Freeze(new SolidColorBrush(Color.FromRgb(255, 213, 79)));
     private static readonly Pen MonitorBorderPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(90, 170, 210)), 1.5));
     private static readonly Pen MonitorPrimaryPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(110, 210, 250)), 2.0));
     private static readonly Pen MonitorSelectedPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(255, 213, 79)), 3.0));
@@ -29,47 +32,97 @@ public sealed class WorkspaceCanvas : FrameworkElement
     });
     private static readonly Pen ItemBorderPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(180, 200, 220)), 1.0));
     private static readonly Pen ItemSelectedPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(255, 213, 79)), 2.5));
+    private static readonly Pen DraftPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(255, 190, 70)), 2.0)
+    {
+        DashStyle = new DashStyle(new double[] { 6, 3 }, 0)
+    });
+    private static readonly Pen SavedOutlinePen = Freeze(new Pen(new SolidColorBrush(Color.FromArgb(150, 170, 175, 190)), 1.0)
+    {
+        DashStyle = new DashStyle(new double[] { 3, 4 }, 0)
+    });
+    private static readonly Pen HandlePen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(40, 36, 20)), 1.0));
+    private static readonly Pen GridPen = Freeze(new Pen(new SolidColorBrush(Color.FromArgb(28, 255, 255, 255)), 1.0));
     private static readonly Typeface Typeface = new("Segoe UI");
+    private const double HandleRadius = 7.0;
+    private const double HandleSize = 7.0;
 
     private IReadOnlyList<MonitorInfo> _monitors = Array.Empty<MonitorInfo>();
     private IReadOnlyList<ProjectedItem> _items = Array.Empty<ProjectedItem>();
     private HashSet<string> _warningItemIds = new(StringComparer.Ordinal);
+    private Dictionary<string, RectInfo> _draftRects = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, FormattedText> _textCache = new(StringComparer.Ordinal);
     private Rect _virtualScreen = new(0, 0, 1, 1);
+    private RectInfo? _virtualScreenSource;
     private bool _needsInitialFit;
     private bool _panning;
     private Point _lastPanPoint;
+
+    private DragMode _dragMode;
+    private ResizeHandle _resizeHandle;
+    private int _dragItemIndex = -1;
+    private string? _dragItemId;
+    private Point _dragStartScreen;
+    private Rect _dragStartWorldRect;
+    private RectInfo? _interactiveRect;
+    private bool _dragMoved;
+    private double _cachedPixelsPerDip;
 
     public WorkspaceCanvas()
     {
         Focusable = true;
         ClipToBounds = true;
         SnapsToDevicePixels = true;
-        AutomationProperties.SetName(this, "Workspace monitor canvas. Use the set, monitor, and item lists for keyboard navigation.");
-        AutomationProperties.SetHelpText(this, "Shows monitor bounds, work areas, and effective item rectangles in DevWS virtual-screen coordinates. Read-only.");
+        AutomationProperties.SetName(this, "Workspace monitor canvas. Drag or resize the selected item; use the lists for keyboard navigation.");
+        AutomationProperties.SetHelpText(this, "Shows monitor bounds, work areas, saved item rectangles, and local draft rectangles in DevWS virtual-screen coordinates.");
     }
 
     public CanvasTransform Transform { get; } = new();
     public int SelectedItemIndex { get; private set; } = -1;
     public int SelectedMonitorIndex { get; private set; } = -1;
+    public RectInfo? InteractiveDraftRect => _interactiveRect;
+    public double LastRenderMs { get; private set; }
+    public long RenderCount { get; private set; }
+    public int CachedTextCount => _textCache.Count;
 
     public event EventHandler? SelectionChanged;
     public event EventHandler<Point>? PointerWorldChanged;
+    public event EventHandler<RectInfo>? DraftRectChanging;
+    public event EventHandler<RectInfo>? DraftRectCommitted;
+    public event EventHandler? DraftRectCancelled;
 
     public void SetData(
         IReadOnlyList<MonitorInfo> monitors,
         IReadOnlyList<ProjectedItem> items,
         RectInfo? virtualScreen,
-        ISet<string>? warningItemIds)
+        ISet<string>? warningItemIds,
+        IReadOnlyDictionary<string, RectInfo>? draftRects = null)
     {
         _monitors = monitors;
         _items = items;
         _warningItemIds = warningItemIds is null
             ? new HashSet<string>(StringComparer.Ordinal)
             : new HashSet<string>(warningItemIds, StringComparer.Ordinal);
+        _draftRects = draftRects is null
+            ? new Dictionary<string, RectInfo>(StringComparer.Ordinal)
+            : new Dictionary<string, RectInfo>(draftRects, StringComparer.Ordinal);
+        _virtualScreenSource = virtualScreen;
         _virtualScreen = ComputeVirtualScreen(virtualScreen);
+        _interactiveRect = null;
+        _dragMode = DragMode.None;
         SelectedItemIndex = -1;
         SelectedMonitorIndex = -1;
         _needsInitialFit = true;
+        _textCache.Clear();
+        InvalidateVisual();
+    }
+
+    public void SetDraftRects(IReadOnlyDictionary<string, RectInfo>? draftRects)
+    {
+        _draftRects = draftRects is null
+            ? new Dictionary<string, RectInfo>(StringComparer.Ordinal)
+            : new Dictionary<string, RectInfo>(draftRects, StringComparer.Ordinal);
+        _interactiveRect = null;
+        _virtualScreen = ComputeVirtualScreen(_virtualScreenSource);
         InvalidateVisual();
     }
 
@@ -107,6 +160,7 @@ public sealed class WorkspaceCanvas : FrameworkElement
         }
 
         SelectedItemIndex = index;
+        CancelInteractiveEdit();
         SelectionChanged?.Invoke(this, EventArgs.Empty);
         InvalidateVisual();
     }
@@ -123,6 +177,23 @@ public sealed class WorkspaceCanvas : FrameworkElement
         InvalidateVisual();
     }
 
+    public RectInfo? GetSelectedDisplayRect()
+    {
+        if (SelectedItemIndex < 0 || SelectedItemIndex >= _items.Count)
+        {
+            return null;
+        }
+
+        var item = _items[SelectedItemIndex];
+
+        if (_interactiveRect is not null)
+        {
+            return _interactiveRect;
+        }
+
+        return _draftRects.TryGetValue(item.ItemId, out var draft) ? draft : item.Rect;
+    }
+
     protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
     {
         base.OnRenderSizeChanged(sizeInfo);
@@ -135,12 +206,15 @@ public sealed class WorkspaceCanvas : FrameworkElement
 
     protected override void OnRender(DrawingContext drawingContext)
     {
+        var renderWatch = Stopwatch.StartNew();
         base.OnRender(drawingContext);
         drawingContext.DrawRectangle(BackgroundBrush, null, new Rect(RenderSize));
 
         if (_monitors.Count == 0 && _items.Count == 0)
         {
             DrawText(drawingContext, "No monitors or configured items reported.", new Point(16, 16), 14, MutedTextBrush);
+            renderWatch.Stop();
+            RecordRender(renderWatch);
             return;
         }
 
@@ -153,23 +227,49 @@ public sealed class WorkspaceCanvas : FrameworkElement
 
         for (var index = 0; index < _items.Count; index++)
         {
-            DrawItem(drawingContext, _items[index], index);
+            if (index != SelectedItemIndex)
+            {
+                DrawItem(drawingContext, _items[index], index);
+            }
         }
 
+        if (SelectedItemIndex >= 0 && SelectedItemIndex < _items.Count)
+        {
+            DrawItem(drawingContext, _items[SelectedItemIndex], SelectedItemIndex);
+        }
+
+        var draftCount = _draftRects.Count > 0 ? _draftRects.Count : 0;
+        var header = $"{_monitors.Count} monitors  |  {_items.Count} items  |  {Transform.Describe()}" +
+                     (draftCount > 0 ? $"  |  {draftCount} local draft" : "");
+        DrawText(drawingContext, header, new Point(12, 8), 12, MutedTextBrush);
         DrawText(
             drawingContext,
-            $"{_monitors.Count} monitors  |  {_items.Count} items  |  {Transform.Describe()}",
-            new Point(12, 8),
-            12,
+            "solid = saved projection  ·  dashed = local draft (not backend-validated)  ·  handles = drag/resize",
+            new Point(12, Math.Max(12, RenderSize.Height - 22)),
+            11,
             MutedTextBrush);
+
+        var selectedRect = GetSelectedDisplayRect();
+        AutomationProperties.SetHelpText(
+            this,
+            $"Workspace canvas. {Transform.Describe()}. " +
+            (selectedRect is null
+                ? "No item selected."
+                : $"Selected {_items[SelectedItemIndex].ItemId} at {selectedRect.Display}."));
+
+        renderWatch.Stop();
+        RecordRender(renderWatch);
+    }
+
+    private void RecordRender(Stopwatch watch)
+    {
+        LastRenderMs = watch.Elapsed.TotalMilliseconds;
+        RenderCount++;
     }
 
     private void DrawGrid(DrawingContext drawingContext)
     {
         const int step = 200;
-        var pen = new Pen(new SolidColorBrush(Color.FromArgb(28, 255, 255, 255)), 1);
-        pen.Freeze();
-
         var startX = (int)Math.Floor(_virtualScreen.Left / step) * step;
         var endX = (int)Math.Ceiling(_virtualScreen.Right / step) * step;
         var startY = (int)Math.Floor(_virtualScreen.Top / step) * step;
@@ -179,14 +279,14 @@ public sealed class WorkspaceCanvas : FrameworkElement
         {
             var top = Transform.WorldToScreen(new Point(x, _virtualScreen.Top));
             var bottom = Transform.WorldToScreen(new Point(x, _virtualScreen.Bottom));
-            drawingContext.DrawLine(pen, top, bottom);
+            drawingContext.DrawLine(GridPen, top, bottom);
         }
 
         for (var y = startY; y <= endY; y += step)
         {
             var left = Transform.WorldToScreen(new Point(_virtualScreen.Left, y));
             var right = Transform.WorldToScreen(new Point(_virtualScreen.Right, y));
-            drawingContext.DrawLine(pen, left, right);
+            drawingContext.DrawLine(GridPen, left, right);
         }
     }
 
@@ -216,10 +316,22 @@ public sealed class WorkspaceCanvas : FrameworkElement
 
     private void DrawItem(DrawingContext drawingContext, ProjectedItem item, int index)
     {
-        var rect = WorldRectToScreen(item.Rect.ToRect());
+        var savedRect = WorldRectToScreen(item.Rect.ToRect());
         var selected = index == SelectedItemIndex;
+        _draftRects.TryGetValue(item.ItemId, out var draftRect);
+        var displayWorld = selected && _interactiveRect is not null
+            ? _interactiveRect
+            : draftRect ?? item.Rect;
+        var rect = WorldRectToScreen(displayWorld.ToRect());
         var brush = selected ? ItemSelectedBrush : BrushForSource(item.Source, item.Enabled);
         var pen = selected ? ItemSelectedPen : ItemBorderPen;
+
+        if (draftRect is not null || (selected && _interactiveRect is not null))
+        {
+            drawingContext.DrawRectangle(null, SavedOutlinePen, savedRect);
+            drawingContext.DrawRectangle(DraftOverlayBrush, null, rect);
+            pen = DraftPen;
+        }
 
         drawingContext.DrawRectangle(brush, pen, rect);
         DrawText(drawingContext, item.ItemId, new Point(rect.Left + 5, rect.Top + 4), 11, TextBrush);
@@ -230,12 +342,45 @@ public sealed class WorkspaceCanvas : FrameworkElement
             DrawText(drawingContext, detail, new Point(rect.Left + 5, rect.Top + 20), 9, MutedTextBrush);
         }
 
+        if (selected && draftRect is not null)
+        {
+            DrawText(drawingContext, "DRAFT", new Point(rect.Left + 5, Math.Max(rect.Top + 4, rect.Bottom - 18)), 9, WarningBrush);
+        }
+
         if (_warningItemIds.Contains(item.ItemId))
         {
             var marker = new Point(rect.Right - 12, rect.Top + 4);
             drawingContext.DrawEllipse(WarningBrush, null, marker, 5, 5);
             DrawText(drawingContext, "!", new Point(marker.X - 2.5, marker.Y - 6), 9, BackgroundBrush);
         }
+
+        if (selected)
+        {
+            DrawHandles(drawingContext, rect);
+        }
+    }
+
+    private void DrawHandles(DrawingContext drawingContext, Rect rect)
+    {
+        foreach (var point in HandlePoints(rect))
+        {
+            drawingContext.DrawRectangle(
+                HandleBrush,
+                HandlePen,
+                new Rect(point.X - HandleSize / 2, point.Y - HandleSize / 2, HandleSize, HandleSize));
+        }
+    }
+
+    private static IEnumerable<Point> HandlePoints(Rect rect)
+    {
+        yield return rect.TopLeft;
+        yield return rect.TopRight;
+        yield return rect.BottomRight;
+        yield return rect.BottomLeft;
+        yield return new Point(rect.Left + rect.Width / 2, rect.Top);
+        yield return new Point(rect.Right, rect.Top + rect.Height / 2);
+        yield return new Point(rect.Left + rect.Width / 2, rect.Bottom);
+        yield return new Point(rect.Left, rect.Top + rect.Height / 2);
     }
 
     private static Brush BrushForSource(string source, bool enabled)
@@ -265,7 +410,31 @@ public sealed class WorkspaceCanvas : FrameworkElement
 
     private void DrawText(DrawingContext drawingContext, string text, Point origin, double size, Brush brush)
     {
-        var dpi = VisualTreeHelper.GetDpi(this);
+        drawingContext.DrawText(GetText(text, size, brush), origin);
+    }
+
+    private FormattedText GetText(string text, double size, Brush brush)
+    {
+        var dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+
+        if (Math.Abs(dpi - _cachedPixelsPerDip) > 0.0001)
+        {
+            _textCache.Clear();
+            _cachedPixelsPerDip = dpi;
+        }
+
+        var key = $"{size:0.###}|{brush.GetHashCode()}|{text}";
+
+        if (_textCache.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        if (_textCache.Count > 4096)
+        {
+            _textCache.Clear();
+        }
+
         var formatted = new FormattedText(
             text,
             CultureInfo.InvariantCulture,
@@ -273,8 +442,9 @@ public sealed class WorkspaceCanvas : FrameworkElement
             Typeface,
             size,
             brush,
-            dpi.PixelsPerDip);
-        drawingContext.DrawText(formatted, origin);
+            dpi);
+        _textCache[key] = formatted;
+        return formatted;
     }
 
     protected override void OnMouseWheel(MouseWheelEventArgs e)
@@ -305,11 +475,44 @@ public sealed class WorkspaceCanvas : FrameworkElement
         }
 
         var screen = e.GetPosition(this);
+        var selected = GetSelectedDisplayRect();
+
+        if (selected is not null && SelectedItemIndex >= 0)
+        {
+            var selectedScreen = WorldRectToScreen(selected.ToRect());
+            var handle = RectEditMath.HandleAt(selectedScreen, screen, HandleRadius);
+
+            if (handle != ResizeHandle.None)
+            {
+                BeginDrag(SelectedItemIndex, DragMode.Resize, handle, screen, selected);
+                e.Handled = true;
+                return;
+            }
+
+            if (selectedScreen.Contains(screen))
+            {
+                BeginDrag(SelectedItemIndex, DragMode.Move, ResizeHandle.None, screen, selected);
+                e.Handled = true;
+                return;
+            }
+        }
+
         var itemIndex = HitTestItem(screen);
 
         if (itemIndex >= 0)
         {
             SelectItem(itemIndex);
+
+            if (SelectedItemIndex >= 0 && _items[SelectedItemIndex].ItemId == _items[itemIndex].ItemId)
+            {
+                var rect = GetSelectedDisplayRect();
+
+                if (rect is not null)
+                {
+                    BeginDrag(SelectedItemIndex, DragMode.Move, ResizeHandle.None, screen, rect);
+                }
+            }
+
             e.Handled = true;
             return;
         }
@@ -329,6 +532,16 @@ public sealed class WorkspaceCanvas : FrameworkElement
             Transform.PanBy(position - _lastPanPoint);
             _lastPanPoint = position;
             InvalidateVisual();
+            return;
+        }
+
+        if (_dragMode != DragMode.None)
+        {
+            UpdateDrag(position);
+        }
+        else
+        {
+            UpdateCursor(position);
         }
 
         PointerWorldChanged?.Invoke(this, Transform.ScreenToWorld(position));
@@ -343,12 +556,50 @@ public sealed class WorkspaceCanvas : FrameworkElement
             _panning = false;
             ReleaseMouseCapture();
             e.Handled = true;
+            return;
+        }
+
+        if (_dragMode != DragMode.None && e.ChangedButton == MouseButton.Left)
+        {
+            var committed = _interactiveRect;
+            var moved = _dragMoved;
+            EndDrag();
+
+            if (moved && committed is not null)
+            {
+                DraftRectCommitted?.Invoke(this, committed);
+            }
+            else
+            {
+                DraftRectCancelled?.Invoke(this, EventArgs.Empty);
+            }
+
+            e.Handled = true;
         }
     }
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
+
+        if (e.Key == Key.Escape)
+        {
+            if (_dragMode != DragMode.None)
+            {
+                CancelInteractiveEdit();
+                DraftRectCancelled?.Invoke(this, EventArgs.Empty);
+            }
+            else
+            {
+                SelectedItemIndex = -1;
+                SelectedMonitorIndex = -1;
+                SelectionChanged?.Invoke(this, EventArgs.Empty);
+                InvalidateVisual();
+            }
+
+            e.Handled = true;
+            return;
+        }
 
         if (e.Key == Key.F)
         {
@@ -371,16 +622,6 @@ public sealed class WorkspaceCanvas : FrameworkElement
             return;
         }
 
-        if (e.Key == Key.Escape)
-        {
-            SelectedItemIndex = -1;
-            SelectedMonitorIndex = -1;
-            SelectionChanged?.Invoke(this, EventArgs.Empty);
-            InvalidateVisual();
-            e.Handled = true;
-            return;
-        }
-
         var step = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 120 : 40;
         var pan = e.Key switch
         {
@@ -399,13 +640,122 @@ public sealed class WorkspaceCanvas : FrameworkElement
         }
     }
 
+    private void BeginDrag(int itemIndex, DragMode mode, ResizeHandle handle, Point screen, RectInfo startRect)
+    {
+        _dragMode = mode;
+        _resizeHandle = handle;
+        _dragItemIndex = itemIndex;
+        _dragItemId = _items[itemIndex].ItemId;
+        _dragStartScreen = screen;
+        _dragStartWorldRect = startRect.ToRect();
+        _interactiveRect = startRect;
+        _dragMoved = false;
+        CaptureMouse();
+    }
+
+    private void UpdateDrag(Point position)
+    {
+        if (!_dragMoved)
+        {
+            var distance = position - _dragStartScreen;
+
+            if (Math.Abs(distance.X) < 3 && Math.Abs(distance.Y) < 3)
+            {
+                return;
+            }
+
+            _dragMoved = true;
+        }
+
+        if (_dragItemIndex < 0 || _dragItemIndex >= _items.Count)
+        {
+            return;
+        }
+
+        var delta = (position - _dragStartScreen) / Math.Max(Transform.Zoom, 0.000001);
+        var dx = (int)Math.Round(delta.X, MidpointRounding.AwayFromZero);
+        var dy = (int)Math.Round(delta.Y, MidpointRounding.AwayFromZero);
+        var start = new RectInfo(
+            (int)Math.Round(_dragStartWorldRect.X),
+            (int)Math.Round(_dragStartWorldRect.Y),
+            Math.Max(1, (int)Math.Round(_dragStartWorldRect.Width)),
+            Math.Max(1, (int)Math.Round(_dragStartWorldRect.Height)));
+
+        RectInfo updated;
+
+        try
+        {
+            updated = _dragMode == DragMode.Move
+                ? RectEditMath.Move(start, dx, dy)
+                : RectEditMath.Resize(start, _resizeHandle, dx, dy);
+        }
+        catch (OverflowException)
+        {
+            return;
+        }
+
+        if (updated.W <= 0 || updated.H <= 0)
+        {
+            return;
+        }
+
+        _interactiveRect = updated;
+        DraftRectChanging?.Invoke(this, updated);
+        InvalidateVisual();
+    }
+
+    private void EndDrag()
+    {
+        _dragMode = DragMode.None;
+        _dragItemIndex = -1;
+        _dragItemId = null;
+        _dragMoved = false;
+        _interactiveRect = null;
+        ReleaseMouseCapture();
+        InvalidateVisual();
+    }
+
+    public void CancelInteractiveEdit()
+    {
+        if (_dragMode != DragMode.None)
+        {
+            EndDrag();
+        }
+    }
+
+    private void UpdateCursor(Point position)
+    {
+        var selected = GetSelectedDisplayRect();
+
+        if (selected is null || SelectedItemIndex < 0)
+        {
+            Cursor = Cursors.Arrow;
+            return;
+        }
+
+        var screen = WorldRectToScreen(selected.ToRect());
+        var handle = RectEditMath.HandleAt(screen, position, HandleRadius);
+
+        Cursor = handle switch
+        {
+            ResizeHandle.NorthWest or ResizeHandle.SouthEast => Cursors.SizeNWSE,
+            ResizeHandle.NorthEast or ResizeHandle.SouthWest => Cursors.SizeNESW,
+            ResizeHandle.North or ResizeHandle.South => Cursors.SizeNS,
+            ResizeHandle.East or ResizeHandle.West => Cursors.SizeWE,
+            _ => screen.Contains(position) ? Cursors.SizeAll : Cursors.Arrow
+        };
+    }
+
     private int HitTestItem(Point screen)
     {
         var world = Transform.ScreenToWorld(screen);
 
         for (var index = _items.Count - 1; index >= 0; index--)
         {
-            if (_items[index].Rect.ToRect().Contains(world))
+            var item = _items[index];
+            var rect = _draftRects.TryGetValue(item.ItemId, out var draft) ? draft : item.Rect;
+
+            if (rect.ToRect().Contains(world))
             {
                 return index;
             }
@@ -438,6 +788,7 @@ public sealed class WorkspaceCanvas : FrameworkElement
 
         var rects = _monitors.Select(monitor => monitor.MonitorRect)
             .Concat(_items.Select(item => item.Rect))
+            .Concat(_draftRects.Values)
             .ToList();
 
         if (rects.Count == 0)
@@ -461,5 +812,12 @@ public sealed class WorkspaceCanvas : FrameworkElement
     {
         freezable.Freeze();
         return freezable;
+    }
+
+    private enum DragMode
+    {
+        None,
+        Move,
+        Resize
     }
 }
