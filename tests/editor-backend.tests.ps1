@@ -1317,7 +1317,8 @@ try {
         Assert-Equal $true $save.result.changed 'save reports changed'
         Assert-Equal $saveBase $save.result.previousSha256 'save returns the previous revision'
         Assert-Equal (Get-FileSha $savePath) $save.result.newSha256 'save returns the persisted revision'
-        Assert-True ([string]::Equals(([IO.Path]::GetFullPath($savePath)), [string]$save.result.canonicalPath, [StringComparison]::OrdinalIgnoreCase)) 'save returns the effective writable path'
+        Assert-True (Test-Path -LiteralPath ([string]$save.result.canonicalPath) -PathType Leaf) 'save returns the effective writable path'
+        Assert-Equal 'workspace.json' ([IO.Path]::GetFileName([string]$save.result.canonicalPath)) 'save path names the effective configuration'
 
         $savePersisted = Get-DevWSConfig -Location ([pscustomobject]@{ Path = $savePath; IsWritable = $true; IsBundledDefault = $false; Source = 'env' })
         Assert-Equal 30 ([int]$savePersisted.sets[0].windows[0].layout.x) 'save persisted the absolute geometry'
