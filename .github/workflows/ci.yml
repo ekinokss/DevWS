@@ -238,3 +238,38 @@ jobs:
           else {
               Write-Output 'CI RESULT: PASSED - only the explicit Medium-token integration skip was accepted.'
           }
+
+  editor-gui:
+    name: WPF editor build and deterministic tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1  # v5
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build editor and test harness
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet build tests/editor-gui/DevWS.Editor.Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) {
+              throw "editor build exited with $LASTEXITCODE"
+          }
+
+      - name: Run deterministic editor tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet run --project tests/editor-gui/DevWS.Editor.Tests.csproj -c Release --no-build
+          if ($LASTEXITCODE -ne 0) {
+              throw "editor tests exited with $LASTEXITCODE"
+          }
