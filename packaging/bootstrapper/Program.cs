@@ -103,7 +103,7 @@ internal static class Program
         PayloadArchive.ExtractEmbedded(staging.Root);
         Console.WriteLine("[setup] embedded payload extracted");
 
-        var exitCode = ProcessRunner.RunInstaller(powerShell.Path, staging.InstallScript, staging.Root);
+        var exitCode = ProcessRunner.RunInstaller(powerShell.Path, staging.InstallScript, staging.Root, identity.InstallLocation);
         Console.WriteLine($"[setup] installer exited with code {exitCode}");
         if (exitCode != 0)
         {
@@ -133,7 +133,7 @@ internal static class Program
         PayloadArchive.ExtractEmbedded(staging.Root);
         Console.WriteLine("[setup] embedded payload extracted");
 
-        var exitCode = ProcessRunner.RunUninstaller(powerShell.Path, Path.Combine(staging.Root, "uninstall.ps1"), staging.Root);
+        var exitCode = ProcessRunner.RunUninstaller(powerShell.Path, Path.Combine(staging.Root, "uninstall.ps1"), staging.Root, identity.InstallLocation);
         Console.WriteLine($"[setup] uninstaller exited with code {exitCode}");
         if (exitCode != 0)
         {
