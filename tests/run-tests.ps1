@@ -24313,7 +24313,7 @@ Write-Output "REPLACEMENT-LOADED"
             $byId[$result.Id] = $result
         }
 
-        Assert-Equal 25 @($summary.Results).Count "health check count includes the privileged-runtime checks"
+        Assert-Equal 26 @($summary.Results).Count "health check count includes the editor and privileged-runtime checks"
 
         foreach ($id in @(
             "os-windows", "powershell-7", "windows-terminal", "autohotkey",
@@ -41145,7 +41145,7 @@ exit 0
         $context = New-P2EHealthStubContext -Name "flood" -ChildBody $floodBody
         $run = Invoke-P2EHealthRun -Context $context -TempDir $tempDir
 
-        Assert-Equal 25 @($run.Summary.Results).Count "health check count is unchanged"
+        Assert-Equal 26 @($run.Summary.Results).Count "health check count includes the editor payload check"
         Assert-Equal $true $run.ById["ws-list"].Ok "a flooding ws list still passes"
         Assert-Equal (Join-Path (Split-Path -Parent $context.CanonicalPath) "sentinel-config.json") $run.ConfigAfter "DEVWS_CONFIG is restored"
         Assert-Equal 0 @(Get-ChildItem -LiteralPath $tempDir -Recurse -File -ErrorAction SilentlyContinue).Count "no temporary files are created by the health check"
