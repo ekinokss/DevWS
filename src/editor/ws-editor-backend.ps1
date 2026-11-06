@@ -1,22 +1,22 @@
-# DevWS v0.4 P6 read-only editor backend.
+# DevWS v0.4 P7 editor backend.
 #
 # Normal-integrity, stdin/stdout JSON Lines protocol host. This file deliberately
 # loads only the six approved DevWS libraries plus the local projection helper.
 # It performs no configuration writes, no worker/broker/coordinator contact, and
-# no live-window operations. P6 adds authoritative `preview`; P5 added structural `validate` and authoritative
-# relative-geometry `convert`; `save` and `preview` remain unimplemented.
+# no live-window operations. P7 adds guarded `save`; P6 added authoritative `preview`.
+# relative-geometry `convert`.
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:Protocol = 'devws-editor/1'
-$script:BackendVersion = '0.4.0-p6'
+$script:BackendVersion = '0.4.0-p7'
 $script:MaxRequestBytes = 4194304
 $script:MaxResponseBytes = 16777216
 $script:MaxJsonDepth = 32
 $script:MaxConfigBytes = 4194304
-$script:SupportedOps = @('hello', 'inspect', 'read-config', 'project', 'validate', 'preview', 'convert', 'shutdown')
-$script:UnsupportedOps = @('save')
+$script:SupportedOps = @('hello', 'inspect', 'read-config', 'project', 'validate', 'preview', 'convert', 'save', 'shutdown')
+$script:UnsupportedOps = @()
 
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -309,6 +309,39 @@ function Test-EditorParams {
         return $null
     }
 
+    if ($Op -eq 'save') {
+        $unknown = @($names | Where-Object { $_ -notin @('draft', 'baseSha256', 'setId', 'topologyFingerprint', 'confirm', 'reviewToken') })
+        if ($unknown.Count -gt 0) {
+            return New-EditorError -Code 'request-invalid' -Message "Unknown save parameter(s): $($unknown -join ', ')."
+        }
+        if ($names -notcontains 'draft' -or $Params.draft -isnot [System.Management.Automation.PSCustomObject]) {
+            return New-EditorError -Code 'request-invalid' -Message "save requires a 'draft' JSON object."
+        }
+        if ($names -notcontains 'baseSha256' -or $Params.baseSha256 -isnot [string] -or $Params.baseSha256 -notmatch '^[0-9a-f]{64}$') {
+            return New-EditorError -Code 'request-invalid' -Message "save 'baseSha256' must be 64 lowercase hexadecimal characters."
+        }
+        if ($names -contains 'setId' -and ($Params.setId -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Params.setId))) {
+            return New-EditorError -Code 'request-invalid' -Message "save 'setId' must be a non-empty string when supplied."
+        }
+        if ($names -contains 'topologyFingerprint' -and ($Params.topologyFingerprint -isnot [string] -or $Params.topologyFingerprint -notmatch '^[0-9A-Fa-f]{64}$')) {
+            return New-EditorError -Code 'request-invalid' -Message "save 'topologyFingerprint' must be 64 hexadecimal characters."
+        }
+        if ($names -notcontains 'confirm' -or $Params.confirm -isnot [bool] -or -not [bool]$Params.confirm) {
+            return New-EditorError -Code 'request-invalid' -Message "save requires 'confirm' to be exactly true."
+        }
+        if ($names -contains 'reviewToken' -and $null -ne $Params.reviewToken -and
+            ($Params.reviewToken -isnot [string] -or $Params.reviewToken -notmatch '^[0-9a-f]{64}$')) {
+            return New-EditorError -Code 'request-invalid' -Message "save 'reviewToken' must be null or 64 lowercase hexadecimal characters."
+        }
+
+        $draftBytes = [System.Text.Encoding]::UTF8.GetByteCount(($Params.draft | ConvertTo-Json -Compress -Depth $script:MaxJsonDepth))
+        if ($draftBytes -gt $script:MaxConfigBytes) {
+            return New-EditorError -Code 'request-invalid' -Message "The save draft is $draftBytes bytes; the limit is $($script:MaxConfigBytes) bytes." -Details ([ordered]@{ sizeBytes = $draftBytes })
+        }
+
+        return $null
+    }
+
     if ($Op -eq 'validate') {
         $unknown = @($names | Where-Object { $_ -ne 'draft' })
         if ($unknown.Count -gt 0) {
@@ -407,13 +440,13 @@ function Get-EditorHello {
             maxConfigBytes   = $script:MaxConfigBytes
             maxInflight      = 1
             readTimeoutMs    = 10000
-            saveTimeoutMs    = $null
+            saveTimeoutMs    = 30000
         }
         capabilities   = [pscustomobject][ordered]@{
             configWritable    = $configWritable
             topologyReadable  = $topologyReadable
-            readOnly          = $true
-            saveSupported     = $false
+            readOnly          = $false
+            saveSupported     = $true
             validateSupported = $true
             previewSupported  = $true
             convertSupported  = $true
@@ -439,13 +472,13 @@ function Get-EditorInspectResult {
         sets         = @($sets)
         topology     = Get-EditorTopologyProjection -Topology $topology
         capabilities = [pscustomobject][ordered]@{
-            canSave      = $false
+            canSave      = [bool]$Snapshot.Location.IsWritable
             canProject   = $true
             canValidate  = $true
             canPreview   = $true
             canConvert   = $true
-            readOnly     = $true
-            reason       = 'p6-preview-read-only'
+            readOnly     = $false
+            reason       = if ($Snapshot.Location.IsWritable) { $null } else { 'config-not-writable' }
         }
     }
 }
@@ -736,6 +769,197 @@ function Invoke-EditorOperation {
             return [pscustomobject]@{
                 Ok          = $true
                 Result      = $preview.Result
+                Warnings    = @($preview.Warnings)
+                ErrorObject = $null
+            }
+        }
+
+        'save' {
+            $draftValidation = Get-EditorDraftValidation -Draft $Params.draft -StartPath $editorRoot
+
+            if (-not [bool]$draftValidation.valid) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'config-invalid' -Message 'The proposed draft is not structurally valid.' -Details ([ordered]@{
+                        validationErrors = @($draftValidation.errors)
+                    })
+                }
+            }
+
+            $snapshot = Read-EditorConfigSnapshot -StartPath $editorRoot -MaxBytes $script:MaxConfigBytes
+
+            if (-not $snapshot.Ok) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code $snapshot.Code -Message $snapshot.Message
+                }
+            }
+
+            if (-not $snapshot.Valid) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'config-invalid' -Message $snapshot.ValidationError
+                }
+            }
+
+            if (-not [bool]$snapshot.Location.IsWritable) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'config-not-writable' -Message "The effective configuration '$($snapshot.Location.Path)' is not writable."
+                }
+            }
+
+            if ([string]$Params.baseSha256 -cne [string]$snapshot.Sha256) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'external-change' -Message 'The canonical configuration changed since the draft was created.' -Details ([ordered]@{
+                        expectedSha256 = [string]$Params.baseSha256
+                        actualSha256   = [string]$snapshot.Sha256
+                    })
+                }
+            }
+
+            $setId = if ($null -ne $Params.PSObject.Properties['setId']) {
+                [string]$Params.setId
+            } else {
+                [string]$snapshot.Config.defaultSet
+            }
+
+            $topology = $null
+            try {
+                $topology = Get-DevWSMonitorTopology
+            }
+            catch {
+                $topology = $null
+            }
+
+            $suppliedTopologyFingerprint = if ($null -ne $Params.PSObject.Properties['topologyFingerprint']) {
+                [string]$Params.topologyFingerprint
+            } else {
+                $null
+            }
+
+            $topologyAvailable = $null -ne $topology -and [bool]$topology.Available
+
+            if (-not [string]::IsNullOrWhiteSpace($suppliedTopologyFingerprint) -and -not $topologyAvailable) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'topology-unavailable' -Message 'A topology fingerprint was supplied, but the monitor topology is unavailable.'
+                }
+            }
+
+            $preview = Get-EditorPreviewCore `
+                -CanonicalConfig $snapshot.Config `
+                -DraftConfig $Params.draft `
+                -SetId $setId `
+                -Topology $topology `
+                -BaseSha256 ([string]$Params.baseSha256) `
+                -CurrentSha256 ([string]$snapshot.Sha256) `
+                -BaseTopologyFingerprint $suppliedTopologyFingerprint
+
+            if (-not [bool]$preview.Ok) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code ([string]$preview.Code) -Message ([string]$preview.Message) -Details $preview.Details
+                }
+            }
+
+            $changed = @($preview.Result.diff).Count -gt 0
+
+            if (-not $changed) {
+                return [pscustomobject]@{
+                    Ok          = $true
+                    Result      = [pscustomobject][ordered]@{
+                        saved         = $true
+                        changed       = $false
+                        previousSha256 = [string]$snapshot.Sha256
+                        newSha256      = [string]$snapshot.Sha256
+                        canonicalPath  = [string]$snapshot.Location.Path
+                    }
+                    Warnings    = @($preview.Warnings)
+                    ErrorObject = $null
+                }
+            }
+
+            $review = $preview.Result.review
+            $reviewToken = if ($null -ne $Params.PSObject.Properties['reviewToken']) {
+                [string]$Params.reviewToken
+            } else {
+                $null
+            }
+
+            if ([bool]$review.requiresAcknowledgement) {
+                if ([string]::IsNullOrWhiteSpace($reviewToken)) {
+                    return [pscustomobject]@{
+                        Ok          = $false
+                        Result      = $null
+                        Warnings    = @()
+                        ErrorObject = New-EditorError -Code 'warnings-not-acknowledged' -Message 'This draft has acknowledgement-required warnings; review them in preview and provide the returned reviewToken.' -Details ([ordered]@{
+                            requiresAcknowledgement = $true
+                            warningIds              = @($review.warningIds)
+                        })
+                    }
+                }
+
+                if ($reviewToken -cne [string]$review.reviewToken) {
+                    return [pscustomobject]@{
+                        Ok          = $false
+                        Result      = $null
+                        Warnings    = @()
+                        ErrorObject = New-EditorError -Code 'review-stale' -Message 'The warning review token no longer matches the current revision, topology, and warning context.'
+                    }
+                }
+            }
+
+            $writtenSha256 = $null
+
+            try {
+                Save-DevWSConfig -Config $Params.draft -Location $snapshot.Location -ExpectedSha256 ([string]$Params.baseSha256) -WrittenSha256 ([ref]$writtenSha256)
+            }
+            catch {
+                $saveCode = if ($null -ne $_.Exception.Data -and $_.Exception.Data.Contains('DevWSCode')) {
+                    [string]$_.Exception.Data['DevWSCode']
+                } else {
+                    'save-failed'
+                }
+
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code $saveCode -Message ([string]$_.Exception.Message)
+                }
+            }
+
+            $after = Read-EditorConfigSnapshot -StartPath $editorRoot -MaxBytes $script:MaxConfigBytes
+            $confirmation = Get-EditorSaveConfirmation -Snapshot $snapshot -AfterSnapshot $after -Changed $true -WrittenSha256 ([string]$writtenSha256)
+
+            if (-not [bool]$confirmation.Ok) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code ([string]$confirmation.Code) -Message ([string]$confirmation.Message) -Details $confirmation.Details
+                }
+            }
+
+            return [pscustomobject]@{
+                Ok          = $true
+                Result      = $confirmation.Result
                 Warnings    = @($preview.Warnings)
                 ErrorObject = $null
             }

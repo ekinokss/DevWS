@@ -167,6 +167,57 @@ public partial class MainWindow : Window
         UpdateStatus();
     }
 
+    private async void SaveButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (!_viewModel.CanSave || _viewModel.Draft is null)
+        {
+            MessageBox.Show(
+                this,
+                _viewModel.SaveAvailabilityText,
+                "Save unavailable",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        var setId = _viewModel.Draft.SetId;
+        var path = string.IsNullOrWhiteSpace(_viewModel.ConfigEffectivePath)
+            ? _viewModel.CanonicalPath
+            : _viewModel.ConfigEffectivePath;
+        var confirmation = MessageBox.Show(
+            this,
+            $"Save set '{setId}' to the configuration file?\n\n{path}\n\n" +
+            "The configuration file will be replaced. Live windows will not be moved, focused, or relaunched.",
+            "Confirm configuration save",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+
+        if (confirmation != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        var saved = await _viewModel.SaveAsync();
+        UpdateDraftOverlay();
+        SyncSelectionFromViewModel();
+        SyncScopeSelection();
+        _viewModel.RefreshEditFields();
+        Canvas.Fit();
+        UpdateStatus();
+
+        if (!saved && _viewModel.SaveOutcomeUncertain)
+        {
+            MessageBox.Show(
+                this,
+                "The save outcome is uncertain. The editor did not retry. Inspect the observed revision before editing or saving again.\n\n" +
+                _viewModel.SaveObservedRevisionText,
+                "Save outcome uncertain",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
     private async void PreviewButton_Click(object sender, RoutedEventArgs e)
     {
         var ok = await _viewModel.PreviewAsync();
@@ -422,7 +473,7 @@ public partial class MainWindow : Window
         base.OnClosing(e);
     }
 
-    public async Task<bool> RunSmokeAsync(string? snapshotPath, string? logPath)
+    public async Task<bool> RunSmokeAsync(string? snapshotPath, string? logPath, bool saveSmoke = false)
     {
         try
         {
@@ -582,7 +633,34 @@ public partial class MainWindow : Window
             var previewReviewRequired = _viewModel.Preview?.Review.RequiresAcknowledgement == true;
             var previewAcknowledged = previewReviewRequired && _viewModel.AcknowledgePreviewWarnings();
             var previewAckOk = !previewReviewRequired || previewAcknowledged;
+            var previewDiffCount = _viewModel.PreviewDiffCount;
+            var previewNoChanges = _viewModel.PreviewNoChanges;
+            var previewWarningCount = _viewModel.PreviewWarningCount;
+            var previewWarningDigest = _viewModel.PreviewWarningDigest;
+            var previewReviewToken = _viewModel.PreviewReviewToken;
+            var previewSavedRect = _viewModel.GetPreviewSavedItem()?.Rect.Display;
+            var previewProposedRect = _viewModel.GetPreviewDraftItem()?.Rect.Display;
+            var previewEffectiveChanged = previewSavedRect is null || previewProposedRect is null
+                ? (bool?)null
+                : !string.Equals(previewSavedRect, previewProposedRect, StringComparison.Ordinal);
             PreviewTabControl.SelectedIndex = previewReviewRequired ? 2 : 1;
+
+            var saveOk = true;
+            var saveDraftClean = true;
+            var saveChanged = false;
+            string? saveError = null;
+            string? saveNewSha256 = null;
+            string? savePersistedSelectedRect = null;
+
+            if (saveSmoke)
+            {
+                saveOk = await _viewModel.SaveAsync();
+                saveDraftClean = !_viewModel.IsDraftDirty;
+                saveChanged = _viewModel.SaveResult?.Changed == true;
+                saveError = _viewModel.SaveErrorText;
+                saveNewSha256 = _viewModel.SaveResult?.NewSha256;
+                savePersistedSelectedRect = _viewModel.SelectedItem?.Item.Rect.Display;
+            }
 
             UpdateDraftOverlay();
             SyncSelectionFromViewModel();
@@ -598,12 +676,6 @@ public partial class MainWindow : Window
                 : _viewModel.DraftPreviewRects.TryGetValue(_viewModel.SelectedItem.Item.ItemId, out var proposed)
                     ? proposed.Display
                     : null;
-            var previewSavedRect = _viewModel.GetPreviewSavedItem()?.Rect.Display;
-            var previewProposedRect = _viewModel.GetPreviewDraftItem()?.Rect.Display;
-            var previewEffectiveChanged = previewSavedRect is null || previewProposedRect is null
-                ? (bool?)null
-                : !string.Equals(previewSavedRect, previewProposedRect, StringComparison.Ordinal);
-
             if (!string.IsNullOrWhiteSpace(snapshotPath))
             {
                 SaveWindowSnapshot(snapshotPath);
@@ -627,7 +699,9 @@ public partial class MainWindow : Window
             var selected = _viewModel.SelectedItem?.Item;
             var evidence = new
             {
-                success = applied && canvasCommit && finalDraftDirty && previewOk && previewAckOk,
+                success = applied && canvasCommit &&
+                    (saveSmoke ? (saveOk && saveDraftClean) : finalDraftDirty) &&
+                    previewOk && previewAckOk,
                 integrity = _viewModel.IntegrityText,
                 processId = Environment.ProcessId,
                 backendPid = _viewModel.BackendPid,
@@ -672,15 +746,26 @@ public partial class MainWindow : Window
                 previewReviewRequired,
                 previewAcknowledged,
                 previewAckOk,
-                previewDiffCount = _viewModel.PreviewDiffCount,
-                previewNoChanges = _viewModel.PreviewNoChanges,
+                previewDiffCount,
+                previewNoChanges,
                 previewSavedRect,
                 previewProposedRect,
                 previewEffectiveChanged,
-                previewWarningCount = _viewModel.PreviewWarningCount,
-                previewWarningDigest = _viewModel.PreviewWarningDigest,
-                previewReviewToken = _viewModel.PreviewReviewToken,
+                previewWarningCount,
+                previewWarningDigest,
+                previewReviewToken,
                 previewMs = Math.Round(_viewModel.LastPreviewMs, 1),
+                saveSmoke,
+                saveOk,
+                saveDraftClean,
+                saveChanged,
+                saveError,
+                saveNewSha256,
+                savePersistedSelectedRect,
+                saveMs = Math.Round(_viewModel.LastSaveMs, 1),
+                saveTransportMs = Math.Round(_viewModel.LastSaveTransportMs, 1),
+                saveParseMs = Math.Round(_viewModel.LastSaveParseMs, 1),
+                saveModelMs = Math.Round(_viewModel.LastSaveModelMs, 1),
                 previewTransportMs = Math.Round(_viewModel.LastPreviewTransportMs, 1),
                 previewParseMs = Math.Round(_viewModel.LastPreviewParseMs, 1),
                 previewModelMs = Math.Round(_viewModel.LastPreviewModelMs, 1),
@@ -791,6 +876,17 @@ public partial class MainWindow : Window
                 evidence.previewWarningDigest,
                 evidence.previewReviewToken,
                 evidence.previewMs,
+                evidence.saveSmoke,
+                evidence.saveOk,
+                evidence.saveDraftClean,
+                evidence.saveChanged,
+                evidence.saveError,
+                evidence.saveNewSha256,
+                evidence.savePersistedSelectedRect,
+                evidence.saveMs,
+                evidence.saveTransportMs,
+                evidence.saveParseMs,
+                evidence.saveModelMs,
                 evidence.previewTransportMs,
                 evidence.previewParseMs,
                 evidence.previewModelMs,

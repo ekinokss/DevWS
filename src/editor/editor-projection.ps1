@@ -1379,6 +1379,70 @@ function Get-EditorWarningReview {
     }
 }
 
+function Get-EditorSaveConfirmation {
+    # Classify the post-commit re-read. A failed or contradictory re-read is
+    # uncertain, never a claim that the file stayed unchanged.
+    param(
+        [Parameter(Mandatory)]$Snapshot,
+        $AfterSnapshot,
+        [bool]$Changed = $true,
+        [AllowNull()][string]$WrittenSha256 = $null
+    )
+
+    if ($null -eq $AfterSnapshot -or -not [bool]$AfterSnapshot.Ok -or
+        -not [bool]$AfterSnapshot.Valid -or [string]::IsNullOrWhiteSpace([string]$AfterSnapshot.Sha256)) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Code    = 'save-outcome-uncertain'
+            Message = 'The save was submitted, but the persisted configuration could not be re-read and validated.'
+            Details = [ordered]@{ observedPath = [string]$Snapshot.Location.Path }
+            Result  = $null
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($WrittenSha256) -and
+        [string]$AfterSnapshot.Sha256 -cne $WrittenSha256) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Code    = 'save-outcome-uncertain'
+            Message = 'The save was submitted, but the persisted bytes do not match the validated temporary write.'
+            Details = [ordered]@{
+                observedSha256 = [string]$AfterSnapshot.Sha256
+                writtenSha256  = $WrittenSha256
+                canonicalPath  = [string]$Snapshot.Location.Path
+            }
+            Result  = $null
+        }
+    }
+
+    if ([string]$AfterSnapshot.Sha256 -ceq [string]$Snapshot.Sha256) {
+        return [pscustomobject][ordered]@{
+            Ok      = $false
+            Code    = 'save-outcome-uncertain'
+            Message = 'The save was submitted, but the persisted revision still matches the base revision.'
+            Details = [ordered]@{
+                observedSha256 = [string]$AfterSnapshot.Sha256
+                canonicalPath  = [string]$Snapshot.Location.Path
+            }
+            Result  = $null
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok      = $true
+        Code    = $null
+        Message = $null
+        Details = $null
+        Result  = [pscustomobject][ordered]@{
+            saved          = $true
+            changed        = $Changed
+            previousSha256 = [string]$Snapshot.Sha256
+            newSha256      = [string]$AfterSnapshot.Sha256
+            canonicalPath  = [string]$Snapshot.Location.Path
+        }
+    }
+}
+
 function Get-EditorPreviewFailure {
     param(
         [Parameter(Mandatory)][string]$Code,

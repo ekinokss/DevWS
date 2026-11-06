@@ -12,6 +12,7 @@ public partial class App : Application
     private string? _snapshotPath;
     private string? _logPath;
     private bool _smoke;
+    private bool _smokeSave;
     private bool _smokeStarted;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -65,7 +66,8 @@ public partial class App : Application
             pwshPath,
             backendPath,
             _devConfigPath,
-            TimeSpan.FromSeconds(10));
+            TimeSpan.FromSeconds(10),
+            TimeSpan.FromSeconds(30));
         var client = new BackendClient(options);
         var session = new EditorSession(client);
         var viewModel = new EditorViewModel(session, _devConfigPath is not null, integrity);
@@ -89,7 +91,7 @@ public partial class App : Application
             }
 
             _smokeStarted = true;
-            var ok = await window.RunSmokeAsync(_snapshotPath, _logPath);
+            var ok = await window.RunSmokeAsync(_snapshotPath, _logPath, _smokeSave);
             Shutdown(ok ? 0 : 1);
         };
     }
@@ -111,6 +113,10 @@ public partial class App : Application
                     break;
                 case "--smoke":
                     _smoke = true;
+                    break;
+                case "--smoke-save":
+                    _smoke = true;
+                    _smokeSave = true;
                     break;
             }
         }

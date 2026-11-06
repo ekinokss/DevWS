@@ -4,7 +4,8 @@ param(
     [int]$Repeat = 1,
     [int]$ItemCount = 0,
     [string]$RepoRoot = (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [switch]$Save
 )
 
 $ErrorActionPreference = 'Stop'
@@ -161,10 +162,20 @@ for ($run = 1; $run -le $Repeat; $run++) {
         }
 
         $canonicalBefore = (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash.ToLowerInvariant()
+
+        if ($Save) {
+            $configPath = Join-Path $runRoot 'workspace.json'
+            Copy-Item -LiteralPath $canonicalPath -Destination $configPath -Force
+            Assert-DevWSConfig -Config (Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json) -Source $configPath
+            $configBefore = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
     }
 
     $arguments = @('--smoke', '--log', ('"' + $logPath + '"'), '--snapshot', ('"' + $snapshotPath + '"'))
-    if ($Mode -eq 'synthetic') {
+    if ($Save) {
+        $arguments += '--smoke-save'
+    }
+    if ($Mode -eq 'synthetic' -or $Save) {
         $arguments += @('--dev-config', ('"' + $configPath + '"'))
     }
 
@@ -199,7 +210,28 @@ for ($run = 1; $run -le $Repeat; $run++) {
         throw 'The editor smoke did not commit a canvas/drag-style draft edit.'
     }
 
-    if ($evidence.finalDraftDirty -ne $true) {
+    if ($Save) {
+        if ($evidence.saveOk -ne $true) {
+            throw "The editor smoke save did not succeed: $($evidence.saveError)"
+        }
+        if ($evidence.saveDraftClean -ne $true -or $evidence.finalDraftDirty -eq $true) {
+            throw 'The editor smoke did not clear the draft after a confirmed save.'
+        }
+        if ($evidence.saveChanged -ne $true) {
+            throw 'The editor smoke save did not report a changed configuration.'
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$evidence.saveNewSha256)) {
+            throw 'The editor smoke save did not return a persisted revision.'
+        }
+        $persistedHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($persistedHash -ne [string]$evidence.saveNewSha256) {
+            throw "The persisted hash '$persistedHash' does not match save.newSha256 '$($evidence.saveNewSha256)'."
+        }
+        if (Test-Path -LiteralPath "$configPath.tmp") {
+            throw 'The editor smoke left a configuration temp file behind.'
+        }
+    }
+    elseif ($evidence.finalDraftDirty -ne $true) {
         throw 'The editor smoke did not retain an unsaved draft for the close-confirmation path.'
     }
 
@@ -240,7 +272,16 @@ for ($run = 1; $run -le $Repeat; $run++) {
         if ($evidence.configSource -ne 'env') {
             throw "Expected the development config source 'env', got '$($evidence.configSource)'."
         }
-        if ($null -eq $configBefore -or (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $configBefore) {
+        $currentHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($Save) {
+            if ($null -eq $configBefore -or $currentHash -eq $configBefore) {
+                throw 'The synthetic development configuration was not persisted by the save smoke.'
+            }
+            if ($currentHash -ne [string]$evidence.saveNewSha256) {
+                throw 'The save smoke persisted hash does not match the returned revision.'
+            }
+        }
+        elseif ($null -eq $configBefore -or $currentHash -ne $configBefore) {
             throw 'The synthetic development configuration changed during the smoke.'
         }
         if ($ItemCount -gt 0) {
@@ -316,6 +357,17 @@ for ($run = 1; $run -le $Repeat; $run++) {
         PreviewWarningDigest = $evidence.previewWarningDigest
         PreviewReviewToken = $evidence.previewReviewToken
         PreviewMs = $evidence.previewMs
+        SaveSmoke = $evidence.saveSmoke
+        SaveOk = $evidence.saveOk
+        SaveDraftClean = $evidence.saveDraftClean
+        SaveChanged = $evidence.saveChanged
+        SaveError = $evidence.saveError
+        SaveNewSha256 = $evidence.saveNewSha256
+        SavePersistedSelectedRect = $evidence.savePersistedSelectedRect
+        SaveMs = $evidence.saveMs
+        SaveTransportMs = $evidence.saveTransportMs
+        SaveParseMs = $evidence.saveParseMs
+        SaveModelMs = $evidence.saveModelMs
         PreviewTransportMs = $evidence.previewTransportMs
         PreviewParseMs = $evidence.previewParseMs
         PreviewModelMs = $evidence.previewModelMs
@@ -347,8 +399,9 @@ for ($run = 1; $run -le $Repeat; $run++) {
         LogPath = $logPath
     }) | Out-Null
 
-    if ($Mode -eq 'synthetic') {
-        $summaryName = if ($run -eq $Repeat) { 'p6-editor-preview.png' } else { "p6-editor-preview-run-$run.png" }
+    if ($Mode -eq 'synthetic' -or $Save) {
+        $baseName = if ($Save) { 'p7-editor-save' } else { 'p6-editor-preview' }
+        $summaryName = if ($run -eq $Repeat) { "$baseName.png" } else { "$baseName-run-$run.png" }
         Copy-Item -LiteralPath $snapshotPath -Destination (Join-Path $OutputDirectory $summaryName) -Force
         if (-not [string]::IsNullOrWhiteSpace([string]$evidence.previewDiffSnapshotPath) -and
             (Test-Path -LiteralPath $evidence.previewDiffSnapshotPath -PathType Leaf)) {
@@ -376,6 +429,9 @@ $summary = [ordered]@{
     medianItemsUpdateMs = (@($results | ForEach-Object { $_.ItemsUpdateMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianCanvasRenderMs = (@($results | ForEach-Object { $_.CanvasRenderMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianPreviewMs = (@($results | ForEach-Object { $_.PreviewMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianSaveMs = (@($results | ForEach-Object { $_.SaveMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianSaveParseMs = (@($results | ForEach-Object { $_.SaveParseMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianSaveModelMs = (@($results | ForEach-Object { $_.SaveModelMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianPreviewParseMs = (@($results | ForEach-Object { $_.PreviewParseMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianPreviewModelMs = (@($results | ForEach-Object { $_.PreviewModelMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianProjectParseMs = (@($results | ForEach-Object { $_.ProjectParseMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]

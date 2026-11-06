@@ -128,7 +128,7 @@ $script:TestGroupCatalog = [ordered]@{
     'relative-authoring'  = 'Relative layout authoring and mutation (v0.3 Phase 5)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
-    'editor-backend'      = 'Read-only editor backend (v0.4 P3/P6)'
+    'editor-backend'      = 'Guarded editor backend (v0.4 P3/P7)'
     'test-harness'        = 'Test harness'
 }
 

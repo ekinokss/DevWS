@@ -65,7 +65,13 @@ internal static class Program
                 ("preview no-op has no proposed changes", ViewModelPreviewNoOp),
                 ("preview invalidates after external revision change", ViewModelPreviewExternalChange),
                 ("preview invalidates after backend restart", ViewModelPreviewBackendRestart),
-                ("preview mode keeps save disabled", PreviewSaveBoundary),
+                ("save requires current preview and explicit review", SavePrerequisites),
+                ("save success reloads and clears dirty state", ViewModelSaveSuccess),
+                ("save refusal preserves the draft and shows the error", ViewModelSaveRefusal),
+                ("uncertain save never retries and reports observed revision", ViewModelSaveUncertain),
+                ("save after backend exit is uncertain and not replayed", ViewModelSaveBackendExit),
+                ("save after malformed response is uncertain and not replayed", ViewModelSaveMalformed),
+                ("no-op save reports unchanged without dirty state", ViewModelSaveNoOp),
                 ("view model revision conflict preserves draft", ViewModelRevisionConflict),
                 ("view model topology conflict blocks relative commit", ViewModelTopologyConflict),
                 ("view model discard clears dirty state", ViewModelDiscard),
@@ -123,7 +129,10 @@ internal static class Program
         True(hello.SupportedOps.Contains("validate"), "validate advertised");
         True(hello.SupportedOps.Contains("convert"), "convert advertised");
         True(hello.SupportedOps.Contains("preview"), "preview advertised");
-        True(hello.ReadOnly, "read-only");
+        True(hello.SupportedOps.Contains("save"), "save advertised");
+        True(!hello.ReadOnly, "writable capabilities");
+        True(hello.SaveSupported, "save supported");
+        Equal(30000L, hello.SaveTimeoutMs, "save timeout advertised");
         True(client.ProcessId is > 0, "backend pid available");
         client.Dispose();
         True(client.HasExited, "backend exited after dispose");
@@ -143,7 +152,7 @@ internal static class Program
     {
         var scenario = NormalScenario();
         scenario["hello"] = Hello(protocol: "devws-editor/2");
-        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(10));
         var error = await CatchAsync(() => client.ConnectAsync());
         Equal("protocol-version-unsupported", error.Code, "protocol refusal");
     }
@@ -207,10 +216,11 @@ internal static class Program
     private static async Task FakeSaveRefusal()
     {
         var scenario = NormalScenario();
-        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        scenario["saveError"] = Error("warnings-not-acknowledged", "Review the warnings before saving.");
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(10));
         await client.ConnectAsync();
-        var error = await CatchAsync(() => client.SendAsync("save"));
-        Equal("unsupported-operation", error.Code, "save refusal");
+        var error = await CatchAsync(() => client.SendSaveAsync(new Dictionary<string, object?> { ["confirm"] = true }));
+        Equal("warnings-not-acknowledged", error.Code, "save refusal");
         var inspect = await client.SendAsync("inspect");
         True(inspect.Result.ValueKind == JsonValueKind.Object, "backend still usable");
     }
@@ -243,7 +253,8 @@ internal static class Program
             _pwsh,
             _realBackend,
             configPath,
-            TimeSpan.FromSeconds(20));
+            TimeSpan.FromSeconds(20),
+            TimeSpan.FromSeconds(30));
         using var client = new BackendClient(options);
         await client.ConnectAsync();
 
@@ -266,7 +277,7 @@ internal static class Program
         Equal(2, ReadArrayLength(projectSet, "items"), "project item count");
 
         var saveError = await CatchAsync(() => client.SendAsync("save"));
-        Equal("unsupported-operation", saveError.Code, "save refusal");
+        Equal("request-invalid", saveError.Code, "save requires draft and baseSha256");
 
         client.Dispose();
         Equal(before, Hash(configPath), "real config unchanged");
@@ -814,7 +825,7 @@ internal static class Program
         True(!vm.IsPreviewAcknowledged, "backend restart invalidates review");
     }
 
-    private static async Task PreviewSaveBoundary()
+    private static async Task SavePrerequisites()
     {
         var scenario = NormalScenario();
         using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
@@ -822,10 +833,176 @@ internal static class Program
         using var vm = new EditorViewModel(session, false, "Medium");
         await vm.LoadAsync();
 
-        True(!vm.CanSave, "save remains disabled");
-        True(vm.SaveUnavailableText.Contains("P6", StringComparison.Ordinal), "save unavailable label names P6");
-        True(await vm.PreviewAsync(), "preview available before save boundary");
-        True(!vm.CanSave, "preview does not enable save");
+        True(!vm.CanSave, "save is disabled before preview");
+        True(await vm.PreviewAsync(), "preview available before save");
+        True(!vm.CanSave, "save requires explicit warning review");
+        True(vm.SaveAvailabilityText.Contains("Review", StringComparison.OrdinalIgnoreCase), "save explains review prerequisite");
+        True(vm.AcknowledgePreviewWarnings(), "warning review accepted");
+        True(vm.CanSave, "save enabled after preview and review");
+
+        var fallback = vm.Items.First(item => item.Item.ItemId == "fallback");
+        vm.SelectItem(fallback);
+        vm.SelectScope(vm.GeometryScopes.First(scope => scope.Kind == GeometryScopeKind.AbsoluteFallback));
+        True(await vm.ApplyGeometryAsync("-1900", "0", "960", "1080"), "edit before save");
+        True(!vm.CanSave, "edit after preview disables save");
+        True(vm.SaveAvailabilityText.Contains("Preview", StringComparison.OrdinalIgnoreCase), "save explains preview prerequisite");
+    }
+
+    private static async Task ViewModelSaveSuccess()
+    {
+        var scenarioPath = NewPath("save-success-scenario.json");
+        var scenario = NormalScenario();
+        WriteScenario(scenarioPath, scenario);
+
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await PrepareDirtyPreviewAsync(vm), "save-success preview");
+        True(vm.AcknowledgePreviewWarnings(), "save-success review");
+        True(vm.CanSave, "save-success ready");
+
+        ApplySavedRevision(scenario, new string('1', 64));
+        WriteScenario(scenarioPath, scenario);
+
+        True(await vm.SaveAsync(), "save succeeds and reloads");
+        True(vm.HasSaveResult, "save result retained");
+        Equal(new string('1', 64), vm.SaveResult!.NewSha256, "save returns the confirmed revision");
+        True(vm.SaveResult.Changed, "save reports changed");
+        True(!vm.IsDraftDirty, "save clears dirty state after reload");
+        True(!vm.HasSaveError, "save has no error");
+        True(vm.SaveStatusText.Contains("Saved", StringComparison.Ordinal), "save status confirms persistence");
+        True(vm.DetailRows.Any(row => row.Label == "Saved revision"), "details include the saved revision");
+        True(vm.LastSaveMs > 0, "save latency recorded");
+    }
+
+    private static async Task ViewModelSaveRefusal()
+    {
+        var scenario = NormalScenario();
+        scenario["saveError"] = Error("external-change", "The canonical configuration changed.");
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await PrepareDirtyPreviewAsync(vm), "refusal preview");
+        True(vm.AcknowledgePreviewWarnings(), "refusal review");
+        True(await vm.SaveAsync() == false, "save refusal returns false");
+        True(vm.HasSaveError, "save refusal is displayed");
+        True(vm.SaveErrorText.Contains("external-change", StringComparison.Ordinal), "save refusal carries the code");
+        True(vm.HasDraftConflict, "external-change save refusal blocks the draft");
+        True(vm.IsDraftDirty, "save refusal preserves the draft");
+        True(!vm.CanSave, "refused save cannot be retried without resolving the conflict");
+    }
+
+    private static async Task ViewModelSaveUncertain()
+    {
+        var scenarioPath = NewPath("save-uncertain-scenario.json");
+        var countPath = NewPath("save-uncertain-count.txt");
+        var scenario = NormalScenario();
+        scenario["saveMode"] = "timeout";
+        scenario["saveCountPath"] = countPath;
+        WriteScenario(scenarioPath, scenario);
+
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(400));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await PrepareDirtyPreviewAsync(vm), "uncertain preview");
+        True(vm.AcknowledgePreviewWarnings(), "uncertain review");
+        True(await vm.SaveAsync() == false, "uncertain save returns false");
+        True(vm.SaveOutcomeUncertain, "save outcome is flagged uncertain");
+        True(vm.SaveErrorText.Contains("timeout", StringComparison.OrdinalIgnoreCase), "uncertain save reports the transport failure");
+        True(vm.SaveObservedRevisionText.Contains(Sha, StringComparison.Ordinal), "uncertain save reports the observed base revision");
+        Equal("1", File.ReadAllText(countPath).Trim(), "uncertain save is not automatically retried");
+        True(vm.IsDraftDirty, "uncertain save preserves the draft");
+        True(!vm.CanSave, "uncertain save blocks another submission");
+    }
+
+    private static async Task ViewModelSaveBackendExit()
+    {
+        var scenarioPath = NewPath("save-exit-scenario.json");
+        var countPath = NewPath("save-exit-count.txt");
+        var scenario = NormalScenario();
+        scenario["saveMode"] = "exit";
+        scenario["saveCountPath"] = countPath;
+        WriteScenario(scenarioPath, scenario);
+
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(10));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await PrepareDirtyPreviewAsync(vm), "exit preview");
+        True(vm.AcknowledgePreviewWarnings(), "exit review");
+        True(await vm.SaveAsync() == false, "backend exit save returns false");
+        True(vm.SaveOutcomeUncertain, "backend exit save is uncertain");
+        True(vm.SaveErrorText.Contains("backend-exited", StringComparison.Ordinal), "backend exit is identified");
+        Equal("1", File.ReadAllText(countPath).Trim(), "backend exit save is not replayed");
+        True(vm.IsDraftDirty, "backend exit preserves the draft");
+    }
+
+    private static async Task ViewModelSaveMalformed()
+    {
+        var scenarioPath = NewPath("save-malformed-scenario.json");
+        var countPath = NewPath("save-malformed-count.txt");
+        var scenario = NormalScenario();
+        scenario["saveMode"] = "malformed";
+        scenario["saveCountPath"] = countPath;
+        WriteScenario(scenarioPath, scenario);
+
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(10));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await vm.PreviewAsync(), "malformed preview");
+        True(vm.AcknowledgePreviewWarnings(), "malformed review");
+        True(await vm.SaveAsync() == false, "malformed save returns false");
+        True(vm.SaveOutcomeUncertain, "malformed save is uncertain");
+        True(vm.SaveErrorText.Contains("protocol-error", StringComparison.Ordinal), "malformed save is identified");
+        Equal("1", File.ReadAllText(countPath).Trim(), "malformed save is not replayed");
+    }
+
+    private static async Task ViewModelSaveNoOp()
+    {
+        var scenario = NormalScenario();
+        scenario["save"] = SaveResult(false);
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await vm.PreviewAsync(), "no-op save preview");
+        True(vm.AcknowledgePreviewWarnings(), "no-op save review");
+        True(await vm.SaveAsync(), "no-op save succeeds");
+        True(vm.HasSaveResult, "no-op save result retained");
+        True(!vm.SaveResult!.Changed, "no-op save reports unchanged");
+        True(vm.SaveStatusText.Contains("No changes", StringComparison.OrdinalIgnoreCase), "no-op save status");
+        True(!vm.IsDraftDirty, "no-op save reloads a clean draft");
+    }
+
+    private static async Task<bool> PrepareDirtyPreviewAsync(EditorViewModel vm)
+    {
+        var fallback = vm.Items.First(item => item.Item.ItemId == "fallback");
+        vm.SelectItem(fallback);
+        vm.SelectScope(vm.GeometryScopes.First(scope => scope.Kind == GeometryScopeKind.AbsoluteFallback));
+
+        if (!await vm.ApplyGeometryAsync("-1900", "0", "960", "1080"))
+        {
+            return false;
+        }
+
+        return await vm.PreviewAsync();
+    }
+
+    private static void ApplySavedRevision(Dictionary<string, object?> scenario, string newSha)
+    {
+        var inspect = (Dictionary<string, object?>)scenario["inspect"]!;
+        ((Dictionary<string, object?>)inspect["config"]!)["sha256"] = newSha;
+        var read = (Dictionary<string, object?>)scenario["readConfig"]!;
+        read["sha256"] = newSha;
+        var projects = (Dictionary<string, object?>)scenario["projects"]!;
+        foreach (var projection in projects.Values.OfType<Dictionary<string, object?>>())
+        {
+            projection["configRevision"] = newSha;
+        }
     }
 
     private static async Task ViewModelRevisionConflict()
@@ -935,12 +1112,13 @@ internal static class Program
             _pwsh,
             _realBackend,
             configPath,
-            TimeSpan.FromSeconds(20));
+            TimeSpan.FromSeconds(20),
+            TimeSpan.FromSeconds(30));
         using var client = new BackendClient(options);
         var hello = await client.ConnectAsync();
         True(hello.SupportedOps.Contains("validate"), "real backend advertises validate");
         True(hello.SupportedOps.Contains("convert"), "real backend advertises convert");
-        True(!hello.SupportedOps.Contains("save"), "real backend does not advertise save");
+        True(hello.SupportedOps.Contains("save"), "real backend advertises save");
         True(hello.SupportedOps.Contains("preview"), "real backend advertises preview");
 
         var inspectResponse = await client.SendAsync("inspect");
@@ -1068,7 +1246,7 @@ internal static class Program
         }
 
         var saveError = await CatchAsync(() => client.SendAsync("save"));
-        Equal("unsupported-operation", saveError.Code, "save still refused");
+        Equal("request-invalid", saveError.Code, "save requires draft and baseSha256");
 
         client.Dispose();
         Equal(before, Hash(configPath), "validate/convert left the real config unchanged");
@@ -1310,6 +1488,7 @@ internal static class Program
         True(source.Contains("\"validate\"", StringComparison.Ordinal), "session calls structural validate");
         True(source.Contains("\"convert\"", StringComparison.Ordinal), "session calls backend convert");
         True(source.Contains("\"preview\"", StringComparison.Ordinal), "session calls backend preview");
+        True(source.Contains("SendSaveAsync", StringComparison.Ordinal), "session uses the non-retried save path");
 
         True(source.Contains("ArgumentList.Add(\"-File\")", StringComparison.Ordinal), "backend uses -File");
         True(source.Contains("-NoProfile", StringComparison.Ordinal), "backend uses -NoProfile");
@@ -1457,13 +1636,19 @@ internal static class Program
         return CreateFakeClient(path, timeout);
     }
 
-    private static BackendClient CreateFakeClient(string scenarioPath, TimeSpan timeout)
+    private static BackendClient CreateFakeClient(string scenarioPath, TimeSpan timeout, TimeSpan? saveTimeout = null)
     {
         var environment = new Dictionary<string, string?>
         {
             ["DEVWS_TEST_SCENARIO"] = scenarioPath
         };
-        var options = new BackendLaunchOptions(_pwsh, _fakeBackend, null, timeout, environment);
+        var options = new BackendLaunchOptions(
+            _pwsh,
+            _fakeBackend,
+            null,
+            timeout,
+            saveTimeout ?? TimeSpan.FromSeconds(30),
+            environment);
         return new BackendClient(options);
     }
 
@@ -1494,6 +1679,7 @@ internal static class Program
             ["convert"] = ConvertResult(),
             ["preview"] = PreviewResult(),
             ["previewWarnings"] = warnings,
+            ["save"] = SaveResult(),
             ["defaultSet"] = "main",
             ["warnings"] = warnings,
             ["projects"] = new Dictionary<string, object?>
@@ -1550,6 +1736,18 @@ internal static class Program
         };
     }
 
+    private static Dictionary<string, object?> SaveResult(bool changed = true)
+    {
+        return new Dictionary<string, object?>
+        {
+            ["saved"] = true,
+            ["changed"] = changed,
+            ["previousSha256"] = Sha,
+            ["newSha256"] = new string('1', 64),
+            ["canonicalPath"] = @"C:\DevWS-Fixture\workspace.json"
+        };
+    }
+
     private static Dictionary<string, object?> ValidateResult(bool valid = true)
     {
         return new Dictionary<string, object?>
@@ -1599,13 +1797,13 @@ internal static class Program
     private static Dictionary<string, object?> Hello(
         string protocol = "devws-editor/1",
         string[]? supportedOps = null,
-        bool readOnly = true)
+        bool readOnly = false)
     {
         return new Dictionary<string, object?>
         {
             ["backendVersion"] = "test-editor-1",
             ["protocol"] = protocol,
-            ["supportedOps"] = supportedOps ?? new[] { "hello", "inspect", "read-config", "project", "validate", "preview", "convert", "shutdown" },
+            ["supportedOps"] = supportedOps ?? new[] { "hello", "inspect", "read-config", "project", "validate", "preview", "convert", "save", "shutdown" },
             ["limits"] = new Dictionary<string, object?>
             {
                 ["maxRequestBytes"] = 4194304,
@@ -1614,14 +1812,14 @@ internal static class Program
                 ["maxConfigBytes"] = 4194304,
                 ["maxInflight"] = 1,
                 ["readTimeoutMs"] = 10000,
-                ["saveTimeoutMs"] = null
+                ["saveTimeoutMs"] = 30000
             },
             ["capabilities"] = new Dictionary<string, object?>
             {
                 ["configWritable"] = true,
                 ["topologyReadable"] = true,
                 ["readOnly"] = readOnly,
-                ["saveSupported"] = false,
+                ["saveSupported"] = true,
                 ["validateSupported"] = true,
                 ["previewSupported"] = true,
                 ["convertSupported"] = true

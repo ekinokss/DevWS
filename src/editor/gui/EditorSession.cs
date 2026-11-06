@@ -19,6 +19,12 @@ public sealed record EditorPreviewMetrics(
     double ModelMs,
     double TotalMs);
 
+public sealed record EditorSaveMetrics(
+    double TransportMs,
+    double ParseMs,
+    double ModelMs,
+    double TotalMs);
+
 public sealed class EditorSession : IDisposable
 {
     private static readonly Dictionary<string, object?> EmptyParameters = new();
@@ -33,6 +39,7 @@ public sealed class EditorSession : IDisposable
     public BackendClient Client => _client;
     public EditorLoadMetrics? LastLoadMetrics { get; private set; }
     public EditorPreviewMetrics? LastPreviewMetrics { get; private set; }
+    public EditorSaveMetrics? LastSaveMetrics { get; private set; }
 
     public async Task<EditorSnapshot> LoadAsync(
         string? setId,
@@ -190,6 +197,53 @@ public sealed class EditorSession : IDisposable
         modelWatch.Stop();
         totalWatch.Stop();
         LastPreviewMetrics = new EditorPreviewMetrics(
+            transportMs,
+            parseMs,
+            modelWatch.Elapsed.TotalMilliseconds,
+            totalWatch.Elapsed.TotalMilliseconds);
+
+        return result;
+    }
+
+    public async Task<SaveResult> SaveAsync(
+        DraftDocument draft,
+        string baseSha256,
+        string setId,
+        string? topologyFingerprint,
+        string? reviewToken,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(EditorSession));
+        }
+
+        draft.EnsureMutationScope();
+        var parameters = new Dictionary<string, object?>
+        {
+            ["draft"] = draft.CreateDraftSnapshot(),
+            ["baseSha256"] = baseSha256,
+            ["setId"] = setId,
+            ["confirm"] = true,
+            ["reviewToken"] = reviewToken
+        };
+
+        if (!string.IsNullOrWhiteSpace(topologyFingerprint))
+        {
+            parameters["topologyFingerprint"] = topologyFingerprint;
+        }
+
+        var totalWatch = Stopwatch.StartNew();
+        var response = await _client
+            .SendSaveAsync(parameters, cancellationToken)
+            .ConfigureAwait(false);
+        var transportMs = _client.LastReadMs;
+        var parseMs = _client.LastParseMs;
+        var modelWatch = Stopwatch.StartNew();
+        var result = SaveResult.Parse(response.Result);
+        modelWatch.Stop();
+        totalWatch.Stop();
+        LastSaveMetrics = new EditorSaveMetrics(
             transportMs,
             parseMs,
             modelWatch.Elapsed.TotalMilliseconds,

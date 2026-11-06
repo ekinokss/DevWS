@@ -164,9 +164,9 @@
             </StackPanel>
 
             <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-                <Button Content="Save (P6 unavailable)" IsEnabled="False"
-                        ToolTip="{Binding SaveUnavailableText}"
-                        AutomationProperties.Name="Save unavailable in P6" />
+                <Button Content="_Save" Click="SaveButton_Click" IsEnabled="{Binding CanSave}"
+                        ToolTip="{Binding SaveAvailabilityText}"
+                        AutomationProperties.Name="Save previewed configuration" />
                 <Button Content="_Preview" Click="PreviewButton_Click" IsEnabled="{Binding CanPreview}"
                         AutomationProperties.Name="Request authoritative preview" />
                 <Button Content="_Refresh" Click="RefreshButton_Click" IsEnabled="{Binding IsNotBusy}"
@@ -405,10 +405,15 @@
                                         <Button Content="Review warnings" Click="ReviewWarningsButton_Click"
                                                 IsEnabled="{Binding CanAcknowledgePreview}"
                                                 AutomationProperties.Name="Acknowledge displayed preview warnings" />
-                                        <TextBlock Text="Save is unavailable in P6." VerticalAlignment="Center"
+                                        <TextBlock Text="Live windows are not changed by saving the configuration." VerticalAlignment="Center"
                                                    Foreground="#A5AAB4" Margin="8,0,0,0" />
                                     </StackPanel>
                                     <TextBlock Text="{Binding PreviewSummaryText}" Foreground="#80DCD7" Margin="0,3,0,0" />
+                                    <TextBlock Text="{Binding SaveStatusText}" Foreground="#D7D9E0" TextWrapping="Wrap" Margin="0,3,0,0" />
+                                    <TextBlock Text="{Binding SaveObservedRevisionText}" Foreground="#FFC457" TextWrapping="Wrap"
+                                               Visibility="{Binding SaveOutcomeUncertain, Converter={StaticResource BoolToVisibility}}" />
+                                    <TextBlock Text="{Binding SaveErrorText}" Foreground="#FF9A9A" TextWrapping="Wrap"
+                                               Visibility="{Binding HasSaveError, Converter={StaticResource BoolToVisibility}}" />
                                 </StackPanel>
                             </Border>
                             <ListBox x:Name="PreviewWarningList" ItemsSource="{Binding PreviewWarnings}"
