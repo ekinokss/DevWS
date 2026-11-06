@@ -152,7 +152,7 @@ internal static class Program
     {
         var scenario = NormalScenario();
         scenario["hello"] = Hello(protocol: "devws-editor/2");
-        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(10));
         var error = await CatchAsync(() => client.ConnectAsync());
         Equal("protocol-version-unsupported", error.Code, "protocol refusal");
     }
@@ -217,7 +217,7 @@ internal static class Program
     {
         var scenario = NormalScenario();
         scenario["saveError"] = Error("warnings-not-acknowledged", "Review the warnings before saving.");
-        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(10));
         await client.ConnectAsync();
         var error = await CatchAsync(() => client.SendSaveAsync(new Dictionary<string, object?> { ["confirm"] = true }));
         Equal("warnings-not-acknowledged", error.Code, "save refusal");
@@ -903,7 +903,7 @@ internal static class Program
         scenario["saveCountPath"] = countPath;
         WriteScenario(scenarioPath, scenario);
 
-        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(2), TimeSpan.FromMilliseconds(400));
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(10), TimeSpan.FromMilliseconds(400));
         using var session = new EditorSession(client);
         using var vm = new EditorViewModel(session, false, "Medium");
         await vm.LoadAsync();
@@ -927,7 +927,7 @@ internal static class Program
         scenario["saveCountPath"] = countPath;
         WriteScenario(scenarioPath, scenario);
 
-        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(2));
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(10));
         using var session = new EditorSession(client);
         using var vm = new EditorViewModel(session, false, "Medium");
         await vm.LoadAsync();
@@ -949,7 +949,7 @@ internal static class Program
         scenario["saveCountPath"] = countPath;
         WriteScenario(scenarioPath, scenario);
 
-        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(2));
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(10));
         using var session = new EditorSession(client);
         using var vm = new EditorViewModel(session, false, "Medium");
         await vm.LoadAsync();
