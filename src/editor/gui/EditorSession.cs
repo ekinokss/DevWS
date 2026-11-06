@@ -8,7 +8,10 @@ public sealed record EditorLoadMetrics(
     double InspectMs,
     double ReadConfigMs,
     double ProjectMs,
-    double TotalMs);
+    double TotalMs,
+    long ProjectResponseBytes,
+    double ProjectParseMs,
+    double ProjectModelMs);
 
 public sealed class EditorSession : IDisposable
 {
@@ -79,8 +82,12 @@ public sealed class EditorSession : IDisposable
 
         var projectWatch = Stopwatch.StartNew();
         var projectResponse = await ProjectCoreAsync(setId, cancellationToken).ConfigureAwait(false);
-        projectWatch.Stop();
+        var projectParseMs = _client.LastParseMs;
+        var projectResponseBytes = _client.LastResponseBytes;
+        var projectModelWatch = Stopwatch.StartNew();
         var projection = WorkspaceProjection.Parse(projectResponse.Result, projectResponse.Warnings);
+        projectModelWatch.Stop();
+        projectWatch.Stop();
 
         EnsureConsistent(inspect, projection);
 
@@ -90,9 +97,142 @@ public sealed class EditorSession : IDisposable
             inspectWatch.Elapsed.TotalMilliseconds,
             readWatch.Elapsed.TotalMilliseconds,
             projectWatch.Elapsed.TotalMilliseconds,
-            total.Elapsed.TotalMilliseconds);
+            total.Elapsed.TotalMilliseconds,
+            projectResponseBytes,
+            projectParseMs,
+            projectModelWatch.Elapsed.TotalMilliseconds);
 
         return new EditorSnapshot(hello, inspect, projection, readHash, document);
+    }
+
+    public async Task<InspectInfo> InspectAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(EditorSession));
+        }
+
+        var response = await _client
+            .SendAsync("inspect", EmptyParameters, cancellationToken)
+            .ConfigureAwait(false);
+        var inspect = InspectInfo.Parse(response.Result);
+
+        if (string.IsNullOrWhiteSpace(inspect.Config.Sha256))
+        {
+            throw new EditorException(
+                "protocol-error",
+                "The editor backend did not return a configuration revision.");
+        }
+
+        return inspect;
+    }
+
+    public async Task<DraftValidationResult> ValidateAsync(
+        DraftDocument draft,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(EditorSession));
+        }
+
+        draft.EnsureMutationScope();
+        var response = await _client
+            .SendAsync(
+                "validate",
+                new Dictionary<string, object?> { ["draft"] = draft.CreateDraftSnapshot() },
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        return DraftValidationResult.Parse(response.Result);
+    }
+
+    public async Task<RelativeConversionResult> ConvertAsync(
+        RectInfo rect,
+        RelativeAnchorInfo anchor,
+        string basis,
+        string? topologyFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(EditorSession));
+        }
+
+        var parameters = new Dictionary<string, object?>
+        {
+            ["rect"] = new Dictionary<string, object?>
+            {
+                ["x"] = rect.X,
+                ["y"] = rect.Y,
+                ["w"] = rect.W,
+                ["h"] = rect.H
+            },
+            ["anchor"] = BuildAnchorParameter(anchor),
+            ["basis"] = basis
+        };
+
+        if (!string.IsNullOrWhiteSpace(topologyFingerprint))
+        {
+            parameters["topologyFingerprint"] = topologyFingerprint;
+        }
+
+        var response = await _client
+            .SendAsync("convert", parameters, cancellationToken)
+            .ConfigureAwait(false);
+
+        return RelativeConversionResult.Parse(response.Result);
+    }
+
+    public async Task<RelativeConversionResult> SelectAnchorAndConvertAsync(
+        RectInfo rect,
+        string basis,
+        string? topologyFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(EditorSession));
+        }
+
+        var parameters = new Dictionary<string, object?>
+        {
+            ["rect"] = new Dictionary<string, object?>
+            {
+                ["x"] = rect.X,
+                ["y"] = rect.Y,
+                ["w"] = rect.W,
+                ["h"] = rect.H
+            },
+            ["selectAnchor"] = true,
+            ["basis"] = basis
+        };
+
+        if (!string.IsNullOrWhiteSpace(topologyFingerprint))
+        {
+            parameters["topologyFingerprint"] = topologyFingerprint;
+        }
+
+        var response = await _client
+            .SendAsync("convert", parameters, cancellationToken)
+            .ConfigureAwait(false);
+
+        return RelativeConversionResult.Parse(response.Result);
+    }
+
+    private static Dictionary<string, object?> BuildAnchorParameter(RelativeAnchorInfo anchor)
+    {
+        var parameter = new Dictionary<string, object?>
+        {
+            ["identity"] = anchor.Identity
+        };
+
+        if (!string.IsNullOrWhiteSpace(anchor.Instance))
+        {
+            parameter["instance"] = anchor.Instance;
+        }
+
+        return parameter;
     }
 
     public async Task<WorkspaceProjection> ProjectAsync(

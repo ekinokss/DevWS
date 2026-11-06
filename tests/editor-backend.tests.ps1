@@ -397,7 +397,7 @@ function Invoke-IsolatedBundledDefaultTest {
 
         Assert-True $hello.ok 'hello succeeds'
         Assert-Equal 'devws-editor/1' $hello.protocol 'hello protocol'
-        Assert-Equal 5 @($hello.result.supportedOps).Count 'hello advertises five operations'
+        Assert-Equal 7 @($hello.result.supportedOps).Count 'hello advertises seven operations'
         Assert-True (-not ($hello.result.supportedOps -contains 'save')) 'hello does not advertise save'
         Assert-Equal $false $hello.result.capabilities.saveSupported 'hello reports save unsupported'
         Assert-Equal $null $hello.result.limits.saveTimeoutMs 'hello reports no save timeout'
@@ -548,7 +548,7 @@ if ($IsolatedBundledDefault) {
 }
 
 try {
-    Write-Host 'P3 editor backend focused tests' -ForegroundColor Cyan
+    Write-Host 'P5 editor backend focused tests' -ForegroundColor Cyan
 
     # 1. Handshake and truthful capabilities.
     $root = New-TempRoot
@@ -559,11 +559,13 @@ try {
     $hello = Invoke-One -ConfigPath $configPath -Id 'hello' -Op 'hello'
     Assert-True $hello.ok 'hello succeeds'
     Assert-Equal 'devws-editor/1' $hello.protocol 'hello protocol'
-    Assert-Equal 5 @($hello.result.supportedOps).Count 'hello advertises exactly five operations'
+    Assert-Equal 7 @($hello.result.supportedOps).Count 'hello advertises exactly seven operations'
     Assert-True ($hello.result.supportedOps -contains 'read-config') 'hello advertises read-config'
     Assert-True (-not ($hello.result.supportedOps -contains 'save')) 'hello does not advertise save'
     Assert-Equal $false $hello.result.capabilities.saveSupported 'hello says save is unsupported'
-    Assert-Equal $false $hello.result.capabilities.validateSupported 'hello says validate is unsupported'
+    Assert-Equal $true $hello.result.capabilities.validateSupported 'hello says validate is supported'
+    Assert-Equal $true $hello.result.capabilities.convertSupported 'hello says convert is supported'
+    Assert-Equal $false $hello.result.capabilities.previewSupported 'hello says preview is unsupported'
     Assert-Equal $true $hello.result.capabilities.readOnly 'hello says read-only'
 
     # 2. inspect metadata and physical-writable vs backend-save distinction.
@@ -633,7 +635,7 @@ try {
         Assert-Equal 'request-invalid' $duplicateId.error.code 'duplicate id refused'
         Assert-Equal 'duplicate-request-id' $duplicateId.error.details.reason 'duplicate id reason'
 
-        foreach ($op in @('validate', 'preview', 'convert', 'save')) {
+        foreach ($op in @('preview', 'save')) {
             $refused = Send-Request -Process $process -Id $op -Op $op
             Assert-Equal 'unsupported-operation' $refused.error.code "$op refused"
         }
@@ -851,6 +853,177 @@ try {
     Assert-Equal $false $incompleteProjection.topology.correlationComplete 'incomplete topology correlation state represented'
     Assert-Equal 'resolved' $incompleteProjection.set.items[0].relativeStatus 'present identity still resolves under incomplete topology'
 
+    # 12b. P5 structural validate and authoritative convert.
+    $validateHashBefore = Get-FileSha $configPath
+    $validateProcess = Start-Backend -ConfigPath $configPath
+    try {
+        $validateHello = Send-Request -Process $validateProcess -Id 'vh' -Op 'hello'
+        Assert-True ($validateHello.result.supportedOps -contains 'validate') 'hello advertises validate'
+        Assert-True ($validateHello.result.supportedOps -contains 'convert') 'hello advertises convert'
+        Assert-True (-not ($validateHello.result.supportedOps -contains 'save')) 'hello still omits save'
+        Assert-True (-not ($validateHello.result.supportedOps -contains 'preview')) 'hello still omits preview'
+        Assert-Equal $true $validateHello.result.capabilities.validateSupported 'hello advertises validate capability'
+        Assert-Equal $true $validateHello.result.capabilities.convertSupported 'hello advertises convert capability'
+        Assert-Equal $false $validateHello.result.capabilities.previewSupported 'hello omits preview capability'
+
+        $validateInspect = Send-Request -Process $validateProcess -Id 'vi' -Op 'inspect'
+        $validDraft = ($config | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $validResult = Send-Request -Process $validateProcess -Id 'v1' -Op 'validate' -Params @{ draft = $validDraft }
+        Assert-True $validResult.ok 'validate succeeds for a valid draft'
+        Assert-Equal $true $validResult.result.valid 'valid draft reports valid'
+        Assert-Equal 0 @($validResult.result.errors).Count 'valid draft has no errors'
+
+        $unknownDraft = ($config | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $unknownDraft | Add-Member -NotePropertyName 'x-unknown' -NotePropertyValue ([pscustomobject][ordered]@{ keep = $true })
+        $unknownResult = Send-Request -Process $validateProcess -Id 'v2' -Op 'validate' -Params @{ draft = $unknownDraft }
+        Assert-Equal $true $unknownResult.result.valid 'unknown top-level properties are preserved and accepted'
+
+        $invalidDraft = ($config | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $invalidDraft.sets[0].windows[0].layout.w = 0
+        $invalidResult = Send-Request -Process $validateProcess -Id 'v3' -Op 'validate' -Params @{ draft = $invalidDraft }
+        Assert-True $invalidResult.ok 'structurally invalid draft is a successful validate response'
+        Assert-Equal $false $invalidResult.result.valid 'invalid draft reports invalid'
+        Assert-True (@($invalidResult.result.errors).Count -ge 1) 'invalid draft has canonical errors'
+        Assert-Contains $invalidResult.result.errors[0].message 'layout.w' 'canonical layout.w message preserved'
+        Assert-Equal 'main' $invalidResult.result.errors[0].setId 'canonical set context'
+        Assert-Equal 'abs' $invalidResult.result.errors[0].itemId 'canonical item context'
+
+        $missingDraft = Send-Request -Process $validateProcess -Id 'v4' -Op 'validate'
+        Assert-Equal 'request-invalid' $missingDraft.error.code 'missing draft refused'
+
+        $topologyAvailable = [bool]$validateInspect.result.topology.available -and @($validateInspect.result.topology.monitors).Count -gt 0
+
+        if ($topologyAvailable) {
+        $primary = @($validateInspect.result.topology.monitors | Where-Object { $_.primary } | Select-Object -First 1)
+        if ($primary.Count -eq 0) { $primary = @($validateInspect.result.topology.monitors | Select-Object -First 1) }
+        Assert-True ($primary.Count -eq 1) 'host primary monitor available for convert'
+
+        $basis = $primary[0].workRect
+        $convertRect = [ordered]@{ x = [int]$basis.x; y = [int]$basis.y; w = [int]$basis.w; h = [int]$basis.h }
+        $anchor = [ordered]@{ identity = [string]$primary[0].identity }
+        if (-not ([string]$primary[0].identity).StartsWith('path:', [StringComparison]::Ordinal)) {
+            $anchor['instance'] = [string]$primary[0].instance
+        }
+        $fingerprint = [string]$validateInspect.result.topology.fingerprint
+        $converted = Send-Request -Process $validateProcess -Id 'c1' -Op 'convert' -Params @{ rect = $convertRect; anchor = $anchor; basis = 'workArea'; topologyFingerprint = $fingerprint }
+        Assert-True $converted.ok 'convert succeeds for an explicit anchor'
+        Assert-Equal ([string]$primary[0].identity) ([string]$converted.result.anchor.identity) 'convert preserves the anchor identity'
+        Assert-Equal 0.0 ([double]$converted.result.normalized.x) 'convert normalized x'
+        Assert-Equal 0.0 ([double]$converted.result.normalized.y) 'convert normalized y'
+        Assert-Equal 1.0 ([double]$converted.result.normalized.w) 'convert normalized w'
+        Assert-Equal 1.0 ([double]$converted.result.normalized.h) 'convert normalized h'
+        Assert-Equal ([int]$basis.x) ([int]$converted.result.roundTripRect.x) 'convert round-trip x'
+        Assert-Equal ([int]$basis.y) ([int]$converted.result.roundTripRect.y) 'convert round-trip y'
+        Assert-Equal ([int]$basis.w) ([int]$converted.result.roundTripRect.w) 'convert round-trip width'
+        Assert-Equal ([int]$basis.h) ([int]$converted.result.roundTripRect.h) 'convert round-trip height'
+        Assert-Equal $true ([bool]$converted.result.reachable) 'convert reachability metadata'
+
+        $selected = Send-Request -Process $validateProcess -Id 'c2' -Op 'convert' -Params @{ rect = $convertRect; selectAnchor = $true; basis = 'workArea'; topologyFingerprint = $fingerprint }
+        Assert-True $selected.ok 'selectAnchor conversion succeeds'
+        Assert-Equal ([string]$primary[0].identity) ([string]$selected.result.anchor.identity) 'selectAnchor chooses the visible monitor'
+
+        $invalidRect = Send-Request -Process $validateProcess -Id 'c3' -Op 'convert' -Params @{ rect = [ordered]@{ x = 0; y = 0; w = 0; h = 10 }; anchor = $anchor; basis = 'workArea' }
+        Assert-Equal 'invalid-rect' $invalidRect.error.code 'convert invalid rect refused'
+
+        $missingAnchor = Send-Request -Process $validateProcess -Id 'c4' -Op 'convert' -Params @{ rect = $convertRect; anchor = [ordered]@{ identity = 'path:DEVWS-TEST/MISSING' }; basis = 'workArea' }
+        Assert-Equal 'anchor-missing' $missingAnchor.error.code 'convert missing anchor refused'
+
+        $wrongFingerprint = Send-Request -Process $validateProcess -Id 'c5' -Op 'convert' -Params @{ rect = $convertRect; anchor = $anchor; basis = 'workArea'; topologyFingerprint = ('A' * 64) }
+        Assert-Equal 'topology-changed' $wrongFingerprint.error.code 'convert fingerprint drift refused'
+        }
+        else {
+            Write-Host '  [SKIP] convert requires a host monitor topology' -ForegroundColor Yellow
+        }
+
+        $previewRefusal = Send-Request -Process $validateProcess -Id 'p1' -Op 'preview'
+        Assert-Equal 'unsupported-operation' $previewRefusal.error.code 'preview remains unimplemented'
+        $saveRefusal = Send-Request -Process $validateProcess -Id 's1' -Op 'save'
+        Assert-Equal 'unsupported-operation' $saveRefusal.error.code 'save remains unimplemented'
+        Send-Request -Process $validateProcess -Id 'vz' -Op 'shutdown' | Out-Null
+        $validateProcess.WaitForExit(10000) | Out-Null
+    }
+    finally {
+        Stop-Backend -Process $validateProcess
+    }
+    Assert-Equal $validateHashBefore (Get-FileSha $configPath) 'validate/convert did not change the config bytes'
+
+    # 12c. Synthetic convert math and anchor refusals (no host topology needed).
+    $convLeft = New-SyntheticMonitor -Identity 'path:TEST/LEFT' -X -1920 -Y 0 -W 1920 -H 1080 -WorkH 1040 -Primary $false
+    $convRight = New-SyntheticMonitor -Identity 'path:TEST/RIGHT' -X 0 -Y 0 -W 2560 -H 1440 -WorkH 1400 -Primary $true
+    $convTopology = New-SyntheticTopology -Monitors @($convLeft, $convRight)
+    $convAnchor = [pscustomobject][ordered]@{ identity = 'path:TEST/LEFT' }
+
+    $fractionConvert = Get-EditorConvert `
+        -Rect ([pscustomobject][ordered]@{ x = -1920; y = 0; w = 640; h = 1040 }) `
+        -Anchor $convAnchor `
+        -SelectAnchor $false `
+        -Basis 'workArea' `
+        -TopologyFingerprint $convTopology.Fingerprint `
+        -Topology $convTopology
+    Assert-True $fractionConvert.Ok 'synthetic convert succeeds'
+    Assert-True ([Math]::Abs([double]$fractionConvert.Result.normalized.x - 0.0) -lt 0.000001) 'synthetic normalized x'
+    Assert-True ([Math]::Abs([double]$fractionConvert.Result.normalized.w - 0.333333) -lt 0.000001) 'synthetic six-decimal normalized width'
+    Assert-Equal -1920 ([int]$fractionConvert.Result.roundTripRect.x) 'synthetic round-trip x'
+    Assert-Equal 640 ([int]$fractionConvert.Result.roundTripRect.w) 'synthetic round-trip width'
+    Assert-Equal $true ([bool]$fractionConvert.Result.reachable) 'synthetic reachability'
+
+    $negativeConvert = Get-EditorConvert `
+        -Rect ([pscustomobject][ordered]@{ x = -2000; y = -20; w = 300; h = 300 }) `
+        -Anchor $convAnchor `
+        -SelectAnchor $false `
+        -Basis 'workArea' `
+        -TopologyFingerprint $convTopology.Fingerprint `
+        -Topology $convTopology
+    Assert-True $negativeConvert.Ok 'negative-origin synthetic convert succeeds'
+    Assert-True ([double]$negativeConvert.Result.normalized.x -lt 0) 'negative-origin normalized x remains negative'
+    Assert-Equal $true ([bool]$negativeConvert.Result.reachable) 'negative-origin reachability'
+
+    $selectedConvert = Get-EditorConvert `
+        -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 800; h = 800 }) `
+        -Anchor $null `
+        -SelectAnchor $true `
+        -Basis 'workArea' `
+        -TopologyFingerprint $convTopology.Fingerprint `
+        -Topology $convTopology
+    Assert-True $selectedConvert.Ok 'synthetic selectAnchor succeeds'
+    Assert-Equal 'path:TEST/RIGHT' ([string]$selectedConvert.Result.anchor.identity) 'selectAnchor chooses the visible monitor'
+
+    $ambiguousTopology = New-SyntheticTopology -Monitors @(
+        (New-SyntheticMonitor -Identity 'path:TEST/DUP' -X -1000 -Y 0 -W 1000 -H 800),
+        (New-SyntheticMonitor -Identity 'path:TEST/DUP' -X 0 -Y 0 -W 1000 -H 800)
+    )
+    $ambiguousConvert = Get-EditorConvert `
+        -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 500; h = 500 }) `
+        -Anchor ([pscustomobject][ordered]@{ identity = 'path:TEST/DUP' }) `
+        -SelectAnchor $false `
+        -Basis 'monitor' `
+        -TopologyFingerprint $ambiguousTopology.Fingerprint `
+        -Topology $ambiguousTopology
+    Assert-Equal $false ([bool]$ambiguousConvert.Ok) 'ambiguous synthetic anchor refused'
+    Assert-Equal 'anchor-ambiguous' ([string]$ambiguousConvert.Code) 'ambiguous synthetic anchor code'
+
+    $unpersistableTopology = New-SyntheticTopology -Monitors @(
+        (New-SyntheticMonitor -Identity 'dummy' -X 0 -Y 0 -W 1000 -H 800)
+    )
+    $unpersistableConvert = Get-EditorConvert `
+        -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 500; h = 500 }) `
+        -Anchor ([pscustomobject][ordered]@{ identity = 'dummy' }) `
+        -SelectAnchor $false `
+        -Basis 'monitor' `
+        -TopologyFingerprint $unpersistableTopology.Fingerprint `
+        -Topology $unpersistableTopology
+    Assert-Equal $false ([bool]$unpersistableConvert.Ok) 'unpersistable synthetic anchor refused'
+    Assert-Equal 'anchor-unpersistable' ([string]$unpersistableConvert.Code) 'unpersistable synthetic anchor code'
+
+    $staleConvert = Get-EditorConvert `
+        -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 500; h = 500 }) `
+        -Anchor $convAnchor `
+        -SelectAnchor $false `
+        -Basis 'workArea' `
+        -TopologyFingerprint ('A' * 64) `
+        -Topology $convTopology
+    Assert-Equal 'topology-changed' ([string]$staleConvert.Code) 'synthetic topology drift refused'
+
     # 13. Non-mutation and static isolation.
     $beforeHash = Get-FileSha $parityPath
     $process = Start-Backend -ConfigPath $parityPath
@@ -864,7 +1037,7 @@ try {
     finally {
         Stop-Backend -Process $process
     }
-    Assert-Equal $beforeHash (Get-FileSha $parityPath) 'config bytes unchanged across P3 requests'
+    Assert-Equal $beforeHash (Get-FileSha $parityPath) 'config bytes unchanged across P3/P5 read-only requests'
 
     $backendText = Get-Content -LiteralPath $backend -Raw
     $projectionText = Get-Content -LiteralPath (Join-Path $RepoRoot 'src\editor\editor-projection.ps1') -Raw
@@ -897,7 +1070,7 @@ finally {
 }
 
 Write-Host ""
-Write-Host ("P3 focused assertions passed: {0}; failed: {1}; skipped: {2}" -f $script:Passed, $script:Failures.Count, $script:Skipped) -ForegroundColor Cyan
+Write-Host ("P5 focused assertions passed: {0}; failed: {1}; skipped: {2}" -f $script:Passed, $script:Failures.Count, $script:Skipped) -ForegroundColor Cyan
 if ($script:Failures.Count -gt 0) {
     $script:Failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
     exit 1

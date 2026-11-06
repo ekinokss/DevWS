@@ -112,6 +112,28 @@ while ($true) {
                 Write-Envelope -Request $request -Result $projection -Warnings $scenario.warnings -ErrorObject $null
             }
         }
+        'validate' {
+            if ($null -ne $scenario.validateError) {
+                Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject $scenario.validateError
+            }
+            elseif ($null -ne $scenario.validate) {
+                Write-Envelope -Request $request -Result $scenario.validate -Warnings @() -ErrorObject $null
+            }
+            else {
+                Write-Envelope -Request $request -Result ([ordered]@{ valid = $true; saveEligible = $false; errors = @() }) -Warnings @() -ErrorObject $null
+            }
+        }
+        'convert' {
+            if ($null -ne $scenario.convertError) {
+                Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject $scenario.convertError
+            }
+            elseif ($null -ne $scenario.convert) {
+                Write-Envelope -Request $request -Result $scenario.convert -Warnings @() -ErrorObject $null
+            }
+            else {
+                Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject (New-ProtocolError -Code 'backend-internal' -Message 'No fake convert result configured.')
+            }
+        }
         'save' {
             $errorObject = if ($null -ne $scenario.saveError) {
                 $scenario.saveError

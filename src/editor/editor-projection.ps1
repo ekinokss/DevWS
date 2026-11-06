@@ -250,6 +250,311 @@ function Get-EditorTopologyProjection {
     }
 }
 
+function Get-EditorDraftValidation {
+    # Structural validation of a complete draft document. This is the same
+    # Assert-DevWSConfig gate used for the canonical file; it is not a semantic
+    # preview and it does not authorize a save. Canonical error messages are
+    # preserved, with best-effort set/item/field context.
+    param(
+        [Parameter(Mandatory)]$Draft,
+        [string]$StartPath = $PSScriptRoot
+    )
+
+    $errors = [System.Collections.Generic.List[object]]::new()
+    $valid = $true
+
+    try {
+        Assert-DevWSConfig -Config $Draft -Source 'editor draft'
+    }
+    catch {
+        $valid = $false
+        $message = [string]$_.Exception.Message
+
+        foreach ($line in @($message -split "\r?\n")) {
+            $trimmed = $line.Trim()
+
+            if (-not $trimmed.StartsWith('- ')) {
+                continue
+            }
+
+            $text = $trimmed.Substring(2).Trim()
+
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                continue
+            }
+
+            $setId = $null
+            $itemId = $null
+            $field = $null
+            $context = [regex]::Match(
+                $text,
+                "^sets\[(?<set>\d+)\] \('(?<setId>[^']+)'\) windows\[(?<item>\d+)\] \('(?<itemId>[^']+)'\) (?<field>layoutMode|layoutRelative(?:\.[A-Za-z0-9_.]+)?|layout(?:\.[xywh])?)\b")
+
+            if ($context.Success) {
+                $setId = [string]$context.Groups['setId'].Value
+                $itemId = [string]$context.Groups['itemId'].Value
+                $field = [string]$context.Groups['field'].Value
+            }
+
+            $errors.Add([pscustomobject][ordered]@{
+                code    = 'config-schema-invalid'
+                message = $text
+                setId   = $setId
+                itemId  = $itemId
+                field   = $field
+            }) | Out-Null
+        }
+
+        if ($errors.Count -eq 0) {
+            $errors.Add([pscustomobject][ordered]@{
+                code    = 'config-schema-invalid'
+                message = $message
+                setId   = $null
+                itemId  = $null
+                field   = $null
+            }) | Out-Null
+        }
+    }
+
+    $saveEligible = $false
+
+    if ($valid) {
+        try {
+            $location = Resolve-DevWSConfigLocation -StartPath $StartPath
+            $saveEligible = [bool]$location.IsWritable
+        }
+        catch {
+            $saveEligible = $false
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        valid        = $valid
+        saveEligible = $saveEligible
+        errors       = @($errors.ToArray())
+    }
+}
+
+function Get-EditorConvertFailure {
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Message,
+        $Details = $null
+    )
+
+    return [pscustomobject][ordered]@{
+        Ok      = $false
+        Code    = $Code
+        Message = $Message
+        Details = $Details
+        Result  = $null
+    }
+}
+
+function Get-EditorConvert {
+    # Absolute rectangle -> normalized relative intent through the existing
+    # relative-layout functions. The GUI never reimplements this math.
+    param(
+        $Rect,
+        $Anchor,
+        [bool]$SelectAnchor,
+        [string]$Basis,
+        [string]$TopologyFingerprint,
+        $Topology
+    )
+
+    if ($null -eq $Topology -or -not [bool](Get-DevWSProperty -Object $Topology -Name 'Available')) {
+        return Get-EditorConvertFailure -Code 'topology-unavailable' -Message 'The current monitor topology is unavailable; no relative conversion is possible.'
+    }
+
+    if ([bool](Get-DevWSProperty -Object $Topology -Name 'IdentityAmbiguous')) {
+        return Get-EditorConvertFailure -Code 'topology-ambiguous' -Message 'Duplicate monitor identities make relative conversion ambiguous.'
+    }
+
+    if (-not [bool](Get-DevWSProperty -Object $Topology -Name 'IdentityComplete')) {
+        return Get-EditorConvertFailure -Code 'topology-incomplete' -Message 'The current monitor topology does not provide complete durable identities.'
+    }
+
+    $actualFingerprint = [string](Get-DevWSProperty -Object $Topology -Name 'Fingerprint')
+
+    if (-not [string]::IsNullOrWhiteSpace($TopologyFingerprint)) {
+        if ([string]::IsNullOrWhiteSpace($actualFingerprint)) {
+            return Get-EditorConvertFailure -Code 'topology-unavailable' -Message 'The current monitor topology has no fingerprint to compare.'
+        }
+
+        if ($actualFingerprint -cne $TopologyFingerprint) {
+            return Get-EditorConvertFailure -Code 'topology-changed' -Message 'The monitor topology changed since the editing session began.' -Details ([ordered]@{
+                expectedFingerprint = $TopologyFingerprint
+                actualFingerprint   = $actualFingerprint
+            })
+        }
+    }
+
+    $monitorsValue = Get-DevWSProperty -Object $Topology -Name 'Monitors'
+    $monitorRects = [System.Collections.Generic.List[object]]::new()
+
+    if ($null -ne $monitorsValue -and $monitorsValue -is [array]) {
+        foreach ($monitor in @($monitorsValue)) {
+            if ($null -ne $monitor -and $null -ne (Get-DevWSProperty -Object $monitor -Name 'MonitorRect')) {
+                $monitorRects.Add((Get-DevWSProperty -Object $monitor -Name 'MonitorRect')) | Out-Null
+            }
+        }
+    }
+
+    $anchorMonitor = $null
+    $identity = $null
+    $instance = $null
+    $basisRect = $null
+
+    if ($SelectAnchor) {
+        $selection = Select-DevWSRelativeAnchorFromRect -Rect $Rect -Topology $Topology
+
+        if (-not [bool]$selection.Ok) {
+            $code = switch ([string]$selection.Status) {
+                'topology-unavailable' { 'topology-unavailable' }
+                'anchor-unpersistable' { 'anchor-unpersistable' }
+                'rect-invalid'         { 'invalid-rect' }
+                default                { 'anchor-missing' }
+            }
+
+            return Get-EditorConvertFailure -Code $code -Message ([string]$selection.Message) -Details ([ordered]@{
+                reason = [string]$selection.Reason
+            })
+        }
+
+        $anchorMonitor = $selection.Monitor
+        $identity = [string](Get-DevWSProperty -Object $anchorMonitor -Name 'IdentityToken')
+        $instance = [string](Get-DevWSProperty -Object $anchorMonitor -Name 'DevicePathInstance')
+
+        if ($identity.StartsWith('path:', [System.StringComparison]::Ordinal)) {
+            $instance = $null
+        }
+
+        $basisResult = Get-DevWSRelativeLayoutBasisRect -Monitor $anchorMonitor -Basis $Basis
+    }
+    else {
+        $monitorSpec = [ordered]@{ identity = [string]$Anchor.identity }
+
+        if ($null -ne $Anchor -and $null -ne $Anchor.PSObject.Properties['instance'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$Anchor.instance)) {
+            $monitorSpec['instance'] = [string]$Anchor.instance
+        }
+
+        $probe = [pscustomobject][ordered]@{
+            monitor = [pscustomobject]$monitorSpec
+            basis   = $Basis
+            rect    = [pscustomobject][ordered]@{ x = 0; y = 0; w = 1; h = 1 }
+        }
+
+        $resolved = Resolve-DevWSRelativeLayoutAnchor -RelativeLayout $probe -Topology $Topology
+
+        if (-not [bool]$resolved.Ok) {
+            $code = switch ([string]$resolved.Status) {
+                'topology-unavailable' { 'topology-unavailable' }
+                'anchor-missing'       { 'anchor-missing' }
+                'anchor-ambiguous'     { 'anchor-ambiguous' }
+                'basis-unavailable'    { 'basis-unavailable' }
+                default                { 'anchor-unpersistable' }
+            }
+
+            return Get-EditorConvertFailure -Code $code -Message ([string]$resolved.Message) -Details ([ordered]@{
+                reason   = [string]$resolved.Reason
+                identity = [string]$resolved.Identity
+                instance = [string]$resolved.Instance
+            })
+        }
+
+        $anchorMonitor = $resolved.Monitor
+        $identity = [string]$resolved.Identity
+        $instance = [string]$resolved.Instance
+
+        $persistable = Test-DevWSRelativeAnchorPersistable -Monitor $anchorMonitor -Topology $Topology
+
+        if (-not [bool]$persistable.Ok) {
+            return Get-EditorConvertFailure -Code 'anchor-unpersistable' -Message ([string]$persistable.Message) -Details ([ordered]@{
+                reason = [string]$persistable.Reason
+            })
+        }
+
+        $basisRect = $resolved.BasisRect
+    }
+
+    if ($null -eq $basisRect) {
+        $basisResult = Get-DevWSRelativeLayoutBasisRect -Monitor $anchorMonitor -Basis $Basis
+
+        if (-not [bool]$basisResult.Ok) {
+            return Get-EditorConvertFailure -Code 'basis-unavailable' -Message ([string]$basisResult.Message) -Details ([ordered]@{
+                reason = [string]$basisResult.Reason
+            })
+        }
+
+        $basisRect = $basisResult.Rect
+    }
+
+    $converted = ConvertFrom-DevWSAbsoluteRectToRelative -Rect $Rect -BasisRect $basisRect
+
+    if (-not [bool]$converted.Ok) {
+        $code = if ([string]$converted.Status -eq 'basis-unavailable') { 'basis-unavailable' } else { 'invalid-rect' }
+        return Get-EditorConvertFailure -Code $code -Message ([string]$converted.Message) -Details ([ordered]@{
+            reason = [string]$converted.Reason
+        })
+    }
+
+    $roundTrip = ConvertTo-DevWSRelativeAbsoluteRect -RelativeRect $converted.Rect -BasisRect $basisRect
+
+    if (-not [bool]$roundTrip.Ok) {
+        return Get-EditorConvertFailure -Code 'invalid-rect' -Message ([string]$roundTrip.Message) -Details ([ordered]@{
+            reason = [string]$roundTrip.Reason
+        })
+    }
+
+    $reachable = $false
+    $visibleRatio = $null
+
+    if ($monitorRects.Count -gt 0) {
+        $metrics = Test-DevWSRectReachable -Rect $roundTrip.Rect -MonitorRects @($monitorRects.ToArray())
+        $reachable = [bool]$metrics.Reachable
+        $visibleRatio = [double]$metrics.VisibleRatio
+    }
+
+    $anchorResult = [ordered]@{ identity = $identity }
+
+    if (-not [string]::IsNullOrWhiteSpace($instance)) {
+        $anchorResult['instance'] = $instance
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok      = $true
+        Code    = $null
+        Message = $null
+        Details = $null
+        Result  = [pscustomobject][ordered]@{
+            anchor        = [pscustomobject]$anchorResult
+            basis         = $Basis
+            basisRect     = [pscustomobject][ordered]@{
+                x = [int]$basisRect.x
+                y = [int]$basisRect.y
+                w = [int]$basisRect.w
+                h = [int]$basisRect.h
+            }
+            normalized    = [pscustomobject][ordered]@{
+                x = [double]$converted.Rect.x
+                y = [double]$converted.Rect.y
+                w = [double]$converted.Rect.w
+                h = [double]$converted.Rect.h
+            }
+            roundTripRect = [pscustomobject][ordered]@{
+                x = [int]$roundTrip.Rect.x
+                y = [int]$roundTrip.Rect.y
+                w = [int]$roundTrip.Rect.w
+                h = [int]$roundTrip.Rect.h
+            }
+            reachable     = $reachable
+            visibleRatio  = $visibleRatio
+        }
+    }
+}
+
 function Get-EditorWarnings {
     param(
         [Parameter(Mandatory)]$Model,

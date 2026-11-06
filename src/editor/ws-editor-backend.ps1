@@ -1,21 +1,22 @@
-# DevWS v0.4 P3 read-only editor backend.
+# DevWS v0.4 P5 read-only editor backend.
 #
 # Normal-integrity, stdin/stdout JSON Lines protocol host. This file deliberately
 # loads only the six approved DevWS libraries plus the local projection helper.
 # It performs no configuration writes, no worker/broker/coordinator contact, and
-# no live-window operations.
+# no live-window operations. P5 adds structural `validate` and authoritative
+# relative-geometry `convert`; `save` and `preview` remain unimplemented.
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:Protocol = 'devws-editor/1'
-$script:BackendVersion = '0.4.0-p3'
+$script:BackendVersion = '0.4.0-p5'
 $script:MaxRequestBytes = 4194304
 $script:MaxResponseBytes = 16777216
 $script:MaxJsonDepth = 32
 $script:MaxConfigBytes = 4194304
-$script:SupportedOps = @('hello', 'inspect', 'read-config', 'project', 'shutdown')
-$script:UnsupportedOps = @('validate', 'preview', 'convert', 'save')
+$script:SupportedOps = @('hello', 'inspect', 'read-config', 'project', 'validate', 'convert', 'shutdown')
+$script:UnsupportedOps = @('preview', 'save')
 
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -282,6 +283,70 @@ function Test-EditorParams {
         return $null
     }
 
+    if ($Op -eq 'validate') {
+        $unknown = @($names | Where-Object { $_ -ne 'draft' })
+        if ($unknown.Count -gt 0) {
+            return New-EditorError -Code 'request-invalid' -Message "Unknown validate parameter(s): $($unknown -join ', ')."
+        }
+        if ($names -notcontains 'draft' -or $Params.draft -isnot [System.Management.Automation.PSCustomObject]) {
+            return New-EditorError -Code 'request-invalid' -Message "validate requires a 'draft' JSON object."
+        }
+
+        $draftBytes = [System.Text.Encoding]::UTF8.GetByteCount(($Params.draft | ConvertTo-Json -Compress -Depth $script:MaxJsonDepth))
+        if ($draftBytes -gt $script:MaxConfigBytes) {
+            return New-EditorError -Code 'request-invalid' -Message "The validate draft is $draftBytes bytes; the limit is $($script:MaxConfigBytes) bytes." -Details ([ordered]@{ sizeBytes = $draftBytes })
+        }
+
+        return $null
+    }
+
+    if ($Op -eq 'convert') {
+        $unknown = @($names | Where-Object { $_ -notin @('rect', 'anchor', 'selectAnchor', 'basis', 'topologyFingerprint') })
+        if ($unknown.Count -gt 0) {
+            return New-EditorError -Code 'request-invalid' -Message "Unknown convert parameter(s): $($unknown -join ', ')."
+        }
+        if ($names -notcontains 'rect' -or $Params.rect -isnot [System.Management.Automation.PSCustomObject]) {
+            return New-EditorError -Code 'request-invalid' -Message "convert requires a 'rect' JSON object."
+        }
+
+        $hasAnchor = $names -contains 'anchor'
+        $hasSelectAnchor = $names -contains 'selectAnchor'
+
+        if ($hasAnchor -eq $hasSelectAnchor) {
+            return New-EditorError -Code 'request-invalid' -Message "convert requires exactly one of 'anchor' or 'selectAnchor'."
+        }
+
+        if ($hasAnchor) {
+            if ($Params.anchor -isnot [System.Management.Automation.PSCustomObject]) {
+                return New-EditorError -Code 'request-invalid' -Message "convert 'anchor' must be a JSON object with 'identity' and optional 'instance'."
+            }
+            $anchorNames = @($Params.anchor.PSObject.Properties.Name)
+            $unknownAnchor = @($anchorNames | Where-Object { $_ -notin @('identity', 'instance') })
+            if ($unknownAnchor.Count -gt 0) {
+                return New-EditorError -Code 'request-invalid' -Message "Unknown convert anchor field(s): $($unknownAnchor -join ', ')."
+            }
+            if ($anchorNames -notcontains 'identity' -or $Params.anchor.identity -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Params.anchor.identity)) {
+                return New-EditorError -Code 'request-invalid' -Message "convert 'anchor.identity' must be a non-empty string."
+            }
+            if ($anchorNames -contains 'instance' -and ($Params.anchor.instance -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Params.anchor.instance))) {
+                return New-EditorError -Code 'request-invalid' -Message "convert 'anchor.instance' must be a non-empty string when supplied."
+            }
+        }
+        elseif ($Params.selectAnchor -isnot [bool] -or -not [bool]$Params.selectAnchor) {
+            return New-EditorError -Code 'request-invalid' -Message "convert 'selectAnchor' must be true when 'anchor' is omitted."
+        }
+
+        if ($names -notcontains 'basis' -or $Params.basis -isnot [string] -or $Params.basis -notin @('workArea', 'monitor')) {
+            return New-EditorError -Code 'request-invalid' -Message "convert 'basis' must be 'workArea' or 'monitor'."
+        }
+
+        if ($names -contains 'topologyFingerprint' -and ($Params.topologyFingerprint -isnot [string] -or $Params.topologyFingerprint -notmatch '^[0-9A-Fa-f]{64}$')) {
+            return New-EditorError -Code 'request-invalid' -Message "convert 'topologyFingerprint' must be 64 hexadecimal characters."
+        }
+
+        return $null
+    }
+
     return $null
 }
 
@@ -323,9 +388,9 @@ function Get-EditorHello {
             topologyReadable  = $topologyReadable
             readOnly          = $true
             saveSupported     = $false
-            validateSupported = $false
+            validateSupported = $true
             previewSupported  = $false
-            convertSupported  = $false
+            convertSupported  = $true
         }
     }
 }
@@ -350,12 +415,52 @@ function Get-EditorInspectResult {
         capabilities = [pscustomobject][ordered]@{
             canSave      = $false
             canProject   = $true
-            canValidate  = $false
+            canValidate  = $true
             canPreview   = $false
-            canConvert   = $false
+            canConvert   = $true
             readOnly     = $true
-            reason       = 'p3-read-only'
+            reason       = 'p5-draft-only'
         }
+    }
+}
+
+function ConvertTo-EditorRectArgument {
+    # Convert a protocol rectangle object into the integer shape expected by the
+    # existing relative-layout functions. Width/height must be greater than 0;
+    # negative origins are valid.
+    param($Value)
+
+    if ($null -eq $Value -or $Value -isnot [System.Management.Automation.PSCustomObject]) {
+        return [pscustomobject]@{ Ok = $false; Rect = $null; Message = "The rectangle must be a JSON object with 'x', 'y', 'w', and 'h'." }
+    }
+
+    $names = @($Value.PSObject.Properties.Name)
+
+    if ($names.Count -ne 4 -or $names -notcontains 'x' -or $names -notcontains 'y' -or $names -notcontains 'w' -or $names -notcontains 'h') {
+        return [pscustomobject]@{ Ok = $false; Rect = $null; Message = "The rectangle must contain exactly 'x', 'y', 'w', and 'h'." }
+    }
+
+    foreach ($field in @('x', 'y', 'w', 'h')) {
+        $number = $Value.$field
+
+        if (-not (Test-DevWSInteger -Value $number) -or $number -lt [int]::MinValue -or $number -gt [int]::MaxValue) {
+            return [pscustomobject]@{ Ok = $false; Rect = $null; Message = "The rectangle field '$field' must be a 32-bit integer." }
+        }
+    }
+
+    if ([long]$Value.w -le 0 -or [long]$Value.h -le 0) {
+        return [pscustomobject]@{ Ok = $false; Rect = $null; Message = "The rectangle width and height must be greater than 0." }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok      = $true
+        Rect    = [pscustomobject][ordered]@{
+            x = [int]$Value.x
+            y = [int]$Value.y
+            w = [int]$Value.w
+            h = [int]$Value.h
+        }
+        Message = $null
     }
 }
 
@@ -518,6 +623,76 @@ function Invoke-EditorOperation {
             }
         }
 
+        'validate' {
+            $validation = Get-EditorDraftValidation -Draft $Params.draft -StartPath $editorRoot
+
+            return [pscustomobject]@{
+                Ok          = $true
+                Result      = [pscustomobject][ordered]@{
+                    valid        = [bool]$validation.valid
+                    saveEligible = [bool]$validation.saveEligible
+                    errors       = @($validation.errors)
+                }
+                Warnings    = @()
+                ErrorObject = $null
+            }
+        }
+
+        'convert' {
+            $rectArgument = ConvertTo-EditorRectArgument -Value $Params.rect
+
+            if (-not [bool]$rectArgument.Ok) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'invalid-rect' -Message ([string]$rectArgument.Message)
+                }
+            }
+
+            try {
+                $topology = Get-DevWSMonitorTopology
+            }
+            catch {
+                $topology = $null
+            }
+
+            $selectAnchor = $false
+            if ($null -ne $Params.PSObject.Properties['selectAnchor']) {
+                $selectAnchor = [bool]$Params.selectAnchor
+            }
+
+            $fingerprint = if ($null -ne $Params.PSObject.Properties['topologyFingerprint']) {
+                [string]$Params.topologyFingerprint
+            } else {
+                $null
+            }
+
+            $converted = Get-EditorConvert `
+                -Rect $rectArgument.Rect `
+                -Anchor $(if ($null -ne $Params.PSObject.Properties['anchor']) { $Params.anchor } else { $null }) `
+                -SelectAnchor $selectAnchor `
+                -Basis ([string]$Params.basis) `
+                -TopologyFingerprint $fingerprint `
+                -Topology $topology
+
+            if (-not [bool]$converted.Ok) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code ([string]$converted.Code) -Message ([string]$converted.Message) -Details $converted.Details
+                }
+            }
+
+            return [pscustomobject]@{
+                Ok          = $true
+                Result      = $converted.Result
+                Warnings    = @()
+                ErrorObject = $null
+            }
+        }
+
         'shutdown' {
             return [pscustomobject]@{ Ok = $true; Result = [pscustomobject]@{ stopped = $true }; Warnings = @(); ErrorObject = $null }
         }
@@ -527,9 +702,9 @@ function Invoke-EditorOperation {
                 Ok          = $false
                 Result      = $null
                 Warnings    = @()
-                ErrorObject = New-EditorError -Code 'unsupported-operation' -Message "Operation '$Op' is not implemented in P3." -Details ([ordered]@{
+                ErrorObject = New-EditorError -Code 'unsupported-operation' -Message "Operation '$Op' is not implemented in P5." -Details ([ordered]@{
                     operation    = $Op
-                    phase        = 'P3'
+                    phase        = 'P5'
                     supportedOps = $script:SupportedOps
                 })
             }
@@ -596,9 +771,9 @@ try {
         }
 
         if ($op -in $script:UnsupportedOps) {
-            Write-EditorResponse -Id $request.id -Op $op -Ok $false -ErrorObject (New-EditorError -Code 'unsupported-operation' -Message "Operation '$op' is not implemented in P3." -Details ([ordered]@{
+            Write-EditorResponse -Id $request.id -Op $op -Ok $false -ErrorObject (New-EditorError -Code 'unsupported-operation' -Message "Operation '$op' is not implemented in P5." -Details ([ordered]@{
                 operation    = $op
-                phase        = 'P3'
+                phase        = 'P5'
                 supportedOps = $script:SupportedOps
             }))
             continue
@@ -607,7 +782,7 @@ try {
         if ($op -notin $script:SupportedOps) {
             Write-EditorResponse -Id $request.id -Op $op -Ok $false -ErrorObject (New-EditorError -Code 'unsupported-operation' -Message "Operation '$op' is not implemented." -Details ([ordered]@{
                 operation    = $op
-                phase        = 'P3'
+                phase        = 'P5'
                 supportedOps = $script:SupportedOps
             }))
             continue

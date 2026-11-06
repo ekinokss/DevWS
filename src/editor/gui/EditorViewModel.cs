@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 
 namespace DevWS.Editor;
@@ -81,6 +82,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
 {
     private readonly EditorSession _session;
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly Dictionary<string, RectInfo> _draftPreviewRects = new(StringComparer.Ordinal);
     private bool _disposed;
     private bool _isBusy;
     private bool _hasError;
@@ -89,6 +91,19 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     private SetOption? _selectedSet;
     private MonitorOption? _selectedMonitor;
     private ItemOption? _selectedItem;
+    private DraftDocument? _draft;
+    private GeometryScopeOption? _selectedScope;
+    private DraftValidationResult? _draftValidation;
+    private bool _hasDraftConflict;
+    private bool _relativeCommitBlocked;
+    private string _draftConflictCode = "";
+    private string _draftConflictMessage = "";
+    private string _editError = "";
+    private string _editX = "";
+    private string _editY = "";
+    private string _editW = "";
+    private string _editH = "";
+    private string _selectedBasis = "workArea";
     private string _configSource = "";
     private string _configRevision = "";
     private string _topologyFingerprint = "";
@@ -112,6 +127,12 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     private double _cpuTotalMs;
     private int? _backendPid;
     private int _warningCount;
+    private double _lastProjectionApplyMs;
+    private double _lastItemsUpdateMs;
+    private double _lastDraftCreateMs;
+    private double _lastValidateMs;
+    private double _lastConvertMs;
+    private double _lastEditCommitMs;
 
     public EditorViewModel(EditorSession session, bool isDevelopmentConfig, string integrityLevel)
     {
@@ -126,6 +147,8 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public ObservableCollection<WarningRow> Warnings { get; } = new();
     public ObservableCollection<WarningRow> ItemWarnings { get; } = new();
     public ObservableCollection<DetailRow> DetailRows { get; } = new();
+    public ObservableCollection<GeometryScopeOption> GeometryScopes { get; } = new();
+    public ObservableCollection<DraftErrorInfo> DraftErrors { get; } = new();
     public HashSet<string> WarningItemIds { get; private set; } = new(StringComparer.Ordinal);
 
     public bool IsDevelopmentConfig { get; }
@@ -135,7 +158,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public bool IsBusy => _isBusy;
     public bool IsNotBusy => !_isBusy;
     public bool HasError => _hasError;
-    public string ReadOnlyBadge => "READ-ONLY";
+    public string ReadOnlyBadge => "DRAFT-ONLY";
     public string DevelopmentBadge => "DEVELOPMENT CONFIG";
     public string IntegrityText => $"Integrity: {_integrityLevel}";
     public string BackendText => _backendPid is null
@@ -153,7 +176,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         ? "Topology: unavailable"
         : $"Topology: {_topologyFingerprint[..Math.Min(12, _topologyFingerprint.Length)]}…";
     public string CountsText => $"{Sets.Count} sets  •  {Monitors.Count} monitors  •  {Items.Count} items  •  {_warningCount} warnings";
-    public string BusyText => _isBusy ? "Loading read-only projection…" : "";
+    public string BusyText => _isBusy ? "Working…" : "";
     public string StatusMessage => _statusMessage;
     public string ErrorCode => _errorCode;
     public string ErrorMessage => _errorMessage;
@@ -179,6 +202,87 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public bool BackendExited => _session.Client.HasExited;
     public int? BackendExitCode => _session.Client.ExitCode;
     public string BackendStderr => _session.Client.LastStderr;
+    public EditorLoadMetrics? LoadMetrics => _session.LastLoadMetrics;
+    public double LastProjectionApplyMs => _lastProjectionApplyMs;
+    public double LastItemsUpdateMs => _lastItemsUpdateMs;
+    public double LastDraftCreateMs => _lastDraftCreateMs;
+    public double LastValidateMs => _lastValidateMs;
+    public double LastConvertMs => _lastConvertMs;
+    public double LastEditCommitMs => _lastEditCommitMs;
+    public DraftDocument? Draft => _draft;
+    public IReadOnlyDictionary<string, RectInfo> DraftPreviewRects => _draftPreviewRects;
+    public bool HasDraft => _draft is not null;
+    public bool IsDraftDirty => _draft?.IsDirty == true;
+    public string DraftBadgeText => IsDraftDirty
+        ? $"UNSAVED DRAFT — {_draft!.DirtyItemIds().Count} item(s)"
+        : "";
+    public string SaveUnavailableText => "Save is not available in P5 (in-memory draft only).";
+    public bool HasDraftConflict => _hasDraftConflict;
+    public string DraftConflictText => _hasDraftConflict
+        ? $"{_draftConflictCode}: {_draftConflictMessage}"
+        : "";
+    public bool CanDiscardDraft => HasDraft && (IsDraftDirty || HasDraftConflict);
+    public bool CanEditGeometry => HasDraft && !HasDraftConflict && !_isBusy && _selectedItem is not null;
+    public bool CanEditSelectedScope => CanEditGeometry &&
+        (_selectedScope?.Kind != GeometryScopeKind.Relative || !_relativeCommitBlocked) &&
+        (_selectedScope?.Kind != GeometryScopeKind.ProfileEntry || !_relativeCommitBlocked);
+    public string ScopeDescription => _selectedScope is null
+        ? "Select an item to edit its geometry."
+        : _selectedScope.Kind switch
+        {
+            GeometryScopeKind.AbsoluteFallback => $"Stored scope: item.layout (absolute fallback) for '{SelectedItem?.Item.ItemId}'",
+            GeometryScopeKind.ProfileEntry => $"Stored scope: layoutProfiles['{_selectedScope.ProfileId}'].layouts['{SelectedItem?.Item.ItemId}']",
+            GeometryScopeKind.Relative => $"Stored scope: layoutRelative for '{SelectedItem?.Item.ItemId}' • anchor {RelativeAnchorSummary()}",
+            _ => ""
+        };
+    public string DraftValidationText => _draft is null
+        ? "Draft: not loaded"
+        : _draftValidation is null
+            ? "Draft validation: not run"
+            : _draftValidation.Valid
+                ? "Draft validation: structurally valid (not a semantic preview or save authorization)"
+                : $"Draft validation: INVALID — {_draftValidation.Errors.Count} error(s)";
+    public bool IsDraftValid => _draftValidation?.Valid == true;
+    public string EditErrorText => _editError;
+    public bool HasEditError => !string.IsNullOrWhiteSpace(_editError);
+    public string EditX
+    {
+        get => _editX;
+        set => Set(ref _editX, value);
+    }
+    public string EditY
+    {
+        get => _editY;
+        set => Set(ref _editY, value);
+    }
+    public string EditW
+    {
+        get => _editW;
+        set => Set(ref _editW, value);
+    }
+    public string EditH
+    {
+        get => _editH;
+        set => Set(ref _editH, value);
+    }
+    public IReadOnlyList<string> BasisOptions { get; } = new[] { "workArea", "monitor" };
+    public string SelectedBasis
+    {
+        get => _selectedBasis;
+        set => Set(ref _selectedBasis, value);
+    }
+    public bool CanConvertToRelative => CanEditGeometry &&
+        SelectedItem is not null &&
+        _draft?.GetLayoutMode(SelectedItem.Item.ItemId) == "absolute";
+    public bool CanConvertToAbsolute => CanEditGeometry &&
+        SelectedItem is not null &&
+        _draft?.GetLayoutMode(SelectedItem.Item.ItemId) == "relative";
+    public string BaseRevisionText => _draft is null
+        ? "—"
+        : _draft.BaseSha256[..Math.Min(12, _draft.BaseSha256.Length)] + "…";
+    public string BaseTopologyText => string.IsNullOrWhiteSpace(_draft?.BaseTopologyFingerprint)
+        ? "unavailable"
+        : _draft!.BaseTopologyFingerprint![..Math.Min(12, _draft.BaseTopologyFingerprint.Length)] + "…";
 
     public SetOption? SelectedSet
     {
@@ -216,10 +320,34 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         }
     }
 
+    public GeometryScopeOption? SelectedScope
+    {
+        get => _selectedScope;
+        private set
+        {
+            if (Set(ref _selectedScope, value))
+            {
+                OnPropertyChanged(nameof(SelectedScope));
+                OnPropertyChanged(nameof(ScopeDescription));
+                OnPropertyChanged(nameof(CanConvertToRelative));
+                OnPropertyChanged(nameof(CanConvertToAbsolute));
+                OnPropertyChanged(nameof(CanEditSelectedScope));
+            }
+        }
+    }
+
     public async Task LoadAsync(string? preferredSetId = null)
     {
         if (_isBusy || _disposed)
         {
+            return;
+        }
+
+        if (IsDraftDirty)
+        {
+            SetDraftConflict(
+                "draft-dirty",
+                "Discard the unsaved draft before reloading the canonical configuration.");
             return;
         }
 
@@ -274,6 +402,14 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
             return;
         }
 
+        if (IsDraftDirty)
+        {
+            SetEditError("Discard the unsaved draft before switching workspace sets.");
+            _statusMessage = "Set switch blocked: the current draft is dirty.";
+            OnPropertyChanged(nameof(StatusMessage));
+            return;
+        }
+
         SetBusy(true);
         ClearError();
 
@@ -284,11 +420,14 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
                 _configRevision,
                 _topologyFingerprint,
                 _lifetime.Token);
+            _draft?.RebindSet(set.Info.Id);
+            _draftPreviewRects.Clear();
+            _draftValidation = null;
+            DraftErrors.Clear();
             ApplyProjection(projection, null);
             SelectedSet = set;
             _statusMessage = $"Projected set '{set.Info.Id}': {Items.Count} items.";
-            OnPropertyChanged(nameof(StatusMessage));
-            OnPropertyChanged(nameof(CountsText));
+            RefreshDraftUi();
         }
         catch (Exception ex)
         {
@@ -307,13 +446,78 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public async Task RefreshAsync()
     {
         _refreshMs = 0;
-        await LoadAsync(SelectedSet?.Info.Id);
+
+        if (!IsDraftDirty)
+        {
+            await LoadAsync(SelectedSet?.Info.Id);
+            return;
+        }
+
+        if (_isBusy)
+        {
+            return;
+        }
+
+        SetBusy(true);
+        ClearError();
+
+        try
+        {
+            var inspect = await _session.InspectAsync(_lifetime.Token);
+
+            if (!string.Equals(inspect.Config.Sha256, _draft!.BaseSha256, StringComparison.Ordinal))
+            {
+                SetDraftConflict(
+                    "external-change",
+                    "The canonical configuration changed while the draft is dirty. The draft was preserved; discard it to reload, or keep working without refreshing.");
+                _statusMessage = "Refresh stopped: the canonical configuration changed.";
+                return;
+            }
+
+            if (!string.Equals(
+                    inspect.Topology.Fingerprint ?? "",
+                    _draft.BaseTopologyFingerprint ?? "",
+                    StringComparison.Ordinal))
+            {
+                SetDraftConflict(
+                    "topology-changed",
+                    "The monitor topology changed while the draft is dirty. Relative/profile commits are blocked; discard the draft to reload.");
+                _statusMessage = "Refresh stopped: the monitor topology changed.";
+                return;
+            }
+
+            var projection = await _session.ProjectAsync(
+                SelectedSet?.Info.Id ?? _draft.SetId,
+                _draft.BaseSha256,
+                _draft.BaseTopologyFingerprint,
+                _lifetime.Token);
+
+            ApplyProjection(projection, inspect.Topology);
+            _statusMessage = $"Refreshed saved projection; draft preserved ({_draft.DirtyItemIds().Count} dirty item(s)).";
+            RefreshDraftUi();
+        }
+        catch (Exception ex)
+        {
+            SetError(ex);
+            if (ex is BackendException backend &&
+                backend.Code is "external-change" or "topology-changed")
+            {
+                SetDraftConflict(backend.Code, backend.Message);
+            }
+        }
+        finally
+        {
+            SetBusy(false);
+            OnPropertyChanged(nameof(RefreshMs));
+        }
     }
 
     public void SelectItem(ItemOption? item)
     {
         SelectedItem = item;
+        RebuildScopes(preserveSelection: false);
         RebuildDetails();
+        RefreshEditFields();
     }
 
     public void SelectItemAt(int index)
@@ -345,6 +549,468 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         }
     }
 
+    public void SelectScope(GeometryScopeOption? scope)
+    {
+        if (scope is null)
+        {
+            return;
+        }
+
+        SelectedScope = scope;
+        RefreshEditFields();
+        RebuildDetails();
+    }
+
+    public void RefreshEditFields()
+    {
+        var rect = GetScopeEditableRect();
+
+        if (rect is null)
+        {
+            EditX = "";
+            EditY = "";
+            EditW = "";
+            EditH = "";
+        }
+        else
+        {
+            EditX = rect.X.ToString(CultureInfo.InvariantCulture);
+            EditY = rect.Y.ToString(CultureInfo.InvariantCulture);
+            EditW = rect.W.ToString(CultureInfo.InvariantCulture);
+            EditH = rect.H.ToString(CultureInfo.InvariantCulture);
+        }
+
+        OnPropertyChanged(nameof(CanEditGeometry));
+        OnPropertyChanged(nameof(CanEditSelectedScope));
+        OnPropertyChanged(nameof(CanConvertToRelative));
+        OnPropertyChanged(nameof(CanConvertToAbsolute));
+        OnPropertyChanged(nameof(ScopeDescription));
+    }
+
+    public RectInfo? GetScopeEditableRect()
+    {
+        if (_draft is null || SelectedItem is null || SelectedScope is null)
+        {
+            return null;
+        }
+
+        var itemId = SelectedItem.Item.ItemId;
+
+        return SelectedScope.Kind switch
+        {
+            GeometryScopeKind.AbsoluteFallback => _draft.GetAbsoluteLayout(itemId),
+            GeometryScopeKind.ProfileEntry when !string.IsNullOrWhiteSpace(SelectedScope.ProfileId) =>
+                _draft.GetProfileEntry(itemId, SelectedScope.ProfileId!) ?? SelectedItem.Item.ProfileEntry,
+            GeometryScopeKind.Relative =>
+                _draftPreviewRects.TryGetValue(itemId, out var preview)
+                    ? preview
+                    : SelectedItem.Item.RelativeRect ?? SelectedItem.Item.FallbackRect ?? _draft.GetAbsoluteLayout(itemId),
+            _ => null
+        };
+    }
+
+    public async Task<bool> ApplyGeometryAsync(string xText, string yText, string wText, string hText)
+    {
+        ClearEditError();
+
+        if (!CanEditSelectedScope)
+        {
+            SetEditError(HasDraftConflict
+                ? "Editing is blocked until the draft conflict is resolved."
+                : "The selected geometry scope cannot be committed in the current state.");
+            return false;
+        }
+
+        if (!TryParseInteger(xText, "X", out var x) ||
+            !TryParseInteger(yText, "Y", out var y) ||
+            !TryParseInteger(wText, "Width", out var w) ||
+            !TryParseInteger(hText, "Height", out var h))
+        {
+            return false;
+        }
+
+        if (w <= 0 || h <= 0)
+        {
+            SetEditError("Width and height must be greater than 0.");
+            return false;
+        }
+
+        return await CommitRectAsync(new RectInfo(x, y, w, h));
+    }
+
+    public async Task<bool> CommitCanvasRectAsync(RectInfo rect)
+    {
+        ClearEditError();
+
+        if (!CanEditSelectedScope)
+        {
+            SetEditError("The selected geometry scope cannot be committed in the current state.");
+            return false;
+        }
+
+        if (rect.W <= 0 || rect.H <= 0)
+        {
+            SetEditError("Width and height must be greater than 0.");
+            return false;
+        }
+
+        return await CommitRectAsync(rect);
+    }
+
+    private async Task<bool> CommitRectAsync(RectInfo rect)
+    {
+        if (_draft is null || SelectedItem is null || SelectedScope is null)
+        {
+            SetEditError("No editable geometry scope is selected.");
+            return false;
+        }
+
+        var itemId = SelectedItem.Item.ItemId;
+        var scope = SelectedScope;
+        var commitWatch = Stopwatch.StartNew();
+
+        SetBusy(true);
+        ClearEditError();
+
+        try
+        {
+            await EnsureCommitContextAsync(scope.Kind is GeometryScopeKind.ProfileEntry or GeometryScopeKind.Relative);
+
+            RectInfo preview;
+
+            if (scope.Kind == GeometryScopeKind.Relative)
+            {
+                var anchor = _draft.GetRelativeAnchor(itemId);
+
+                if (anchor is null)
+                {
+                    SetEditError("This relative item has no usable anchor or basis; the relative edit was refused.");
+                    return false;
+                }
+
+                var convertWatch = Stopwatch.StartNew();
+                var converted = await _session.ConvertAsync(
+                    rect,
+                    anchor,
+                    anchor.Basis,
+                    _draft.BaseTopologyFingerprint,
+                    _lifetime.Token);
+                convertWatch.Stop();
+                _lastConvertMs = convertWatch.Elapsed.TotalMilliseconds;
+
+                _draft.SetRelativeRect(itemId, converted.Normalized);
+                preview = converted.RoundTripRect;
+            }
+            else if (scope.Kind == GeometryScopeKind.ProfileEntry)
+            {
+                if (string.IsNullOrWhiteSpace(scope.ProfileId))
+                {
+                    SetEditError("The profile entry scope has no profile id.");
+                    return false;
+                }
+
+                _draft.SetProfileEntry(itemId, scope.ProfileId!, rect);
+                preview = rect;
+            }
+            else
+            {
+                _draft.SetAbsoluteLayout(itemId, rect);
+                preview = rect;
+            }
+
+            _draft.EnsureMutationScope();
+            _draftPreviewRects[itemId] = preview;
+            commitWatch.Stop();
+            _lastEditCommitMs = commitWatch.Elapsed.TotalMilliseconds;
+
+            await ValidateDraftCoreAsync();
+            RebuildScopes(preserveSelection: true);
+            RebuildDetails();
+            RefreshEditFields();
+            RefreshDraftUi();
+
+            _statusMessage = scope.Kind == GeometryScopeKind.Relative
+                ? $"Relative geometry committed in memory for '{itemId}'; normalized fractions stored in the draft."
+                : $"Draft geometry updated for '{itemId}' ({scope.Display}).";
+            OnPropertyChanged(nameof(StatusMessage));
+            return true;
+        }
+        catch (BackendException ex)
+        {
+            HandleDraftBackendError(ex);
+            return false;
+        }
+        catch (EditorException ex)
+        {
+            if (ex.Code is "unsupported-mutation" or "invalid-rect" or "draft-invalid")
+            {
+                _draft?.RevertItem(itemId);
+                _draftPreviewRects.Remove(itemId);
+            }
+
+            SetEditError(ex.Message);
+            _statusMessage = "Draft edit refused.";
+            OnPropertyChanged(nameof(StatusMessage));
+            return false;
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    public async Task RevertSelectedAsync()
+    {
+        if (_draft is null || SelectedItem is null || !IsDraftDirty)
+        {
+            return;
+        }
+
+        var itemId = SelectedItem.Item.ItemId;
+        _draft.RevertItem(itemId);
+        _draftPreviewRects.Remove(itemId);
+        ClearEditError();
+        await ValidateDraftCoreAsync();
+        RebuildScopes(preserveSelection: true);
+        RebuildDetails();
+        RefreshEditFields();
+        RefreshDraftUi();
+        _statusMessage = $"Reverted the draft geometry for '{itemId}'.";
+        OnPropertyChanged(nameof(StatusMessage));
+    }
+
+    public async Task DiscardDraftAsync(bool reload)
+    {
+        if (_draft is null)
+        {
+            return;
+        }
+
+        _draft.DiscardAll();
+        _draftPreviewRects.Clear();
+        _draftValidation = null;
+        DraftErrors.Clear();
+        _hasDraftConflict = false;
+        _relativeCommitBlocked = false;
+        _draftConflictCode = "";
+        _draftConflictMessage = "";
+        ClearEditError();
+        RebuildScopes(preserveSelection: true);
+        RebuildDetails();
+        RefreshEditFields();
+        RefreshDraftUi();
+
+        if (reload)
+        {
+            await LoadAsync(SelectedSet?.Info.Id);
+        }
+        else
+        {
+            _statusMessage = "All in-memory draft changes were discarded.";
+            OnPropertyChanged(nameof(StatusMessage));
+        }
+    }
+
+    public async Task DiscardDraftAndReloadAsync()
+    {
+        await DiscardDraftAsync(reload: true);
+    }
+
+    public async Task ConvertToRelativeAsync()
+    {
+        ClearEditError();
+
+        if (!CanConvertToRelative || _draft is null || SelectedItem is null)
+        {
+            SetEditError("The selected item is not an absolute item that can be converted to relative mode.");
+            return;
+        }
+
+        var itemId = SelectedItem.Item.ItemId;
+        var rect = _draft.GetAbsoluteLayout(itemId);
+
+        SetBusy(true);
+
+        try
+        {
+            await EnsureCommitContextAsync(requiresTopology: true);
+            var convertWatch = Stopwatch.StartNew();
+            var converted = await _session.SelectAnchorAndConvertAsync(
+                rect,
+                SelectedBasis,
+                _draft.BaseTopologyFingerprint,
+                _lifetime.Token);
+            convertWatch.Stop();
+            _lastConvertMs = convertWatch.Elapsed.TotalMilliseconds;
+
+            _draft.SetRelativeMode(
+                itemId,
+                converted.Identity,
+                converted.Instance,
+                converted.Basis,
+                converted.Normalized);
+            _draft.EnsureMutationScope();
+            _draftPreviewRects[itemId] = converted.RoundTripRect;
+
+            await ValidateDraftCoreAsync();
+            RebuildScopes(preserveSelection: true);
+            SelectedScope = GeometryScopes.FirstOrDefault(scope => scope.Kind == GeometryScopeKind.Relative) ?? SelectedScope;
+            RebuildDetails();
+            RefreshEditFields();
+            RefreshDraftUi();
+            _statusMessage = $"Converted '{itemId}' to relative mode using backend anchor selection ({converted.Identity}).";
+            OnPropertyChanged(nameof(StatusMessage));
+        }
+        catch (BackendException ex)
+        {
+            HandleDraftBackendError(ex);
+        }
+        catch (EditorException ex)
+        {
+            if (ex.Code is "unsupported-mutation" or "invalid-rect" or "draft-invalid")
+            {
+                _draft.RevertItem(itemId);
+                _draftPreviewRects.Remove(itemId);
+            }
+
+            SetEditError(ex.Message);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    public async Task ConvertToAbsoluteAsync()
+    {
+        ClearEditError();
+
+        if (!CanConvertToAbsolute || _draft is null || SelectedItem is null)
+        {
+            SetEditError("The selected item is not a relative item that can be converted to absolute mode.");
+            return;
+        }
+
+        var itemId = SelectedItem.Item.ItemId;
+        var anchor = _draft.GetRelativeAnchor(itemId);
+        var rect = _draftPreviewRects.TryGetValue(itemId, out var preview)
+            ? preview
+            : SelectedItem.Item.RelativeRect;
+
+        if (anchor is null || rect is null)
+        {
+            SetEditError("The relative item has no resolved anchor/rectangle; conversion to absolute was refused.");
+            return;
+        }
+
+        SetBusy(true);
+
+        try
+        {
+            await EnsureCommitContextAsync(requiresTopology: true);
+            var convertWatch = Stopwatch.StartNew();
+            var converted = await _session.ConvertAsync(
+                rect,
+                anchor,
+                anchor.Basis,
+                _draft.BaseTopologyFingerprint,
+                _lifetime.Token);
+            convertWatch.Stop();
+            _lastConvertMs = convertWatch.Elapsed.TotalMilliseconds;
+
+            _draft.SetAbsoluteMode(itemId, converted.RoundTripRect);
+            _draft.EnsureMutationScope();
+            _draftPreviewRects[itemId] = converted.RoundTripRect;
+
+            await ValidateDraftCoreAsync();
+            RebuildScopes(preserveSelection: true);
+            SelectedScope = GeometryScopes.FirstOrDefault(scope => scope.Kind == GeometryScopeKind.AbsoluteFallback) ?? SelectedScope;
+            RebuildDetails();
+            RefreshEditFields();
+            RefreshDraftUi();
+            _statusMessage = $"Converted '{itemId}' to absolute mode at {converted.RoundTripRect.Display}.";
+            OnPropertyChanged(nameof(StatusMessage));
+        }
+        catch (BackendException ex)
+        {
+            HandleDraftBackendError(ex);
+        }
+        catch (EditorException ex)
+        {
+            if (ex.Code is "unsupported-mutation" or "invalid-rect" or "draft-invalid")
+            {
+                _draft.RevertItem(itemId);
+                _draftPreviewRects.Remove(itemId);
+            }
+
+            SetEditError(ex.Message);
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    private async Task EnsureCommitContextAsync(bool requiresTopology)
+    {
+        if (_draft is null)
+        {
+            throw new EditorException("draft-missing", "No draft is loaded.");
+        }
+
+        var inspect = await _session.InspectAsync(_lifetime.Token);
+
+        if (!string.Equals(inspect.Config.Sha256, _draft.BaseSha256, StringComparison.Ordinal))
+        {
+            SetDraftConflict(
+                "external-change",
+                "The canonical configuration changed while the draft is dirty. The edit was refused and the draft was preserved.");
+            throw new EditorException(
+                "external-change",
+                "The canonical configuration changed; the draft edit was refused.",
+                requiresRefresh: true);
+        }
+
+        if (requiresTopology &&
+            !string.Equals(
+                inspect.Topology.Fingerprint ?? "",
+                _draft.BaseTopologyFingerprint ?? "",
+                StringComparison.Ordinal))
+        {
+            _relativeCommitBlocked = true;
+            SetDraftConflict(
+                "topology-changed",
+                "The monitor topology changed. Relative/profile commits are blocked until the draft is discarded and reloaded.");
+            throw new EditorException(
+                "topology-changed",
+                "The monitor topology changed; the relative/profile edit was refused.",
+                requiresRefresh: true);
+        }
+    }
+
+    private async Task ValidateDraftCoreAsync()
+    {
+        if (_draft is null)
+        {
+            return;
+        }
+
+        var watch = Stopwatch.StartNew();
+        var result = await _session.ValidateAsync(_draft, _lifetime.Token);
+        watch.Stop();
+        _lastValidateMs = watch.Elapsed.TotalMilliseconds;
+        _draftValidation = result;
+
+        DraftErrors.Clear();
+        foreach (var error in result.Errors)
+        {
+            DraftErrors.Add(error);
+        }
+
+        OnPropertyChanged(nameof(DraftValidationText));
+        OnPropertyChanged(nameof(IsDraftValid));
+    }
+
     private void ApplySnapshot(EditorSnapshot snapshot, string? preferredSetId)
     {
         Sets.Clear();
@@ -373,6 +1039,15 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         _handshakeMs = snapshot.Hello is null ? 0 : _session.Client.LastConnectMs;
         _initialLoadCompleted = true;
         _requiresRefresh = false;
+        _hasDraftConflict = false;
+        _relativeCommitBlocked = false;
+        _draftConflictCode = "";
+        _draftConflictMessage = "";
+        _draftPreviewRects.Clear();
+        _draftValidation = null;
+        _draft = null;
+        DraftErrors.Clear();
+        ClearEditError();
 
         Monitors.Clear();
         foreach (var monitor in snapshot.Inspect.Topology.Monitors)
@@ -383,6 +1058,20 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         SelectedMonitor = null;
         ApplyProjection(snapshot.Projection, snapshot.Inspect.Topology);
         SelectedMonitor ??= Monitors.FirstOrDefault();
+
+        var draftWatch = Stopwatch.StartNew();
+        _draft = DraftDocument.Create(
+            snapshot.Document,
+            snapshot.Inspect.Config.Sha256,
+            snapshot.Inspect.Topology.Fingerprint,
+            SelectedSet?.Info.Id ?? "");
+        draftWatch.Stop();
+        _lastDraftCreateMs = draftWatch.Elapsed.TotalMilliseconds;
+
+        RebuildScopes(preserveSelection: false);
+        RebuildDetails();
+        RefreshEditFields();
+        RefreshDraftUi();
 
         OnPropertyChanged(nameof(ConfigSource));
         OnPropertyChanged(nameof(ConfigText));
@@ -403,6 +1092,8 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
 
     private void ApplyProjection(WorkspaceProjection projection, TopologyInfo? fallbackTopology)
     {
+        var applyWatch = Stopwatch.StartNew();
+        var selectedItemId = SelectedItem?.Item.ItemId;
         _projectedSet = projection.Set;
         _configRevision = string.IsNullOrWhiteSpace(projection.ConfigRevision)
             ? _configRevision
@@ -414,11 +1105,14 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
             ?? fallbackTopology?.VirtualScreenRect;
         _warningCount = projection.Warnings.Count;
 
+        var itemsWatch = Stopwatch.StartNew();
         Items.Clear();
         foreach (var item in projection.Set.Items)
         {
             Items.Add(new ItemOption(item));
         }
+        itemsWatch.Stop();
+        _lastItemsUpdateMs = itemsWatch.Elapsed.TotalMilliseconds;
 
         Warnings.Clear();
         foreach (var warning in projection.Warnings)
@@ -433,9 +1127,15 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
                 .Select(id => id!),
             StringComparer.Ordinal);
 
-        SelectedItem = Items.FirstOrDefault();
+        SelectedItem = !string.IsNullOrWhiteSpace(selectedItemId)
+            ? Items.FirstOrDefault(item => string.Equals(item.Item.ItemId, selectedItemId, StringComparison.Ordinal))
+            : null;
+        SelectedItem ??= Items.FirstOrDefault();
         SelectedMonitor = SelectedMonitor is null ? Monitors.FirstOrDefault() : SelectedMonitor;
+        RebuildScopes(preserveSelection: true);
         RebuildDetails();
+        applyWatch.Stop();
+        _lastProjectionApplyMs = applyWatch.Elapsed.TotalMilliseconds;
 
         OnPropertyChanged(nameof(VirtualScreenRect));
         OnPropertyChanged(nameof(ConfigRevision));
@@ -443,6 +1143,75 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(TopologyText));
         OnPropertyChanged(nameof(CountsText));
         OnPropertyChanged(nameof(WarningItemIds));
+    }
+
+    private void RebuildScopes(bool preserveSelection)
+    {
+        var priorKind = preserveSelection ? SelectedScope?.Kind : null;
+        var priorProfile = preserveSelection ? SelectedScope?.ProfileId : null;
+        var item = SelectedItem?.Item;
+        GeometryScopes.Clear();
+
+        if (item is null || _draft is null)
+        {
+            SelectedScope = null;
+            OnPropertyChanged(nameof(GeometryScopes));
+            return;
+        }
+
+        var absoluteRect = _draft.GetAbsoluteLayout(item.ItemId);
+        GeometryScopes.Add(new GeometryScopeOption(
+            GeometryScopeKind.AbsoluteFallback,
+            $"Absolute fallback — {absoluteRect.Display}",
+            $"item.layout ({item.ItemId})"));
+
+        if (item.ProfileEntry is not null && !string.IsNullOrWhiteSpace(item.ProfileId))
+        {
+            var entry = _draft.GetProfileEntry(item.ItemId, item.ProfileId!) ?? item.ProfileEntry;
+            GeometryScopes.Add(new GeometryScopeOption(
+                GeometryScopeKind.ProfileEntry,
+                $"Profile entry '{item.ProfileId}' — {entry.Display}",
+                $"layoutProfiles['{item.ProfileId}'].layouts['{item.ItemId}']",
+                item.ProfileId));
+        }
+
+        if (string.Equals(_draft.GetLayoutMode(item.ItemId), "relative", StringComparison.Ordinal) &&
+            _draft.GetRelativeAnchor(item.ItemId) is not null)
+        {
+            var relativeRect = _draft.GetRelativeRect(item.ItemId);
+            var rectText = relativeRect is null
+                ? "unresolved"
+                : $"{relativeRect.X:0.######},{relativeRect.Y:0.######} {relativeRect.W:0.######}x{relativeRect.H:0.######}";
+            GeometryScopes.Add(new GeometryScopeOption(
+                GeometryScopeKind.Relative,
+                $"Relative placement — {rectText}",
+                $"item.layoutRelative ({item.ItemId})"));
+        }
+
+        GeometryScopeOption? target = null;
+
+        if (priorKind is not null)
+        {
+            target = GeometryScopes.FirstOrDefault(scope =>
+                scope.Kind == priorKind &&
+                string.Equals(scope.ProfileId, priorProfile, StringComparison.Ordinal));
+        }
+
+        if (target is null)
+        {
+            target = item.Source switch
+            {
+                "profile" => GeometryScopes.FirstOrDefault(scope => scope.Kind == GeometryScopeKind.ProfileEntry),
+                "relative" or "relative-fallback" => GeometryScopes.FirstOrDefault(scope => scope.Kind == GeometryScopeKind.Relative),
+                _ => null
+            };
+        }
+
+        SelectedScope = target
+            ?? GeometryScopes.FirstOrDefault(scope => scope.Kind == GeometryScopeKind.AbsoluteFallback)
+            ?? GeometryScopes.FirstOrDefault();
+
+        OnPropertyChanged(nameof(GeometryScopes));
     }
 
     private void RebuildDetails()
@@ -463,7 +1232,8 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         DetailRows.Add(new DetailRow("Type", item.Type));
         DetailRows.Add(new DetailRow("Enabled", YesNo(item.Enabled)));
         DetailRows.Add(new DetailRow("Layout mode", item.LayoutMode));
-        DetailRows.Add(new DetailRow("Effective rect", item.Rect.Display));
+        DetailRows.Add(new DetailRow("Draft mode", _draft?.GetLayoutMode(item.ItemId) ?? item.LayoutMode));
+        DetailRows.Add(new DetailRow("Saved effective rect", item.Rect.Display));
         DetailRows.Add(new DetailRow("Placement source", item.Source));
         DetailRows.Add(new DetailRow("Placement status", $"{item.PlacementStatus} ({item.PlacementReason})"));
         var setProfile = _projectedSet?.ProfileMatch;
@@ -483,6 +1253,17 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         DetailRows.Add(new DetailRow("Reachable", YesNo(item.Reachable)));
         DetailRows.Add(new DetailRow("Visible ratio", item.VisibleRatio is null ? "—" : $"{item.VisibleRatio:0.###}"));
         DetailRows.Add(new DetailRow("Apply geometry", YesNo(item.ApplyGeometry)));
+
+        DetailRows.Add(new DetailRow("Draft state", IsDraftDirty ? "UNSAVED — in memory only" : "clean"));
+        DetailRows.Add(new DetailRow("Edit scope", SelectedScope?.Display ?? "—"));
+        DetailRows.Add(new DetailRow("Stored geometry", GetScopeEditableRect()?.Display ?? "—"));
+        DetailRows.Add(new DetailRow(
+            "Proposed draft",
+            _draftPreviewRects.TryGetValue(item.ItemId, out var preview) ? preview.Display : "—"));
+        DetailRows.Add(new DetailRow("Draft validation", DraftValidationText));
+        DetailRows.Add(new DetailRow("Base revision", BaseRevisionText));
+        DetailRows.Add(new DetailRow("Base topology", BaseTopologyText));
+        DetailRows.Add(new DetailRow("Save", "unavailable in P5"));
 
         foreach (var warning in Warnings.Where(warning => IsWarningRelevant(warning.Info, item.ItemId, set?.Info.Id)))
         {
@@ -530,8 +1311,98 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         return parts.Count == 0 ? "—" : string.Join("  •  ", parts);
     }
 
+    private string RelativeAnchorSummary()
+    {
+        if (_draft is null || SelectedItem is null)
+        {
+            return "—";
+        }
+
+        var anchor = _draft.GetRelativeAnchor(SelectedItem.Item.ItemId);
+        return anchor is null
+            ? "unresolved"
+            : $"{anchor.Identity} · {anchor.Basis}";
+    }
+
     private static string YesNo(bool value) => value ? "yes" : "no";
     private static string YesNo(bool? value) => value is null ? "—" : value.Value ? "yes" : "no";
+
+    private bool TryParseInteger(string text, string label, out int value)
+    {
+        if (int.TryParse(text?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+        {
+            return true;
+        }
+
+        SetEditError($"{label} must be a 32-bit integer. Negative X/Y values are allowed.");
+        value = 0;
+        return false;
+    }
+
+    private void SetEditError(string message)
+    {
+        _editError = message;
+        OnPropertyChanged(nameof(EditErrorText));
+        OnPropertyChanged(nameof(HasEditError));
+    }
+
+    private void ClearEditError()
+    {
+        if (string.IsNullOrEmpty(_editError))
+        {
+            return;
+        }
+
+        _editError = "";
+        OnPropertyChanged(nameof(EditErrorText));
+        OnPropertyChanged(nameof(HasEditError));
+    }
+
+    private void SetDraftConflict(string code, string message)
+    {
+        _hasDraftConflict = true;
+        _draftConflictCode = code;
+        _draftConflictMessage = message;
+        OnPropertyChanged(nameof(HasDraftConflict));
+        OnPropertyChanged(nameof(DraftConflictText));
+        OnPropertyChanged(nameof(CanEditGeometry));
+        OnPropertyChanged(nameof(CanEditSelectedScope));
+        OnPropertyChanged(nameof(CanDiscardDraft));
+    }
+
+    private void HandleDraftBackendError(BackendException exception)
+    {
+        SetEditError($"{exception.Code}: {exception.Message}");
+
+        if (exception.Code is "external-change" or "topology-changed")
+        {
+            SetDraftConflict(exception.Code, exception.Message);
+            _relativeCommitBlocked = true;
+        }
+
+        _statusMessage = $"Draft edit refused: {exception.Code}.";
+        OnPropertyChanged(nameof(StatusMessage));
+    }
+
+    private void RefreshDraftUi()
+    {
+        OnPropertyChanged(nameof(HasDraft));
+        OnPropertyChanged(nameof(IsDraftDirty));
+        OnPropertyChanged(nameof(DraftBadgeText));
+        OnPropertyChanged(nameof(CanDiscardDraft));
+        OnPropertyChanged(nameof(CanEditGeometry));
+        OnPropertyChanged(nameof(CanEditSelectedScope));
+        OnPropertyChanged(nameof(CanConvertToRelative));
+        OnPropertyChanged(nameof(CanConvertToAbsolute));
+        OnPropertyChanged(nameof(DraftValidationText));
+        OnPropertyChanged(nameof(IsDraftValid));
+        OnPropertyChanged(nameof(ScopeDescription));
+        OnPropertyChanged(nameof(BaseRevisionText));
+        OnPropertyChanged(nameof(BaseTopologyText));
+        OnPropertyChanged(nameof(EditErrorText));
+        OnPropertyChanged(nameof(HasEditError));
+        OnPropertyChanged(nameof(CountsText));
+    }
 
     private void SetBusy(bool busy)
     {
@@ -539,6 +1410,10 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         {
             OnPropertyChanged(nameof(IsNotBusy));
             OnPropertyChanged(nameof(BusyText));
+            OnPropertyChanged(nameof(CanEditGeometry));
+            OnPropertyChanged(nameof(CanEditSelectedScope));
+            OnPropertyChanged(nameof(CanConvertToRelative));
+            OnPropertyChanged(nameof(CanConvertToAbsolute));
         }
     }
 
@@ -582,7 +1457,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
             _ => true
         };
 
-        _statusMessage = "Read-only load failed. Review the error and refresh.";
+        _statusMessage = "Load failed. Review the error and refresh.";
         OnPropertyChanged(nameof(HasError));
         OnPropertyChanged(nameof(RequiresRefresh));
         OnPropertyChanged(nameof(ErrorCode));
@@ -605,9 +1480,12 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         Warnings.Clear();
         ItemWarnings.Clear();
         DetailRows.Clear();
+        GeometryScopes.Clear();
+        DraftErrors.Clear();
         WarningItemIds = new HashSet<string>(StringComparer.Ordinal);
         SelectedItem = null;
         SelectedMonitor = null;
+        SelectedScope = null;
         _projectedSet = null;
         _virtualScreenRect = null;
         _warningCount = 0;

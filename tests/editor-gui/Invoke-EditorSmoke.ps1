@@ -191,6 +191,22 @@ for ($run = 1; $run -le $Repeat; $run++) {
         throw "The editor smoke did not run at Medium integrity: $($evidence.integrity)"
     }
 
+    if ($evidence.applied -ne $true) {
+        throw 'The editor smoke did not commit a numeric draft edit.'
+    }
+
+    if ($evidence.canvasCommit -ne $true) {
+        throw 'The editor smoke did not commit a canvas/drag-style draft edit.'
+    }
+
+    if ($evidence.finalDraftDirty -ne $true) {
+        throw 'The editor smoke did not retain an unsaved draft for the close-confirmation path.'
+    }
+
+    if ($evidence.draftValidation -notmatch 'structurally valid') {
+        throw "The editor smoke draft was not structurally valid: $($evidence.draftValidation)."
+    }
+
     if ($evidence.backendExited -ne $true) {
         throw 'The editor backend child did not exit.'
     }
@@ -221,6 +237,9 @@ for ($run = 1; $run -le $Repeat; $run++) {
         if ($evidence.warningCount -lt 1) {
             throw "Expected at least one warning, got $($evidence.warningCount)."
         }
+        if ($evidence.relativeEditOk -ne $true) {
+            throw "The synthetic relative edit did not succeed: $($evidence.relativeError)"
+        }
     }
     else {
         if ($null -eq $canonicalBefore -or (Get-FileHash -LiteralPath $canonicalPath -Algorithm SHA256).Hash.ToLowerInvariant() -ne $canonicalBefore) {
@@ -246,11 +265,40 @@ for ($run = 1; $run -le $Repeat; $run++) {
         SelectedItemSource = $evidence.selectedItemSource
         SelectedItemPlacement = $evidence.selectedItemPlacement
         SelectedItemRect = $evidence.selectedItemRect
+        EditScope = $evidence.editScope
+        EditBefore = $evidence.editBefore
+        EditAfter = $evidence.editAfter
+        Applied = $evidence.applied
+        DraftDirtyAfterApply = $evidence.draftDirtyAfterApply
+        DraftValidation = $evidence.draftValidation
+        CanvasCommit = $evidence.canvasCommit
+        CanvasBefore = $evidence.canvasBefore
+        CanvasAfter = $evidence.canvasAfter
+        RevertedDirty = $evidence.revertedDirty
+        RelativeEditOk = $evidence.relativeEditOk
+        RelativeBefore = $evidence.relativeBefore
+        RelativeAfter = $evidence.relativeAfter
+        RelativeNormalized = $evidence.relativeNormalized
+        FinalProposed = $evidence.finalProposed
+        EditApplyMs = $evidence.editApplyMs
+        EditCommitMs = $evidence.editCommitMs
+        ValidateMs = $evidence.validateMs
+        ConvertMs = $evidence.convertMs
+        DraftCreateMs = $evidence.draftCreateMs
+        ProjectionApplyMs = $evidence.projectionApplyMs
+        ItemsUpdateMs = $evidence.itemsUpdateMs
         HandshakeMs = $evidence.handshakeMs
         LoadMs = $evidence.loadMs
         RefreshMs = $evidence.refreshMs
-        SmokeElapsedMs = $evidence.SmokeElapsedMs
+        SmokeElapsedMs = $evidence.smokeElapsedMs
         WorkingSetMB = $evidence.workingSetMB
+        ProjectResponseBytes = $evidence.projectResponseBytes
+        ProjectParseMs = $evidence.projectParseMs
+        ProjectModelMs = $evidence.projectModelMs
+        ProjectRequestMs = $evidence.projectRequestMs
+        CanvasRenderMs = $evidence.canvasRenderMs
+        CanvasRenderCount = $evidence.canvasRenderCount
+        CachedTextCount = $evidence.cachedTextCount
         BackendPid = $evidence.backendPid
         BackendExited = $evidence.backendExited
         BackendExitCode = $evidence.backendExitCode
@@ -259,7 +307,7 @@ for ($run = 1; $run -le $Repeat; $run++) {
     }) | Out-Null
 
     if ($Mode -eq 'synthetic') {
-        $summaryName = if ($run -eq $Repeat) { 'p4-editor-smoke.png' } else { "p4-editor-smoke-run-$run.png" }
+        $summaryName = if ($run -eq $Repeat) { 'p5-editor-draft.png' } else { "p5-editor-draft-run-$run.png" }
         Copy-Item -LiteralPath $snapshotPath -Destination (Join-Path $OutputDirectory $summaryName) -Force
     }
 }
@@ -274,6 +322,15 @@ $summary = [ordered]@{
     medianRefreshMs = (@($results | ForEach-Object { $_.RefreshMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianSmokeElapsedMs = (@($results | ForEach-Object { $_.SmokeElapsedMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianWorkingSetMB = (@($results | ForEach-Object { $_.WorkingSetMB }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianEditCommitMs = (@($results | ForEach-Object { $_.EditCommitMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianValidateMs = (@($results | ForEach-Object { $_.ValidateMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianConvertMs = (@($results | ForEach-Object { $_.ConvertMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianDraftCreateMs = (@($results | ForEach-Object { $_.DraftCreateMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianProjectionApplyMs = (@($results | ForEach-Object { $_.ProjectionApplyMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianItemsUpdateMs = (@($results | ForEach-Object { $_.ItemsUpdateMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianCanvasRenderMs = (@($results | ForEach-Object { $_.CanvasRenderMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianProjectParseMs = (@($results | ForEach-Object { $_.ProjectParseMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianProjectModelMs = (@($results | ForEach-Object { $_.ProjectModelMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
 }
 
 $summary | ConvertTo-Json -Depth 10
