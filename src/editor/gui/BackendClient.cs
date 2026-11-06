@@ -474,7 +474,7 @@ public sealed class BackendClient : IDisposable
         }
 
         var supportedOps = JsonText.StringArray(result, "supportedOps");
-        foreach (var required in new[] { "inspect", "read-config", "project", "validate", "convert" })
+        foreach (var required in new[] { "inspect", "read-config", "project", "validate", "preview", "convert" })
         {
             if (!supportedOps.Contains(required, StringComparer.Ordinal))
             {

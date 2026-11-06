@@ -1,22 +1,22 @@
-# DevWS v0.4 P5 read-only editor backend.
+# DevWS v0.4 P6 read-only editor backend.
 #
 # Normal-integrity, stdin/stdout JSON Lines protocol host. This file deliberately
 # loads only the six approved DevWS libraries plus the local projection helper.
 # It performs no configuration writes, no worker/broker/coordinator contact, and
-# no live-window operations. P5 adds structural `validate` and authoritative
+# no live-window operations. P6 adds authoritative `preview`; P5 added structural `validate` and authoritative
 # relative-geometry `convert`; `save` and `preview` remain unimplemented.
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $script:Protocol = 'devws-editor/1'
-$script:BackendVersion = '0.4.0-p5'
+$script:BackendVersion = '0.4.0-p6'
 $script:MaxRequestBytes = 4194304
 $script:MaxResponseBytes = 16777216
 $script:MaxJsonDepth = 32
 $script:MaxConfigBytes = 4194304
-$script:SupportedOps = @('hello', 'inspect', 'read-config', 'project', 'validate', 'convert', 'shutdown')
-$script:UnsupportedOps = @('preview', 'save')
+$script:SupportedOps = @('hello', 'inspect', 'read-config', 'project', 'validate', 'preview', 'convert', 'shutdown')
+$script:UnsupportedOps = @('save')
 
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false, $true)
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -283,6 +283,32 @@ function Test-EditorParams {
         return $null
     }
 
+    if ($Op -eq 'preview') {
+        $unknown = @($names | Where-Object { $_ -notin @('draft', 'baseSha256', 'setId', 'baseTopologyFingerprint') })
+        if ($unknown.Count -gt 0) {
+            return New-EditorError -Code 'request-invalid' -Message "Unknown preview parameter(s): $($unknown -join ', ')."
+        }
+        if ($names -notcontains 'draft' -or $Params.draft -isnot [System.Management.Automation.PSCustomObject]) {
+            return New-EditorError -Code 'request-invalid' -Message "preview requires a 'draft' JSON object."
+        }
+        if ($names -notcontains 'baseSha256' -or $Params.baseSha256 -isnot [string] -or $Params.baseSha256 -notmatch '^[0-9a-f]{64}$') {
+            return New-EditorError -Code 'request-invalid' -Message "preview 'baseSha256' must be 64 lowercase hexadecimal characters."
+        }
+        if ($names -contains 'setId' -and ($Params.setId -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Params.setId))) {
+            return New-EditorError -Code 'request-invalid' -Message "preview 'setId' must be a non-empty string when supplied."
+        }
+        if ($names -contains 'baseTopologyFingerprint' -and ($Params.baseTopologyFingerprint -isnot [string] -or $Params.baseTopologyFingerprint -notmatch '^[0-9A-Fa-f]{64}$')) {
+            return New-EditorError -Code 'request-invalid' -Message "preview 'baseTopologyFingerprint' must be 64 hexadecimal characters."
+        }
+
+        $draftBytes = [System.Text.Encoding]::UTF8.GetByteCount(($Params.draft | ConvertTo-Json -Compress -Depth $script:MaxJsonDepth))
+        if ($draftBytes -gt $script:MaxConfigBytes) {
+            return New-EditorError -Code 'request-invalid' -Message "The preview draft is $draftBytes bytes; the limit is $($script:MaxConfigBytes) bytes." -Details ([ordered]@{ sizeBytes = $draftBytes })
+        }
+
+        return $null
+    }
+
     if ($Op -eq 'validate') {
         $unknown = @($names | Where-Object { $_ -ne 'draft' })
         if ($unknown.Count -gt 0) {
@@ -389,7 +415,7 @@ function Get-EditorHello {
             readOnly          = $true
             saveSupported     = $false
             validateSupported = $true
-            previewSupported  = $false
+            previewSupported  = $true
             convertSupported  = $true
         }
     }
@@ -416,10 +442,10 @@ function Get-EditorInspectResult {
             canSave      = $false
             canProject   = $true
             canValidate  = $true
-            canPreview   = $false
+            canPreview   = $true
             canConvert   = $true
             readOnly     = $true
-            reason       = 'p5-draft-only'
+            reason       = 'p6-preview-read-only'
         }
     }
 }
@@ -623,6 +649,98 @@ function Invoke-EditorOperation {
             }
         }
 
+        'preview' {
+            $snapshot = Read-EditorConfigSnapshot -StartPath $editorRoot -MaxBytes $script:MaxConfigBytes
+
+            if (-not $snapshot.Ok) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code $snapshot.Code -Message $snapshot.Message
+                }
+            }
+
+            if (-not $snapshot.Valid) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'config-invalid' -Message $snapshot.ValidationError
+                }
+            }
+
+            if ([string]$Params.baseSha256 -cne [string]$snapshot.Sha256) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'external-change' -Message 'The canonical configuration changed since the draft was created.' -Details ([ordered]@{
+                        expectedSha256 = [string]$Params.baseSha256
+                        actualSha256   = [string]$snapshot.Sha256
+                    })
+                }
+            }
+
+            $draftValidation = Get-EditorDraftValidation -Draft $Params.draft -StartPath $editorRoot
+
+            if (-not [bool]$draftValidation.valid) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code 'config-invalid' -Message 'The proposed draft is not structurally valid.' -Details ([ordered]@{
+                        validationErrors = @($draftValidation.errors)
+                    })
+                }
+            }
+
+            $setId = if ($null -ne $Params.PSObject.Properties['setId']) {
+                [string]$Params.setId
+            } else {
+                [string]$snapshot.Config.defaultSet
+            }
+
+            $topology = $null
+            try {
+                $topology = Get-DevWSMonitorTopology
+            }
+            catch {
+                $topology = $null
+            }
+
+            $baseTopologyFingerprint = if ($null -ne $Params.PSObject.Properties['baseTopologyFingerprint']) {
+                [string]$Params.baseTopologyFingerprint
+            } else {
+                $null
+            }
+
+            $preview = Get-EditorPreviewCore `
+                -CanonicalConfig $snapshot.Config `
+                -DraftConfig $Params.draft `
+                -SetId $setId `
+                -Topology $topology `
+                -BaseSha256 ([string]$Params.baseSha256) `
+                -CurrentSha256 ([string]$snapshot.Sha256) `
+                -BaseTopologyFingerprint $baseTopologyFingerprint
+
+            if (-not [bool]$preview.Ok) {
+                return [pscustomobject]@{
+                    Ok          = $false
+                    Result      = $null
+                    Warnings    = @()
+                    ErrorObject = New-EditorError -Code ([string]$preview.Code) -Message ([string]$preview.Message) -Details $preview.Details
+                }
+            }
+
+            return [pscustomobject]@{
+                Ok          = $true
+                Result      = $preview.Result
+                Warnings    = @($preview.Warnings)
+                ErrorObject = $null
+            }
+        }
+
         'validate' {
             $validation = Get-EditorDraftValidation -Draft $Params.draft -StartPath $editorRoot
 
@@ -702,9 +820,9 @@ function Invoke-EditorOperation {
                 Ok          = $false
                 Result      = $null
                 Warnings    = @()
-                ErrorObject = New-EditorError -Code 'unsupported-operation' -Message "Operation '$Op' is not implemented in P5." -Details ([ordered]@{
+                ErrorObject = New-EditorError -Code 'unsupported-operation' -Message "Operation '$Op' is not implemented in P6." -Details ([ordered]@{
                     operation    = $Op
-                    phase        = 'P5'
+                    phase        = 'P6'
                     supportedOps = $script:SupportedOps
                 })
             }
@@ -771,9 +889,9 @@ try {
         }
 
         if ($op -in $script:UnsupportedOps) {
-            Write-EditorResponse -Id $request.id -Op $op -Ok $false -ErrorObject (New-EditorError -Code 'unsupported-operation' -Message "Operation '$op' is not implemented in P5." -Details ([ordered]@{
+            Write-EditorResponse -Id $request.id -Op $op -Ok $false -ErrorObject (New-EditorError -Code 'unsupported-operation' -Message "Operation '$op' is not implemented in P6." -Details ([ordered]@{
                 operation    = $op
-                phase        = 'P5'
+                phase        = 'P6'
                 supportedOps = $script:SupportedOps
             }))
             continue
@@ -782,7 +900,7 @@ try {
         if ($op -notin $script:SupportedOps) {
             Write-EditorResponse -Id $request.id -Op $op -Ok $false -ErrorObject (New-EditorError -Code 'unsupported-operation' -Message "Operation '$op' is not implemented." -Details ([ordered]@{
                 operation    = $op
-                phase        = 'P5'
+                phase        = 'P6'
                 supportedOps = $script:SupportedOps
             }))
             continue

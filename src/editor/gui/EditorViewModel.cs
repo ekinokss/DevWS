@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text.Json.Nodes;
 
 namespace DevWS.Editor;
 
@@ -72,7 +73,7 @@ public sealed class WarningRow
     }
 
     public WarningInfo Info { get; }
-    public string Display => Info.Display;
+    public string Display => Info.Display + (Info.RequiresAcknowledgement ? "  [acknowledgement required]" : "");
     public override string ToString() => Display;
 }
 
@@ -80,6 +81,8 @@ public sealed record DetailRow(string Label, string Value);
 
 public sealed class EditorViewModel : ObservableObject, IDisposable
 {
+    private static readonly IReadOnlyDictionary<string, RectInfo> EmptyRectDictionary =
+        new Dictionary<string, RectInfo>(StringComparer.Ordinal);
     private readonly EditorSession _session;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Dictionary<string, RectInfo> _draftPreviewRects = new(StringComparer.Ordinal);
@@ -92,6 +95,13 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     private MonitorOption? _selectedMonitor;
     private ItemOption? _selectedItem;
     private DraftDocument? _draft;
+    private PreviewResult? _preview;
+    private JsonObject? _previewDraftSnapshot;
+    private int? _previewBackendPid;
+    private bool _previewStale = true;
+    private bool _previewAcknowledged;
+    private string? _acknowledgedReviewToken;
+    private string _previewError = "";
     private GeometryScopeOption? _selectedScope;
     private DraftValidationResult? _draftValidation;
     private bool _hasDraftConflict;
@@ -133,6 +143,10 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     private double _lastValidateMs;
     private double _lastConvertMs;
     private double _lastEditCommitMs;
+    private double _lastPreviewMs;
+    private double _lastPreviewTransportMs;
+    private double _lastPreviewParseMs;
+    private double _lastPreviewModelMs;
 
     public EditorViewModel(EditorSession session, bool isDevelopmentConfig, string integrityLevel)
     {
@@ -149,6 +163,10 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public ObservableCollection<DetailRow> DetailRows { get; } = new();
     public ObservableCollection<GeometryScopeOption> GeometryScopes { get; } = new();
     public ObservableCollection<DraftErrorInfo> DraftErrors { get; } = new();
+    public ObservableCollection<PreviewDiffRow> PreviewDiffs { get; } = new();
+    public ObservableCollection<PreviewDiffRow> ItemPreviewDiffs { get; } = new();
+    public ObservableCollection<WarningRow> PreviewWarnings { get; } = new();
+    public ObservableCollection<WarningRow> ItemPreviewWarnings { get; } = new();
     public HashSet<string> WarningItemIds { get; private set; } = new(StringComparer.Ordinal);
 
     public bool IsDevelopmentConfig { get; }
@@ -216,7 +234,8 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public string DraftBadgeText => IsDraftDirty
         ? $"UNSAVED DRAFT — {_draft!.DirtyItemIds().Count} item(s)"
         : "";
-    public string SaveUnavailableText => "Save is not available in P5 (in-memory draft only).";
+    public string SaveUnavailableText => "Save is not available in P6 (preview/review only).";
+    public bool CanSave => false;
     public bool HasDraftConflict => _hasDraftConflict;
     public string DraftConflictText => _hasDraftConflict
         ? $"{_draftConflictCode}: {_draftConflictMessage}"
@@ -226,6 +245,106 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public bool CanEditSelectedScope => CanEditGeometry &&
         (_selectedScope?.Kind != GeometryScopeKind.Relative || !_relativeCommitBlocked) &&
         (_selectedScope?.Kind != GeometryScopeKind.ProfileEntry || !_relativeCommitBlocked);
+    public bool CanPreview => HasDraft && !HasDraftConflict && !_isBusy;
+    public bool HasPreview => _preview is not null;
+    public PreviewResult? Preview => _preview;
+    public bool IsPreviewCurrent =>
+        _preview is not null &&
+        !_previewStale &&
+        _draft is not null &&
+        _previewDraftSnapshot is not null &&
+        _previewBackendPid is not null &&
+        _session.Client.ProcessId == _previewBackendPid &&
+        _draft.MatchesSnapshot(_previewDraftSnapshot);
+    public bool HasPreviewError => !string.IsNullOrWhiteSpace(_previewError);
+    public string PreviewErrorText => _previewError;
+    public string PreviewSummaryText
+    {
+        get
+        {
+            if (_preview is null)
+            {
+                return HasPreviewError ? "Preview failed" : "Preview: not run";
+            }
+
+            if (!IsPreviewCurrent)
+            {
+                return "Preview: stale — run Preview again";
+            }
+
+            return _preview.Diff.Count == 0
+                ? "Preview: no proposed changes"
+                : $"Preview: {_preview.Diff.Count} stored change(s)";
+        }
+    }
+    public int PreviewDiffCount => IsPreviewCurrent && _preview is not null ? _preview.Diff.Count : 0;
+    public int PreviewWarningCount => IsPreviewCurrent && _preview is not null ? _preview.Warnings.Count : 0;
+    public bool PreviewNoChanges => IsPreviewCurrent && _preview is not null && _preview.Diff.Count == 0;
+    public bool IsPreviewAcknowledged =>
+        _previewAcknowledged &&
+        IsPreviewCurrent &&
+        _preview is not null &&
+        string.Equals(_acknowledgedReviewToken, _preview.Review.ReviewToken, StringComparison.Ordinal);
+    public bool CanAcknowledgePreview =>
+        IsPreviewCurrent &&
+        _preview is not null &&
+        _preview.Review.RequiresAcknowledgement &&
+        !IsPreviewAcknowledged;
+    public string ReviewStatusText
+    {
+        get
+        {
+            if (_preview is null)
+            {
+                return "Run Preview to review warnings.";
+            }
+
+            if (!IsPreviewCurrent)
+            {
+                return "Preview is stale; run Preview again before reviewing warnings.";
+            }
+
+            if (!_preview.Review.RequiresAcknowledgement)
+            {
+                return "No acknowledgement required.";
+            }
+
+            return IsPreviewAcknowledged
+                ? "Warnings reviewed — save remains unavailable in P6."
+                : "Explicit review required for the displayed warnings.";
+        }
+    }
+    public double LastPreviewMs => _lastPreviewMs;
+    public double LastPreviewTransportMs => _lastPreviewTransportMs;
+    public double LastPreviewParseMs => _lastPreviewParseMs;
+    public double LastPreviewModelMs => _lastPreviewModelMs;
+    public string? PreviewWarningDigest => IsPreviewCurrent ? _preview?.Review.WarningDigest : null;
+    public string? PreviewReviewToken => IsPreviewCurrent ? _preview?.Review.ReviewToken : null;
+    public IReadOnlyDictionary<string, RectInfo> CanvasDraftRects =>
+        IsPreviewCurrent ? EmptyRectDictionary : _draftPreviewRects;
+    public IReadOnlyDictionary<string, RectInfo> CanvasPreviewRects
+    {
+        get
+        {
+            if (!IsPreviewCurrent || _preview is null)
+            {
+                return EmptyRectDictionary;
+            }
+
+            var saved = _preview.SavedSet.Items.ToDictionary(item => item.ItemId, item => item.Rect, StringComparer.Ordinal);
+            var proposed = new Dictionary<string, RectInfo>(StringComparer.Ordinal);
+
+            foreach (var item in _preview.DraftSet.Items)
+            {
+                if (!saved.TryGetValue(item.ItemId, out var savedRect) || !Equals(savedRect, item.Rect))
+                {
+                    proposed[item.ItemId] = item.Rect;
+                }
+            }
+
+            return proposed;
+        }
+    }
     public string ScopeDescription => _selectedScope is null
         ? "Select an item to edit its geometry."
         : _selectedScope.Kind switch
@@ -420,6 +539,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
                 _configRevision,
                 _topologyFingerprint,
                 _lifetime.Token);
+            ClearPreview();
             _draft?.RebindSet(set.Info.Id);
             _draftPreviewRects.Clear();
             _draftValidation = null;
@@ -446,6 +566,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public async Task RefreshAsync()
     {
         _refreshMs = 0;
+        InvalidatePreview();
 
         if (!IsDraftDirty)
         {
@@ -516,6 +637,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     {
         SelectedItem = item;
         RebuildScopes(preserveSelection: false);
+        RebuildItemPreview();
         RebuildDetails();
         RefreshEditFields();
     }
@@ -719,6 +841,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
             }
 
             _draft.EnsureMutationScope();
+            InvalidatePreview();
             _draftPreviewRects[itemId] = preview;
             commitWatch.Stop();
             _lastEditCommitMs = commitWatch.Elapsed.TotalMilliseconds;
@@ -768,6 +891,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
 
         var itemId = SelectedItem.Item.ItemId;
         _draft.RevertItem(itemId);
+        InvalidatePreview();
         _draftPreviewRects.Remove(itemId);
         ClearEditError();
         await ValidateDraftCoreAsync();
@@ -787,6 +911,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         }
 
         _draft.DiscardAll();
+        ClearPreview();
         _draftPreviewRects.Clear();
         _draftValidation = null;
         DraftErrors.Clear();
@@ -814,6 +939,243 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public async Task DiscardDraftAndReloadAsync()
     {
         await DiscardDraftAsync(reload: true);
+    }
+
+    public async Task<bool> PreviewAsync()
+    {
+        ClearPreviewError();
+
+        if (!CanPreview || _draft is null)
+        {
+            SetPreviewError(HasDraftConflict
+                ? "Preview is blocked by the current draft conflict."
+                : "Preview is unavailable while the editor is busy or has no draft.");
+            return false;
+        }
+
+        SetBusy(true);
+
+        try
+        {
+            await ValidateDraftCoreAsync();
+
+            if (_draftValidation is null || !_draftValidation.Valid)
+            {
+                SetPreviewError("Draft validation failed; preview was not requested.");
+                return false;
+            }
+
+            var watch = Stopwatch.StartNew();
+            var result = await _session.PreviewAsync(
+                _draft,
+                _draft.BaseSha256,
+                _draft.SetId,
+                _draft.BaseTopologyFingerprint,
+                _lifetime.Token);
+            watch.Stop();
+            _lastPreviewMs = watch.Elapsed.TotalMilliseconds;
+            var metrics = _session.LastPreviewMetrics;
+            _lastPreviewTransportMs = metrics?.TransportMs ?? 0;
+            _lastPreviewParseMs = metrics?.ParseMs ?? 0;
+            _lastPreviewModelMs = metrics?.ModelMs ?? 0;
+            ApplyPreviewResult(result);
+            return true;
+        }
+        catch (BackendException ex)
+        {
+            HandlePreviewBackendError(ex);
+            return false;
+        }
+        catch (EditorException ex)
+        {
+            SetPreviewError($"{ex.Code}: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    public bool AcknowledgePreviewWarnings()
+    {
+        if (!CanAcknowledgePreview || _preview is null)
+        {
+            return false;
+        }
+
+        _previewAcknowledged = true;
+        _acknowledgedReviewToken = _preview.Review.ReviewToken;
+        _statusMessage = "Warnings reviewed explicitly; save remains unavailable in P6.";
+        OnPropertyChanged(nameof(StatusMessage));
+        NotifyPreviewState();
+        return true;
+    }
+
+    public ProjectedItem? GetPreviewSavedItem()
+    {
+        var itemId = SelectedItem?.Item.ItemId;
+
+        return itemId is null
+            ? null
+            : _preview?.SavedSet.Items.FirstOrDefault(item => string.Equals(item.ItemId, itemId, StringComparison.Ordinal));
+    }
+
+    public ProjectedItem? GetPreviewDraftItem()
+    {
+        var itemId = SelectedItem?.Item.ItemId;
+
+        return itemId is null
+            ? null
+            : _preview?.DraftSet.Items.FirstOrDefault(item => string.Equals(item.ItemId, itemId, StringComparison.Ordinal));
+    }
+
+    private void ApplyPreviewResult(PreviewResult result)
+    {
+        _preview = result;
+        _previewDraftSnapshot = _draft?.CreateDraftSnapshot();
+        _previewBackendPid = _session.Client.ProcessId;
+        _previewStale = false;
+        _previewAcknowledged = false;
+        _acknowledgedReviewToken = null;
+        _previewError = "";
+
+        PreviewDiffs.Clear();
+        foreach (var entry in result.Diff)
+        {
+            PreviewDiffs.Add(new PreviewDiffRow(entry));
+        }
+
+        PreviewWarnings.Clear();
+        foreach (var warning in result.Warnings)
+        {
+            PreviewWarnings.Add(new WarningRow(warning));
+        }
+
+        RebuildItemPreview();
+        RebuildDetails();
+        RefreshDraftUi();
+        _statusMessage = result.Diff.Count == 0
+            ? "Preview current: no proposed changes."
+            : $"Preview current: {result.Diff.Count} stored change(s).";
+        OnPropertyChanged(nameof(StatusMessage));
+    }
+
+    private void InvalidatePreview(bool clearError = true)
+    {
+        _previewStale = true;
+        _previewAcknowledged = false;
+        _acknowledgedReviewToken = null;
+
+        if (clearError)
+        {
+            _previewError = "";
+        }
+
+        NotifyPreviewState();
+    }
+
+    private void ClearPreview()
+    {
+        _preview = null;
+        _previewDraftSnapshot = null;
+        _previewBackendPid = null;
+        _previewStale = true;
+        _previewAcknowledged = false;
+        _acknowledgedReviewToken = null;
+        _previewError = "";
+        PreviewDiffs.Clear();
+        ItemPreviewDiffs.Clear();
+        PreviewWarnings.Clear();
+        ItemPreviewWarnings.Clear();
+        NotifyPreviewState();
+    }
+
+    private void SetPreviewError(string message)
+    {
+        _previewError = message;
+        _previewStale = true;
+        _previewAcknowledged = false;
+        _acknowledgedReviewToken = null;
+        NotifyPreviewState();
+    }
+
+    private void ClearPreviewError()
+    {
+        if (string.IsNullOrEmpty(_previewError))
+        {
+            return;
+        }
+
+        _previewError = "";
+        NotifyPreviewState();
+    }
+
+    private void HandlePreviewBackendError(BackendException exception)
+    {
+        if (exception.Code is "external-change" or "topology-changed")
+        {
+            SetDraftConflict(exception.Code, exception.Message);
+        }
+
+        SetPreviewError($"{exception.Code}: {exception.Message}");
+        _statusMessage = $"Preview refused: {exception.Code}.";
+        OnPropertyChanged(nameof(StatusMessage));
+    }
+
+    private void RebuildItemPreview()
+    {
+        ItemPreviewDiffs.Clear();
+        ItemPreviewWarnings.Clear();
+
+        var itemId = SelectedItem?.Item.ItemId;
+
+        if (itemId is null || _preview is null)
+        {
+            return;
+        }
+
+        foreach (var row in PreviewDiffs.Where(row => string.Equals(row.Entry.ItemId, itemId, StringComparison.Ordinal)))
+        {
+            ItemPreviewDiffs.Add(row);
+        }
+
+        foreach (var warning in _preview.Warnings.Where(warning => IsPreviewWarningRelevant(warning, itemId)))
+        {
+            ItemPreviewWarnings.Add(new WarningRow(warning));
+        }
+    }
+
+    private bool IsPreviewWarningRelevant(WarningInfo warning, string itemId)
+    {
+        if (string.Equals(warning.Details.ItemId, itemId, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return string.IsNullOrWhiteSpace(warning.Details.ItemId) &&
+               (string.IsNullOrWhiteSpace(warning.Details.SetId) ||
+                string.Equals(warning.Details.SetId, _draft?.SetId, StringComparison.Ordinal));
+    }
+
+    private void NotifyPreviewState()
+    {
+        OnPropertyChanged(nameof(HasPreview));
+        OnPropertyChanged(nameof(Preview));
+        OnPropertyChanged(nameof(IsPreviewCurrent));
+        OnPropertyChanged(nameof(HasPreviewError));
+        OnPropertyChanged(nameof(PreviewErrorText));
+        OnPropertyChanged(nameof(PreviewSummaryText));
+        OnPropertyChanged(nameof(PreviewDiffCount));
+        OnPropertyChanged(nameof(PreviewWarningCount));
+        OnPropertyChanged(nameof(PreviewNoChanges));
+        OnPropertyChanged(nameof(IsPreviewAcknowledged));
+        OnPropertyChanged(nameof(CanAcknowledgePreview));
+        OnPropertyChanged(nameof(ReviewStatusText));
+        OnPropertyChanged(nameof(PreviewWarningDigest));
+        OnPropertyChanged(nameof(PreviewReviewToken));
+        OnPropertyChanged(nameof(CanvasPreviewRects));
+        OnPropertyChanged(nameof(CanvasDraftRects));
     }
 
     public async Task ConvertToRelativeAsync()
@@ -850,6 +1212,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
                 converted.Basis,
                 converted.Normalized);
             _draft.EnsureMutationScope();
+            InvalidatePreview();
             _draftPreviewRects[itemId] = converted.RoundTripRect;
 
             await ValidateDraftCoreAsync();
@@ -920,6 +1283,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
 
             _draft.SetAbsoluteMode(itemId, converted.RoundTripRect);
             _draft.EnsureMutationScope();
+            InvalidatePreview();
             _draftPreviewRects[itemId] = converted.RoundTripRect;
 
             await ValidateDraftCoreAsync();
@@ -1013,6 +1377,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
 
     private void ApplySnapshot(EditorSnapshot snapshot, string? preferredSetId)
     {
+        ClearPreview();
         Sets.Clear();
         foreach (var set in snapshot.Inspect.Sets)
         {
@@ -1258,12 +1623,41 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         DetailRows.Add(new DetailRow("Edit scope", SelectedScope?.Display ?? "—"));
         DetailRows.Add(new DetailRow("Stored geometry", GetScopeEditableRect()?.Display ?? "—"));
         DetailRows.Add(new DetailRow(
-            "Proposed draft",
+            "Local draft",
             _draftPreviewRects.TryGetValue(item.ItemId, out var preview) ? preview.Display : "—"));
         DetailRows.Add(new DetailRow("Draft validation", DraftValidationText));
         DetailRows.Add(new DetailRow("Base revision", BaseRevisionText));
         DetailRows.Add(new DetailRow("Base topology", BaseTopologyText));
-        DetailRows.Add(new DetailRow("Save", "unavailable in P5"));
+        DetailRows.Add(new DetailRow("Save", "unavailable in P6"));
+        DetailRows.Add(new DetailRow("Preview", PreviewSummaryText));
+
+        var previewSaved = GetPreviewSavedItem();
+        var previewDraft = GetPreviewDraftItem();
+
+        if (_preview is not null)
+        {
+            DetailRows.Add(new DetailRow("Preview saved effective", previewSaved?.Rect.Display ?? "—"));
+            DetailRows.Add(new DetailRow("Preview proposed effective", previewDraft?.Rect.Display ?? "—"));
+            DetailRows.Add(new DetailRow(
+                "Effective placement changed",
+                previewSaved is null || previewDraft is null
+                    ? "—"
+                    : Equals(previewSaved.Rect, previewDraft.Rect) ? "no" : "yes"));
+            DetailRows.Add(new DetailRow("Preview active source", previewDraft?.Source ?? "—"));
+            DetailRows.Add(new DetailRow("Preview warnings", _preview.Warnings.Count.ToString()));
+
+            foreach (var row in ItemPreviewDiffs.Take(6))
+            {
+                DetailRows.Add(new DetailRow("Stored change", row.Display));
+            }
+
+            foreach (var warning in ItemPreviewWarnings.Take(4))
+            {
+                DetailRows.Add(new DetailRow("Preview warning", warning.Display));
+            }
+
+            DetailRows.Add(new DetailRow("Review", ReviewStatusText));
+        }
 
         foreach (var warning in Warnings.Where(warning => IsWarningRelevant(warning.Info, item.ItemId, set?.Info.Id)))
         {
@@ -1363,11 +1757,13 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         _hasDraftConflict = true;
         _draftConflictCode = code;
         _draftConflictMessage = message;
+        InvalidatePreview(clearError: false);
         OnPropertyChanged(nameof(HasDraftConflict));
         OnPropertyChanged(nameof(DraftConflictText));
         OnPropertyChanged(nameof(CanEditGeometry));
         OnPropertyChanged(nameof(CanEditSelectedScope));
         OnPropertyChanged(nameof(CanDiscardDraft));
+        OnPropertyChanged(nameof(CanPreview));
     }
 
     private void HandleDraftBackendError(BackendException exception)
@@ -1402,6 +1798,7 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(EditErrorText));
         OnPropertyChanged(nameof(HasEditError));
         OnPropertyChanged(nameof(CountsText));
+        NotifyPreviewState();
     }
 
     private void SetBusy(bool busy)
@@ -1414,6 +1811,8 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(CanEditSelectedScope));
             OnPropertyChanged(nameof(CanConvertToRelative));
             OnPropertyChanged(nameof(CanConvertToAbsolute));
+            OnPropertyChanged(nameof(CanPreview));
+            OnPropertyChanged(nameof(CanAcknowledgePreview));
         }
     }
 

@@ -58,6 +58,14 @@ internal static class Program
                 ("view model numeric edit updates draft and validates", ViewModelNumericEdit),
                 ("view model relative edit uses backend convert", ViewModelRelativeEdit),
                 ("view model convert refusal preserves draft", ViewModelConvertFailure),
+                ("view model preview distinguishes saved and proposed", ViewModelPreviewSuccess),
+                ("preview review requires explicit acknowledgement and edit invalidates it", ViewModelPreviewReview),
+                ("preview refusal is surfaced without a current preview", ViewModelPreviewFailure),
+                ("preview topology drift becomes a conflict", ViewModelPreviewTopologyFailure),
+                ("preview no-op has no proposed changes", ViewModelPreviewNoOp),
+                ("preview invalidates after external revision change", ViewModelPreviewExternalChange),
+                ("preview invalidates after backend restart", ViewModelPreviewBackendRestart),
+                ("preview mode keeps save disabled", PreviewSaveBoundary),
                 ("view model revision conflict preserves draft", ViewModelRevisionConflict),
                 ("view model topology conflict blocks relative commit", ViewModelTopologyConflict),
                 ("view model discard clears dirty state", ViewModelDiscard),
@@ -114,6 +122,7 @@ internal static class Program
         True(hello.SupportedOps.Contains("inspect"), "inspect advertised");
         True(hello.SupportedOps.Contains("validate"), "validate advertised");
         True(hello.SupportedOps.Contains("convert"), "convert advertised");
+        True(hello.SupportedOps.Contains("preview"), "preview advertised");
         True(hello.ReadOnly, "read-only");
         True(client.ProcessId is > 0, "backend pid available");
         client.Dispose();
@@ -565,7 +574,7 @@ internal static class Program
         True(vm.IsDraftDirty, "dirty after numeric edit");
         True(vm.IsDraftValid, "valid after numeric edit");
         True(vm.DraftPreviewRects.ContainsKey("profile"), "preview rect recorded");
-        True(vm.DetailRows.Any(row => row.Label == "Proposed draft" && row.Value.Contains("640x480", StringComparison.Ordinal)), "proposed draft detail");
+        True(vm.DetailRows.Any(row => row.Label == "Local draft" && row.Value.Contains("640x480", StringComparison.Ordinal)), "proposed draft detail");
         True(vm.LastValidateMs >= 0, "validate timing recorded");
 
         var invalid = await vm.ApplyGeometryAsync("abc", "0", "100", "100");
@@ -628,6 +637,195 @@ internal static class Program
         True(!vm.IsDraftDirty, "refused relative edit left draft clean");
         True(vm.HasDraftConflict, "convert refusal becomes a conflict");
         True(vm.EditErrorText.Contains("topology-changed", StringComparison.Ordinal), "structured convert error visible");
+    }
+
+    private static async Task ViewModelPreviewSuccess()
+    {
+        var scenario = NormalScenario();
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+
+        True(await vm.PreviewAsync(), "preview succeeds");
+        True(vm.IsPreviewCurrent, "preview is current");
+        Equal(1, vm.PreviewDiffCount, "preview diff count");
+        True(!vm.PreviewNoChanges, "preview has proposed changes");
+        Equal(1, vm.PreviewWarningCount, "preview warning count");
+        True(vm.CanAcknowledgePreview, "preview requires explicit review");
+        True(!vm.IsPreviewAcknowledged, "preview is not automatically acknowledged");
+        Equal(new RectInfo(-1920, 0, 960, 1080), vm.Preview!.SavedSet.Items.First(item => item.ItemId == "fallback").Rect, "preview saved rect");
+        Equal(new RectInfo(-1900, 0, 960, 1080), vm.Preview.DraftSet.Items.First(item => item.ItemId == "fallback").Rect, "preview draft rect");
+        True(vm.CanvasPreviewRects.ContainsKey("fallback"), "canvas has proposed preview rect");
+        Equal(new RectInfo(-1900, 0, 960, 1080), vm.CanvasPreviewRects["fallback"], "canvas proposed rect");
+        True(vm.CanvasDraftRects.Count == 0, "local overlay hidden while preview is current");
+        True(vm.PreviewSummaryText.Contains("stored change", StringComparison.OrdinalIgnoreCase), "preview summary");
+        True(vm.DetailRows.Any(row => row.Label == "Preview proposed effective"), "details include preview effective");
+
+        var fallbackItem = vm.Items.First(item => item.Item.ItemId == "fallback");
+        vm.SelectItem(fallbackItem);
+        Equal(1, vm.ItemPreviewDiffs.Count, "per-item preview diff selection");
+        True(vm.DetailRows.Any(row => row.Label == "Stored change"), "details include selected stored change");
+        vm.SelectItem(vm.Items.First(item => item.Item.ItemId == "profile"));
+        Equal(0, vm.ItemPreviewDiffs.Count, "unrelated item has no preview diff");
+    }
+
+    private static async Task ViewModelPreviewReview()
+    {
+        var scenario = NormalScenario();
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+
+        True(await vm.PreviewAsync(), "review preview succeeds");
+        True(!vm.IsPreviewAcknowledged, "review is not automatic");
+        True(vm.ReviewStatusText.Contains("Explicit review", StringComparison.OrdinalIgnoreCase), "explicit review status");
+        True(vm.AcknowledgePreviewWarnings(), "explicit acknowledgement accepted");
+        True(vm.IsPreviewAcknowledged, "review state acknowledged");
+        True(vm.ReviewStatusText.Contains("reviewed", StringComparison.OrdinalIgnoreCase), "reviewed status");
+        True(vm.PreviewReviewToken == new string('d', 64), "review token retained");
+
+        var fallback = vm.Items.First(item => item.Item.ItemId == "fallback");
+        vm.SelectItem(fallback);
+        vm.SelectScope(vm.GeometryScopes.First(scope => scope.Kind == GeometryScopeKind.AbsoluteFallback));
+        True(await vm.ApplyGeometryAsync("-1900", "0", "960", "1080"), "edit after acknowledgement");
+        True(!vm.IsPreviewCurrent, "edit invalidates preview");
+        True(!vm.IsPreviewAcknowledged, "edit invalidates acknowledgement");
+        True(!vm.CanAcknowledgePreview, "stale preview cannot be acknowledged");
+        True(vm.PreviewSummaryText.Contains("stale", StringComparison.OrdinalIgnoreCase), "stale summary");
+    }
+
+    private static async Task ViewModelPreviewFailure()
+    {
+        var scenario = NormalScenario();
+        scenario["previewError"] = Error("unsupported-mutation", "The draft changes an unauthorized field.");
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+
+        True(!await vm.PreviewAsync(), "preview refusal reported");
+        True(vm.HasPreviewError, "preview error state");
+        True(vm.PreviewErrorText.Contains("unsupported-mutation", StringComparison.Ordinal), "structured preview error");
+        True(!vm.IsPreviewCurrent, "failed preview is not current");
+        True(!vm.CanAcknowledgePreview, "failed preview cannot be acknowledged");
+        True(!vm.HasDraftConflict, "unsupported mutation is not a revision conflict");
+    }
+
+    private static async Task ViewModelPreviewTopologyFailure()
+    {
+        var scenario = NormalScenario();
+        scenario["previewError"] = Error("topology-changed", "The monitor topology changed.");
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+
+        True(!await vm.PreviewAsync(), "topology drift preview refused");
+        True(vm.HasDraftConflict, "topology drift becomes a conflict");
+        True(vm.PreviewErrorText.Contains("topology-changed", StringComparison.Ordinal), "topology drift error");
+        True(!vm.IsPreviewCurrent, "topology drift preview not current");
+        True(!vm.CanAcknowledgePreview, "topology drift review blocked");
+    }
+
+    private static async Task ViewModelPreviewNoOp()
+    {
+        var scenario = NormalScenario();
+        var preview = (Dictionary<string, object?>)scenario["preview"]!;
+        preview["diff"] = Array.Empty<object?>();
+        preview["draftSet"] = preview["savedSet"];
+        preview["review"] = new Dictionary<string, object?>
+        {
+            ["baseSha256"] = Sha,
+            ["topologyFingerprint"] = Fingerprint,
+            ["warningIds"] = Array.Empty<string>(),
+            ["warningDigest"] = null,
+            ["requiresAcknowledgement"] = false,
+            ["reviewToken"] = null
+        };
+        scenario["previewWarnings"] = Array.Empty<object?>();
+
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+
+        True(await vm.PreviewAsync(), "no-op preview succeeds");
+        True(vm.PreviewNoChanges, "no-op preview reports no changes");
+        Equal(0, vm.PreviewDiffCount, "no-op diff count");
+        True(!vm.CanAcknowledgePreview, "no-op does not require acknowledgement");
+        True(!vm.IsPreviewAcknowledged, "no-op is not acknowledged");
+        True(vm.ReviewStatusText.Contains("No acknowledgement", StringComparison.Ordinal), "no-op review status");
+        Equal(0, vm.CanvasPreviewRects.Count, "no-op has no proposed canvas rectangles");
+    }
+
+    private static async Task ViewModelPreviewExternalChange()
+    {
+        var scenarioPath = NewPath("preview-external-scenario.json");
+        WriteScenario(scenarioPath, NormalScenario());
+
+        using var client = CreateFakeClient(scenarioPath, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await vm.PreviewAsync(), "external-change preview baseline");
+        True(vm.IsPreviewCurrent, "preview current before external change");
+        True(vm.AcknowledgePreviewWarnings(), "baseline acknowledgement");
+
+        var scenario = NormalScenario();
+        var inspect = (Dictionary<string, object?>)scenario["inspect"]!;
+        var config = (Dictionary<string, object?>)inspect["config"]!;
+        config["sha256"] = new string('e', 64);
+        WriteScenario(scenarioPath, scenario);
+
+        await vm.RefreshAsync();
+        True(!vm.IsPreviewCurrent, "external change invalidates preview");
+        True(!vm.IsPreviewAcknowledged, "external change invalidates review");
+        True(vm.HasDraftConflict || vm.HasError, "external change is reported");
+        True(vm.PreviewSummaryText.Contains("stale", StringComparison.OrdinalIgnoreCase), "external stale summary");
+    }
+
+    private static async Task ViewModelPreviewBackendRestart()
+    {
+        var scenario = NormalScenario();
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+        True(await vm.PreviewAsync(), "restart preview baseline");
+        True(vm.IsPreviewCurrent, "preview current before backend exit");
+        True(vm.BackendPid is > 0, "backend pid available for restart test");
+
+        using (var process = Process.GetProcessById(vm.BackendPid!.Value))
+        {
+            process.Kill(entireProcessTree: true);
+            process.WaitForExit(3000);
+        }
+
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+
+        while (vm.IsPreviewCurrent && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+
+        True(!vm.IsPreviewCurrent, "backend restart invalidates preview");
+        True(!vm.IsPreviewAcknowledged, "backend restart invalidates review");
+    }
+
+    private static async Task PreviewSaveBoundary()
+    {
+        var scenario = NormalScenario();
+        using var client = CreateFakeClient(scenario, TimeSpan.FromSeconds(2));
+        using var session = new EditorSession(client);
+        using var vm = new EditorViewModel(session, false, "Medium");
+        await vm.LoadAsync();
+
+        True(!vm.CanSave, "save remains disabled");
+        True(vm.SaveUnavailableText.Contains("P6", StringComparison.Ordinal), "save unavailable label names P6");
+        True(await vm.PreviewAsync(), "preview available before save boundary");
+        True(!vm.CanSave, "preview does not enable save");
     }
 
     private static async Task ViewModelRevisionConflict()
@@ -743,7 +941,7 @@ internal static class Program
         True(hello.SupportedOps.Contains("validate"), "real backend advertises validate");
         True(hello.SupportedOps.Contains("convert"), "real backend advertises convert");
         True(!hello.SupportedOps.Contains("save"), "real backend does not advertise save");
-        True(!hello.SupportedOps.Contains("preview"), "real backend does not advertise preview");
+        True(hello.SupportedOps.Contains("preview"), "real backend advertises preview");
 
         var inspectResponse = await client.SendAsync("inspect");
         var inspect = InspectInfo.Parse(inspectResponse.Result);
@@ -1100,8 +1298,7 @@ internal static class Program
 
         foreach (var forbiddenCall in new[]
         {
-            "SendAsync(\"save\"",
-            "SendAsync(\"preview\""
+            "SendAsync(\"save\""
         })
         {
             True(!source.Contains(forbiddenCall, StringComparison.Ordinal), $"production GUI must not call {forbiddenCall}");
@@ -1112,6 +1309,7 @@ internal static class Program
         True(!canvasSource.Contains("SendAsync", StringComparison.Ordinal), "canvas never sends requests during drag/resize");
         True(source.Contains("\"validate\"", StringComparison.Ordinal), "session calls structural validate");
         True(source.Contains("\"convert\"", StringComparison.Ordinal), "session calls backend convert");
+        True(source.Contains("\"preview\"", StringComparison.Ordinal), "session calls backend preview");
 
         True(source.Contains("ArgumentList.Add(\"-File\")", StringComparison.Ordinal), "backend uses -File");
         True(source.Contains("-NoProfile", StringComparison.Ordinal), "backend uses -NoProfile");
@@ -1294,12 +1492,60 @@ internal static class Program
             ["readConfig"] = ReadConfig(),
             ["validate"] = ValidateResult(),
             ["convert"] = ConvertResult(),
+            ["preview"] = PreviewResult(),
+            ["previewWarnings"] = warnings,
             ["defaultSet"] = "main",
             ["warnings"] = warnings,
             ["projects"] = new Dictionary<string, object?>
             {
                 ["main"] = Projection("main", MainItems(), Sha, true),
                 ["secondary"] = Projection("secondary", Array.Empty<object?>(), Sha, false)
+            }
+        };
+    }
+
+    private static Dictionary<string, object?> PreviewResult()
+    {
+        var savedProjection = Projection("main", MainItems(), Sha, true);
+        var savedSet = (Dictionary<string, object?>)savedProjection["set"]!;
+        var draftItems = MainItems();
+        var fallback = (Dictionary<string, object?>)draftItems.First(item =>
+            item is Dictionary<string, object?> dictionary &&
+            string.Equals(dictionary["itemId"] as string, "fallback", StringComparison.Ordinal))!;
+        fallback["rect"] = Rect(-1900, 0, 960, 1080);
+
+        var draftProjection = Projection("main", draftItems, Sha, true);
+        var draftSet = (Dictionary<string, object?>)draftProjection["set"]!;
+
+        return new Dictionary<string, object?>
+        {
+            ["baseSha256"] = Sha,
+            ["currentSha256"] = Sha,
+            ["baseMatches"] = true,
+            ["setId"] = "main",
+            ["topologyFingerprint"] = Fingerprint,
+            ["savedSet"] = savedSet,
+            ["draftSet"] = draftSet,
+            ["diff"] = new object?[]
+            {
+                new Dictionary<string, object?>
+                {
+                    ["setId"] = "main",
+                    ["itemId"] = "fallback",
+                    ["scope"] = "fallback",
+                    ["field"] = "layout",
+                    ["before"] = Rect(-1920, 0, 960, 1080),
+                    ["after"] = Rect(-1900, 0, 960, 1080)
+                }
+            },
+            ["review"] = new Dictionary<string, object?>
+            {
+                ["baseSha256"] = Sha,
+                ["topologyFingerprint"] = Fingerprint,
+                ["warningIds"] = new[] { "anchor-missing|main|fallback|path:TEST/MISSING" },
+                ["warningDigest"] = new string('c', 64),
+                ["requiresAcknowledgement"] = true,
+                ["reviewToken"] = new string('d', 64)
             }
         };
     }
@@ -1359,7 +1605,7 @@ internal static class Program
         {
             ["backendVersion"] = "test-editor-1",
             ["protocol"] = protocol,
-            ["supportedOps"] = supportedOps ?? new[] { "hello", "inspect", "read-config", "project", "validate", "convert", "shutdown" },
+            ["supportedOps"] = supportedOps ?? new[] { "hello", "inspect", "read-config", "project", "validate", "preview", "convert", "shutdown" },
             ["limits"] = new Dictionary<string, object?>
             {
                 ["maxRequestBytes"] = 4194304,
@@ -1377,7 +1623,7 @@ internal static class Program
                 ["readOnly"] = readOnly,
                 ["saveSupported"] = false,
                 ["validateSupported"] = true,
-                ["previewSupported"] = false,
+                ["previewSupported"] = true,
                 ["convertSupported"] = true
             }
         };

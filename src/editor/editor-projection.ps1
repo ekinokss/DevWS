@@ -555,6 +555,26 @@ function Get-EditorConvert {
     }
 }
 
+function Test-EditorWarningRequiresAcknowledgement {
+    param([string]$Code)
+
+    if ($Code -ceq 'deferred-qualification') {
+        return $false
+    }
+
+    return $Code -in @(
+        'anchor-missing',
+        'anchor-ambiguous',
+        'anchor-unpersistable',
+        'relative-unreachable',
+        'fallback-unreachable',
+        'profile-unreachable',
+        'topology-unavailable',
+        'topology-incomplete',
+        'topology-ambiguous'
+    )
+}
+
 function Get-EditorWarnings {
     param(
         [Parameter(Mandatory)]$Model,
@@ -573,10 +593,17 @@ function Get-EditorWarnings {
                 id                      = $id
                 code                    = 'profile-refusal'
                 message                 = (Get-DevWSLayoutWriteRefusalMessage -Reason $reason)
-                requiresAcknowledgement = $true
+                requiresAcknowledgement = (Test-EditorWarningRequiresAcknowledgement -Code 'profile-refusal')
                 details                 = [pscustomobject][ordered]@{
-                    setId  = $SetId
-                    reason = $reason
+                    setId           = $SetId
+                    itemId          = $null
+                    profileId       = $null
+                    identity        = $null
+                    instance        = $null
+                    reason          = $reason
+                    relativeStatus  = $null
+                    placementStatus = $null
+                    placementReason = $null
                 }
             }) | Out-Null
         }
@@ -618,6 +645,13 @@ function Get-EditorWarnings {
             $null
         }
 
+        $instance = if ($null -ne $item.RelativeLayout -and $null -ne $item.RelativeLayout.monitor -and
+            $null -ne $item.RelativeLayout.monitor.PSObject.Properties['instance']) {
+            [string]$item.RelativeLayout.monitor.instance
+        } else {
+            $null
+        }
+
         $id = "$code|$SetId|$($item.ItemId)|$identity"
         if (-not $seen.Add($id)) {
             continue
@@ -627,11 +661,14 @@ function Get-EditorWarnings {
             id                      = $id
             code                    = $code
             message                 = $message
-            requiresAcknowledgement = $true
+            requiresAcknowledgement = (Test-EditorWarningRequiresAcknowledgement -Code $code)
             details                 = [pscustomobject][ordered]@{
                 setId           = $SetId
                 itemId          = [string]$item.ItemId
+                profileId       = $item.ProfileId
                 identity        = $identity
+                instance        = $instance
+                reason          = [string]$item.RelativeReason
                 relativeStatus  = $relativeStatus
                 placementStatus = $placementStatus
                 placementReason = [string]$item.PlacementReason
@@ -717,5 +754,755 @@ function Get-EditorProjection {
         set            = $setProjection
         topology       = Get-EditorTopologyProjection -Topology $Topology
         warnings       = @($warningItems)
+    }
+}
+
+# ---------------------------------------------------------------------------
+# P6 preview helpers
+# ---------------------------------------------------------------------------
+
+function ConvertTo-EditorJsonPointerToken {
+    param([Parameter(Mandatory)][string]$Token)
+
+    return $Token.Replace('~', '~0').Replace('/', '~1')
+}
+
+function Get-EditorJsonKind {
+    param($Value)
+
+    if ($null -eq $Value) { return 'null' }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) { return 'object' }
+    if ($Value -is [array]) { return 'array' }
+    if ($Value -is [string]) { return 'string' }
+    if ($Value -is [bool]) { return 'boolean' }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or
+        $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]) {
+        return 'number'
+    }
+
+    return 'other'
+}
+
+function Test-EditorJsonNumber {
+    param($Value)
+
+    return $Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or
+        $Value -is [double] -or $Value -is [decimal] -or $Value -is [single]
+}
+
+function Test-EditorJsonEqual {
+    param($Left, $Right)
+
+    $leftKind = Get-EditorJsonKind -Value $Left
+    $rightKind = Get-EditorJsonKind -Value $Right
+
+    if ($leftKind -cne $rightKind) {
+        return $false
+    }
+
+    switch ($leftKind) {
+        'null' { return $true }
+        'number' { return ([double]$Left -eq [double]$Right) }
+        'string' { return ($Left -ceq $Right) }
+        'boolean' { return ([bool]$Left -eq [bool]$Right) }
+        'array' {
+            if ($Left.Count -ne $Right.Count) {
+                return $false
+            }
+
+            for ($index = 0; $index -lt $Left.Count; $index++) {
+                if (-not (Test-EditorJsonEqual -Left $Left[$index] -Right $Right[$index])) {
+                    return $false
+                }
+            }
+
+            return $true
+        }
+        'object' {
+            $leftNames = @($Left.PSObject.Properties | ForEach-Object { [string]$_.Name })
+            $rightNames = @($Right.PSObject.Properties | ForEach-Object { [string]$_.Name })
+
+            if ($leftNames.Count -ne $rightNames.Count) {
+                return $false
+            }
+
+            $rightSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            foreach ($name in $rightNames) {
+                $rightSet.Add($name) | Out-Null
+            }
+
+            foreach ($name in $leftNames) {
+                if (-not $rightSet.Contains($name)) {
+                    return $false
+                }
+
+                if (-not (Test-EditorJsonEqual -Left $Left.$name -Right $Right.$name)) {
+                    return $false
+                }
+            }
+
+            return $true
+        }
+        default {
+            return ([string]$Left -ceq [string]$Right)
+        }
+    }
+}
+
+function Compare-EditorJson {
+    param(
+        $Left,
+        $Right,
+        [string]$Path,
+        [System.Collections.Generic.List[object]]$Differences
+    )
+
+    if (Test-EditorJsonEqual -Left $Left -Right $Right) {
+        return
+    }
+
+    $leftKind = Get-EditorJsonKind -Value $Left
+    $rightKind = Get-EditorJsonKind -Value $Right
+
+    if ($leftKind -eq 'object' -and $rightKind -eq 'object') {
+        $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+
+        foreach ($property in $Left.PSObject.Properties) {
+            $names.Add([string]$property.Name) | Out-Null
+        }
+
+        foreach ($property in $Right.PSObject.Properties) {
+            $names.Add([string]$property.Name) | Out-Null
+        }
+
+        $ordered = @($names)
+        [System.Array]::Sort($ordered, [System.StringComparer]::Ordinal)
+
+        foreach ($name in $ordered) {
+            $token = ConvertTo-EditorJsonPointerToken -Token $name
+            $childPath = "$Path/$token"
+            $leftHas = $null -ne $Left.PSObject.Properties[$name]
+            $rightHas = $null -ne $Right.PSObject.Properties[$name]
+
+            if (-not $leftHas -or -not $rightHas) {
+                $Differences.Add([pscustomobject][ordered]@{
+                    path   = $childPath
+                    reason = 'presence'
+                    before = if ($leftHas) { $Left.$name } else { $null }
+                    after  = if ($rightHas) { $Right.$name } else { $null }
+                }) | Out-Null
+                continue
+            }
+
+            Compare-EditorJson -Left $Left.$name -Right $Right.$name -Path $childPath -Differences $Differences
+        }
+
+        return
+    }
+
+    if ($leftKind -eq 'array' -and $rightKind -eq 'array') {
+        if ($Left.Count -ne $Right.Count) {
+            $Differences.Add([pscustomobject][ordered]@{
+                path   = $Path
+                reason = 'array-length'
+                before = $Left.Count
+                after  = $Right.Count
+            }) | Out-Null
+            return
+        }
+
+        for ($index = 0; $index -lt $Left.Count; $index++) {
+            Compare-EditorJson -Left $Left[$index] -Right $Right[$index] -Path "$Path/$index" -Differences $Differences
+        }
+
+        return
+    }
+
+    $Differences.Add([pscustomobject][ordered]@{
+        path   = $Path
+        reason = 'value'
+        before = $Left
+        after  = $Right
+    }) | Out-Null
+}
+
+function Get-EditorSetIndex {
+    param(
+        $Config,
+        [Parameter(Mandatory)][string]$SetId
+    )
+
+    $sets = $Config.sets
+
+    if ($null -eq $sets -or $sets -isnot [array]) {
+        return -1
+    }
+
+    for ($index = 0; $index -lt $sets.Count; $index++) {
+        if ([string](Get-DevWSProperty -Object $sets[$index] -Name 'id') -ieq $SetId) {
+            return $index
+        }
+    }
+
+    return -1
+}
+
+function Get-EditorNormalizedPreviewConfig {
+    # Clone the complete document and apply the contract's semantic
+    # equivalences: absent layoutMode equals "absolute", and absent/empty
+    # layoutProfiles are equivalent when no profiles are present.
+    param([Parameter(Mandatory)]$Config)
+
+    $copy = $Config | ConvertTo-Json -Depth 40 | ConvertFrom-Json
+    $sets = $copy.sets
+
+    if ($null -eq $sets -or $sets -isnot [array]) {
+        return $copy
+    }
+
+    foreach ($set in @($sets)) {
+        $profiles = $set.layoutProfiles
+
+        if ($null -eq $profiles -or $profiles -isnot [array] -or @($profiles).Count -eq 0) {
+            $set.PSObject.Properties.Remove('layoutProfiles')
+        }
+
+        $windows = $set.windows
+
+        foreach ($item in @($windows)) {
+            if ($null -eq $item -or $item -isnot [System.Management.Automation.PSCustomObject]) {
+                continue
+            }
+
+            if ($null -eq $item.PSObject.Properties['layoutMode']) {
+                $item | Add-Member -NotePropertyName 'layoutMode' -NotePropertyValue 'absolute' -Force
+            }
+        }
+    }
+
+    return $copy
+}
+
+function Test-EditorAllowedMutationPath {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$TargetSetIndex
+    )
+
+    $prefix = "/sets/$TargetSetIndex"
+    $patterns = @(
+        "^$prefix/windows/\d+/layout/(x|y|w|h)$",
+        "^$prefix/windows/\d+/layoutMode$",
+        "^$prefix/windows/\d+/layoutRelative$",
+        "^$prefix/windows/\d+/layoutRelative/monitor/(identity|instance)$",
+        "^$prefix/windows/\d+/layoutRelative/basis$",
+        "^$prefix/windows/\d+/layoutRelative/rect/(x|y|w|h)$",
+        "^$prefix/layoutProfiles/\d+/layouts/[^/]+/(x|y|w|h)$"
+    )
+
+    foreach ($pattern in $patterns) {
+        if ($Path -match $pattern) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-EditorDraftAudit {
+    param(
+        [Parameter(Mandatory)]$CanonicalConfig,
+        [Parameter(Mandatory)]$DraftConfig,
+        [Parameter(Mandatory)][string]$SetId
+    )
+
+    $canonical = Get-EditorNormalizedPreviewConfig -Config $CanonicalConfig
+    $draft = Get-EditorNormalizedPreviewConfig -Config $DraftConfig
+    $targetIndex = Get-EditorSetIndex -Config $canonical -SetId $SetId
+
+    if ($targetIndex -lt 0) {
+        return [pscustomobject][ordered]@{
+            Ok              = $false
+            Code            = 'set-not-found'
+            Message         = "The canonical configuration does not contain set '$SetId'."
+            Details         = [ordered]@{ setId = $SetId }
+            Diff            = @()
+            Violations      = @()
+            RequiresTopology = $false
+        }
+    }
+
+    if ((Get-EditorSetIndex -Config $draft -SetId $SetId) -lt 0) {
+        return [pscustomobject][ordered]@{
+            Ok              = $false
+            Code            = 'set-not-found'
+            Message         = "The draft does not contain set '$SetId'."
+            Details         = [ordered]@{ setId = $SetId }
+            Diff            = @()
+            Violations      = @()
+            RequiresTopology = $false
+        }
+    }
+
+    $differences = [System.Collections.Generic.List[object]]::new()
+    Compare-EditorJson -Left $canonical -Right $draft -Path '' -Differences $differences
+    $violations = [System.Collections.Generic.List[object]]::new()
+    $requiresTopology = $false
+
+    foreach ($difference in $differences) {
+        if (-not (Test-EditorAllowedMutationPath -Path ([string]$difference.path) -TargetSetIndex $targetIndex)) {
+            $violations.Add($difference) | Out-Null
+            continue
+        }
+
+        if ($difference.path -match '/layoutMode$' -or
+            $difference.path -match '/layoutRelative' -or
+            $difference.path -match '/layoutProfiles/\d+/layouts/') {
+            $requiresTopology = $true
+        }
+    }
+
+    $draftSet = @($draft.sets)[$targetIndex]
+    $itemIndex = 0
+
+    foreach ($item in @(Get-DevWSProperty -Object $draftSet -Name 'windows')) {
+        if ($null -eq $item -or $item -isnot [System.Management.Automation.PSCustomObject]) {
+            $itemIndex++
+            continue
+        }
+
+        $mode = [string](Get-DevWSProperty -Object $item -Name 'layoutMode')
+        $relative = Get-DevWSProperty -Object $item -Name 'layoutRelative'
+
+        if ($mode -ceq 'relative' -and $null -eq $relative) {
+            $violations.Add([pscustomobject][ordered]@{
+                path   = "/sets/$targetIndex/windows/$itemIndex/layoutRelative"
+                reason = 'mode-incoherent'
+                before = $null
+                after  = $null
+            }) | Out-Null
+            $requiresTopology = $true
+        }
+        elseif ($mode -cne 'relative' -and $null -ne $relative) {
+            $violations.Add([pscustomobject][ordered]@{
+                path   = "/sets/$targetIndex/windows/$itemIndex/layoutRelative"
+                reason = 'mode-incoherent'
+                before = $null
+                after  = $null
+            }) | Out-Null
+            $requiresTopology = $true
+        }
+
+        $itemIndex++
+    }
+
+    if ($violations.Count -gt 0) {
+        $first = $violations[0]
+        $reasonCode = switch ([string]$first.reason) {
+            'value'        { 'field-not-allowed' }
+            'presence'     { 'structural-identity' }
+            'array-length' { 'structural-identity' }
+            'mode-incoherent' { 'mode-incoherent' }
+            default        { 'field-not-allowed' }
+        }
+
+        return [pscustomobject][ordered]@{
+            Ok              = $false
+            Code            = 'unsupported-mutation'
+            Message         = 'The draft changes a field that the v0.4 editor is not authorized to modify.'
+            Details         = [ordered]@{
+                path           = [string]$first.path
+                reason         = $reasonCode
+                differenceReason = [string]$first.reason
+                targetSetId    = $SetId
+                allowedScopes  = @('geometry', 'relative-geometry', 'existing-profile-entry-geometry')
+            }
+            Diff            = @()
+            Violations      = @($violations.ToArray())
+            RequiresTopology = $requiresTopology
+        }
+    }
+
+    $diff = @(Get-EditorSemanticDiff -CanonicalConfig $canonical -DraftConfig $draft -SetId $SetId)
+
+    return [pscustomobject][ordered]@{
+        Ok              = $true
+        Code            = $null
+        Message         = $null
+        Details         = $null
+        Diff            = $diff
+        Violations      = @()
+        RequiresTopology = ($requiresTopology -or @($diff | Where-Object {
+            $_.scope -eq 'relative' -or $_.scope -eq 'mode' -or $_.scope.StartsWith('profile:', [System.StringComparison]::Ordinal)
+        }).Count -gt 0)
+    }
+}
+
+function Get-EditorSemanticDiff {
+    param(
+        [Parameter(Mandatory)]$CanonicalConfig,
+        [Parameter(Mandatory)]$DraftConfig,
+        [Parameter(Mandatory)][string]$SetId
+    )
+
+    $targetIndex = Get-EditorSetIndex -Config $CanonicalConfig -SetId $SetId
+
+    if ($targetIndex -lt 0) {
+        return @()
+    }
+
+    $canonicalSet = @($CanonicalConfig.sets)[$targetIndex]
+    $draftSet = @($DraftConfig.sets)[$targetIndex]
+    $canonicalItems = @($canonicalSet.windows)
+    $draftItems = @($draftSet.windows)
+    $diff = [System.Collections.Generic.List[object]]::new()
+
+    for ($itemIndex = 0; $itemIndex -lt [Math]::Min($canonicalItems.Count, $draftItems.Count); $itemIndex++) {
+        $beforeItem = $canonicalItems[$itemIndex]
+        $afterItem = $draftItems[$itemIndex]
+        $itemId = [string](Get-DevWSProperty -Object $afterItem -Name 'id')
+
+        $beforeLayout = Get-DevWSProperty -Object $beforeItem -Name 'layout'
+        $afterLayout = Get-DevWSProperty -Object $afterItem -Name 'layout'
+
+        if (-not (Test-EditorJsonEqual -Left $beforeLayout -Right $afterLayout)) {
+            $diff.Add([pscustomobject][ordered]@{
+                setId  = $SetId
+                itemId = $itemId
+                scope  = 'fallback'
+                field  = 'layout'
+                before = $beforeLayout
+                after  = $afterLayout
+            }) | Out-Null
+        }
+
+        $beforeMode = [string](Get-DevWSProperty -Object $beforeItem -Name 'layoutMode')
+        $afterMode = [string](Get-DevWSProperty -Object $afterItem -Name 'layoutMode')
+
+        if ($beforeMode -cne $afterMode) {
+            $diff.Add([pscustomobject][ordered]@{
+                setId  = $SetId
+                itemId = $itemId
+                scope  = 'mode'
+                field  = 'layoutMode'
+                before = $beforeMode
+                after  = $afterMode
+            }) | Out-Null
+        }
+
+        $beforeRelative = Get-DevWSProperty -Object $beforeItem -Name 'layoutRelative'
+        $afterRelative = Get-DevWSProperty -Object $afterItem -Name 'layoutRelative'
+
+        if (($null -eq $beforeRelative) -ne ($null -eq $afterRelative)) {
+            $diff.Add([pscustomobject][ordered]@{
+                setId  = $SetId
+                itemId = $itemId
+                scope  = 'relative'
+                field  = 'layoutRelative'
+                before = $beforeRelative
+                after  = $afterRelative
+            }) | Out-Null
+        }
+        elseif ($null -ne $beforeRelative -and $null -ne $afterRelative) {
+            $beforeMonitor = Get-DevWSProperty -Object $beforeRelative -Name 'monitor'
+            $afterMonitor = Get-DevWSProperty -Object $afterRelative -Name 'monitor'
+            $beforeIdentity = Get-DevWSProperty -Object $beforeMonitor -Name 'identity'
+            $afterIdentity = Get-DevWSProperty -Object $afterMonitor -Name 'identity'
+            $beforeInstance = Get-DevWSProperty -Object $beforeMonitor -Name 'instance'
+            $afterInstance = Get-DevWSProperty -Object $afterMonitor -Name 'instance'
+            $beforeBasis = Get-DevWSProperty -Object $beforeRelative -Name 'basis'
+            $afterBasis = Get-DevWSProperty -Object $afterRelative -Name 'basis'
+
+            if (-not (Test-EditorJsonEqual -Left $beforeIdentity -Right $afterIdentity)) {
+                $diff.Add([pscustomobject][ordered]@{
+                    setId  = $SetId
+                    itemId = $itemId
+                    scope  = 'relative'
+                    field  = 'layoutRelative.monitor.identity'
+                    before = $beforeIdentity
+                    after  = $afterIdentity
+                }) | Out-Null
+            }
+
+            if (-not (Test-EditorJsonEqual -Left $beforeInstance -Right $afterInstance)) {
+                $diff.Add([pscustomobject][ordered]@{
+                    setId  = $SetId
+                    itemId = $itemId
+                    scope  = 'relative'
+                    field  = 'layoutRelative.monitor.instance'
+                    before = $beforeInstance
+                    after  = $afterInstance
+                }) | Out-Null
+            }
+
+            if (-not (Test-EditorJsonEqual -Left $beforeBasis -Right $afterBasis)) {
+                $diff.Add([pscustomobject][ordered]@{
+                    setId  = $SetId
+                    itemId = $itemId
+                    scope  = 'relative'
+                    field  = 'layoutRelative.basis'
+                    before = $beforeBasis
+                    after  = $afterBasis
+                }) | Out-Null
+            }
+
+            $beforeRect = Get-DevWSProperty -Object $beforeRelative -Name 'rect'
+            $afterRect = Get-DevWSProperty -Object $afterRelative -Name 'rect'
+
+            foreach ($fieldName in @('x', 'y', 'w', 'h')) {
+                $beforeValue = Get-DevWSProperty -Object $beforeRect -Name $fieldName
+                $afterValue = Get-DevWSProperty -Object $afterRect -Name $fieldName
+
+                if (-not (Test-EditorJsonEqual -Left $beforeValue -Right $afterValue)) {
+                    $diff.Add([pscustomobject][ordered]@{
+                        setId  = $SetId
+                        itemId = $itemId
+                        scope  = 'relative'
+                        field  = "layoutRelative.rect.$fieldName"
+                        before = $beforeValue
+                        after  = $afterValue
+                    }) | Out-Null
+                }
+            }
+        }
+    }
+
+    $canonicalProfiles = $canonicalSet.layoutProfiles
+    $draftProfiles = $draftSet.layoutProfiles
+
+    if ($null -ne $canonicalProfiles -and $null -ne $draftProfiles) {
+        for ($profileIndex = 0; $profileIndex -lt [Math]::Min(@($canonicalProfiles).Count, @($draftProfiles).Count); $profileIndex++) {
+            $canonicalProfile = @($canonicalProfiles)[$profileIndex]
+            $draftProfile = @($draftProfiles)[$profileIndex]
+            $profileId = [string](Get-DevWSProperty -Object $draftProfile -Name 'id')
+            $canonicalLayouts = $canonicalProfile.layouts
+            $draftLayouts = $draftProfile.layouts
+
+            if ($null -eq $canonicalLayouts -or $null -eq $draftLayouts) {
+                continue
+            }
+
+            foreach ($property in @($canonicalLayouts.PSObject.Properties)) {
+                $itemId = [string]$property.Name
+                $beforeRect = Get-DevWSProperty -Object $canonicalLayouts -Name $itemId
+                $afterRect = Get-DevWSProperty -Object $draftLayouts -Name $itemId
+
+                if (-not (Test-EditorJsonEqual -Left $beforeRect -Right $afterRect)) {
+                    $diff.Add([pscustomobject][ordered]@{
+                        setId  = $SetId
+                        itemId = $itemId
+                        scope  = "profile:$profileId"
+                        field  = "layouts.$itemId"
+                        before = $beforeRect
+                        after  = $afterRect
+                    }) | Out-Null
+                }
+            }
+        }
+    }
+
+    return @($diff.ToArray())
+}
+
+function Get-EditorWarningReviewKey {
+    param([Parameter(Mandatory)]$Warning)
+
+    $details = Get-DevWSProperty -Object $Warning -Name 'details'
+
+    return [pscustomobject][ordered]@{
+        id              = [string](Get-DevWSProperty -Object $Warning -Name 'id')
+        code            = [string](Get-DevWSProperty -Object $Warning -Name 'code')
+        setId           = [string](Get-DevWSProperty -Object $details -Name 'setId')
+        itemId          = [string](Get-DevWSProperty -Object $details -Name 'itemId')
+        profileId       = [string](Get-DevWSProperty -Object $details -Name 'profileId')
+        identity        = [string](Get-DevWSProperty -Object $details -Name 'identity')
+        instance        = [string](Get-DevWSProperty -Object $details -Name 'instance')
+        reason          = [string](Get-DevWSProperty -Object $details -Name 'reason')
+        relativeStatus  = [string](Get-DevWSProperty -Object $details -Name 'relativeStatus')
+        placementStatus = [string](Get-DevWSProperty -Object $details -Name 'placementStatus')
+        placementReason = [string](Get-DevWSProperty -Object $details -Name 'placementReason')
+    }
+}
+
+function Get-EditorWarningReview {
+    param(
+        [object[]]$Warnings = @(),
+        [Parameter(Mandatory)][string]$BaseSha256,
+        [AllowNull()][string]$TopologyFingerprint = $null,
+        [bool]$HasChanges = $false
+    )
+
+    $acknowledgementWarnings = @($Warnings | Where-Object {
+        [bool](Get-DevWSProperty -Object $_ -Name 'requiresAcknowledgement') -and
+        [string](Get-DevWSProperty -Object $_ -Name 'code') -cne 'deferred-qualification'
+    })
+
+    if (-not $HasChanges -or $acknowledgementWarnings.Count -eq 0) {
+        return [pscustomobject][ordered]@{
+            baseSha256             = $BaseSha256
+            topologyFingerprint    = $TopologyFingerprint
+            warningIds             = @()
+            warningDigest          = $null
+            requiresAcknowledgement = $false
+            reviewToken            = $null
+        }
+    }
+
+    $warningIds = [System.Collections.Generic.List[string]]::new()
+    $keysById = @{}
+
+    foreach ($warning in $acknowledgementWarnings) {
+        $id = [string](Get-DevWSProperty -Object $warning -Name 'id')
+        if ($keysById.ContainsKey($id)) {
+            continue
+        }
+
+        $warningIds.Add($id) | Out-Null
+        $keysById[$id] = Get-EditorWarningReviewKey -Warning $warning
+    }
+
+    $warningIds.Sort([System.StringComparer]::Ordinal)
+    $keys = @($warningIds | ForEach-Object { $keysById[$_] })
+    $keyJson = ConvertTo-Json -InputObject @($keys) -Compress -Depth 12
+    $digestBytes = [System.Text.Encoding]::UTF8.GetBytes($keyJson)
+    $warningDigest = Get-EditorSha256Hex -Bytes $digestBytes
+    $tokenSource = "devws-editor/1`n$BaseSha256`n$([string]$TopologyFingerprint)`n$warningDigest"
+    $reviewToken = Get-EditorSha256Hex -Bytes ([System.Text.Encoding]::UTF8.GetBytes($tokenSource))
+
+    return [pscustomobject][ordered]@{
+        baseSha256             = $BaseSha256
+        topologyFingerprint    = $TopologyFingerprint
+        warningIds             = @($warningIds.ToArray())
+        warningDigest          = $warningDigest
+        requiresAcknowledgement = $true
+        reviewToken            = $reviewToken
+    }
+}
+
+function Get-EditorPreviewFailure {
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Message,
+        $Details = $null
+    )
+
+    return [pscustomobject][ordered]@{
+        Ok      = $false
+        Code    = $Code
+        Message = $Message
+        Details = $Details
+        Result  = $null
+        Warnings = @()
+    }
+}
+
+function Get-EditorPreviewCore {
+    # Pure preview composition over the canonical/draft documents and one
+    # topology snapshot. The backend owns file reads and structural
+    # validation; this helper owns the allowlist, diff, projections, and
+    # review binding.
+    param(
+        [Parameter(Mandatory)]$CanonicalConfig,
+        [Parameter(Mandatory)]$DraftConfig,
+        [Parameter(Mandatory)][string]$SetId,
+        $Topology,
+        [Parameter(Mandatory)][string]$BaseSha256,
+        [Parameter(Mandatory)][string]$CurrentSha256,
+        [AllowNull()][string]$BaseTopologyFingerprint = $null
+    )
+
+    $audit = Get-EditorDraftAudit -CanonicalConfig $CanonicalConfig -DraftConfig $DraftConfig -SetId $SetId
+
+    if (-not [bool]$audit.Ok) {
+        return Get-EditorPreviewFailure -Code ([string]$audit.Code) -Message ([string]$audit.Message) -Details $audit.Details
+    }
+
+    $topologyAvailable = $null -ne $Topology -and [bool](Get-DevWSProperty -Object $Topology -Name 'Available')
+    $identityComplete = $topologyAvailable -and [bool](Get-DevWSProperty -Object $Topology -Name 'IdentityComplete')
+    $correlationComplete = $topologyAvailable -and [bool](Get-DevWSProperty -Object $Topology -Name 'CorrelationComplete')
+    $actualFingerprint = if ($topologyAvailable) { [string](Get-DevWSProperty -Object $Topology -Name 'Fingerprint') } else { $null }
+    $requiresTopology = [bool]$audit.RequiresTopology
+
+    if ($requiresTopology) {
+        if (-not $topologyAvailable) {
+            return Get-EditorPreviewFailure -Code 'topology-unavailable' -Message 'The draft changes relative or profile geometry, but the monitor topology is unavailable.'
+        }
+
+        if (-not $identityComplete -or -not $correlationComplete) {
+            return Get-EditorPreviewFailure -Code 'topology-incomplete' -Message 'The draft changes relative or profile geometry, but the monitor topology is incomplete.'
+        }
+
+        if ([string]::IsNullOrWhiteSpace($BaseTopologyFingerprint)) {
+            return Get-EditorPreviewFailure -Code 'request-invalid' -Message "preview 'baseTopologyFingerprint' is required for relative/profile changes." -Details ([ordered]@{
+                reason = 'topology-fingerprint-required'
+            })
+        }
+
+        if ([string]::IsNullOrWhiteSpace($actualFingerprint)) {
+            return Get-EditorPreviewFailure -Code 'topology-unavailable' -Message 'The monitor topology has no fingerprint to compare.'
+        }
+
+        if ($actualFingerprint -cne $BaseTopologyFingerprint) {
+            return Get-EditorPreviewFailure -Code 'topology-changed' -Message 'The monitor topology changed since the draft was created.' -Details ([ordered]@{
+                expectedFingerprint = $BaseTopologyFingerprint
+                actualFingerprint   = $actualFingerprint
+            })
+        }
+    }
+    elseif ($topologyAvailable -and -not [string]::IsNullOrWhiteSpace($BaseTopologyFingerprint) -and
+        $actualFingerprint -cne $BaseTopologyFingerprint) {
+        return Get-EditorPreviewFailure -Code 'topology-changed' -Message 'The monitor topology changed since the draft was created.' -Details ([ordered]@{
+            expectedFingerprint = $BaseTopologyFingerprint
+            actualFingerprint   = $actualFingerprint
+        })
+    }
+
+    try {
+        $canonicalSet = Resolve-DevWSTargetSet -Config $CanonicalConfig -Set $SetId
+        $draftSet = Resolve-DevWSTargetSet -Config $DraftConfig -Set $SetId
+    }
+    catch {
+        return Get-EditorPreviewFailure -Code 'set-not-found' -Message $_.Exception.Message -Details ([ordered]@{ setId = $SetId })
+    }
+
+    $savedProjection = Get-EditorProjection `
+        -Config $CanonicalConfig `
+        -Set $canonicalSet `
+        -Topology $Topology `
+        -ConfigRevision $CurrentSha256
+
+    $draftProjection = Get-EditorProjection `
+        -Config $DraftConfig `
+        -Set $draftSet `
+        -Topology $Topology `
+        -ConfigRevision $BaseSha256
+
+    $warnings = @($draftProjection.warnings)
+    $diff = @($audit.Diff)
+    $review = Get-EditorWarningReview `
+        -Warnings $warnings `
+        -BaseSha256 $BaseSha256 `
+        -TopologyFingerprint $(if ($topologyAvailable) { $actualFingerprint } else { $null }) `
+        -HasChanges:($diff.Count -gt 0)
+
+    $result = [pscustomobject][ordered]@{
+        baseSha256        = $BaseSha256
+        currentSha256     = $CurrentSha256
+        baseMatches       = ($BaseSha256 -ceq $CurrentSha256)
+        setId             = $SetId
+        topologyFingerprint = if ($topologyAvailable) { $actualFingerprint } else { $null }
+        savedSet          = $savedProjection.set
+        draftSet          = $draftProjection.set
+        diff              = @($diff)
+        review            = $review
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok      = $true
+        Code    = $null
+        Message = $null
+        Details = $null
+        Result  = $result
+        Warnings = @($warnings)
     }
 }

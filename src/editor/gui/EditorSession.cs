@@ -13,6 +13,12 @@ public sealed record EditorLoadMetrics(
     double ProjectParseMs,
     double ProjectModelMs);
 
+public sealed record EditorPreviewMetrics(
+    double TransportMs,
+    double ParseMs,
+    double ModelMs,
+    double TotalMs);
+
 public sealed class EditorSession : IDisposable
 {
     private static readonly Dictionary<string, object?> EmptyParameters = new();
@@ -26,6 +32,7 @@ public sealed class EditorSession : IDisposable
 
     public BackendClient Client => _client;
     public EditorLoadMetrics? LastLoadMetrics { get; private set; }
+    public EditorPreviewMetrics? LastPreviewMetrics { get; private set; }
 
     public async Task<EditorSnapshot> LoadAsync(
         string? setId,
@@ -145,6 +152,50 @@ public sealed class EditorSession : IDisposable
             .ConfigureAwait(false);
 
         return DraftValidationResult.Parse(response.Result);
+    }
+
+    public async Task<PreviewResult> PreviewAsync(
+        DraftDocument draft,
+        string baseSha256,
+        string setId,
+        string? baseTopologyFingerprint,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(EditorSession));
+        }
+
+        draft.EnsureMutationScope();
+        var parameters = new Dictionary<string, object?>
+        {
+            ["draft"] = draft.CreateDraftSnapshot(),
+            ["baseSha256"] = baseSha256,
+            ["setId"] = setId
+        };
+
+        if (!string.IsNullOrWhiteSpace(baseTopologyFingerprint))
+        {
+            parameters["baseTopologyFingerprint"] = baseTopologyFingerprint;
+        }
+
+        var totalWatch = Stopwatch.StartNew();
+        var response = await _client
+            .SendAsync("preview", parameters, cancellationToken)
+            .ConfigureAwait(false);
+        var transportMs = _client.LastReadMs;
+        var parseMs = _client.LastParseMs;
+        var modelWatch = Stopwatch.StartNew();
+        var result = PreviewResult.Parse(response.Result, response.Warnings);
+        modelWatch.Stop();
+        totalWatch.Stop();
+        LastPreviewMetrics = new EditorPreviewMetrics(
+            transportMs,
+            parseMs,
+            modelWatch.Elapsed.TotalMilliseconds,
+            totalWatch.Elapsed.TotalMilliseconds);
+
+        return result;
     }
 
     public async Task<RelativeConversionResult> ConvertAsync(

@@ -19,6 +19,7 @@ public sealed class WorkspaceCanvas : FrameworkElement
     private static readonly Brush ItemUnavailableBrush = Freeze(new SolidColorBrush(Color.FromRgb(58, 58, 62)));
     private static readonly Brush ItemSelectedBrush = Freeze(new SolidColorBrush(Color.FromRgb(120, 90, 30)));
     private static readonly Brush DraftOverlayBrush = Freeze(new SolidColorBrush(Color.FromArgb(70, 255, 196, 87)));
+    private static readonly Brush PreviewOverlayBrush = Freeze(new SolidColorBrush(Color.FromArgb(60, 80, 210, 210)));
     private static readonly Brush TextBrush = Freeze(new SolidColorBrush(Color.FromRgb(235, 235, 240)));
     private static readonly Brush MutedTextBrush = Freeze(new SolidColorBrush(Color.FromRgb(165, 170, 180)));
     private static readonly Brush WarningBrush = Freeze(new SolidColorBrush(Color.FromRgb(255, 196, 87)));
@@ -32,13 +33,14 @@ public sealed class WorkspaceCanvas : FrameworkElement
     });
     private static readonly Pen ItemBorderPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(180, 200, 220)), 1.0));
     private static readonly Pen ItemSelectedPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(255, 213, 79)), 2.5));
-    private static readonly Pen DraftPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(255, 190, 70)), 2.0)
+    private static readonly Pen LocalDraftPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(255, 190, 70)), 2.0)
     {
         DashStyle = new DashStyle(new double[] { 6, 3 }, 0)
     });
-    private static readonly Pen SavedOutlinePen = Freeze(new Pen(new SolidColorBrush(Color.FromArgb(150, 170, 175, 190)), 1.0)
+    private static readonly Pen SavedOutlinePen = Freeze(new Pen(new SolidColorBrush(Color.FromArgb(190, 170, 175, 190)), 1.5));
+    private static readonly Pen PreviewPen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(80, 220, 215)), 2.0)
     {
-        DashStyle = new DashStyle(new double[] { 3, 4 }, 0)
+        DashStyle = new DashStyle(new double[] { 5, 3 }, 0)
     });
     private static readonly Pen HandlePen = Freeze(new Pen(new SolidColorBrush(Color.FromRgb(40, 36, 20)), 1.0));
     private static readonly Pen GridPen = Freeze(new Pen(new SolidColorBrush(Color.FromArgb(28, 255, 255, 255)), 1.0));
@@ -50,6 +52,7 @@ public sealed class WorkspaceCanvas : FrameworkElement
     private IReadOnlyList<ProjectedItem> _items = Array.Empty<ProjectedItem>();
     private HashSet<string> _warningItemIds = new(StringComparer.Ordinal);
     private Dictionary<string, RectInfo> _draftRects = new(StringComparer.Ordinal);
+    private Dictionary<string, RectInfo> _previewRects = new(StringComparer.Ordinal);
     private readonly Dictionary<string, FormattedText> _textCache = new(StringComparer.Ordinal);
     private Rect _virtualScreen = new(0, 0, 1, 1);
     private RectInfo? _virtualScreenSource;
@@ -95,7 +98,8 @@ public sealed class WorkspaceCanvas : FrameworkElement
         IReadOnlyList<ProjectedItem> items,
         RectInfo? virtualScreen,
         ISet<string>? warningItemIds,
-        IReadOnlyDictionary<string, RectInfo>? draftRects = null)
+        IReadOnlyDictionary<string, RectInfo>? draftRects = null,
+        IReadOnlyDictionary<string, RectInfo>? previewRects = null)
     {
         _monitors = monitors;
         _items = items;
@@ -105,6 +109,9 @@ public sealed class WorkspaceCanvas : FrameworkElement
         _draftRects = draftRects is null
             ? new Dictionary<string, RectInfo>(StringComparer.Ordinal)
             : new Dictionary<string, RectInfo>(draftRects, StringComparer.Ordinal);
+        _previewRects = previewRects is null
+            ? new Dictionary<string, RectInfo>(StringComparer.Ordinal)
+            : new Dictionary<string, RectInfo>(previewRects, StringComparer.Ordinal);
         _virtualScreenSource = virtualScreen;
         _virtualScreen = ComputeVirtualScreen(virtualScreen);
         _interactiveRect = null;
@@ -121,6 +128,16 @@ public sealed class WorkspaceCanvas : FrameworkElement
         _draftRects = draftRects is null
             ? new Dictionary<string, RectInfo>(StringComparer.Ordinal)
             : new Dictionary<string, RectInfo>(draftRects, StringComparer.Ordinal);
+        _interactiveRect = null;
+        _virtualScreen = ComputeVirtualScreen(_virtualScreenSource);
+        InvalidateVisual();
+    }
+
+    public void SetPreviewRects(IReadOnlyDictionary<string, RectInfo>? previewRects)
+    {
+        _previewRects = previewRects is null
+            ? new Dictionary<string, RectInfo>(StringComparer.Ordinal)
+            : new Dictionary<string, RectInfo>(previewRects, StringComparer.Ordinal);
         _interactiveRect = null;
         _virtualScreen = ComputeVirtualScreen(_virtualScreenSource);
         InvalidateVisual();
@@ -191,7 +208,12 @@ public sealed class WorkspaceCanvas : FrameworkElement
             return _interactiveRect;
         }
 
-        return _draftRects.TryGetValue(item.ItemId, out var draft) ? draft : item.Rect;
+        if (_draftRects.TryGetValue(item.ItemId, out var draft))
+        {
+            return draft;
+        }
+
+        return _previewRects.TryGetValue(item.ItemId, out var preview) ? preview : item.Rect;
     }
 
     protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
@@ -238,13 +260,17 @@ public sealed class WorkspaceCanvas : FrameworkElement
             DrawItem(drawingContext, _items[SelectedItemIndex], SelectedItemIndex);
         }
 
-        var draftCount = _draftRects.Count > 0 ? _draftRects.Count : 0;
+        var draftCount = _draftRects.Count;
+        var previewCount = _previewRects.Count;
         var header = $"{_monitors.Count} monitors  |  {_items.Count} items  |  {Transform.Describe()}" +
-                     (draftCount > 0 ? $"  |  {draftCount} local draft" : "");
+                     (draftCount > 0 ? $"  |  {draftCount} local draft" : "") +
+                     (previewCount > 0 ? $"  |  {previewCount} preview change(s)" : "");
         DrawText(drawingContext, header, new Point(12, 8), 12, MutedTextBrush);
         DrawText(
             drawingContext,
-            "solid = saved projection  ·  dashed = local draft (not backend-validated)  ·  handles = drag/resize",
+            previewCount > 0
+                ? "solid = saved effective  ·  teal dashed = authoritative preview  ·  amber dashed = local unpreviewed  ·  handles = drag/resize"
+                : "solid = saved effective  ·  amber dashed = local draft (not backend-validated)  ·  handles = drag/resize",
             new Point(12, Math.Max(12, RenderSize.Height - 22)),
             11,
             MutedTextBrush);
@@ -319,18 +345,29 @@ public sealed class WorkspaceCanvas : FrameworkElement
         var savedRect = WorldRectToScreen(item.Rect.ToRect());
         var selected = index == SelectedItemIndex;
         _draftRects.TryGetValue(item.ItemId, out var draftRect);
+        _previewRects.TryGetValue(item.ItemId, out var previewRect);
         var displayWorld = selected && _interactiveRect is not null
             ? _interactiveRect
-            : draftRect ?? item.Rect;
+            : draftRect ?? previewRect ?? item.Rect;
         var rect = WorldRectToScreen(displayWorld.ToRect());
         var brush = selected ? ItemSelectedBrush : BrushForSource(item.Source, item.Enabled);
         var pen = selected ? ItemSelectedPen : ItemBorderPen;
 
-        if (draftRect is not null || (selected && _interactiveRect is not null))
+        if (draftRect is not null || previewRect is not null || (selected && _interactiveRect is not null))
         {
             drawingContext.DrawRectangle(null, SavedOutlinePen, savedRect);
+        }
+
+        if (previewRect is not null)
+        {
+            drawingContext.DrawRectangle(PreviewOverlayBrush, null, rect);
+            pen = PreviewPen;
+        }
+
+        if (draftRect is not null)
+        {
             drawingContext.DrawRectangle(DraftOverlayBrush, null, rect);
-            pen = DraftPen;
+            pen = LocalDraftPen;
         }
 
         drawingContext.DrawRectangle(brush, pen, rect);
@@ -344,7 +381,11 @@ public sealed class WorkspaceCanvas : FrameworkElement
 
         if (selected && draftRect is not null)
         {
-            DrawText(drawingContext, "DRAFT", new Point(rect.Left + 5, Math.Max(rect.Top + 4, rect.Bottom - 18)), 9, WarningBrush);
+            DrawText(drawingContext, "LOCAL", new Point(rect.Left + 5, Math.Max(rect.Top + 4, rect.Bottom - 18)), 9, WarningBrush);
+        }
+        else if (selected && previewRect is not null)
+        {
+            DrawText(drawingContext, "PREVIEW", new Point(rect.Left + 5, Math.Max(rect.Top + 4, rect.Bottom - 18)), 9, PreviewPen.Brush);
         }
 
         if (_warningItemIds.Contains(item.ItemId))
@@ -753,7 +794,11 @@ public sealed class WorkspaceCanvas : FrameworkElement
         for (var index = _items.Count - 1; index >= 0; index--)
         {
             var item = _items[index];
-            var rect = _draftRects.TryGetValue(item.ItemId, out var draft) ? draft : item.Rect;
+            var rect = _draftRects.TryGetValue(item.ItemId, out var draft)
+                ? draft
+                : _previewRects.TryGetValue(item.ItemId, out var preview)
+                    ? preview
+                    : item.Rect;
 
             if (rect.ToRect().Contains(world))
             {
@@ -789,6 +834,7 @@ public sealed class WorkspaceCanvas : FrameworkElement
         var rects = _monitors.Select(monitor => monitor.MonitorRect)
             .Concat(_items.Select(item => item.Rect))
             .Concat(_draftRects.Values)
+            .Concat(_previewRects.Values)
             .ToList();
 
         if (rects.Count == 0)

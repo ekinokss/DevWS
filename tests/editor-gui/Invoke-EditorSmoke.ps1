@@ -207,6 +207,23 @@ for ($run = 1; $run -le $Repeat; $run++) {
         throw "The editor smoke draft was not structurally valid: $($evidence.draftValidation)."
     }
 
+    if ($evidence.previewOk -ne $true) {
+        throw 'The editor smoke did not obtain an authoritative preview.'
+    }
+
+    if ($evidence.previewAckOk -ne $true) {
+        throw 'The editor smoke did not explicitly acknowledge required preview warnings.'
+    }
+
+    if ($evidence.previewDiffCount -lt 1 -or $evidence.previewNoChanges -eq $true) {
+        throw "The editor smoke preview did not report the draft change (diff=$($evidence.previewDiffCount))."
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$evidence.previewSavedRect) -or
+        [string]::IsNullOrWhiteSpace([string]$evidence.previewProposedRect)) {
+        throw 'The editor smoke preview did not report saved and proposed effective rectangles.'
+    }
+
     if ($evidence.backendExited -ne $true) {
         throw 'The editor backend child did not exit.'
     }
@@ -239,6 +256,13 @@ for ($run = 1; $run -le $Repeat; $run++) {
         }
         if ($evidence.relativeEditOk -ne $true) {
             throw "The synthetic relative edit did not succeed: $($evidence.relativeError)"
+        }
+        if ($evidence.previewReviewRequired -ne $true -or $evidence.previewAcknowledged -ne $true) {
+            throw 'The synthetic preview did not require and receive an explicit warning review.'
+        }
+        if (([string]$evidence.previewWarningDigest).Length -ne 64 -or
+            ([string]$evidence.previewReviewToken).Length -ne 64) {
+            throw 'The synthetic preview did not return a 64-character warning digest and review token.'
         }
     }
     else {
@@ -280,6 +304,22 @@ for ($run = 1; $run -le $Repeat; $run++) {
         RelativeAfter = $evidence.relativeAfter
         RelativeNormalized = $evidence.relativeNormalized
         FinalProposed = $evidence.finalProposed
+        PreviewOk = $evidence.previewOk
+        PreviewDiffCount = $evidence.previewDiffCount
+        PreviewNoChanges = $evidence.previewNoChanges
+        PreviewReviewRequired = $evidence.previewReviewRequired
+        PreviewAcknowledged = $evidence.previewAcknowledged
+        PreviewSavedRect = $evidence.previewSavedRect
+        PreviewProposedRect = $evidence.previewProposedRect
+        PreviewEffectiveChanged = $evidence.previewEffectiveChanged
+        PreviewWarningCount = $evidence.previewWarningCount
+        PreviewWarningDigest = $evidence.previewWarningDigest
+        PreviewReviewToken = $evidence.previewReviewToken
+        PreviewMs = $evidence.previewMs
+        PreviewTransportMs = $evidence.previewTransportMs
+        PreviewParseMs = $evidence.previewParseMs
+        PreviewModelMs = $evidence.previewModelMs
+        PreviewDiffSnapshotPath = $evidence.previewDiffSnapshotPath
         EditApplyMs = $evidence.editApplyMs
         EditCommitMs = $evidence.editCommitMs
         ValidateMs = $evidence.validateMs
@@ -303,12 +343,18 @@ for ($run = 1; $run -le $Repeat; $run++) {
         BackendExited = $evidence.backendExited
         BackendExitCode = $evidence.backendExitCode
         SnapshotPath = $snapshotPath
+        DiffSnapshotPath = $evidence.previewDiffSnapshotPath
         LogPath = $logPath
     }) | Out-Null
 
     if ($Mode -eq 'synthetic') {
-        $summaryName = if ($run -eq $Repeat) { 'p5-editor-draft.png' } else { "p5-editor-draft-run-$run.png" }
+        $summaryName = if ($run -eq $Repeat) { 'p6-editor-preview.png' } else { "p6-editor-preview-run-$run.png" }
         Copy-Item -LiteralPath $snapshotPath -Destination (Join-Path $OutputDirectory $summaryName) -Force
+        if (-not [string]::IsNullOrWhiteSpace([string]$evidence.previewDiffSnapshotPath) -and
+            (Test-Path -LiteralPath $evidence.previewDiffSnapshotPath -PathType Leaf)) {
+            $diffName = if ($run -eq $Repeat) { 'p6-editor-preview-diff.png' } else { "p6-editor-preview-diff-run-$run.png" }
+            Copy-Item -LiteralPath $evidence.previewDiffSnapshotPath -Destination (Join-Path $OutputDirectory $diffName) -Force
+        }
     }
 }
 
@@ -329,6 +375,9 @@ $summary = [ordered]@{
     medianProjectionApplyMs = (@($results | ForEach-Object { $_.ProjectionApplyMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianItemsUpdateMs = (@($results | ForEach-Object { $_.ItemsUpdateMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianCanvasRenderMs = (@($results | ForEach-Object { $_.CanvasRenderMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianPreviewMs = (@($results | ForEach-Object { $_.PreviewMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianPreviewParseMs = (@($results | ForEach-Object { $_.PreviewParseMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
+    medianPreviewModelMs = (@($results | ForEach-Object { $_.PreviewModelMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianProjectParseMs = (@($results | ForEach-Object { $_.ProjectParseMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
     medianProjectModelMs = (@($results | ForEach-Object { $_.ProjectModelMs }) | Sort-Object)[[Math]::Floor($results.Count / 2)]
 }

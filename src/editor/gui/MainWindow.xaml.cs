@@ -167,6 +167,35 @@ public partial class MainWindow : Window
         UpdateStatus();
     }
 
+    private async void PreviewButton_Click(object sender, RoutedEventArgs e)
+    {
+        var ok = await _viewModel.PreviewAsync();
+        UpdateDraftOverlay();
+        SyncScopeSelection();
+        _viewModel.RefreshEditFields();
+
+        if (!ok)
+        {
+            PreviewTabControl.SelectedIndex = 2;
+        }
+        else if (_viewModel.PreviewNoChanges)
+        {
+            PreviewTabControl.SelectedIndex = 1;
+        }
+        else
+        {
+            PreviewTabControl.SelectedIndex = _viewModel.PreviewWarningCount > 0 ? 2 : 1;
+        }
+
+        UpdateStatus();
+    }
+
+    private void ReviewWarningsButton_Click(object sender, RoutedEventArgs e)
+    {
+        _viewModel.AcknowledgePreviewWarnings();
+        UpdateStatus();
+    }
+
     private async void RefreshButton_Click(object sender, RoutedEventArgs e)
     {
         await _viewModel.RefreshAsync();
@@ -295,7 +324,8 @@ public partial class MainWindow : Window
                 _viewModel.Items.Select(item => item.Item).ToList(),
                 _viewModel.VirtualScreenRect,
                 _viewModel.WarningItemIds,
-                _viewModel.DraftPreviewRects);
+                _viewModel.CanvasDraftRects,
+                _viewModel.CanvasPreviewRects);
 
             if (resetView)
             {
@@ -319,7 +349,8 @@ public partial class MainWindow : Window
 
         try
         {
-            Canvas.SetDraftRects(_viewModel.DraftPreviewRects);
+            Canvas.SetDraftRects(_viewModel.CanvasDraftRects);
+            Canvas.SetPreviewRects(_viewModel.CanvasPreviewRects);
             Canvas.SelectItem(_viewModel.SelectedItem is null ? -1 : _viewModel.Items.IndexOf(_viewModel.SelectedItem));
             Canvas.SelectMonitor(_viewModel.SelectedMonitor is null ? -1 : _viewModel.Monitors.IndexOf(_viewModel.SelectedMonitor));
         }
@@ -546,6 +577,17 @@ public partial class MainWindow : Window
             SyncSelectionFromViewModel();
             SyncScopeSelection();
             _viewModel.RefreshEditFields();
+
+            var previewOk = await _viewModel.PreviewAsync();
+            var previewReviewRequired = _viewModel.Preview?.Review.RequiresAcknowledgement == true;
+            var previewAcknowledged = previewReviewRequired && _viewModel.AcknowledgePreviewWarnings();
+            var previewAckOk = !previewReviewRequired || previewAcknowledged;
+            PreviewTabControl.SelectedIndex = previewReviewRequired ? 2 : 1;
+
+            UpdateDraftOverlay();
+            SyncSelectionFromViewModel();
+            SyncScopeSelection();
+            _viewModel.RefreshEditFields();
             Canvas.Fit();
             UpdateLayout();
 
@@ -556,16 +598,36 @@ public partial class MainWindow : Window
                 : _viewModel.DraftPreviewRects.TryGetValue(_viewModel.SelectedItem.Item.ItemId, out var proposed)
                     ? proposed.Display
                     : null;
+            var previewSavedRect = _viewModel.GetPreviewSavedItem()?.Rect.Display;
+            var previewProposedRect = _viewModel.GetPreviewDraftItem()?.Rect.Display;
+            var previewEffectiveChanged = previewSavedRect is null || previewProposedRect is null
+                ? (bool?)null
+                : !string.Equals(previewSavedRect, previewProposedRect, StringComparison.Ordinal);
 
             if (!string.IsNullOrWhiteSpace(snapshotPath))
             {
                 SaveWindowSnapshot(snapshotPath);
             }
 
+            string? previewDiffSnapshotPath = null;
+
+            if (!string.IsNullOrWhiteSpace(snapshotPath))
+            {
+                var snapshotDirectory = Path.GetDirectoryName(Path.GetFullPath(snapshotPath));
+                previewDiffSnapshotPath = Path.Combine(
+                    snapshotDirectory ?? ".",
+                    Path.GetFileNameWithoutExtension(snapshotPath) + "-diff" + Path.GetExtension(snapshotPath));
+                PreviewTabControl.SelectedIndex = 1;
+                UpdateLayout();
+                SaveWindowSnapshot(previewDiffSnapshotPath);
+                PreviewTabControl.SelectedIndex = previewReviewRequired ? 2 : 1;
+                UpdateLayout();
+            }
+
             var selected = _viewModel.SelectedItem?.Item;
             var evidence = new
             {
-                success = applied && canvasCommit && finalDraftDirty,
+                success = applied && canvasCommit && finalDraftDirty && previewOk && previewAckOk,
                 integrity = _viewModel.IntegrityText,
                 processId = Environment.ProcessId,
                 backendPid = _viewModel.BackendPid,
@@ -606,6 +668,23 @@ public partial class MainWindow : Window
                 finalDraftDirty,
                 finalDraftItemCount,
                 finalProposed,
+                previewOk,
+                previewReviewRequired,
+                previewAcknowledged,
+                previewAckOk,
+                previewDiffCount = _viewModel.PreviewDiffCount,
+                previewNoChanges = _viewModel.PreviewNoChanges,
+                previewSavedRect,
+                previewProposedRect,
+                previewEffectiveChanged,
+                previewWarningCount = _viewModel.PreviewWarningCount,
+                previewWarningDigest = _viewModel.PreviewWarningDigest,
+                previewReviewToken = _viewModel.PreviewReviewToken,
+                previewMs = Math.Round(_viewModel.LastPreviewMs, 1),
+                previewTransportMs = Math.Round(_viewModel.LastPreviewTransportMs, 1),
+                previewParseMs = Math.Round(_viewModel.LastPreviewParseMs, 1),
+                previewModelMs = Math.Round(_viewModel.LastPreviewModelMs, 1),
+                previewDiffSnapshotPath,
                 editApplyMs = Math.Round(applyWatch.Elapsed.TotalMilliseconds, 1),
                 editCommitMs = Math.Round(_viewModel.LastEditCommitMs, 1),
                 validateMs = Math.Round(_viewModel.LastValidateMs, 1),
@@ -699,6 +778,23 @@ public partial class MainWindow : Window
                 evidence.finalDraftDirty,
                 evidence.finalDraftItemCount,
                 evidence.finalProposed,
+                evidence.previewOk,
+                evidence.previewReviewRequired,
+                evidence.previewAcknowledged,
+                evidence.previewAckOk,
+                evidence.previewDiffCount,
+                evidence.previewNoChanges,
+                evidence.previewSavedRect,
+                evidence.previewProposedRect,
+                evidence.previewEffectiveChanged,
+                evidence.previewWarningCount,
+                evidence.previewWarningDigest,
+                evidence.previewReviewToken,
+                evidence.previewMs,
+                evidence.previewTransportMs,
+                evidence.previewParseMs,
+                evidence.previewModelMs,
+                evidence.previewDiffSnapshotPath,
                 evidence.editApplyMs,
                 evidence.editCommitMs,
                 evidence.validateMs,
