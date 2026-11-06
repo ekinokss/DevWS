@@ -14,7 +14,8 @@ public sealed record BackendHello(
     bool SaveSupported,
     long MaxRequestBytes,
     long MaxResponseBytes,
-    int MaxJsonDepth);
+    int MaxJsonDepth,
+    long SaveTimeoutMs);
 
 public sealed class BackendResponse
 {
@@ -39,6 +40,7 @@ public sealed class BackendException : Exception
         string? details = null,
         bool isTransportFailure = false,
         bool isProtocolError = false,
+        bool outcomeUncertain = false,
         Exception? inner = null)
         : base(message, inner)
     {
@@ -47,6 +49,7 @@ public sealed class BackendException : Exception
         DetailsText = details;
         IsTransportFailure = isTransportFailure;
         IsProtocolError = isProtocolError;
+        OutcomeUncertain = outcomeUncertain;
     }
 
     public string Code { get; }
@@ -54,6 +57,7 @@ public sealed class BackendException : Exception
     public string? DetailsText { get; }
     public bool IsTransportFailure { get; }
     public bool IsProtocolError { get; }
+    public bool OutcomeUncertain { get; }
 }
 
 public sealed class BackendLaunchOptions
@@ -63,6 +67,7 @@ public sealed class BackendLaunchOptions
         string backendScriptPath,
         string? devConfigPath = null,
         TimeSpan? requestTimeout = null,
+        TimeSpan? saveRequestTimeout = null,
         IReadOnlyDictionary<string, string?>? additionalEnvironment = null)
     {
         PwshPath = FullExistingFile(pwshPath, "PowerShell executable");
@@ -79,6 +84,12 @@ public sealed class BackendLaunchOptions
             throw new ArgumentOutOfRangeException(nameof(requestTimeout));
         }
 
+        SaveRequestTimeout = saveRequestTimeout ?? TimeSpan.FromSeconds(30);
+        if (SaveRequestTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(saveRequestTimeout));
+        }
+
         AdditionalEnvironment = additionalEnvironment ?? new Dictionary<string, string?>();
     }
 
@@ -86,6 +97,7 @@ public sealed class BackendLaunchOptions
     public string BackendScriptPath { get; }
     public string? DevConfigPath { get; }
     public TimeSpan RequestTimeout { get; }
+    public TimeSpan SaveRequestTimeout { get; }
     public IReadOnlyDictionary<string, string?> AdditionalEnvironment { get; }
 
     private static string FullExistingFile(string path, string label)
@@ -161,10 +173,42 @@ public sealed class BackendClient : IDisposable
         }
     }
 
-    public async Task<BackendResponse> SendAsync(
+    public Task<BackendResponse> SendAsync(
         string op,
         object? parameters = null,
         CancellationToken cancellationToken = default)
+    {
+        return SendCoreAsync(
+            op,
+            parameters,
+            _options.RequestTimeout,
+            retryTransportFailure: true,
+            outcomeSensitive: false,
+            cancellationToken);
+    }
+
+    public Task<BackendResponse> SendSaveAsync(
+        object parameters,
+        CancellationToken cancellationToken = default)
+    {
+        // Save is never retried automatically: a timeout or lost response may
+        // mean the file was already replaced. The caller must inspect instead.
+        return SendCoreAsync(
+            "save",
+            parameters,
+            _options.SaveRequestTimeout,
+            retryTransportFailure: false,
+            outcomeSensitive: true,
+            cancellationToken);
+    }
+
+    private async Task<BackendResponse> SendCoreAsync(
+        string op,
+        object? parameters,
+        TimeSpan timeout,
+        bool retryTransportFailure,
+        bool outcomeSensitive,
+        CancellationToken cancellationToken)
     {
         if (_disposed)
         {
@@ -180,9 +224,9 @@ public sealed class BackendClient : IDisposable
             {
                 try
                 {
-                    return await SendOnceCoreAsync(op, parameters, cancellationToken).ConfigureAwait(false);
+                    return await SendOnceCoreAsync(op, parameters, timeout, outcomeSensitive, cancellationToken).ConfigureAwait(false);
                 }
-                catch (BackendException ex) when (ex.IsTransportFailure && attempt == 0)
+                catch (BackendException ex) when (retryTransportFailure && ex.IsTransportFailure && attempt == 0)
                 {
                     await RestartCoreAsync(cancellationToken).ConfigureAwait(false);
                 }
@@ -329,6 +373,8 @@ public sealed class BackendClient : IDisposable
     private async Task<BackendResponse> SendOnceCoreAsync(
         string op,
         object? parameters,
+        TimeSpan timeout,
+        bool outcomeSensitive,
         CancellationToken cancellationToken)
     {
         if (_process is null || _process.HasExited || _stdin is null || _stdout is null)
@@ -364,10 +410,11 @@ public sealed class BackendClient : IDisposable
                 "The editor backend exited before the request could be written.",
                 retryable: true,
                 isTransportFailure: true,
+                outcomeUncertain: outcomeSensitive,
                 inner: ex);
         }
 
-        var line = await ReadLineWithTimeoutAsync(cancellationToken).ConfigureAwait(false);
+        var line = await ReadLineWithTimeoutAsync(cancellationToken, timeout, outcomeSensitive).ConfigureAwait(false);
         if (line is null)
         {
             StopProcessCore();
@@ -375,7 +422,8 @@ public sealed class BackendClient : IDisposable
                 "backend-exited",
                 "The editor backend exited before responding.",
                 retryable: true,
-                isTransportFailure: true);
+                isTransportFailure: true,
+                outcomeUncertain: outcomeSensitive);
         }
 
         LastResponseBytes = Encoding.UTF8.GetByteCount(line);
@@ -395,6 +443,7 @@ public sealed class BackendClient : IDisposable
                 "protocol-error",
                 "The editor backend returned malformed JSON.",
                 isProtocolError: true,
+                outcomeUncertain: outcomeSensitive,
                 inner: ex);
         }
 
@@ -414,7 +463,8 @@ public sealed class BackendClient : IDisposable
                 throw new BackendException(
                     "protocol-error",
                     "The editor backend response did not match the request.",
-                    isProtocolError: true);
+                    isProtocolError: true,
+                    outcomeUncertain: outcomeSensitive);
             }
 
             if (root.ValueKind != JsonValueKind.Object ||
@@ -425,7 +475,8 @@ public sealed class BackendClient : IDisposable
                 throw new BackendException(
                     "protocol-error",
                     "The editor backend response did not contain a boolean result state.",
-                    isProtocolError: true);
+                    isProtocolError: true,
+                    outcomeUncertain: outcomeSensitive);
             }
 
             if (!okElement.GetBoolean())
@@ -462,6 +513,8 @@ public sealed class BackendClient : IDisposable
         var response = await SendOnceCoreAsync(
             "hello",
             new Dictionary<string, object?>(),
+            _options.RequestTimeout,
+            false,
             cancellationToken).ConfigureAwait(false);
 
         var result = response.Result;
@@ -474,7 +527,7 @@ public sealed class BackendClient : IDisposable
         }
 
         var supportedOps = JsonText.StringArray(result, "supportedOps");
-        foreach (var required in new[] { "inspect", "read-config", "project", "validate", "preview", "convert" })
+        foreach (var required in new[] { "inspect", "read-config", "project", "validate", "preview", "convert", "save" })
         {
             if (!supportedOps.Contains(required, StringComparer.Ordinal))
             {
@@ -487,11 +540,12 @@ public sealed class BackendClient : IDisposable
 
         var capabilities = JsonText.Object(result, "capabilities");
         var readOnly = JsonText.Bool(capabilities, "readOnly");
-        if (!readOnly)
+        var saveSupported = JsonText.Bool(capabilities, "saveSupported");
+        if (readOnly || !saveSupported)
         {
             throw new BackendException(
-                "read-only-required",
-                "The editor backend did not advertise read-only capabilities.");
+                "save-unsupported",
+                "The editor backend did not advertise guarded save capabilities.");
         }
 
         return new BackendHello(
@@ -499,13 +553,17 @@ public sealed class BackendClient : IDisposable
             JsonText.String(result, "backendVersion"),
             supportedOps,
             readOnly,
-            JsonText.Bool(capabilities, "saveSupported"),
+            saveSupported,
             JsonText.Long(JsonText.Object(result, "limits"), "maxRequestBytes"),
             JsonText.Long(JsonText.Object(result, "limits"), "maxResponseBytes"),
-            JsonText.Int(JsonText.Object(result, "limits"), "maxJsonDepth"));
+            JsonText.Int(JsonText.Object(result, "limits"), "maxJsonDepth"),
+            JsonText.Long(JsonText.Object(result, "limits"), "saveTimeoutMs"));
     }
 
-    private async Task<string?> ReadLineWithTimeoutAsync(CancellationToken cancellationToken)
+    private async Task<string?> ReadLineWithTimeoutAsync(
+        CancellationToken cancellationToken,
+        TimeSpan requestTimeout,
+        bool outcomeSensitive)
     {
         if (_stdout is null)
         {
@@ -513,7 +571,7 @@ public sealed class BackendClient : IDisposable
         }
 
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        timeout.CancelAfter(_options.RequestTimeout);
+        timeout.CancelAfter(requestTimeout);
         var readWatch = Stopwatch.StartNew();
 
         try
@@ -530,9 +588,10 @@ public sealed class BackendClient : IDisposable
             StopProcessCore();
             throw new BackendException(
                 "timeout",
-                $"The editor backend did not respond within {_options.RequestTimeout.TotalSeconds:0.#} seconds.",
+                $"The editor backend did not respond within {requestTimeout.TotalSeconds:0.#} seconds.",
                 retryable: true,
-                isTransportFailure: true);
+                isTransportFailure: true,
+                outcomeUncertain: outcomeSensitive);
         }
     }
 

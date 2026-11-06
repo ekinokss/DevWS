@@ -144,6 +144,27 @@ public sealed class PreviewResult
     }
 }
 
+public sealed class SaveResult
+{
+    public bool Saved { get; init; }
+    public bool Changed { get; init; }
+    public string PreviousSha256 { get; init; } = "";
+    public string NewSha256 { get; init; } = "";
+    public string CanonicalPath { get; init; } = "";
+
+    public static SaveResult Parse(JsonElement element)
+    {
+        return new SaveResult
+        {
+            Saved = JsonText.Bool(element, "saved"),
+            Changed = JsonText.Bool(element, "changed"),
+            PreviousSha256 = JsonText.String(element, "previousSha256"),
+            NewSha256 = JsonText.String(element, "newSha256"),
+            CanonicalPath = JsonText.String(element, "canonicalPath")
+        };
+    }
+}
+
 public sealed class PreviewDiffRow
 {
     public PreviewDiffRow(PreviewDiffEntry entry)

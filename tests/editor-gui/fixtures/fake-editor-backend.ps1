@@ -151,14 +151,34 @@ while ($true) {
             }
         }
         'save' {
-            $errorObject = if ($null -ne $scenario.saveError) {
-                $scenario.saveError
-            }
-            else {
-                New-ProtocolError -Code 'unsupported-operation' -Message "Operation 'save' is not implemented in P3."
+            $countPath = [string]$scenario.saveCountPath
+            if (-not [string]::IsNullOrWhiteSpace($countPath)) {
+                $count = 0
+                if (Test-Path -LiteralPath $countPath -PathType Leaf) {
+                    $count = [int](Get-Content -LiteralPath $countPath -Raw)
+                }
+                Set-Content -LiteralPath $countPath -Value ([string]($count + 1)) -Encoding ASCII
             }
 
-            Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject $errorObject
+            switch ([string]$scenario.saveMode) {
+                'timeout' { Start-Sleep -Seconds 5; continue }
+                'exit' { exit 9 }
+                'malformed' {
+                    [Console]::Out.WriteLine('{bad save json')
+                    [Console]::Out.Flush()
+                    continue
+                }
+            }
+
+            if ($null -ne $scenario.saveError) {
+                Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject $scenario.saveError
+            }
+            elseif ($null -ne $scenario.save) {
+                Write-Envelope -Request $request -Result $scenario.save -Warnings @() -ErrorObject $null
+            }
+            else {
+                Write-Envelope -Request $request -Result $null -Warnings @() -ErrorObject (New-ProtocolError -Code 'backend-internal' -Message 'No fake save result configured.')
+            }
         }
         'shutdown' {
             Write-Envelope -Request $request -Result ([ordered]@{ stopped = $true }) -Warnings @() -ErrorObject $null

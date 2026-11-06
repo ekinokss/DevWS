@@ -147,6 +147,14 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     private double _lastPreviewTransportMs;
     private double _lastPreviewParseMs;
     private double _lastPreviewModelMs;
+    private SaveResult? _saveResult;
+    private string _saveError = "";
+    private bool _saveOutcomeUncertain;
+    private string _saveObservedRevision = "";
+    private double _lastSaveMs;
+    private double _lastSaveTransportMs;
+    private double _lastSaveParseMs;
+    private double _lastSaveModelMs;
 
     public EditorViewModel(EditorSession session, bool isDevelopmentConfig, string integrityLevel)
     {
@@ -234,8 +242,108 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     public string DraftBadgeText => IsDraftDirty
         ? $"UNSAVED DRAFT — {_draft!.DirtyItemIds().Count} item(s)"
         : "";
-    public string SaveUnavailableText => "Save is not available in P6 (preview/review only).";
-    public bool CanSave => false;
+    public string SaveAvailabilityText
+    {
+        get
+        {
+            if (!HasDraft)
+            {
+                return "Load a configuration before saving.";
+            }
+
+            if (HasDraftConflict)
+            {
+                return "Resolve the draft conflict before saving.";
+            }
+
+            if (!_writable)
+            {
+                return "The effective configuration is not writable.";
+            }
+
+            if (_saveOutcomeUncertain)
+            {
+                return "The previous save outcome is uncertain. Inspect the configuration before retrying.";
+            }
+
+            if (!IsPreviewCurrent)
+            {
+                return "Run Preview for the exact draft before saving.";
+            }
+
+            if (_preview is not null && _preview.Review.RequiresAcknowledgement && !IsPreviewAcknowledged)
+            {
+                return "Review the displayed warnings before saving.";
+            }
+
+            return "Save the previewed draft to the configuration file. Live windows are not moved, focused, or relaunched.";
+        }
+    }
+    public bool CanSave =>
+        HasDraft &&
+        !HasDraftConflict &&
+        !_isBusy &&
+        _writable &&
+        !_saveOutcomeUncertain &&
+        IsPreviewCurrent &&
+        _preview is not null &&
+        (!_preview.Review.RequiresAcknowledgement || IsPreviewAcknowledged);
+    public bool HasSaveResult => _saveResult is not null;
+    public SaveResult? SaveResult => _saveResult;
+    public bool HasSaveError => !string.IsNullOrWhiteSpace(_saveError);
+    public string SaveErrorText => _saveError;
+    public bool SaveOutcomeUncertain => _saveOutcomeUncertain;
+    public string SaveObservedRevisionText => _saveObservedRevision;
+    public double LastSaveMs => _lastSaveMs;
+    public double LastSaveTransportMs => _lastSaveTransportMs;
+    public double LastSaveParseMs => _lastSaveParseMs;
+    public double LastSaveModelMs => _lastSaveModelMs;
+    public string SaveStatusText
+    {
+        get
+        {
+            if (_saveOutcomeUncertain)
+            {
+                return string.IsNullOrWhiteSpace(_saveObservedRevision)
+                    ? "Save outcome uncertain; the configuration could not be inspected."
+                    : $"Save outcome uncertain; observed revision {ShortRevision(_saveObservedRevision)}. Inspect before retrying.";
+            }
+
+            if (HasSaveError)
+            {
+                return $"Save refused: {_saveError}";
+            }
+
+            if (_saveResult is not null)
+            {
+                return _saveResult.Changed
+                    ? $"Saved set '{SelectedSet?.Info.Id ?? "—"}' — revision {ShortRevision(_saveResult.NewSha256)}. Live windows unchanged."
+                    : $"No changes to save; revision {ShortRevision(_saveResult.NewSha256)} is already current.";
+            }
+
+            if (HasDraftConflict)
+            {
+                return "Save unavailable: resolve the configuration conflict.";
+            }
+
+            if (!_writable)
+            {
+                return "Save unavailable: configuration is read-only.";
+            }
+
+            if (!IsPreviewCurrent)
+            {
+                return "Save unavailable: preview the current draft first.";
+            }
+
+            if (_preview is not null && _preview.Review.RequiresAcknowledgement && !IsPreviewAcknowledged)
+            {
+                return "Save unavailable: review the displayed warnings first.";
+            }
+
+            return $"Ready to save set '{SelectedSet?.Info.Id ?? "—"}'.";
+        }
+    }
     public bool HasDraftConflict => _hasDraftConflict;
     public string DraftConflictText => _hasDraftConflict
         ? $"{_draftConflictCode}: {_draftConflictMessage}"
@@ -310,8 +418,8 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
             }
 
             return IsPreviewAcknowledged
-                ? "Warnings reviewed — save remains unavailable in P6."
-                : "Explicit review required for the displayed warnings.";
+                ? "Warnings reviewed explicitly. Save remains a separate confirmed action."
+                : "Explicit review required before saving the displayed warnings.";
         }
     }
     public double LastPreviewMs => _lastPreviewMs;
@@ -1006,10 +1114,150 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
 
         _previewAcknowledged = true;
         _acknowledgedReviewToken = _preview.Review.ReviewToken;
-        _statusMessage = "Warnings reviewed explicitly; save remains unavailable in P6.";
+        _statusMessage = "Warnings reviewed explicitly. Saving still requires a separate confirmed action.";
         OnPropertyChanged(nameof(StatusMessage));
         NotifyPreviewState();
         return true;
+    }
+
+    public async Task<bool> SaveAsync()
+    {
+        if (!CanSave || _draft is null || _preview is null || SelectedSet is null)
+        {
+            return false;
+        }
+
+        _saveResult = null;
+        _saveError = "";
+        _saveObservedRevision = "";
+        _saveOutcomeUncertain = false;
+        NotifySaveState();
+
+        var setId = _draft.SetId;
+        var baseSha256 = _draft.BaseSha256;
+        var reviewToken = _preview.Review.RequiresAcknowledgement ? _preview.Review.ReviewToken : null;
+        var selectedItemId = SelectedItem?.Item.ItemId;
+        SetBusy(true);
+
+        try
+        {
+            var watch = Stopwatch.StartNew();
+            var result = await _session.SaveAsync(
+                _draft,
+                baseSha256,
+                setId,
+                _draft.BaseTopologyFingerprint,
+                reviewToken,
+                _lifetime.Token);
+            watch.Stop();
+            _lastSaveMs = watch.Elapsed.TotalMilliseconds;
+            var metrics = _session.LastSaveMetrics;
+            _lastSaveTransportMs = metrics?.TransportMs ?? 0;
+            _lastSaveParseMs = metrics?.ParseMs ?? 0;
+            _lastSaveModelMs = metrics?.ModelMs ?? 0;
+            _saveResult = result;
+            _saveError = "";
+
+            var reloaded = await ReloadAfterSaveAsync(setId, selectedItemId);
+
+            if (reloaded)
+            {
+                _statusMessage = result.Changed
+                    ? $"Saved set '{setId}' at revision {ShortRevision(result.NewSha256)}. Live windows were not changed."
+                    : $"No configuration changes were needed; revision {ShortRevision(result.NewSha256)} is current.";
+            }
+            else
+            {
+                _saveError = $"The save was confirmed at revision {ShortRevision(result.NewSha256)}, but the editor could not reload the persisted configuration.";
+                _statusMessage = "Save confirmed, but the reload failed. Inspect before editing or saving again.";
+            }
+
+            OnPropertyChanged(nameof(StatusMessage));
+            NotifySaveState();
+            return reloaded;
+        }
+        catch (BackendException ex)
+        {
+            if (ex.OutcomeUncertain || ex.Code is "timeout" or "backend-exited" or "protocol-error")
+            {
+                _saveOutcomeUncertain = true;
+                _saveError = $"{ex.Code}: {ex.Message}";
+                await ObserveAfterUncertainSaveAsync(baseSha256);
+            }
+            else
+            {
+                _saveError = $"{ex.Code}: {ex.Message}";
+
+                if (ex.Code is "external-change" or "topology-changed")
+                {
+                    SetDraftConflict(ex.Code, ex.Message);
+                }
+
+                if (ex.Code is "review-stale" or "warnings-not-acknowledged")
+                {
+                    InvalidatePreview(clearError: false);
+                }
+            }
+
+            _statusMessage = _saveOutcomeUncertain
+                ? "Save outcome uncertain; inspect the configuration before retrying."
+                : $"Save refused: {ex.Code}.";
+            OnPropertyChanged(nameof(StatusMessage));
+            NotifySaveState();
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _saveError = ex.Message;
+            _statusMessage = "Save failed before confirmation; the draft was preserved.";
+            OnPropertyChanged(nameof(StatusMessage));
+            NotifySaveState();
+            return false;
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
+    private async Task<bool> ReloadAfterSaveAsync(string setId, string? selectedItemId)
+    {
+        try
+        {
+            var snapshot = await _session.LoadAsync(setId, _lifetime.Token);
+            ApplySnapshot(snapshot, setId);
+
+            if (!string.IsNullOrWhiteSpace(selectedItemId))
+            {
+                var item = Items.FirstOrDefault(candidate => string.Equals(candidate.Item.ItemId, selectedItemId, StringComparison.Ordinal));
+                if (item is not null)
+                {
+                    SelectItem(item);
+                }
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            SetError(ex);
+            return false;
+        }
+    }
+
+    private async Task ObserveAfterUncertainSaveAsync(string baseSha256)
+    {
+        try
+        {
+            var inspect = await _session.InspectAsync(_lifetime.Token);
+            _saveObservedRevision = string.Equals(inspect.Config.Sha256, baseSha256, StringComparison.Ordinal)
+                ? $"{inspect.Config.Sha256} (unchanged base; the save did not commit)"
+                : $"{inspect.Config.Sha256} (changed from base; the draft may have been persisted)";
+        }
+        catch (Exception ex)
+        {
+            _saveObservedRevision = $"inspection failed: {ex.Message}";
+        }
     }
 
     public ProjectedItem? GetPreviewSavedItem()
@@ -1032,6 +1280,10 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
 
     private void ApplyPreviewResult(PreviewResult result)
     {
+        _saveResult = null;
+        _saveError = "";
+        _saveOutcomeUncertain = false;
+        _saveObservedRevision = "";
         _preview = result;
         _previewDraftSnapshot = _draft?.CreateDraftSnapshot();
         _previewBackendPid = _session.Client.ProcessId;
@@ -1176,6 +1428,23 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(PreviewReviewToken));
         OnPropertyChanged(nameof(CanvasPreviewRects));
         OnPropertyChanged(nameof(CanvasDraftRects));
+        OnPropertyChanged(nameof(CanSave));
+        OnPropertyChanged(nameof(SaveStatusText));
+        OnPropertyChanged(nameof(SaveAvailabilityText));
+    }
+
+    private void NotifySaveState()
+    {
+        OnPropertyChanged(nameof(CanSave));
+        OnPropertyChanged(nameof(HasSaveResult));
+        OnPropertyChanged(nameof(SaveResult));
+        OnPropertyChanged(nameof(HasSaveError));
+        OnPropertyChanged(nameof(SaveErrorText));
+        OnPropertyChanged(nameof(SaveOutcomeUncertain));
+        OnPropertyChanged(nameof(SaveObservedRevisionText));
+        OnPropertyChanged(nameof(SaveStatusText));
+        OnPropertyChanged(nameof(SaveAvailabilityText));
+        OnPropertyChanged(nameof(LastSaveMs));
     }
 
     public async Task ConvertToRelativeAsync()
@@ -1628,8 +1897,19 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         DetailRows.Add(new DetailRow("Draft validation", DraftValidationText));
         DetailRows.Add(new DetailRow("Base revision", BaseRevisionText));
         DetailRows.Add(new DetailRow("Base topology", BaseTopologyText));
-        DetailRows.Add(new DetailRow("Save", "unavailable in P6"));
+        DetailRows.Add(new DetailRow("Save", SaveStatusText));
         DetailRows.Add(new DetailRow("Preview", PreviewSummaryText));
+
+        if (_saveResult is not null)
+        {
+            DetailRows.Add(new DetailRow("Saved revision", ShortRevision(_saveResult.NewSha256)));
+            DetailRows.Add(new DetailRow("Saved path", _saveResult.CanonicalPath));
+        }
+
+        if (_saveOutcomeUncertain)
+        {
+            DetailRows.Add(new DetailRow("Observed after uncertain save", _saveObservedRevision));
+        }
 
         var previewSaved = GetPreviewSavedItem();
         var previewDraft = GetPreviewDraftItem();
@@ -1719,7 +1999,9 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
     }
 
     private static string YesNo(bool value) => value ? "yes" : "no";
-    private static string YesNo(bool? value) => value is null ? "—" : value.Value ? "yes" : "no";
+    private static string YesNo(bool? value) => value is null ? "-" : value.Value ? "yes" : "no";
+    private static string ShortRevision(string? revision) =>
+        string.IsNullOrWhiteSpace(revision) ? "—" : revision[..Math.Min(12, revision.Length)] + "…";
 
     private bool TryParseInteger(string text, string label, out int value)
     {
@@ -1764,6 +2046,9 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(CanEditSelectedScope));
         OnPropertyChanged(nameof(CanDiscardDraft));
         OnPropertyChanged(nameof(CanPreview));
+        OnPropertyChanged(nameof(CanSave));
+        OnPropertyChanged(nameof(SaveStatusText));
+        OnPropertyChanged(nameof(SaveAvailabilityText));
     }
 
     private void HandleDraftBackendError(BackendException exception)
@@ -1813,6 +2098,9 @@ public sealed class EditorViewModel : ObservableObject, IDisposable
             OnPropertyChanged(nameof(CanConvertToAbsolute));
             OnPropertyChanged(nameof(CanPreview));
             OnPropertyChanged(nameof(CanAcknowledgePreview));
+            OnPropertyChanged(nameof(CanSave));
+            OnPropertyChanged(nameof(SaveStatusText));
+            OnPropertyChanged(nameof(SaveAvailabilityText));
         }
     }
 

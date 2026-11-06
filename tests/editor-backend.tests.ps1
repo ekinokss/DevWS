@@ -397,10 +397,11 @@ function Invoke-IsolatedBundledDefaultTest {
 
         Assert-True $hello.ok 'hello succeeds'
         Assert-Equal 'devws-editor/1' $hello.protocol 'hello protocol'
-        Assert-Equal 8 @($hello.result.supportedOps).Count 'hello advertises eight operations'
-        Assert-True (-not ($hello.result.supportedOps -contains 'save')) 'hello does not advertise save'
-        Assert-Equal $false $hello.result.capabilities.saveSupported 'hello reports save unsupported'
-        Assert-Equal $null $hello.result.limits.saveTimeoutMs 'hello reports no save timeout'
+        Assert-Equal 9 @($hello.result.supportedOps).Count 'hello advertises nine operations'
+        Assert-True ($hello.result.supportedOps -contains 'save') 'hello advertises save'
+        Assert-Equal $true $hello.result.capabilities.saveSupported 'hello reports save supported'
+        Assert-Equal $false $hello.result.capabilities.readOnly 'hello reports writable capabilities'
+        Assert-Equal 30000 $hello.result.limits.saveTimeoutMs 'hello reports the save timeout'
 
         $inspectRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-inspect'; op = 'inspect'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
         $inspectExchange = Send-RawLine -Process $process -Raw $inspectRaw
@@ -466,16 +467,20 @@ function Invoke-IsolatedBundledDefaultTest {
         Assert-Equal @($expectedModel.Items).Count @($project.result.set.items).Count 'project item count matches the resolver'
         Assert-Equal $false (Test-Path -LiteralPath $canonicalPath -PathType Leaf) 'project did not create the canonical file'
 
-        $saveRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-save'; op = 'save'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
+        $saveRaw = ([ordered]@{
+            protocol = 'devws-editor/1'
+            id = 'iso-save'
+            op = 'save'
+            params = @{ draft = $read.result.document; baseSha256 = [string]$read.result.sha256; confirm = $true }
+        } | ConvertTo-Json -Compress -Depth 20)
         $saveExchange = Send-RawLine -Process $process -Raw $saveRaw
         Write-Host "REQUEST $saveRaw"
         Write-Host "RESPONSE $($saveExchange.Raw)"
         $save = $saveExchange.Object
 
-        Assert-Equal $false $save.ok 'save is refused'
-        Assert-Equal 'unsupported-operation' $save.error.code 'save is unsupported'
+        Assert-Equal $false $save.ok 'save is refused for the bundled default'
+        Assert-Equal 'config-not-writable' $save.error.code 'save refuses the read-only bundled default'
         Assert-Equal $null $save.result 'save returns no result'
-        Assert-True (-not ($save.error.details.supportedOps -contains 'save')) 'save refusal does not advertise save'
         Assert-Equal $false (Test-Path -LiteralPath $canonicalPath -PathType Leaf) 'save did not create the canonical file'
 
         $shutdownRaw = ([ordered]@{ protocol = 'devws-editor/1'; id = 'iso-shutdown'; op = 'shutdown'; params = @{} } | ConvertTo-Json -Compress -Depth 20)
@@ -548,7 +553,7 @@ if ($IsolatedBundledDefault) {
 }
 
 try {
-    Write-Host 'P6 editor backend focused tests' -ForegroundColor Cyan
+    Write-Host 'P7 editor backend focused tests' -ForegroundColor Cyan
 
     # 1. Handshake and truthful capabilities.
     $root = New-TempRoot
@@ -559,14 +564,15 @@ try {
     $hello = Invoke-One -ConfigPath $configPath -Id 'hello' -Op 'hello'
     Assert-True $hello.ok 'hello succeeds'
     Assert-Equal 'devws-editor/1' $hello.protocol 'hello protocol'
-    Assert-Equal 8 @($hello.result.supportedOps).Count 'hello advertises exactly eight operations'
+    Assert-Equal 9 @($hello.result.supportedOps).Count 'hello advertises exactly nine operations'
     Assert-True ($hello.result.supportedOps -contains 'read-config') 'hello advertises read-config'
-    Assert-True (-not ($hello.result.supportedOps -contains 'save')) 'hello does not advertise save'
-    Assert-Equal $false $hello.result.capabilities.saveSupported 'hello says save is unsupported'
+    Assert-True ($hello.result.supportedOps -contains 'save') 'hello advertises save'
+    Assert-Equal $true $hello.result.capabilities.saveSupported 'hello says save is supported'
     Assert-Equal $true $hello.result.capabilities.validateSupported 'hello says validate is supported'
     Assert-Equal $true $hello.result.capabilities.convertSupported 'hello says convert is supported'
     Assert-Equal $true $hello.result.capabilities.previewSupported 'hello says preview is supported'
-    Assert-Equal $true $hello.result.capabilities.readOnly 'hello says read-only'
+    Assert-Equal $false $hello.result.capabilities.readOnly 'hello says writable capabilities'
+    Assert-Equal 30000 $hello.result.limits.saveTimeoutMs 'hello reports the save timeout'
 
     # 2. inspect metadata and physical-writable vs backend-save distinction.
     $inspect = Invoke-One -ConfigPath $configPath -Id 'inspect' -Op 'inspect'
@@ -574,7 +580,9 @@ try {
     Assert-Equal $configPath $inspect.result.config.effectivePath 'inspect effective path'
     Assert-Equal 'env' $inspect.result.config.source 'inspect source'
     Assert-Equal $true $inspect.result.config.writable 'inspect reports physical writability'
-    Assert-Equal $false $inspect.result.capabilities.canSave 'inspect does not advertise save'
+    Assert-Equal $true $inspect.result.capabilities.canSave 'inspect advertises save for a writable config'
+    Assert-Equal $null $inspect.result.capabilities.reason 'writable inspect has no refusal reason'
+    Assert-Equal $false $inspect.result.capabilities.readOnly 'inspect advertises writable capabilities'
     Assert-Equal 1 @($inspect.result.sets).Count 'inspect sets'
     Assert-Equal 'main' $inspect.result.sets[0].id 'inspect set id'
     Assert-True ($null -ne $inspect.result.topology.PSObject.Properties['available']) 'inspect reports topology availability'
@@ -634,11 +642,6 @@ try {
         $duplicateId = Send-Request -Process $process -Id 'u' -Op 'hello'
         Assert-Equal 'request-invalid' $duplicateId.error.code 'duplicate id refused'
         Assert-Equal 'duplicate-request-id' $duplicateId.error.details.reason 'duplicate id reason'
-
-        foreach ($op in @('save')) {
-            $refused = Send-Request -Process $process -Id $op -Op $op
-            Assert-Equal 'unsupported-operation' $refused.error.code "$op refused"
-        }
 
         $shutdown = Send-Request -Process $process -Id 'z' -Op 'shutdown'
         Assert-True $shutdown.ok 'shutdown succeeds'
@@ -860,7 +863,7 @@ try {
         $validateHello = Send-Request -Process $validateProcess -Id 'vh' -Op 'hello'
         Assert-True ($validateHello.result.supportedOps -contains 'validate') 'hello advertises validate'
         Assert-True ($validateHello.result.supportedOps -contains 'convert') 'hello advertises convert'
-        Assert-True (-not ($validateHello.result.supportedOps -contains 'save')) 'hello still omits save'
+        Assert-True ($validateHello.result.supportedOps -contains 'save') 'hello advertises save'
         Assert-True ($validateHello.result.supportedOps -contains 'preview') 'hello advertises preview'
         Assert-Equal $true $validateHello.result.capabilities.validateSupported 'hello advertises validate capability'
         Assert-Equal $true $validateHello.result.capabilities.convertSupported 'hello advertises convert capability'
@@ -938,7 +941,7 @@ try {
         $previewMissing = Send-Request -Process $validateProcess -Id 'p1' -Op 'preview'
         Assert-Equal 'request-invalid' $previewMissing.error.code 'preview requires draft and baseSha256'
         $saveRefusal = Send-Request -Process $validateProcess -Id 's1' -Op 'save'
-        Assert-Equal 'unsupported-operation' $saveRefusal.error.code 'save remains unimplemented'
+        Assert-Equal 'request-invalid' $saveRefusal.error.code 'save requires draft and baseSha256'
         Send-Request -Process $validateProcess -Id 'vz' -Op 'shutdown' | Out-Null
         $validateProcess.WaitForExit(10000) | Out-Null
     }
@@ -991,7 +994,7 @@ try {
         }
 
         $saveResponse = Send-Request -Process $previewProcess -Id 'p6' -Op 'save'
-        Assert-Equal 'unsupported-operation' $saveResponse.error.code 'save remains unsupported in P6'
+        Assert-Equal 'request-invalid' $saveResponse.error.code 'save requires draft and baseSha256'
         Send-Request -Process $previewProcess -Id 'p7' -Op 'shutdown' | Out-Null
         $previewProcess.WaitForExit(10000) | Out-Null
     }
@@ -1282,6 +1285,365 @@ try {
     $warningNoMessageReview = Get-EditorWarningReview -Warnings @($warningA) -BaseSha256 ('a' * 64) -TopologyFingerprint $convTopology.Fingerprint -HasChanges $true
     Assert-Equal ([string]$warningMessageReview.warningDigest) ([string]$warningNoMessageReview.warningDigest) 'human warning message does not affect digest'
 
+    # 12e. P7 guarded save and persistence.
+    $saveRoot = New-TempRoot
+    $saveConfig = New-Config -Windows @(
+        (New-Terminal -Id 'save-abs' -WindowId 'DEVWS-P7-SAVE' -Layout ([pscustomobject][ordered]@{ x = 10; y = 20; w = 500; h = 400 }))
+    )
+    $saveConfig | Add-Member -NotePropertyName 'x-unknown' -NotePropertyValue ([pscustomobject][ordered]@{ keep = 'yes' })
+    $saveConfig.sets[0].windows[0] | Add-Member -NotePropertyName 'x-item-unknown' -NotePropertyValue ([pscustomobject][ordered]@{ keep = 7 })
+    $savePath = Write-TestConfig -Config $saveConfig -Directory $saveRoot
+    $saveOriginalHash = Get-FileSha $savePath
+    $saveProcess = Start-Backend -ConfigPath $savePath
+
+    try {
+        $saveInspect = Send-Request -Process $saveProcess -Id 'sv-i' -Op 'inspect'
+        $saveRead = Send-Request -Process $saveProcess -Id 'sv-r' -Op 'read-config' -Params @{ expectedSha256 = $saveInspect.result.config.sha256 }
+        $saveBase = [string]$saveInspect.result.config.sha256
+        $saveDraft = ($saveRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $saveDraft.sets[0].windows[0].layout.x = 30
+
+        $savePreview = Send-Request -Process $saveProcess -Id 'sv-p' -Op 'preview' -Params @{ draft = $saveDraft; baseSha256 = $saveBase }
+        Assert-True $savePreview.ok 'save fixture preview succeeds'
+        Assert-Equal 1 @($savePreview.result.diff).Count 'save fixture preview has one change'
+        Assert-Equal $false ([bool]$savePreview.result.review.requiresAcknowledgement) 'absolute save fixture needs no review'
+
+        $missingConfirm = Send-Request -Process $saveProcess -Id 'sv-c0' -Op 'save' -Params @{ draft = $saveDraft; baseSha256 = $saveBase }
+        Assert-Equal 'request-invalid' $missingConfirm.error.code 'save requires explicit confirmation'
+
+        $save = Send-Request -Process $saveProcess -Id 'sv-s1' -Op 'save' -Params @{ draft = $saveDraft; baseSha256 = $saveBase; confirm = $true }
+        Assert-True $save.ok 'absolute save succeeds'
+        Assert-Equal $true $save.result.saved 'save reports saved'
+        Assert-Equal $true $save.result.changed 'save reports changed'
+        Assert-Equal $saveBase $save.result.previousSha256 'save returns the previous revision'
+        Assert-Equal (Get-FileSha $savePath) $save.result.newSha256 'save returns the persisted revision'
+        Assert-True ([string]::Equals(([IO.Path]::GetFullPath($savePath)), [string]$save.result.canonicalPath, [StringComparison]::OrdinalIgnoreCase)) 'save returns the effective writable path'
+
+        $savePersisted = Get-DevWSConfig -Location ([pscustomobject]@{ Path = $savePath; IsWritable = $true; IsBundledDefault = $false; Source = 'env' })
+        Assert-Equal 30 ([int]$savePersisted.sets[0].windows[0].layout.x) 'save persisted the absolute geometry'
+        Assert-Equal 7 ([int]$savePersisted.sets[0].windows[0].'x-item-unknown'.keep) 'save preserved item unknown properties'
+        Assert-Equal 'yes' ([string]$savePersisted.'x-unknown'.keep) 'save preserved document unknown properties'
+
+        $saveNewHash = [string]$save.result.newSha256
+        $timestampBeforeNoop = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc.Ticks
+        $noop = Send-Request -Process $saveProcess -Id 'sv-s2' -Op 'save' -Params @{ draft = $savePersisted; baseSha256 = $saveNewHash; confirm = $true }
+        $timestampAfterNoop = (Get-Item -LiteralPath $savePath).LastWriteTimeUtc.Ticks
+        Assert-True $noop.ok 'no-op save succeeds'
+        Assert-Equal $false $noop.result.changed 'no-op save reports unchanged'
+        Assert-Equal $saveNewHash $noop.result.newSha256 'no-op save returns the same revision'
+        Assert-Equal $timestampBeforeNoop $timestampAfterNoop 'no-op save does not replace the file'
+        Assert-Equal $saveNewHash (Get-FileSha $savePath) 'no-op save leaves the bytes unchanged'
+
+        $stale = Send-Request -Process $saveProcess -Id 'sv-s3' -Op 'save' -Params @{ draft = $saveDraft; baseSha256 = $saveBase; confirm = $true }
+        Assert-Equal 'external-change' $stale.error.code 'stale base revision refuses the save'
+        Assert-Equal $saveNewHash (Get-FileSha $savePath) 'stale save leaves the persisted bytes unchanged'
+
+        $unauthorized = ($savePersisted | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $unauthorized.sets[0].windows[0].path = 'C:\Windows\System32'
+        $unauthorizedSave = Send-Request -Process $saveProcess -Id 'sv-s4' -Op 'save' -Params @{ draft = $unauthorized; baseSha256 = $saveNewHash; confirm = $true }
+        Assert-Equal 'unsupported-mutation' $unauthorizedSave.error.code 'save independently rejects a non-geometry mutation'
+        Assert-Contains ([string]$unauthorizedSave.error.details.path) '/path' 'save refusal names the offending path'
+        Assert-Equal $saveNewHash (Get-FileSha $savePath) 'rejected non-geometry save leaves the bytes unchanged'
+
+        $crossSet = ($savePersisted | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $crossSet.sets += [pscustomobject][ordered]@{
+            id = 'other'
+            windows = @([pscustomobject][ordered]@{
+                id = 'other-item'; type = 'terminal'; enabled = $true; windowId = 'DEVWS-P7-OTHER'; path = 'C:\Windows'; elevated = $true
+                tabs = @([pscustomobject][ordered]@{ command = $null; args = @() }); activeTab = 0
+                layout = [pscustomobject][ordered]@{ x = 0; y = 0; w = 100; h = 100 }
+            })
+        }
+        $crossSetSave = Send-Request -Process $saveProcess -Id 'sv-s5' -Op 'save' -Params @{ draft = $crossSet; baseSha256 = $saveNewHash; confirm = $true }
+        Assert-Equal 'unsupported-mutation' $crossSetSave.error.code 'save rejects set-membership changes'
+        Assert-Equal $saveNewHash (Get-FileSha $savePath) 'cross-set save refusal leaves the bytes unchanged'
+
+        $invalidSaveDraft = ($savePersisted | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $invalidSaveDraft.sets[0].windows[0].layout.w = 0
+        $invalidSave = Send-Request -Process $saveProcess -Id 'sv-s6' -Op 'save' -Params @{ draft = $invalidSaveDraft; baseSha256 = $saveNewHash; confirm = $true }
+        Assert-Equal 'config-invalid' $invalidSave.error.code 'save rejects an invalid draft'
+        Assert-Equal $saveNewHash (Get-FileSha $savePath) 'invalid save leaves the bytes unchanged'
+
+        Send-Request -Process $saveProcess -Id 'sv-x' -Op 'shutdown' | Out-Null
+        $saveProcess.WaitForExit(10000) | Out-Null
+    }
+    finally {
+        Stop-Backend -Process $saveProcess
+    }
+    Assert-True ($saveOriginalHash -cne (Get-FileSha $savePath)) 'absolute save changed the disposable fixture'
+
+    # Warning-token enforcement without requiring topology: the changed scope is
+    # an absolute fallback, while an unchanged relative item still warns.
+    $warnRoot = New-TempRoot
+    $warnConfig = New-Config -Windows @(
+        (New-Terminal -Id 'warn-abs' -WindowId 'DEVWS-P7-WARN-ABS' -Layout ([pscustomobject][ordered]@{ x = 10; y = 20; w = 300; h = 200 })),
+        (New-RelativeTerminal -Id 'warn-rel' -WindowId 'DEVWS-P7-WARN-REL' -Fallback ([pscustomobject][ordered]@{ x = 40; y = 50; w = 400; h = 300 }) -Identity 'path:DEVWS-P7/MISSING' -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 0.5; h = 1 }))
+    )
+    $warnPath = Write-TestConfig -Config $warnConfig -Directory $warnRoot
+    $warnProcess = Start-Backend -ConfigPath $warnPath
+
+    try {
+        $warnInspect = Send-Request -Process $warnProcess -Id 'wv-i' -Op 'inspect'
+        $warnRead = Send-Request -Process $warnProcess -Id 'wv-r' -Op 'read-config' -Params @{ expectedSha256 = $warnInspect.result.config.sha256 }
+        $warnBase = [string]$warnInspect.result.config.sha256
+        $warnDraft = ($warnRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+        $warnDraft.sets[0].windows[0].layout.x = 15
+        $warnPreview = Send-Request -Process $warnProcess -Id 'wv-p' -Op 'preview' -Params @{ draft = $warnDraft; baseSha256 = $warnBase }
+        Assert-True $warnPreview.ok 'warning fixture preview succeeds'
+        Assert-Equal $true ([bool]$warnPreview.result.review.requiresAcknowledgement) 'warning fixture requires acknowledgement'
+        $warnToken = [string]$warnPreview.result.review.reviewToken
+        Assert-Equal 64 $warnToken.Length 'warning fixture returns a review token'
+
+        $noToken = Send-Request -Process $warnProcess -Id 'wv-s1' -Op 'save' -Params @{ draft = $warnDraft; baseSha256 = $warnBase; confirm = $true }
+        Assert-Equal 'warnings-not-acknowledged' $noToken.error.code 'save refuses missing warning acknowledgement'
+        Assert-Equal $warnBase (Get-FileSha $warnPath) 'missing-token save leaves the bytes unchanged'
+
+        $badToken = Send-Request -Process $warnProcess -Id 'wv-s2' -Op 'save' -Params @{ draft = $warnDraft; baseSha256 = $warnBase; confirm = $true; reviewToken = ('a' * 64) }
+        Assert-Equal 'review-stale' $badToken.error.code 'save refuses a stale review token'
+        Assert-Equal $warnBase (Get-FileSha $warnPath) 'stale-token save leaves the bytes unchanged'
+
+        $tokenSave = Send-Request -Process $warnProcess -Id 'wv-s3' -Op 'save' -Params @{ draft = $warnDraft; baseSha256 = $warnBase; confirm = $true; reviewToken = $warnToken }
+        Assert-True $tokenSave.ok 'save succeeds with the matching review token'
+        Assert-Equal $true $tokenSave.result.changed 'token save reports changed'
+        $warnPersisted = Get-DevWSConfig -Location ([pscustomobject]@{ Path = $warnPath; IsWritable = $true; IsBundledDefault = $false; Source = 'env' })
+        Assert-Equal 15 ([int]$warnPersisted.sets[0].windows[0].layout.x) 'token save persisted the fallback edit'
+        Assert-Equal 'relative' ([string]$warnPersisted.sets[0].windows[1].layoutMode) 'token save preserved relative mode'
+        Assert-Equal 'path:DEVWS-P7/MISSING' ([string]$warnPersisted.sets[0].windows[1].layoutRelative.monitor.identity) 'token save preserved the unresolved anchor'
+        Send-Request -Process $warnProcess -Id 'wv-x' -Op 'shutdown' | Out-Null
+        $warnProcess.WaitForExit(10000) | Out-Null
+    }
+    finally {
+        Stop-Backend -Process $warnProcess
+    }
+
+    # Profile-entry and relative saves use the host topology when available. The
+    # pure preview tests above already cover resolver behavior with synthetic
+    # topology; here the same shapes are persisted through the backend.
+    $topologyForSave = $warnInspect.result.topology
+    if ([bool]$topologyForSave.available -and @($topologyForSave.monitors).Count -gt 0) {
+        $saveMonitor = @($topologyForSave.monitors)[0]
+        $saveIdentity = [string]$saveMonitor.identity
+        $saveFingerprint = [string]$topologyForSave.fingerprint
+        $saveSignature = [string]$topologyForSave.signature
+
+        $profileRoot = New-TempRoot
+        $profileConfig = New-Config -Windows @(
+            (New-Terminal -Id 'profile-item' -WindowId 'DEVWS-P7-PROFILE' -Layout ([pscustomobject][ordered]@{ x = 10; y = 20; w = 500; h = 400 })),
+            (New-Terminal -Id 'profile-other' -WindowId 'DEVWS-P7-PROFILE-OTHER' -Layout ([pscustomobject][ordered]@{ x = 60; y = 70; w = 300; h = 200 }))
+        ) -Profiles @(
+            (New-Profile -Id 'matched' -Tokens @($saveSignature -split ';') -Layouts @{ 'profile-item' = [pscustomobject][ordered]@{ x = 100; y = 110; w = 600; h = 500 } })
+        )
+        $profilePath = Write-TestConfig -Config $profileConfig -Directory $profileRoot
+        $profileProcess = Start-Backend -ConfigPath $profilePath
+        try {
+            $profileInspect = Send-Request -Process $profileProcess -Id 'pv-i' -Op 'inspect'
+            $profileRead = Send-Request -Process $profileProcess -Id 'pv-r' -Op 'read-config' -Params @{ expectedSha256 = $profileInspect.result.config.sha256 }
+            $profileDraft = ($profileRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+            $profileDraft.sets[0].layoutProfiles[0].layouts.'profile-item'.x = 135
+            $profileSave = Send-Request -Process $profileProcess -Id 'pv-s' -Op 'save' -Params @{
+                draft = $profileDraft
+                baseSha256 = [string]$profileInspect.result.config.sha256
+                topologyFingerprint = $saveFingerprint
+                confirm = $true
+            }
+            Assert-True $profileSave.ok 'profile-entry save succeeds'
+            Assert-Equal $true $profileSave.result.changed 'profile-entry save reports changed'
+            $profilePersisted = Read-DevWSConfigFile -Path $profilePath
+            Assert-Equal 135 ([int]$profilePersisted.sets[0].layoutProfiles[0].layouts.'profile-item'.x) 'profile-entry geometry persisted'
+            Assert-Equal 600 ([int]$profilePersisted.sets[0].layoutProfiles[0].layouts.'profile-item'.w) 'unchanged profile-entry geometry preserved'
+            Send-Request -Process $profileProcess -Id 'pv-x' -Op 'shutdown' | Out-Null
+            $profileProcess.WaitForExit(10000) | Out-Null
+        }
+        finally {
+            Stop-Backend -Process $profileProcess
+        }
+
+        $relativeRoot = New-TempRoot
+        $relativeConfig = New-Config -Windows @(
+            (New-RelativeTerminal -Id 'relative-item' -WindowId 'DEVWS-P7-REL' -Fallback ([pscustomobject][ordered]@{ x = 10; y = 20; w = 500; h = 400 }) -Identity $saveIdentity -Basis 'workArea' -Rect ([pscustomobject][ordered]@{ x = 0; y = 0; w = 0.5; h = 1 }))
+        )
+        $relativePath = Write-TestConfig -Config $relativeConfig -Directory $relativeRoot
+        $relativeProcess = Start-Backend -ConfigPath $relativePath
+        try {
+            $relativeInspect = Send-Request -Process $relativeProcess -Id 'rv-i' -Op 'inspect'
+            $relativeRead = Send-Request -Process $relativeProcess -Id 'rv-r' -Op 'read-config' -Params @{ expectedSha256 = $relativeInspect.result.config.sha256 }
+            $relativeDraft = ($relativeRead.result.document | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+            $relativeDraft.sets[0].windows[0].layoutRelative.rect.x = 0.25
+            $relativeSave = Send-Request -Process $relativeProcess -Id 'rv-s' -Op 'save' -Params @{
+                draft = $relativeDraft
+                baseSha256 = [string]$relativeInspect.result.config.sha256
+                topologyFingerprint = $saveFingerprint
+                confirm = $true
+            }
+            Assert-True $relativeSave.ok 'relative-geometry save succeeds'
+            Assert-Equal $true $relativeSave.result.changed 'relative save reports changed'
+            $relativePersisted = Read-DevWSConfigFile -Path $relativePath
+            Assert-Equal 'relative' ([string]$relativePersisted.sets[0].windows[0].layoutMode) 'relative mode persisted'
+            Assert-Equal 0.25 ([double]$relativePersisted.sets[0].windows[0].layoutRelative.rect.x) 'relative rectangle persisted'
+            Assert-Equal $saveIdentity ([string]$relativePersisted.sets[0].windows[0].layoutRelative.monitor.identity) 'relative anchor persisted'
+
+            $modeDraft = ($relativePersisted | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+            $modeDraft.sets[0].windows[0].PSObject.Properties.Remove('layoutRelative')
+            $modeDraft.sets[0].windows[0] | Add-Member -NotePropertyName layoutMode -NotePropertyValue 'absolute' -Force
+            $modeSave = Send-Request -Process $relativeProcess -Id 'rv-s2' -Op 'save' -Params @{
+                draft = $modeDraft
+                baseSha256 = (Get-FileSha $relativePath)
+                topologyFingerprint = $saveFingerprint
+                confirm = $true
+            }
+            Assert-True $modeSave.ok 'relative-to-absolute save succeeds'
+            $modePersisted = Read-DevWSConfigFile -Path $relativePath
+            Assert-Equal $false ($null -ne $modePersisted.sets[0].windows[0].PSObject.Properties['layoutRelative']) 'relative-to-absolute save removed layoutRelative'
+
+            $absoluteToRelative = ($modePersisted | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+            $absoluteToRelative.sets[0].windows[0] | Add-Member -NotePropertyName layoutMode -NotePropertyValue 'relative' -Force
+            $absoluteToRelative.sets[0].windows[0] | Add-Member -NotePropertyName layoutRelative -NotePropertyValue ([pscustomobject][ordered]@{
+                monitor = [pscustomobject][ordered]@{ identity = $saveIdentity }
+                basis = 'workArea'
+                rect = [pscustomobject][ordered]@{ x = 0.125; y = 0.25; w = 0.5; h = 0.5 }
+            }) -Force
+            $absoluteSave = Send-Request -Process $relativeProcess -Id 'rv-s3' -Op 'save' -Params @{
+                draft = $absoluteToRelative
+                baseSha256 = (Get-FileSha $relativePath)
+                topologyFingerprint = $saveFingerprint
+                confirm = $true
+            }
+            Assert-True $absoluteSave.ok 'absolute-to-relative save succeeds'
+            $absolutePersisted = Read-DevWSConfigFile -Path $relativePath
+            Assert-Equal 'relative' ([string]$absolutePersisted.sets[0].windows[0].layoutMode) 'absolute-to-relative mode persisted'
+            Assert-Equal 0.125 ([double]$absolutePersisted.sets[0].windows[0].layoutRelative.rect.x) 'absolute-to-relative rectangle persisted'
+
+            $driftDraft = ($absolutePersisted | ConvertTo-Json -Depth 30 | ConvertFrom-Json)
+            $driftDraft.sets[0].windows[0].layoutRelative.rect.x = 0.375
+            $driftHash = Get-FileSha $relativePath
+            $driftSave = Send-Request -Process $relativeProcess -Id 'rv-s4' -Op 'save' -Params @{
+                draft = $driftDraft
+                baseSha256 = $driftHash
+                topologyFingerprint = ('A' * 64)
+                confirm = $true
+            }
+            Assert-Equal 'topology-changed' $driftSave.error.code 'relative save refuses a topology mismatch'
+            Assert-Equal $driftHash (Get-FileSha $relativePath) 'topology refusal leaves the bytes unchanged'
+            Send-Request -Process $relativeProcess -Id 'rv-x' -Op 'shutdown' | Out-Null
+            $relativeProcess.WaitForExit(10000) | Out-Null
+        }
+        finally {
+            Stop-Backend -Process $relativeProcess
+        }
+    }
+    else {
+        $script:Skipped++
+        Write-Host '  [SKIP] profile/relative persistence cases: host topology is unavailable' -ForegroundColor Yellow
+    }
+
+    # Post-commit re-read classification (deterministic helper seam).
+    $confirmationBase = [pscustomobject]@{ Sha256 = ('a' * 64); Location = [pscustomobject]@{ Path = 'C:\fixture\workspace.json' } }
+    $confirmationMissing = Get-EditorSaveConfirmation -Snapshot $confirmationBase -AfterSnapshot $null
+    Assert-Equal 'save-outcome-uncertain' ([string]$confirmationMissing.Code) 'missing post-save re-read is uncertain'
+    $confirmationInvalid = Get-EditorSaveConfirmation -Snapshot $confirmationBase -AfterSnapshot ([pscustomobject]@{ Ok = $true; Valid = $false; Sha256 = ('b' * 64) })
+    Assert-Equal 'save-outcome-uncertain' ([string]$confirmationInvalid.Code) 'invalid post-save re-read is uncertain'
+    $confirmationSame = Get-EditorSaveConfirmation -Snapshot $confirmationBase -AfterSnapshot ([pscustomobject]@{ Ok = $true; Valid = $true; Sha256 = ('a' * 64) })
+    Assert-Equal 'save-outcome-uncertain' ([string]$confirmationSame.Code) 'unchanged post-save revision is uncertain'
+    $confirmationNew = Get-EditorSaveConfirmation -Snapshot $confirmationBase -AfterSnapshot ([pscustomobject]@{ Ok = $true; Valid = $true; Sha256 = ('b' * 64) })
+    Assert-True $confirmationNew.Ok 'changed post-save revision is confirmed'
+    Assert-Equal ('b' * 64) ([string]$confirmationNew.Result.newSha256) 'confirmation returns the observed revision'
+    Assert-Equal 'C:\fixture\workspace.json' ([string]$confirmationNew.Result.canonicalPath) 'confirmation returns the effective path'
+
+    # ExpectedSha256 / mutex primitive tests.
+    $mutexRoot = New-TempRoot
+    $mutexConfig = New-Config -Windows @(
+        (New-Terminal -Id 'mutex' -WindowId 'DEVWS-P7-MUTEX' -Layout ([pscustomobject][ordered]@{ x = 10; y = 20; w = 300; h = 200 }))
+    )
+    $mutexPath = Write-TestConfig -Config $mutexConfig -Directory $mutexRoot
+    $mutexHash = Get-FileSha $mutexPath
+    $mutexLocation = [pscustomobject]@{ Path = $mutexPath; IsWritable = $true; IsBundledDefault = $false; Source = 'env' }
+    $mutexConfig.sets[0].windows[0].layout.x = 25
+    Save-DevWSConfig -Config $mutexConfig -Location $mutexLocation -ExpectedSha256 $mutexHash
+    Assert-Equal 25 ([int](Read-DevWSConfigFile -Path $mutexPath).sets[0].windows[0].layout.x) 'Save-DevWSConfig accepted the matching revision'
+    $mutexAfter = Get-FileSha $mutexPath
+    try {
+        $mutexConfig.sets[0].windows[0].layout.x = 99
+        Save-DevWSConfig -Config $mutexConfig -Location $mutexLocation -ExpectedSha256 $mutexHash
+        Fail-Test 'Save-DevWSConfig did not refuse a stale revision'
+    }
+    catch {
+        Assert-Equal 'external-change' ([string]$_.Exception.Data['DevWSCode']) 'Save-DevWSConfig refuses a stale revision'
+    }
+    Assert-Equal $mutexAfter (Get-FileSha $mutexPath) 'stale Save-DevWSConfig leaves the bytes unchanged'
+    Assert-Equal $false (Test-Path -LiteralPath "$mutexPath.tmp") 'stale Save-DevWSConfig cleaned the temp file'
+
+    # A participating writer waits on Local\DevWS.Config.Write while another
+    # participant holds it, then commits its own expected revision.
+    $mutexChildPath = Join-Path $mutexRoot 'child-save.ps1'
+    $mutexMarker = Join-Path $mutexRoot 'child-entered.txt'
+    $mutexChildError = Join-Path $mutexRoot 'child-error.txt'
+    $childConfig = (Read-DevWSConfigFile -Path $mutexPath)
+    $childConfig.sets[0].windows[0].layout.x = 44
+    $childConfig | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $mutexRoot 'child.json') -Encoding UTF8
+    $childScript = @"
+`$ErrorActionPreference = 'Stop'
+. '$libRoot\devws-paths.ps1'
+. '$libRoot\devws-config.ps1'
+[IO.File]::WriteAllText('$mutexMarker', 'entered')
+`$cfg = Read-DevWSConfigFile -Path '$(Join-Path $mutexRoot 'child.json')'
+`$loc = [pscustomobject]@{ Path = '$mutexPath'; IsWritable = `$true; IsBundledDefault = `$false; Source = 'env' }
+Save-DevWSConfig -Config `$cfg -Location `$loc -ExpectedSha256 '$mutexAfter'
+"@
+    Set-Content -LiteralPath $mutexChildPath -Value $childScript -Encoding UTF8
+    $heldMutex = [Threading.Mutex]::new($false, 'Local\DevWS.Config.Write')
+    $held = $heldMutex.WaitOne([TimeSpan]::FromSeconds(5))
+    Assert-True $held 'test acquired the configuration write mutex'
+    $child = $null
+    $child = Start-Process -FilePath $pwsh -ArgumentList @('-NoLogo','-NoProfile','-File',$mutexChildPath) -PassThru -RedirectStandardError $mutexChildError
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not (Test-Path -LiteralPath $mutexMarker) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+        Assert-True (Test-Path -LiteralPath $mutexMarker) 'participating writer reached the save call'
+        Start-Sleep -Milliseconds 300
+        Assert-Equal $false $child.HasExited 'participating writer waits while the mutex is held'
+        $heldMutex.ReleaseMutex(); $held = $false
+        Assert-True ($child.WaitForExit(15000)) 'participating writer completes after the mutex is released'
+        Assert-Equal 0 $child.ExitCode 'participating writer succeeds'
+        Assert-Equal 44 ([int](Read-DevWSConfigFile -Path $mutexPath).sets[0].windows[0].layout.x) 'participating writer persisted under the mutex'
+    }
+    finally {
+        if ($held) { try { $heldMutex.ReleaseMutex() } catch {} }
+        $heldMutex.Dispose()
+        if ($null -ne $child) {
+            if (-not $child.HasExited) { $child.Kill() }
+            $child.Dispose()
+        }
+    }
+
+    $legacyConfig = (Read-DevWSConfigFile -Path $mutexPath)
+    $legacyConfig.sets[0].windows[0].layout.x = 55
+    Save-DevWSConfig -Config $legacyConfig -Location $mutexLocation
+    Assert-Equal 55 ([int](Read-DevWSConfigFile -Path $mutexPath).sets[0].windows[0].layout.x) 'legacy Save-DevWSConfig callers still write'
+
+    # A genuine OS write failure leaves the canonical bytes intact and cleans the temp file.
+    $failRoot = New-TempRoot
+    $failConfig = New-Config -Windows @(
+        (New-Terminal -Id 'fail' -WindowId 'DEVWS-P7-FAIL' -Layout ([pscustomobject][ordered]@{ x = 10; y = 20; w = 300; h = 200 }))
+    )
+    $failPath = Write-TestConfig -Config $failConfig -Directory $failRoot
+    $failHash = Get-FileSha $failPath
+    $failConfig.sets[0].windows[0].layout.x = 35
+    Set-ItemProperty -LiteralPath $failPath -Name IsReadOnly -Value $true
+    try {
+        try {
+            Save-DevWSConfig -Config $failConfig -Location ([pscustomobject]@{ Path = $failPath; IsWritable = $true; IsBundledDefault = $false; Source = 'env' }) -ExpectedSha256 $failHash
+            Fail-Test 'Save-DevWSConfig did not report a read-only replacement failure'
+        }
+        catch {
+            Assert-True ([string]::IsNullOrEmpty([string]$_.Exception.Data['DevWSCode'])) 'read-only replacement is an unclassified save failure'
+        }
+        Assert-Equal $failHash (Get-FileSha $failPath) 'read-only replacement leaves the bytes unchanged'
+        Assert-Equal $false (Test-Path -LiteralPath "$failPath.tmp") 'read-only replacement cleans the temp file'
+    }
+    finally {
+        Set-ItemProperty -LiteralPath $failPath -Name IsReadOnly -Value $false
+    }
+
     # 13. Non-mutation and static isolation.
     $beforeHash = Get-FileSha $parityPath
     $process = Start-Backend -ConfigPath $parityPath
@@ -1328,7 +1690,7 @@ finally {
 }
 
 Write-Host ""
-Write-Host ("P6 focused assertions passed: {0}; failed: {1}; skipped: {2}" -f $script:Passed, $script:Failures.Count, $script:Skipped) -ForegroundColor Cyan
+Write-Host ("P7 focused assertions passed: {0}; failed: {1}; skipped: {2}" -f $script:Passed, $script:Failures.Count, $script:Skipped) -ForegroundColor Cyan
 if ($script:Failures.Count -gt 0) {
     $script:Failures | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
     exit 1

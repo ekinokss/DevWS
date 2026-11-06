@@ -2003,18 +2003,48 @@ function Assert-DevWSV2Config {
     Throw-DevWSValidationErrors -Source $Source -Errors $errors
 }
 
+function Get-DevWSFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
+function New-DevWSConfigWriteException {
+    param(
+        [Parameter(Mandatory)][string]$Code,
+        [Parameter(Mandatory)][string]$Message
+    )
+
+    $exception = [System.InvalidOperationException]::new($Message)
+    $exception.Data['DevWSCode'] = $Code
+    return $exception
+}
+
 function Save-DevWSConfig {
     param(
         [Parameter(Mandatory)]
         $Config,
         [Parameter(Mandatory)]
-        $Location
+        $Location,
+        [string]$ExpectedSha256 = $null
     )
 
     Assert-DevWSConfigWritable -Location $Location
 
-    $json = $Config | ConvertTo-Json -Depth 20
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256) -and $ExpectedSha256 -notmatch '^[0-9a-f]{64}$') {
+        throw (New-DevWSConfigWriteException -Code 'external-change' -Message "ExpectedSha256 must be 64 lowercase hexadecimal characters.")
+    }
 
+    $json = $Config | ConvertTo-Json -Depth 20
     $directory = [System.IO.Path]::GetDirectoryName($Location.Path)
 
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
@@ -2022,24 +2052,62 @@ function Save-DevWSConfig {
     }
 
     $tempPath = "$($Location.Path).tmp"
+    $mutex = [System.Threading.Mutex]::new($false, 'Local\DevWS.Config.Write')
+    $acquired = $false
 
     try {
-        [System.IO.File]::WriteAllText(
-            $tempPath,
-            $json + [Environment]::NewLine,
-            [System.Text.UTF8Encoding]::new($false)
-        )
+        try {
+            $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds(10))
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # The previous owner died while holding the mutex. Ownership is
+            # granted to this caller; proceed under the same expected-hash gate.
+            $acquired = $true
+        }
 
-        # Serialize/validate before replacing the canonical file.
-        $reloaded = Read-DevWSConfigFile -Path $tempPath
-        Assert-DevWSConfig -Config $reloaded -Source $tempPath
+        if (-not $acquired) {
+            throw (New-DevWSConfigWriteException -Code 'save-failed' -Message "Timed out waiting for the configuration write lock.")
+        }
 
-        [System.IO.File]::Move($tempPath, $Location.Path, $true)
+        if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+            $actualSha256 = Get-DevWSFileSha256 -Path $Location.Path
+
+            if ($actualSha256 -cne $ExpectedSha256) {
+                throw (New-DevWSConfigWriteException -Code 'external-change' -Message "The canonical configuration changed before the save could be committed.")
+            }
+        }
+
+        try {
+            [System.IO.File]::WriteAllText(
+                $tempPath,
+                $json + [Environment]::NewLine,
+                [System.Text.UTF8Encoding]::new($false)
+            )
+
+            # Serialize/validate before replacing the canonical file.
+            $reloaded = Read-DevWSConfigFile -Path $tempPath
+            Assert-DevWSConfig -Config $reloaded -Source $tempPath
+
+            [System.IO.File]::Move($tempPath, $Location.Path, $true)
+        }
+        finally {
+            if (Test-Path -LiteralPath $tempPath) {
+                Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
     finally {
-        if (Test-Path -LiteralPath $tempPath) {
-            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        if ($acquired) {
+            try {
+                $mutex.ReleaseMutex()
+            }
+            catch {
+                # A release failure must not mask the save outcome. The mutex is
+                # released on process exit at the latest.
+            }
         }
+
+        $mutex.Dispose()
     }
 }
 
