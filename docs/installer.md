@@ -222,6 +222,14 @@ installation. There is no onboarding wizard.
 
 The source-managed manifest for this root contains **39 entries**.
 
+The `bin\ws.cmd` shim disables inherited delayed expansion, forwards the caller's arguments
+unchanged, and returns the CLI process exit code. Arguments containing `cmd.exe`
+metacharacters (`&`, `|`, `<`, `>`, `^`) must be quoted by the caller: `cmd.exe` parses
+those characters before a batch file can receive them, so no `.cmd` shim can recover an
+unquoted metacharacter. Quoting keeps the value as one token, for example
+`ws set-geometry item --relative --anchor "path:...&..." ...`. The same quoting rule
+applies when PowerShell 5.1 launches a `.cmd` with native arguments.
+
 ### Administrator-protected privileged runtime — `%ProgramFiles%\DevWS\privileged`
 
 | Path | Contents |

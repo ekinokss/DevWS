@@ -14485,6 +14485,96 @@ public static class DevWSAppCandidateTestWindow
         }
     }
 
+    Test-Case "ws.cmd shim forwards quoted meta-character arguments intact and propagates exit codes" {
+        $shim = Join-Path $RepoRoot "src\shim\ws.cmd"
+        $root = Join-Path $TestRoot "p9br shim root"
+        $app  = Join-Path $root "DevWS\app"
+        New-Item -ItemType Directory -Path $app -Force | Out-Null
+        $stub = Join-Path $app "ws.ps1"
+        $argsFile = Join-Path $root "args.json"
+
+        Set-Content -LiteralPath $stub -Encoding utf8 -Value @'
+$args | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:P9BR_ARGS_FILE -Encoding utf8
+if (-not [string]::IsNullOrEmpty($env:P9BR_EXIT_CODE)) { exit [int]$env:P9BR_EXIT_CODE }
+exit 0
+'@
+
+        $savedLocal = $env:LOCALAPPDATA
+        $savedArgs  = $env:P9BR_ARGS_FILE
+        $savedExit  = $env:P9BR_EXIT_CODE
+        $env:LOCALAPPDATA = $root
+        $env:P9BR_ARGS_FILE = $argsFile
+        Remove-Item Env:\P9BR_EXIT_CODE -ErrorAction SilentlyContinue
+
+        function Quote-ShimArg([string]$Value) {
+            return '"' + ($Value -replace '"', '\"') + '"'
+        }
+
+        function Invoke-ShimLine([string]$ArgumentsLine, [switch]$DelayedExpansion) {
+            if (Test-Path -LiteralPath $argsFile) { Remove-Item -LiteralPath $argsFile -Force }
+            $line = '"' + $shim + '" ' + $ArgumentsLine
+            if ($DelayedExpansion) {
+                & cmd.exe /d /v:on /c $line 2>&1 | Out-Null
+            }
+            else {
+                & cmd.exe /d /c $line 2>&1 | Out-Null
+            }
+            $code = $LASTEXITCODE
+            $received = @()
+            if (Test-Path -LiteralPath $argsFile) {
+                $received = @((Get-Content -LiteralPath $argsFile -Raw | ConvertFrom-Json))
+            }
+            return [pscustomobject]@{ Code = $code; Arguments = $received }
+        }
+
+        try {
+            $identity = 'path:MSH062E/5&1A097CD8&0&UID5527112'
+            $quoted = (@('set-geometry', 'd1-item', '--anchor', $identity, '--x', '0.5') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal 0 $result.Code "quoted identity exit code"
+            Assert-Equal ("set-geometry|d1-item|--anchor|$identity|--x|0.5") ($result.Arguments -join '|') "quoted path identity arrives intact through the actual shim"
+
+            $quoted = (@('--path', 'C:\Program Files\DevWS') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal ("--path|C:\Program Files\DevWS") ($result.Arguments -join '|') "argument with spaces survives a spaced install path"
+
+            $quoted = (@('--pipe', 'a|b', '--caret', 'a^b', '--percent', '100%') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal ("--pipe|a|b|--caret|a^b|--percent|100%") ($result.Arguments -join '|') "quoted |, ^ and % arrive intact"
+
+            $quoted = (@('--value', 'a!b') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted -DelayedExpansion
+            Assert-Equal ("--value|a!b") ($result.Arguments -join '|') "inherited delayed expansion no longer eats !"
+
+            $marker = Join-Path $root 'pwned.txt'
+            $payload = 'x& echo PWNED > ' + $marker
+            $quoted = (@('--value', $payload) | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal ("--value|$payload") ($result.Arguments -join '|') "quoted metacharacters are not interpreted as commands"
+            Assert-True (-not (Test-Path -LiteralPath $marker)) "quoted argument did not execute a second-stage command"
+
+            $env:P9BR_EXIT_CODE = '42'
+            try {
+                $result = Invoke-ShimLine (Quote-ShimArg 'exit-check')
+                Assert-Equal 42 $result.Code "exit code propagates through the shim"
+            }
+            finally {
+                Remove-Item Env:\P9BR_EXIT_CODE -ErrorAction SilentlyContinue
+            }
+
+            # Documented shell requirement: cmd.exe parses unquoted & before any
+            # batch shim can receive it, so the argument is split at the caller.
+            $result = Invoke-ShimLine ('--anchor ' + $identity)
+            Assert-True (($result.Arguments -join '|') -ne ("--anchor|$identity")) "unquoted & is split by cmd before the shim (caller must quote)"
+        }
+        finally {
+            $env:LOCALAPPDATA = $savedLocal
+            if ($null -eq $savedArgs) { Remove-Item Env:\P9BR_ARGS_FILE -ErrorAction SilentlyContinue } else { $env:P9BR_ARGS_FILE = $savedArgs }
+            if ($null -eq $savedExit) { Remove-Item Env:\P9BR_EXIT_CODE -ErrorAction SilentlyContinue } else { $env:P9BR_EXIT_CODE = $savedExit }
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     Test-Case "shim and hotkey templates match generated installed content" {
         $shimTemplate = Get-Content -LiteralPath (Join-Path $RepoRoot "src\shim\ws.cmd") -Raw
         $shimGenerated = New-DevWSShimContent
@@ -16065,6 +16155,19 @@ foreach ($entry in $argv) { Write-Output ("ARG:" + $entry) }
         Assert-True (-not (Test-DevWSLegacyShimContent -Content "@echo off`r`npwsh.exe -NoLogo -NoProfile -File `"%LOCALAPPDATA%\DevWS\app\ws.ps1`" %*")) "forwarding shim is not legacy"
         Assert-True (-not (Test-DevWSLegacyShimContent -Content "@echo off`r`npwsh.exe -NoLogo -NoProfile -File `"%USERPROFILE%\.ws\other.ps1`" %*")) "near miss rejected"
         Assert-True (-not (Test-DevWSLegacyShimContent -Content "@echo off`r`necho extra`r`npwsh.exe -NoLogo -NoProfile -File `"%USERPROFILE%\.ws\ws.ps1`" %*")) "extra line rejected"
+    }
+
+    Test-Case "forwarding shim recognition accepts the pre-fix and hardened forms" {
+        $fixture = New-InstallFixture "shim-forwarding-forms"
+        $oldLine = 'pwsh.exe -NoLogo -NoProfile -File "' + (Join-Path $fixture.Root 'app\ws.ps1') + '" %*'
+        $oldContent = "@echo off`r`n$oldLine`r`n"
+        Assert-True (Test-DevWSForwardingShimContent -Content $oldContent -InstallRoot $fixture.Root) "pre-fix forwarding shim is recognized"
+
+        $newContent = New-DevWSShimContent -InstallRoot $fixture.Root
+        Assert-True (Test-DevWSForwardingShimContent -Content $newContent -InstallRoot $fixture.Root) "hardened forwarding shim is recognized"
+
+        $wrong = "@echo off`r`npwsh.exe -NoLogo -NoProfile -File `"$($fixture.Root)\app\other.ps1`" %*`r`n"
+        Assert-True (-not (Test-DevWSForwardingShimContent -Content $wrong -InstallRoot $fixture.Root)) "near miss is not a forwarding shim"
     }
 
     Test-Case "legacy shim migration only replaces the recognized shim once" {
