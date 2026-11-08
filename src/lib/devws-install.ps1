@@ -2442,7 +2442,7 @@ function New-DevWSShimContent {
         $target = $appScript
     }
 
-    return ("@echo off" + "`r`n" + "pwsh.exe -NoLogo -NoProfile -File `"$target`" %*" + "`r`n")
+    return ("@echo off" + "`r`n" + "setlocal EnableExtensions DisableDelayedExpansion" + "`r`n" + "pwsh.exe -NoLogo -NoProfile -File `"$target`" %*" + "`r`n" + "exit /b %ERRORLEVEL%" + "`r`n")
 }
 
 function Get-DevWSScriptLines {
@@ -2475,18 +2475,26 @@ function Test-DevWSForwardingShimContent {
     )
 
     $lines = @(Get-DevWSScriptLines -Content $Content)
-
-    if ($lines.Count -ne 2) {
-        return $false
-    }
-
-    if ($lines[0] -ine "@echo off") {
-        return $false
-    }
-
     $expected = @(Get-DevWSScriptLines -Content (New-DevWSShimContent -InstallRoot $InstallRoot))
 
-    return ($lines[1] -ieq $expected[1])
+    if ($lines.Count -eq $expected.Count) {
+        for ($index = 0; $index -lt $expected.Count; $index++) {
+            if ($lines[$index] -ine $expected[$index]) {
+                return $false
+            }
+        }
+
+        return $true
+    }
+
+    # Pre-fix two-line forwarding shim. It is still DevWS-owned (not the v1
+    # legacy form) and must be recognized during install/uninstall planning.
+    if ($lines.Count -eq 2 -and $lines[0] -ieq "@echo off") {
+        $pwshLine = @($expected | Where-Object { $_ -like "pwsh.exe *" })[0]
+        return ($lines[1] -ieq $pwshLine)
+    }
+
+    return $false
 }
 
 function Install-DevWSLegacyShim {
