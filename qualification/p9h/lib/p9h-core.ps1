@@ -267,3 +267,17 @@ function Assert-P9HArtifactPresent {
         Sha256 = Get-P9HFileSha256 -Path $Path
     }
 }
+
+function Copy-P9HArgs {
+    # Explicit key-by-key copy of a parameter table.
+    #
+    # Hashtable.Clone() followed by property assignment is not valid PowerShell
+    # ("a hash table can only be added to another hash table"), so callers that
+    # need an independent copy build one here. Lives in core so every module and
+    # test that splats a parameter table gets the same behaviour.
+    param([Parameter(Mandatory)][hashtable]$Table)
+
+    $copy = @{}
+    foreach ($k in @($Table.Keys)) { $copy[$k] = $Table[$k] }
+    return $copy
+}

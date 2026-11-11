@@ -142,3 +142,79 @@ configuration.
   limitation must be recorded rather than silently accepted.
 - Evidence durability is bounded by the OS filesystem. A catastrophic host failure can still
   lose artifacts; the design states this rather than claiming otherwise.
+
+### Stage 2.3 corrections (independent review of PR #21 @ 8e0f156)
+
+Two of these are verdict weaknesses; one is a **lost-regression** finding that matters as much as
+the code fixes.
+
+#### The N-series was silently dropped (70 -> 87 instead of 70 -> 96)
+
+Stage 2.2 replaced the whole verdict test function, so the nine N-series cases disappeared while the
+total *rose*. Nothing complained. Restored in full, with N8's expectation adapted to the stricter
+contract below. The registry is now guarded automatically:
+
+- `Test-P9HTestRegistry` checks the **runtime** results (unique ids, exact count, every series
+  present) **and** the **source** literals in the test file, and fails as a case (`R1`) if a
+  registered case never ran or a series vanished.
+- Registered total is **100** (96 + W15, W16, X13, X14 for the new corrections).
+
+#### N2-A accepted an empty window inventory
+
+`Windows=[]` satisfied every N2-A predicate, so "no window was observed" passed a criterion that
+requires **positively observed window creation and attribution**.
+
+| Counterexample | Then | Now |
+| --- | --- | --- |
+| Valid but empty post-window inventory | **N2A=PASS** | `no-newly-observed-attributed-window` |
+| Missing pre-window inventory | synthesized an empty baseline | `pre-window-observation-unavailable` |
+
+N2-A now needs a readable **pre and post** inventory, a newly observed HWND whose PID is causally
+attributed, and the fallback rectangle absent from *that* window.
+
+#### Attribution ignored the launch window
+
+`Get-P9HLaunchAttribution` received `LauncherPid`/`LaunchedAtUtc` but never used them, so a **stale**
+process carrying the matching `-WindowId/-TerminalId/-SetId` argv from an earlier run counted as
+newly created.
+
+| Counterexample | Then | Now |
+| --- | --- | --- |
+| Same argv, created 5 h before the launch | **ProcessAttributed=True** | `creation-time-outside-launch-window` |
+
+Attribution now requires: launch identity in argv **and** a recovered creation time **and** that time
+inside `[launchedAt - tolerance, exitedAt + tolerance]` **and** a PID different from the launcher.
+Parentage is still never inferred - the terminal is created by the elevated broker.
+
+#### Trace identity requirements were invented, then hardened
+
+Stage 2.2 required a per-event `trialId`. **DevWS never emits one** - verified by reading
+`src/lib/devws-paths.ps1` and every `Write-DevWSLaunchTrace` call site: zero occurrences of any trial
+identifier, and `planId` appears only on `stage2-broker-ready`/`stage2-broker-replanned`. That made
+every **real** production trace invalid.
+
+`Test-P9HLaunchTrace` now validates using only fields the product emits:
+
+| Requirement | Source |
+| --- | --- |
+| Framework fields `event`, `utcMs`, `pid` | `Write-DevWSLaunchTrace` |
+| Non-empty `planId` on `stage2-broker-ready` | `devws-launch.ps1:650` |
+| Consistent `planId` on `stage2-broker-replanned` | `devws-launch.ps1:698` |
+| Transaction identity `set` consistent across the plan and `transaction-end` | `devws-launch.ps1:569,901` |
+| Causal order: event rank **and** monotonic `utcMs` | emitted by every event |
+| Clean completion: `finalized=1`, `failures=0`, `broker=true`, `uncertain=false` | `devws-launch.ps1:770,901` |
+
+| Counterexample | Then | Now |
+| --- | --- | --- |
+| Production-shaped trace (no `trialId`) | **INCONCLUSIVE** (real traces rejected) | eligible for PASS |
+| Trace with no `planId` anywhere | PASS | `trace-plan-id-missing` |
+
+#### Two further defects found while writing the fixes
+
+- `ConvertFrom-Json` turns an ISO-8601 `Z` string into a `DateTime` with `Kind=Local` whose ticks are
+  **local** wall-clock ticks. Unconditional `ToUniversalTime()` double-applied the offset and pushed
+  valid process start times out of the launch window. `ConvertTo-P9HUtcOrNull` now honours `Kind`.
+- `$null -ne $value` is **not** a presence test when `$value` is an array: comparing `$null` with
+  `@()` yields `@()` (falsy). A valid but empty `Windows` array therefore looked like a missing
+  inventory and blocked every attribution path. Presence is now tested on the property object
+  (`Test-P9HHasProperty`).

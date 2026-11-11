@@ -585,48 +585,15 @@ function Invoke-P9HE1ObserverTests {
         -Pass ((-not $f3proof.Proven) -and $f3proof.Reason -eq 'post-not-active') -Evidence $f3
 }
 
-function Copy-P9HArgs {
-    # Explicit ordered copy of a parameter table. Hashtable.Clone() followed
-    # by property assignment is not valid PowerShell (a hash table can only be
-    # assigned by key), so the copy is built key by key.
-    param([Parameter(Mandatory)][hashtable]$Table)
-    $copy = @{}
-    foreach ($k in @($Table.Keys)) { $copy[$k] = $Table[$k] }
-    return $copy
-}
 
 function Invoke-P9HVerdictTests {
-    # V-series: E1 verdict rules (V1-V14 retained; V9-V14 strengthened by Stage 2.2).
-    # W-series: Stage 2.2 trace-validity and N2 causal-attribution cases.
+    # E1 (V), N2 attribution (N), trace/attribution (W), and evidence-contract (X)
+    # verdict tests.
     #
-    # Stage 2.2 additions required by review:
-    #   W1  complete valid trace                         -> eligible for PASS
-    #   W2  valid events + one malformed line            -> not PASS
-    #   W3  missing required event                       -> not PASS
-    #   W4  contradictory finalization events            -> not PASS
-    #   W5  events from different trials                 -> not PASS
-    #   W6  incompatible plan ids                        -> not PASS
-    #   W7  events in invalid order                      -> not PASS
-    #   W8  unrelated terminal process with valid start  -> not PASS
-    #   W9  unrelated process's window                   -> not PASS
-    #   W10 matching PID, incompatible creation time     -> not PASS
-    #   W11 correct window type, unrelated transaction   -> not PASS
-    #   W12 clean trace + exit 0 without attribution     -> not PASS
-    #   W13 inconsistent plan/terminal identifiers       -> not PASS
-    #   W14 positive: real detached-terminal architecture -> PASS
-    #
-    #   X1  window-omission request cannot yield PASS    -> not PASS
-    #   X2  asserted tokenRectBytes only (no records)    -> not PASS
-    #   X3  fabricated negative-origin summary           -> not PASS
-    #   X4  parsedMonitors disagree with token list      -> not PASS
-    #   X5  identical summaries, different mappings      -> not PASS
-    #   X6  capture omitting trialId                     -> not PASS
-    #   X7  different trial ids                          -> not PASS
-    #   X8  pre-capture timestamp after disconnect       -> not PASS
-    #   X9  post-capture timestamp before reconnect      -> not PASS
-    #   X10 reversed pre/post capture ordering           -> not PASS
-    #   X11 malformed timestamp                          -> not PASS
-    #   X12 valid raw captures + matching topology       -> PASS
+    # Stage 2.3 restored the nine N-series cases that Stage 2.2 dropped when it
+    # replaced this function, so the registered total is 96 (70 + 14 W + 12 X).
+    # N8's expectation is adapted: an empty window inventory no longer evidences
+    # the skip, because N2-A requires positively observed window creation.
     param([Parameter(Mandatory)][string]$SandboxRoot)
 
     $trial = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind selftest
@@ -634,18 +601,17 @@ function Invoke-P9HVerdictTests {
     $tid = $trial.TrialId
     $logon = '2026-11-11T10:00:00.0000000Z'
 
-    # ---------- capture builder (raw per-monitor records are authoritative) ----------
+    $windowId = 'DevWS-main-p9h-item'
+    $terminalId = 'p9h-item'
+    $setId = 'main'
+
+    # ---------- capture builder ----------
     $writeCapture = {
         param(
-            [string]$name,
-            [string[]]$tokens,
-            [int]$sessionId = 3,
-            [bool]$includeTokens = $true,
-            [bool]$includeRecords = $true,
-            [string]$trialId = '',
-            [bool]$withNegativeOrigin = $true,
-            [string]$capturedUtc = '',
-            [string[]]$recordIdentities = $null,
+            [string]$name, [string[]]$tokens, [int]$sessionId = 3,
+            [bool]$includeTokens = $true, [bool]$includeRecords = $true,
+            [string]$trialId = '', [bool]$withNegativeOrigin = $true,
+            [string]$capturedUtc = '', [string[]]$recordIdentities = $null,
             [string[]]$recordRects = $null
         )
         $obj = [ordered]@{ tokenCount = $tokens.Count; identityComplete = $true; sessionId = $sessionId }
@@ -656,9 +622,6 @@ function Invoke-P9HVerdictTests {
 
         if ($includeRecords) {
             $ids = if ($null -ne $recordIdentities) { $recordIdentities } else { $tokens }
-            # A typed List[pscustomobject] is used because
-            # '$array += @{...}' appends the hashtable ENTRIES rather than the
-            # hashtable itself.
             $records = [System.Collections.Generic.List[pscustomobject]]::new()
             for ($i = 0; $i -lt $ids.Count; $i++) {
                 $rect = if ($null -ne $recordRects -and $i -lt $recordRects.Count) { $recordRects[$i] }
@@ -668,11 +631,7 @@ function Invoke-P9HVerdictTests {
                 $records.Add([pscustomobject][ordered]@{ identity = $ids[$i]; rect = $rect })
             }
             $obj.parsedMonitors = @($records)
-        }
-
-        # A summary string that AGREES with the records (what the real snapshot writes).
-        if ($includeRecords) {
-            $obj.tokenRectBytes = (@($obj.parsedMonitors | ForEach-Object { '{0}@{1}' -f $_.identity, $_.rect }) -join ';')
+            $obj.tokenRectBytes = (@($records | ForEach-Object { '{0}@{1}' -f $_.identity, $_.rect }) -join ';')
         }
 
         $p = Join-Path $dir $name
@@ -702,18 +661,18 @@ function Invoke-P9HVerdictTests {
     $tokensA = @('path:DEFAULT_MONITOR/1&ABCDEF&0&UID1001', 'path:DEFAULT_MONITOR/1&ABCDEF&0&UID1002')
     $tokensDiff = @('path:DEFAULT_MONITOR/1&ABCDEF&0&UID1001', 'path:DEFAULT_MONITOR/1&ABCDEF&0&UID9002')
 
-    # Captures are written with timestamps bracketing the transition.
     $preUtc = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('o')
+    $postUtc = (Get-Date).ToUniversalTime().AddMinutes(5).ToString('o')
+
     $prePath = & $writeCapture 'e1-pre.json' $tokensA 3 $true $true $tid $true $preUtc
     $logGood = & $writeLog 'v-good.jsonl' @(
         @{ Phase = 'pre'; State = 0 }
         @{ Phase = 'disconnect-observed'; State = 4 }
         @{ Phase = 'post'; State = 0 }
     )
-    $postUtc = (Get-Date).ToUniversalTime().AddMinutes(5).ToString('o')
     $postPath = & $writeCapture 'e1-post.json' $tokensA 3 $true $true $tid $true $postUtc
 
-    # ---- V1: complete valid dataset => PASS ----
+    # ======================= E1 V-series =======================
     $v = Get-P9HE1Verdict -PreCapturePath $prePath -PostCapturePath $postPath -ObserverLogPath $logGood `
         -TargetSessionId 3 -TargetUser 'qauser' -TargetLogonTime $logon -TrialId $tid
     Add-P9HTestResult -Id 'V1' -Title 'Complete valid dataset satisfies E1' `
@@ -721,7 +680,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} reasons={1}" -f $v.Verdict, ($v.Reasons -join ',')) `
         -Pass ($v.Verdict -eq 'PASS') -Evidence $logGood
 
-    # ---- V2: two valid captures without a proven transition ----
     $logNoProof = & $writeLog 'v-noproof.jsonl' @(
         @{ Phase = 'pre'; State = 0 }
         @{ Phase = 'disconnect-observed'; State = 0 }
@@ -733,7 +691,6 @@ function Invoke-P9HVerdictTests {
         -Input 'disconnect never observed' -Expected 'NOT FULLY EVIDENCED' `
         -Actual ("Verdict={0}" -f $v.Verdict) -Pass ($v.Verdict -eq 'NOT FULLY EVIDENCED') -Evidence $logNoProof
 
-    # ---- V3: a new logon reusing the session id is not accepted ----
     $records = @([pscustomobject]@{ SessionId = 3; User = 'qauser'; State = 4; StationName = 'RDP-Tcp#0'; LogonTime = '2026-11-11T11:11:11.0000000Z' })
     $m = Get-P9HTargetSessionRecord -Records $records -SessionId 3 -User 'qauser' -LogonTime $logon
     Add-P9HTestResult -Id 'V3' -Title 'A new logon reusing the session id is not accepted' `
@@ -741,11 +698,7 @@ function Invoke-P9HVerdictTests {
         -Actual ("Ok={0} reason={1}" -f $m.Ok, $m.Reason) `
         -Pass ((-not $m.Ok) -and $m.Reason -eq 'logon-mismatch') -Evidence $null
 
-    # ================= N2 fixtures =================
-    $windowId = 'DevWS-main-p9h-item'
-    $terminalId = 'p9h-item'
-    $setId = 'main'
-
+    # ======================= shared N2 fixtures =======================
     $fixturePath = Join-Path $dir 'n2-fixture.json'
     Write-P9HArtifact -Path $fixturePath -Lines @(([ordered]@{
                 itemId = $terminalId; enabledItems = 1; enabledTerminals = 1; totalItems = 1
@@ -759,89 +712,125 @@ function Invoke-P9HVerdictTests {
     $preWin = Join-Path $dir 'n2-pre-windows.json'
     Write-P9HArtifact -Path $preWin -Lines @('{"Windows":[]}')
 
-    # The bootstrap argv the PRODUCT actually writes (devws-terminal.ps1:182-199).
-    $bootstrapCmd = 'pwsh.exe -NoExit -File "C:\Program Files\DevWS\privileged\helpers\cwd-shell-bootstrap.ps1" ' +
-        "-SetId $setId -TerminalId $terminalId -WindowId $windowId -TabIndex 0 -SessionId synthetic-session " +
-        '-PublicationPath "C:\ProgramData\DevWS\x.json" -ChildSpecBase64 e30='
-
     $postWinPath = Join-Path $dir 'n2-post-windows.json'
     Write-P9HArtifact -Path $postWinPath -Lines @(([ordered]@{
                 Windows = @([ordered]@{ hwnd = '0xA1'; pid = 4242; visible = $true; class = 'CASCADIA_HOSTING_WINDOW_CLASS'; x = 44; y = 52; width = 1129; height = 635; title = $windowId })
             } | ConvertTo-Json -Depth 5))
 
+    # The argv the PRODUCT actually writes (src/lib/devws-terminal.ps1:182-199).
+    $bootstrapCmd = 'pwsh.exe -NoExit -File "C:\Program Files\DevWS\privileged\helpers\cwd-shell-bootstrap.ps1" ' +
+        "-SetId $setId -TerminalId $terminalId -WindowId $windowId -TabIndex 0 -SessionId synthetic-session " +
+        '-PublicationPath "C:\ProgramData\DevWS\x.json" -ChildSpecBase64 e30='
+
+    $launchStart = (Get-Date).ToUniversalTime().AddMinutes(-1)
+    $launchEnd = (Get-Date).ToUniversalTime().AddMinutes(1)
+    $procStart = (Get-Date).ToUniversalTime()
+
     $newProcPath = Join-Path $dir 'n2-new-processes.json'
     Write-P9HArtifact -Path $newProcPath -Lines @(([ordered]@{
-                Added = @([ordered]@{ pid = 4242; ppid = 4240; name = 'pwsh.exe'; startUtc = (Get-P9HUtcStamp); commandLine = $bootstrapCmd })
+                Added = @([ordered]@{ pid = 4242; ppid = 4240; name = 'pwsh.exe'; startUtc = $procStart.ToString('o'); commandLine = $bootstrapCmd })
             } | ConvertTo-Json -Depth 5))
 
     $exitPath = Join-Path $dir 'n2-exit-good.json'
     $rec = New-P9HExitRecord -TrialId $tid -Outcome 'exited' -ExitCode 0 -LauncherPid 4240 `
         -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $dir `
-        -LaunchedAtUtc (Get-P9HUtcStamp) -ExitedAtUtc (Get-P9HUtcStamp)
+        -LaunchedAtUtc $launchStart.ToString('o') -ExitedAtUtc $launchEnd.ToString('o')
     $null = Write-P9HExitRecord -Path $exitPath -Record $rec
 
-    $e1 = (@{ event = 'lifecycle-layout-plan'; source = 'relative'; skipped = @($terminalId); trialId = $tid; planId = 'plan-1' } | ConvertTo-Json -Compress)
-    $e2 = (@{ event = 'stage2-broker-ready'; planId = 'plan-1'; failed = 0 } | ConvertTo-Json -Compress)
-    $e3 = (@{ event = 'stage2-terminal-final'; planId = 'plan-1'; finalized = 1; failures = 0 } | ConvertTo-Json -Compress)
-    $e4 = (@{ event = 'transaction-end'; planId = 'plan-1'; broker = $true; uncertain = $false; failures = @() } | ConvertTo-Json -Compress)
-
-    $tracePath = Join-Path $dir 'n2-trace.jsonl'
-    Write-P9HArtifact -Path $tracePath -Lines @($e1, $e2, $e3, $e4)
-
-    $n2args = @{
-        FixturePath     = $fixturePath
-        StdoutPath      = $stdoutPath
-        PreWindowPath   = $preWin
-        PostWindowPath  = $postWinPath
-        ExitRecordPath  = $exitPath
-        NewProcessPath  = $newProcPath
-        TrialId         = $tid
-        ExpectedWindowId   = $windowId
-        ExpectedTerminalId = $terminalId
-        ExpectedSetId      = $setId
+    # The REAL production trace shape: framework fields event/utcMs/pid, data
+    # fields per src/lib/devws-launch.ps1, planId ONLY on broker-ready, and `set`
+    # as the transaction identity (the product emits no trialId at all).
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $mkEvent = {
+        param([string]$event, [hashtable]$extra, [long]$offsetMs)
+        $o = @{ event = $event; utcMs = ($nowMs + $offsetMs); pid = 9000 }
+        foreach ($k in $extra.Keys) { $o[$k] = $extra[$k] }
+        return ($o | ConvertTo-Json -Compress)
     }
 
-    # ---- V4: missing exit record => N2-B INCONCLUSIVE ----
+    $traceLines = @(
+        (& $mkEvent 'lifecycle-layout-plan' @{ set = $setId; profileAware = $false; source = 'relative'; profileId = ''; fingerprint = 'SYNTH1234'; skipped = @($terminalId) } 0)
+        (& $mkEvent 'transaction-start' @{ set = $setId; terminals = 1; apps = 0 } 10)
+        (& $mkEvent 'stage2-broker-prepare-sent' @{ set = $setId } 20)
+        (& $mkEvent 'stage2-broker-ready' @{ planId = 'plan-real-1'; elapsedMs = 1140; present = 0; missing = 1; ambiguous = 0; failed = 0 } 30)
+        (& $mkEvent 'stage2-go-ack' @{ recheckMs = 0; ackAt = 123 } 40)
+        (& $mkEvent 'stage2-terminal-kick' @{ count = 1; firstAt = 456; lastAt = 456 } 50)
+        (& $mkEvent 'stage2-terminal-final' @{ finalized = 1; failures = 0 } 60)
+        (& $mkEvent 'transaction-end' @{ set = $setId; broker = $true; uncertain = $false; layoutSource = 'relative'; profileId = ''; failures = @() } 70)
+    )
+    $tracePath = Join-Path $dir 'n2-trace.jsonl'
+    Write-P9HArtifact -Path $tracePath -Lines $traceLines
+
+    $n2args = @{
+        FixturePath = $fixturePath; StdoutPath = $stdoutPath
+        PreWindowPath = $preWin; PostWindowPath = $postWinPath
+        ExitRecordPath = $exitPath; NewProcessPath = $newProcPath
+        TrialId = $tid
+        ExpectedWindowId = $windowId; ExpectedTerminalId = $terminalId; ExpectedSetId = $setId
+    }
+
+    function Try-N2([hashtable]$overrides) {
+        $a = Copy-P9HArgs -Table $n2args
+        $a.TracePath = $tracePath
+        foreach ($k in $overrides.Keys) { $a[$k] = $overrides[$k] }
+        return Get-P9HN2Verdicts @a
+    }
+
+    # ======================= N2 V-series =======================
     $a4 = Copy-P9HArgs -Table $n2args; $a4.TracePath = $tracePath; $a4.ExitRecordPath = (Join-Path $dir 'missing-exit.json')
     $nv = Get-P9HN2Verdicts @a4
     Add-P9HTestResult -Id 'V4' -Title 'Clean broker trace without exit record cannot PASS N2-B' `
         -Input 'absent exit record' -Expected 'N2B=INCONCLUSIVE' `
         -Actual ("N2B={0}" -f $nv.N2B.Verdict) -Pass ($nv.N2B.Verdict -eq 'INCONCLUSIVE') -Evidence $tracePath
-
-    # ---- V5: N2-A PASS does not imply N2-B PASS ----
-    Add-P9HTestResult -Id 'V5' -Title 'N2-A PASS does not imply N2-B PASS' -Input 'same run as V4' `
+    # V5 proves INDEPENDENCE: N2-A can PASS while N2-B does not. It must break
+    # only an N2-B input, because a missing exit record also removes the launch
+    # window that N2-A attribution needs, making BOTH verdicts indeterminate
+    # (that is V4's point, not V5's).
+    $v5BadTrace = Join-Path $dir 'v5-trace.jsonl'
+    Write-P9HArtifact -Path $v5BadTrace -Lines @(
+        (& $mkEvent 'lifecycle-layout-plan' @{ set = $setId; profileAware = $false; source = 'relative'; profileId = ''; fingerprint = 'X'; skipped = @($terminalId) } 0)
+        (& $mkEvent 'stage2-broker-ready' @{ planId = 'plan-v5'; elapsedMs = 1; present = 0; missing = 1; ambiguous = 0; failed = 0 } 30)
+        (& $mkEvent 'stage2-terminal-final' @{ finalized = 1; failures = 1 } 60)
+        (& $mkEvent 'transaction-end' @{ set = $setId; broker = $true; uncertain = $false; layoutSource = 'relative'; profileId = ''; failures = @('terminal identification failed') } 70)
+    )
+    $nv5 = Try-N2 @{ TracePath = $v5BadTrace }
+    # V5 proves INDEPENDENCE: N2-A can PASS while N2-B does not. The isolating
+    # input keeps the trace, window and attribution evidence fully valid and
+    # breaks ONLY an N2-B input - a captured NONZERO exit code. (A broken trace
+    # would fail both verdicts, which is V4's territory, not an independence proof.)
+    $exitV5 = Join-Path $dir 'v5-exit-nonzero.json'
+    $recV5 = New-P9HExitRecord -TrialId $tid -Outcome 'exited' -ExitCode 3 -LauncherPid 4240 `
+        -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $dir `
+        -LaunchedAtUtc $launchStart.ToString('o') -ExitedAtUtc $launchEnd.ToString('o')
+    $null = Write-P9HExitRecord -Path $exitV5 -Record $recV5
+    $nv5 = Try-N2 @{ ExitRecordPath = $exitV5 }
+    Add-P9HTestResult -Id 'V5' -Title 'N2-A PASS does not imply N2-B PASS' `
+        -Input 'valid trace and window evidence, captured nonzero exit code 3' `
         -Expected 'N2A=PASS and N2B!=PASS' `
-        -Actual ("N2A={0} N2B={1}" -f $nv.N2A.Verdict, $nv.N2B.Verdict) `
-        -Pass ($nv.N2A.Verdict -eq 'PASS' -and $nv.N2B.Verdict -ne 'PASS') -Evidence $tracePath
+        -Actual ("N2A={0} N2B={1}" -f $nv5.N2A.Verdict, $nv5.N2B.Verdict) `
+        -Pass ($nv5.N2A.Verdict -eq 'PASS' -and $nv5.N2B.Verdict -ne 'PASS') -Evidence $exitV5
 
-    # ---- V6: complete evidence => N2-B PASS (actual detached architecture) ----
-    $a6 = Copy-P9HArgs -Table $n2args; $a6.TracePath = $tracePath
-    $nv2 = Get-P9HN2Verdicts @a6
-    Add-P9HTestResult -Id 'V6' -Title 'Complete evidence passes N2-B (detached broker-created terminal)' `
-        -Input 'exit 0 + argv identity + attributed window + valid trace' -Expected 'N2B=PASS' `
-        -Actual ("N2B={0} exit={1} procAttr={2} winAttr={3} trace={4}" -f $nv2.N2B.Verdict, $nv2.N2B.ExitCode, $nv2.N2B.ProcessAttributed, $nv2.N2B.WindowAttributed, $nv2.N2B.TraceValid) `
+    $nv2 = Try-N2 @{}
+    Add-P9HTestResult -Id 'V6' -Title 'Complete evidence passes N2-B (real detached architecture)' `
+        -Input 'production-shaped trace + exit 0 + argv identity + attributed window' -Expected 'N2B=PASS' `
+        -Actual ("N2B={0} exit={1} procAttr={2} winAttr={3} trace={4} planId={5}" -f $nv2.N2B.Verdict, $nv2.N2B.ExitCode, $nv2.N2B.ProcessAttributed, $nv2.N2B.WindowAttributed, $nv2.N2B.TraceValid, $nv2.N2B.TracePlanId) `
         -Pass ($nv2.N2B.Verdict -eq 'PASS' -and $nv2.N2B.ExitCode -eq 0) -Evidence $exitPath
 
-    # ---- V7: captured nonzero exit => FAIL ----
     $exitBad = Join-Path $dir 'n2-exit-bad.json'
     $recBad = New-P9HExitRecord -TrialId $tid -Outcome 'exited' -ExitCode 1 -LauncherPid 4240 `
         -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $dir `
-        -LaunchedAtUtc (Get-P9HUtcStamp) -ExitedAtUtc (Get-P9HUtcStamp)
+        -LaunchedAtUtc $launchStart.ToString('o') -ExitedAtUtc $launchEnd.ToString('o')
     $null = Write-P9HExitRecord -Path $exitBad -Record $recBad
-    $a7 = Copy-P9HArgs -Table $n2args; $a7.TracePath = $tracePath; $a7.ExitRecordPath = $exitBad
-    $nv3 = Get-P9HN2Verdicts @a7
+    $nv3 = Try-N2 @{ ExitRecordPath = $exitBad }
     Add-P9HTestResult -Id 'V7' -Title 'Captured nonzero exit is a lifecycle FAIL' `
         -Input 'exit code 1' -Expected 'N2B=FAIL' -Actual ("N2B={0}" -f $nv3.N2B.Verdict) `
         -Pass ($nv3.N2B.Verdict -eq 'FAIL') -Evidence $exitBad
 
-    # ---- V8: instrumentation gap => INCONCLUSIVE ----
-    $a8 = Copy-P9HArgs -Table $n2args; $a8.TracePath = $tracePath; $a8.ExitRecordPath = (Join-Path $dir 'none.json')
-    $nv4 = Get-P9HN2Verdicts @a8
+    $nv4 = Try-N2 @{ ExitRecordPath = (Join-Path $dir 'none.json') }
     Add-P9HTestResult -Id 'V8' -Title 'Instrumentation gap yields INCONCLUSIVE not FAIL' `
         -Input 'absent exit record' -Expected 'N2B=INCONCLUSIVE' `
         -Actual ("N2B={0}" -f $nv4.N2B.Verdict) -Pass ($nv4.N2B.Verdict -eq 'INCONCLUSIVE') -Evidence $null
 
-    # ---- V9: no negative-origin monitor ----
     $p9 = & $writeCapture 'v9-pre.json' $tokensA 3 $true $true $tid $false $preUtc
     $q9 = & $writeCapture 'v9-post.json' $tokensA 3 $true $true $tid $false $postUtc
     $v9 = Get-P9HE1Verdict -PreCapturePath $p9 -PostCapturePath $q9 -ObserverLogPath $logGood `
@@ -851,7 +840,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} negObserved={1}" -f $v9.Verdict, $v9.SubObservations['negativeOriginObserved']) `
         -Pass ($v9.Verdict -ne 'PASS') -Evidence $p9
 
-    # ---- V10: wrong session ----
     $p10 = & $writeCapture 'v10-pre.json' $tokensA 5 $true $true $tid $true $preUtc
     $q10 = & $writeCapture 'v10-post.json' $tokensA 5 $true $true $tid $true $postUtc
     $v10 = Get-P9HE1Verdict -PreCapturePath $p10 -PostCapturePath $q10 -ObserverLogPath $logGood `
@@ -861,7 +849,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} matchTarget={1}" -f $v10.Verdict, $v10.SubObservations['sessionMatchesTarget']) `
         -Pass ($v10.Verdict -ne 'PASS') -Evidence $p10
 
-    # ---- V11: incompatible pre/post sessions ----
     $p11 = & $writeCapture 'v11-pre.json' $tokensA 3 $true $true $tid $true $preUtc
     $q11 = & $writeCapture 'v11-post.json' $tokensA 4 $true $true $tid $true $postUtc
     $v11 = Get-P9HE1Verdict -PreCapturePath $p11 -PostCapturePath $q11 -ObserverLogPath $logGood `
@@ -871,7 +858,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} consistent={1}" -f $v11.Verdict, $v11.SubObservations['sessionConsistent']) `
         -Pass ($v11.Verdict -ne 'PASS') -Evidence $p11
 
-    # ---- V12: no raw token identity at all ----
     $p12 = & $writeCapture 'v12-pre.json' $tokensA 3 $false $false $tid $true $preUtc
     $q12 = & $writeCapture 'v12-post.json' $tokensA 3 $false $false $tid $true $postUtc
     $v12 = Get-P9HE1Verdict -PreCapturePath $p12 -PostCapturePath $q12 -ObserverLogPath $logGood `
@@ -881,7 +867,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} reasons={1}" -f $v12.Verdict, ($v12.Reasons -join ',')) `
         -Pass ($v12.Verdict -ne 'PASS') -Evidence $p12
 
-    # ---- V13: different tokens with a valid transition ----
     $p13 = & $writeCapture 'v13-pre.json' $tokensA 3 $true $true $tid $true $preUtc
     $q13 = & $writeCapture 'v13-post.json' $tokensDiff 3 $true $true $tid $true $postUtc
     $v13 = Get-P9HE1Verdict -PreCapturePath $p13 -PostCapturePath $q13 -ObserverLogPath $logGood `
@@ -891,7 +876,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} reasons={1}" -f $v13.Verdict, ($v13.Reasons -join ',')) `
         -Pass ($v13.Verdict -ne 'PASS' -and $v13.Reasons -contains 'token-sets-differ') -Evidence $q13
 
-    # ---- V14: pre+disconnect but no post-reconnect record ----
     $logIncomplete = & $writeLog 'v14.jsonl' @(
         @{ Phase = 'pre'; State = 0 }
         @{ Phase = 'disconnect-observed'; State = 4 }
@@ -903,84 +887,161 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} reason={1}" -f $v14.Verdict, $v14.DisconnectReason) `
         -Pass ($v14.Verdict -eq 'NOT FULLY EVIDENCED') -Evidence $logIncomplete
 
-    # ================= W-series: trace validity + causal attribution =================
+    # ======================= N-series (RESTORED from Stage 2.1) =======================
+    # N1: exit 0 + clean trace but NO attributable new process.
+    $noProcPath = Join-Path $dir 'n1-new-processes.json'
+    Write-P9HArtifact -Path $noProcPath -Lines @('{"Added":[]}')
+    $n1 = Try-N2 @{ NewProcessPath = $noProcPath }
+    Add-P9HTestResult -Id 'N1' -Title 'Exit 0 with a clean trace but no attributable process cannot PASS N2-B' `
+        -Input 'empty Added process list' -Expected 'N2B not PASS' `
+        -Actual ("N2B={0} procAttr={1} reason={2}" -f $n1.N2B.Verdict, $n1.N2B.ProcessAttributed, $n1.N2B.AttributionReason) `
+        -Pass ($n1.N2B.Verdict -ne 'PASS') -Evidence $noProcPath
 
-    function Try-N2([hashtable]$overrides) {
-        $a = Copy-P9HArgs -Table $n2args
-        $a.TracePath = $tracePath
-        foreach ($k in $overrides.Keys) { $a[$k] = $overrides[$k] }
-        return Get-P9HN2Verdicts @a
-    }
+    # N2: exit 0 + clean trace but NO attributable window.
+    $noWinPath = Join-Path $dir 'n2-post-windows-empty.json'
+    Write-P9HArtifact -Path $noWinPath -Lines @('{"Windows":[]}')
+    $n2v = Try-N2 @{ PostWindowPath = $noWinPath }
+    Add-P9HTestResult -Id 'N2' -Title 'Exit 0 with a clean trace but no attributable window cannot PASS N2-B' `
+        -Input 'valid empty post-window inventory' -Expected 'N2B not PASS' `
+        -Actual ("N2B={0} winAttr={1}" -f $n2v.N2B.Verdict, $n2v.N2B.WindowAttributed) `
+        -Pass ($n2v.N2B.Verdict -ne 'PASS') -Evidence $noWinPath
 
-    # ---- W1: complete valid trace is eligible for PASS ----
+    # N3: new window owned by an unrelated PID.
+    $unrelatedWin = Join-Path $dir 'n3-post-windows.json'
+    Write-P9HArtifact -Path $unrelatedWin -Lines @(([ordered]@{
+                Windows = @([ordered]@{ hwnd = '0xB2'; pid = 9999; visible = $true; class = 'CASCADIA_HOSTING_WINDOW_CLASS'; x = 10; y = 10; width = 800; height = 600; title = 'unrelated' })
+            } | ConvertTo-Json -Depth 5))
+    $n3 = Try-N2 @{ PostWindowPath = $unrelatedWin }
+    Add-P9HTestResult -Id 'N3' -Title 'A new window owned by an unrelated PID cannot PASS N2-B' `
+        -Input 'window pid 9999, launched process pid 4242' -Expected 'N2B not PASS' `
+        -Actual ("N2B={0} winAttr={1}" -f $n3.N2B.Verdict, $n3.N2B.WindowAttributed) `
+        -Pass ($n3.N2B.Verdict -ne 'PASS') -Evidence $unrelatedWin
+
+    # N4: trace from a different transaction (`set` mismatch - the product's id).
+    $foreignTrace = Join-Path $dir 'n4-trace.jsonl'
+    Write-P9HArtifact -Path $foreignTrace -Lines @(
+        (& $mkEvent 'lifecycle-layout-plan' @{ set = 'other-set'; profileAware = $false; source = 'relative'; profileId = ''; fingerprint = 'X'; skipped = @($terminalId) } 0)
+        (& $mkEvent 'stage2-broker-ready' @{ planId = 'plan-foreign'; elapsedMs = 1; present = 0; missing = 1; ambiguous = 0; failed = 0 } 30)
+        (& $mkEvent 'stage2-terminal-final' @{ finalized = 1; failures = 0 } 60)
+        (& $mkEvent 'transaction-end' @{ set = 'other-set'; broker = $true; uncertain = $false; layoutSource = 'relative'; profileId = ''; failures = @() } 70)
+    )
+    $n4 = Try-N2 @{ TracePath = $foreignTrace }
+    Add-P9HTestResult -Id 'N4' -Title 'A trace belonging to a different transaction cannot PASS N2-B' `
+        -Input "trace set='other-set'" -Expected 'N2B not PASS' `
+        -Actual ("N2B={0} reasons={1}" -f $n4.N2B.Verdict, ($n4.N2B.Reasons -join ',')) `
+        -Pass ($n4.N2B.Verdict -ne 'PASS') -Evidence $foreignTrace
+
+    # N5: degraded process evidence (no recovered start time).
+    $degradedProc = Join-Path $dir 'n5-new-processes.json'
+    Write-P9HArtifact -Path $degradedProc -Lines @(([ordered]@{
+                Added = @([ordered]@{ pid = 4242; ppid = 4240; name = 'pwsh.exe'; startUtc = $null; commandLine = $bootstrapCmd })
+            } | ConvertTo-Json -Depth 5))
+    $n5 = Try-N2 @{ NewProcessPath = $degradedProc }
+    Add-P9HTestResult -Id 'N5' -Title 'Degraded process evidence yields INCONCLUSIVE, never an inferred PASS' `
+        -Input 'new process with no recovered start time' -Expected 'N2B=INCONCLUSIVE' `
+        -Actual ("N2B={0} procAttr={1}" -f $n5.N2B.Verdict, $n5.N2B.ProcessAttributed) `
+        -Pass ($n5.N2B.Verdict -eq 'INCONCLUSIVE') -Evidence $degradedProc
+
+    # N6: missing post-window artifact.
+    $n6 = Try-N2 @{ PostWindowPath = (Join-Path $dir 'no-such-windows.json') }
+    Add-P9HTestResult -Id 'N6' -Title 'Missing post-window artifact cannot PASS N2-A' `
+        -Input 'absent post-window observation' -Expected 'N2A not PASS, observed=false' `
+        -Actual ("N2A={0} postObserved={1}" -f $n6.N2A.Verdict, $n6.N2A.PostStateObserved) `
+        -Pass ($n6.N2A.Verdict -ne 'PASS' -and -not $n6.N2A.PostStateObserved) -Evidence $null
+
+    # N7: malformed post-window artifact.
+    $malformedWin = Join-Path $dir 'n7-post-windows.json'
+    Write-P9HArtifact -Path $malformedWin -Lines @('{"Windows": [')
+    $n7 = Try-N2 @{ PostWindowPath = $malformedWin }
+    Add-P9HTestResult -Id 'N7' -Title 'Malformed post-window artifact cannot PASS N2-A' `
+        -Input 'truncated JSON' -Expected 'N2A not PASS' `
+        -Actual ("N2A={0}" -f $n7.N2A.Verdict) `
+        -Pass ($n7.N2A.Verdict -ne 'PASS') -Evidence $malformedWin
+
+    # N8: EMPTY but valid inventory. Stage 2.1 expected PASS here; Stage 2.3
+    # requires positively observed window creation, so an empty inventory is an
+    # evidence gap, NOT a placement-skip PASS.
+    $n8 = Try-N2 @{ PostWindowPath = $noWinPath }
+    Add-P9HTestResult -Id 'N8' -Title 'A valid but empty window inventory cannot evidence the placement skip' `
+        -Input 'observed zero windows, nothing at 9000,9000' -Expected 'N2A not PASS (no window creation observed)' `
+        -Actual ("N2A={0} postObserved={1} postCount={2}" -f $n8.N2A.Verdict, $n8.N2A.PostStateObserved, $n8.N2A.PostWindowCount) `
+        -Pass ($n8.N2A.Verdict -ne 'PASS') -Evidence $noWinPath
+
+    # N9: fallback actually applied.
+    $fallbackWin = Join-Path $dir 'n9-post-windows.json'
+    Write-P9HArtifact -Path $fallbackWin -Lines @(([ordered]@{
+                Windows = @([ordered]@{ hwnd = '0xC3'; pid = 4242; visible = $true; class = 'CASCADIA_HOSTING_WINDOW_CLASS'; x = 9000; y = 9000; width = 640; height = 480; title = 'fallback' })
+            } | ConvertTo-Json -Depth 5))
+    $n9 = Try-N2 @{ PostWindowPath = $fallbackWin }
+    Add-P9HTestResult -Id 'N9' -Title 'A window observed at the fallback rectangle fails N2-A' `
+        -Input 'window at 9000,9000' -Expected 'N2A not PASS, fallbackApplied=true' `
+        -Actual ("N2A={0} fallbackApplied={1}" -f $n9.N2A.Verdict, $n9.N2A.FallbackApplied) `
+        -Pass ($n9.N2A.Verdict -ne 'PASS' -and $n9.N2A.FallbackApplied -eq $true) -Evidence $fallbackWin
+
+    # ======================= W-series: trace validity + attribution =======================
     $w1 = Try-N2 @{}
-    Add-P9HTestResult -Id 'W1' -Title 'Complete valid trace with attribution is eligible for PASS' `
-        -Input 'four required events, one planId, in order' -Expected 'PASS' `
-        -Actual ("N2B={0} traceOk={1}" -f $w1.N2B.Verdict, $w1.N2B.TraceValid) `
+    Add-P9HTestResult -Id 'W1' -Title 'Complete valid production trace with attribution is eligible for PASS' `
+        -Input 'real schema: set + utcMs + planId on broker-ready' -Expected 'PASS' `
+        -Actual ("N2B={0} traceOk={1} planId={2}" -f $w1.N2B.Verdict, $w1.N2B.TraceValid, $w1.N2B.TracePlanId) `
         -Pass ($w1.N2B.Verdict -eq 'PASS') -Evidence $tracePath
 
-    # ---- W2: valid events + one malformed line ----
     $t2 = Join-Path $dir 'w2-trace.jsonl'
-    Write-P9HArtifact -Path $t2 -Lines @($e1, $e2, '{"event":"noise","junk":', $e3, $e4)
+    Write-P9HArtifact -Path $t2 -Lines @($traceLines[0], $traceLines[3], '{"event":"noise","junk":', $traceLines[6], $traceLines[7])
     $w2 = Try-N2 @{ TracePath = $t2 }
     Add-P9HTestResult -Id 'W2' -Title 'Valid events plus one malformed trace line cannot PASS' `
         -Input 'all required events present, one line unparseable' -Expected 'not PASS' `
-        -Actual ("N2B={0} reason={1}" -f $w2.N2B.Verdict, $w2.N2B.Reasons -join ',') `
+        -Actual ("N2B={0} reason={1}" -f $w2.N2B.Verdict, ($w2.N2B.Reasons -join ',')) `
         -Pass ($w2.N2B.Verdict -ne 'PASS') -Evidence $t2
 
-    # ---- W3: missing required event ----
     $t3 = Join-Path $dir 'w3-trace.jsonl'
-    Write-P9HArtifact -Path $t3 -Lines @($e1, $e2, $e4)
+    Write-P9HArtifact -Path $t3 -Lines @($traceLines[0], $traceLines[3], $traceLines[7])
     $w3 = Try-N2 @{ TracePath = $t3 }
     Add-P9HTestResult -Id 'W3' -Title 'A trace missing a required event cannot PASS' `
         -Input 'no stage2-terminal-final' -Expected 'not PASS' `
         -Actual ("N2B={0}" -f $w3.N2B.Verdict) -Pass ($w3.N2B.Verdict -ne 'PASS') -Evidence $t3
 
-    # ---- W4: contradictory finalization events ----
     $t4 = Join-Path $dir 'w4-trace.jsonl'
-    Write-P9HArtifact -Path $t4 -Lines @($e1, $e2, (@{ event = 'stage2-terminal-final'; planId = 'plan-1'; finalized = 1; failures = 2 } | ConvertTo-Json -Compress), $e3, $e4)
+    Write-P9HArtifact -Path $t4 -Lines @($traceLines[0], $traceLines[3],
+        (& $mkEvent 'stage2-terminal-final' @{ finalized = 1; failures = 2 } 55), $traceLines[6], $traceLines[7])
     $w4 = Try-N2 @{ TracePath = $t4 }
     Add-P9HTestResult -Id 'W4' -Title 'Contradictory finalization events cannot PASS' `
         -Input 'two terminal-final events with different outcomes' -Expected 'not PASS' `
-        -Actual ("N2B={0} reason={1}" -f $w4.N2B.Verdict, $w4.N2B.Reasons -join ',') `
+        -Actual ("N2B={0} reason={1}" -f $w4.N2B.Verdict, ($w4.N2B.Reasons -join ',')) `
         -Pass ($w4.N2B.Verdict -ne 'PASS') -Evidence $t4
 
-    # ---- W5: events from different trials ----
+    # W5: events from different transactions (set conflict) - the product's own id.
     $t5 = Join-Path $dir 'w5-trace.jsonl'
     Write-P9HArtifact -Path $t5 -Lines @(
-        (@{ event = 'lifecycle-layout-plan'; source = 'relative'; skipped = @($terminalId); trialId = $tid; planId = 'plan-1' } | ConvertTo-Json -Compress)
-        (@{ event = 'stage2-broker-ready'; planId = 'plan-1'; failed = 0; trialId = 'p9h-foreign-99999999' } | ConvertTo-Json -Compress)
-        $e3, $e4
+        (& $mkEvent 'lifecycle-layout-plan' @{ set = $setId; profileAware = $false; source = 'relative'; profileId = ''; fingerprint = 'X'; skipped = @($terminalId) } 0)
+        (& $mkEvent 'stage2-broker-ready' @{ planId = 'plan-1'; elapsedMs = 1; present = 0; missing = 1; ambiguous = 0; failed = 0 } 30)
+        (& $mkEvent 'stage2-terminal-final' @{ finalized = 1; failures = 0 } 60)
+        (& $mkEvent 'transaction-end' @{ set = 'conflicting-set'; broker = $true; uncertain = $false; layoutSource = 'relative'; profileId = ''; failures = @() } 70)
     )
     $w5 = Try-N2 @{ TracePath = $t5 }
-    Add-P9HTestResult -Id 'W5' -Title 'Events from different trials cannot PASS' `
-        -Input 'conflicting trialId across events' -Expected 'not PASS' `
-        -Actual ("N2B={0} reason={1}" -f $w5.N2B.Verdict, $w5.N2B.Reasons -join ',') `
+    Add-P9HTestResult -Id 'W5' -Title 'Events carrying conflicting transaction identities cannot PASS' `
+        -Input "plan set='$setId', transaction-end set='conflicting-set'" -Expected 'not PASS' `
+        -Actual ("N2B={0} reason={1}" -f $w5.N2B.Verdict, ($w5.N2B.Reasons -join ',')) `
         -Pass ($w5.N2B.Verdict -ne 'PASS') -Evidence $t5
 
-    # ---- W6: incompatible plan ids ----
+    # W6: incompatible plan ids (broker-ready vs broker-replanned).
     $t6 = Join-Path $dir 'w6-trace.jsonl'
-    Write-P9HArtifact -Path $t6 -Lines @(
-        (@{ event = 'lifecycle-layout-plan'; source = 'relative'; skipped = @($terminalId); trialId = $tid; planId = 'plan-A' } | ConvertTo-Json -Compress)
-        (@{ event = 'stage2-broker-ready'; planId = 'plan-B'; failed = 0 } | ConvertTo-Json -Compress)
-        (@{ event = 'stage2-terminal-final'; planId = 'plan-C'; finalized = 1; failures = 0 } | ConvertTo-Json -Compress)
-        (@{ event = 'transaction-end'; planId = 'plan-D'; broker = $true; uncertain = $false; failures = @() } | ConvertTo-Json -Compress)
-    )
+    Write-P9HArtifact -Path $t6 -Lines @($traceLines[0],
+        (& $mkEvent 'stage2-broker-ready' @{ planId = 'plan-A'; elapsedMs = 1; present = 0; missing = 1; ambiguous = 0; failed = 0 } 30),
+        (& $mkEvent 'stage2-broker-replanned' @{ planId = 'plan-B' } 35),
+        $traceLines[6], $traceLines[7])
     $w6 = Try-N2 @{ TracePath = $t6 }
     Add-P9HTestResult -Id 'W6' -Title 'Events carrying incompatible plan ids cannot PASS' `
-        -Input 'four different planIds' -Expected 'not PASS' `
-        -Actual ("N2B={0} reason={1}" -f $w6.N2B.Verdict, $w6.N2B.Reasons -join ',') `
+        -Input 'broker-ready plan-A then broker-replanned plan-B' -Expected 'not PASS' `
+        -Actual ("N2B={0} reason={1}" -f $w6.N2B.Verdict, ($w6.N2B.Reasons -join ',')) `
         -Pass ($w6.N2B.Verdict -ne 'PASS') -Evidence $t6
 
-    # ---- W7: invalid event order ----
     $t7 = Join-Path $dir 'w7-trace.jsonl'
-    Write-P9HArtifact -Path $t7 -Lines @($e1, $e3, $e2, $e4)
+    Write-P9HArtifact -Path $t7 -Lines @($traceLines[0], $traceLines[6], $traceLines[3], $traceLines[7])
     $w7 = Try-N2 @{ TracePath = $t7 }
     Add-P9HTestResult -Id 'W7' -Title 'Events in an invalid causal order cannot PASS' `
         -Input 'terminal-final before broker-ready' -Expected 'not PASS' `
         -Actual ("N2B={0}" -f $w7.N2B.Verdict) -Pass ($w7.N2B.Verdict -ne 'PASS') -Evidence $t7
 
-    # ---- W8: unrelated terminal process with a valid start time ----
     $unrelatedProc = Join-Path $dir 'w8-proc.json'
     Write-P9HArtifact -Path $unrelatedProc -Lines @(([ordered]@{
                 Added = @([ordered]@{ pid = 7777; ppid = 1; name = 'pwsh.exe'; startUtc = (Get-P9HUtcStamp); commandLine = 'pwsh.exe -NoExit -File "C:\Users\someone\Documents\scratch.ps1"' })
@@ -991,7 +1052,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("N2B={0} procAttr={1} reason={2}" -f $w8.N2B.Verdict, $w8.N2B.ProcessAttributed, $w8.N2B.AttributionReason) `
         -Pass ($w8.N2B.Verdict -ne 'PASS') -Evidence $unrelatedProc
 
-    # ---- W9: window owned by the unrelated process ----
     $w9Proc = Join-Path $dir 'w9-proc.json'
     Write-P9HArtifact -Path $w9Proc -Lines @(([ordered]@{
                 Added = @([ordered]@{ pid = 7778; ppid = 1; name = 'pwsh.exe'; startUtc = (Get-P9HUtcStamp); commandLine = 'pwsh.exe -NoProfile' })
@@ -1006,11 +1066,8 @@ function Invoke-P9HVerdictTests {
         -Actual ("N2B={0} winAttr={1}" -f $w9.N2B.Verdict, $w9.N2B.WindowAttributed) `
         -Pass ($w9.N2B.Verdict -ne 'PASS') -Evidence $w9Win
 
-    # ---- W10: matching PID but incompatible creation time ----
     $w10Proc = Join-Path $dir 'w10-proc.json'
     Write-P9HArtifact -Path $w10Proc -Lines @(([ordered]@{
-                # Same PID as the attributed window owner, launch identity present,
-                # but no recoverable start time => cannot be attributed.
                 Added = @([ordered]@{ pid = 4242; ppid = 4240; name = 'pwsh.exe'; startUtc = $null; commandLine = $bootstrapCmd })
             } | ConvertTo-Json -Depth 5))
     $w10 = Try-N2 @{ NewProcessPath = $w10Proc }
@@ -1019,7 +1076,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("N2B={0} procAttr={1}" -f $w10.N2B.Verdict, $w10.N2B.ProcessAttributed) `
         -Pass ($w10.N2B.Verdict -ne 'PASS') -Evidence $w10Proc
 
-    # ---- W11: correct window class but unrelated transaction ----
     $w11Proc = Join-Path $dir 'w11-proc.json'
     Write-P9HArtifact -Path $w11Proc -Lines @(([ordered]@{
                 Added = @([ordered]@{ pid = 4243; ppid = 4240; name = 'pwsh.exe'; startUtc = (Get-P9HUtcStamp); commandLine = $bootstrapCmd.Replace($windowId, 'DevWS-main-OTHER') })
@@ -1030,7 +1086,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("N2B={0} procAttr={1}" -f $w11.N2B.Verdict, $w11.N2B.ProcessAttributed) `
         -Pass ($w11.N2B.Verdict -ne 'PASS') -Evidence $w11Proc
 
-    # ---- W12: clean trace + exit 0, no attribution ----
     $w12Empty = Join-Path $dir 'w12-empty.json'
     Write-P9HArtifact -Path $w12Empty -Lines @('{"Added":[]}')
     $w12 = Try-N2 @{ NewProcessPath = $w12Empty }
@@ -1038,7 +1093,6 @@ function Invoke-P9HVerdictTests {
         -Input 'no new processes at all' -Expected 'not PASS' `
         -Actual ("N2B={0}" -f $w12.N2B.Verdict) -Pass ($w12.N2B.Verdict -ne 'PASS') -Evidence $null
 
-    # ---- W13: inconsistent terminal identifiers ----
     $w13Proc = Join-Path $dir 'w13-proc.json'
     Write-P9HArtifact -Path $w13Proc -Lines @(([ordered]@{
                 Added = @([ordered]@{ pid = 4244; ppid = 4240; name = 'pwsh.exe'; startUtc = (Get-P9HUtcStamp); commandLine = $bootstrapCmd.Replace("-TerminalId $terminalId", '-TerminalId wrong-item') })
@@ -1049,31 +1103,68 @@ function Invoke-P9HVerdictTests {
         -Actual ("N2B={0} procAttr={1}" -f $w13.N2B.Verdict, $w13.N2B.ProcessAttributed) `
         -Pass ($w13.N2B.Verdict -ne 'PASS') -Evidence $w13Proc
 
-    # ---- W14: positive, real detached architecture ----
     $w14 = Try-N2 @{}
     Add-P9HTestResult -Id 'W14' -Title 'The real detached broker-created terminal architecture passes' `
         -Input 'pwsh child carrying -SetId/-TerminalId/-WindowId from the broker' -Expected 'PASS' `
         -Actual ("N2B={0} procAttr={1} winAttr={2}" -f $w14.N2B.Verdict, $w14.N2B.ProcessAttributed, $w14.N2B.WindowAttributed) `
         -Pass ($w14.N2B.Verdict -eq 'PASS') -Evidence $newProcPath
 
-    # ================= X-series: window-omission and E1 raw-monitor contract =================
+    # W15 (Stage 2.3): STALE matching-argv process, started before the launch.
+    $w15Proc = Join-Path $dir 'w15-proc.json'
+    $staleStart = (Get-Date).ToUniversalTime().AddHours(-5).ToString('o')
+    Write-P9HArtifact -Path $w15Proc -Lines @(([ordered]@{
+                Added = @([ordered]@{ pid = 4245; ppid = 4240; name = 'pwsh.exe'; startUtc = $staleStart; commandLine = $bootstrapCmd })
+            } | ConvertTo-Json -Depth 5))
+    $w15 = Try-N2 @{ NewProcessPath = $w15Proc }
+    Add-P9HTestResult -Id 'W15' -Title 'A stale process with matching argv but a pre-launch creation time cannot PASS' `
+        -Input 'correct argv identity, created 5 hours before the launch' -Expected 'not PASS' `
+        -Actual ("N2B={0} procAttr={1} reason={2}" -f $w15.N2B.Verdict, $w15.N2B.ProcessAttributed, $w15.N2B.AttributionReason) `
+        -Pass ($w15.N2B.Verdict -ne 'PASS' -and -not $w15.N2B.ProcessAttributed) -Evidence $w15Proc
 
-    # ---- X1: a request to omit window evidence cannot yield PASS ----
+    # W16 (Stage 2.3): trace with NO planId anywhere.
+    $w16Trace = Join-Path $dir 'w16-trace.jsonl'
+    Write-P9HArtifact -Path $w16Trace -Lines @(
+        (& $mkEvent 'lifecycle-layout-plan' @{ set = $setId; profileAware = $false; source = 'relative'; profileId = ''; fingerprint = 'X'; skipped = @($terminalId) } 0)
+        (& $mkEvent 'stage2-broker-ready' @{ elapsedMs = 1; present = 0; missing = 1; ambiguous = 0; failed = 0 } 30)
+        (& $mkEvent 'stage2-terminal-final' @{ finalized = 1; failures = 0 } 60)
+        (& $mkEvent 'transaction-end' @{ set = $setId; broker = $true; uncertain = $false; layoutSource = 'relative'; profileId = ''; failures = @() } 70)
+    )
+    $w16 = Try-N2 @{ TracePath = $w16Trace }
+    Add-P9HTestResult -Id 'W16' -Title 'A trace with no plan identity cannot PASS' `
+        -Input 'stage2-broker-ready without planId' -Expected 'not PASS' `
+        -Actual ("N2B={0} reason={1}" -f $w16.N2B.Verdict, ($w16.N2B.Reasons -join ',')) `
+        -Pass ($w16.N2B.Verdict -ne 'PASS') -Evidence $w16Trace
+
+    # ======================= X-series: window omission + E1 provenance =======================
     $x1 = $false
     try {
         $a1 = Copy-P9HArgs -Table $n2args
         $a1.TracePath = $tracePath
-        $a1.PostWindowPath = $preWin          # observed, but zero windows
-        $a1.WindowRequired = 'no'             # Stage 2.1 bypass argument
+        $a1.PostWindowPath = $noWinPath
+        $a1.WindowRequired = 'no'
         $r1 = Get-P9HN2Verdicts @a1
         $x1 = ($r1.N2B.Verdict -ne 'PASS')
     }
-    catch { $x1 = $true }   # the parameter no longer exists: request is unsupported
+    catch { $x1 = $true }
     Add-P9HTestResult -Id 'X1' -Title 'A window-omission request cannot lower the N2-B threshold' `
         -Input "WindowRequired='no' with zero observed windows" -Expected 'not PASS (or rejected)' `
         -Actual ("blocked={0}" -f $x1) -Pass $x1 -Evidence $null
 
-    # ---- X2: asserted summary only, no monitor records ----
+    # X1b (Stage 2.3): empty window inventory must not satisfy N2-A either.
+    $x1b = $false
+    try {
+        $a1b = Copy-P9HArgs -Table $n2args
+        $a1b.TracePath = $tracePath
+        $a1b.PostWindowPath = $noWinPath
+        $a1b.WindowRequired = 'no'
+        $r1b = Get-P9HN2Verdicts @a1b
+        $x1b = ($r1b.N2A.Verdict -ne 'PASS')
+    }
+    catch { $x1b = $true }
+    Add-P9HTestResult -Id 'X13' -Title 'An empty window inventory cannot satisfy N2-A even with an omission request' `
+        -Input "WindowRequired='no', Windows=[]" -Expected 'N2A not PASS' `
+        -Actual ("blocked={0}" -f $x1b) -Pass $x1b -Evidence $null
+
     $x2Pre = Join-Path $dir 'x2-pre.json'
     $x2Post = Join-Path $dir 'x2-post.json'
     $summary = [ordered]@{
@@ -1092,7 +1183,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} reasons={1}" -f $x2.Verdict, ($x2.Reasons -join ',')) `
         -Pass ($x2.Verdict -ne 'PASS') -Evidence $x2Pre
 
-    # ---- X3: fabricated negative-origin summary ----
     $x3Pre = Join-Path $dir 'x3-pre.json'
     $x3Post = Join-Path $dir 'x3-post.json'
     $fab = [ordered]@{
@@ -1109,11 +1199,8 @@ function Invoke-P9HVerdictTests {
         -Input 'tokenRectBytes claims x=-9999 with no monitor records' -Expected 'not PASS' `
         -Actual ("Verdict={0}" -f $x3.Verdict) -Pass ($x3.Verdict -ne 'PASS') -Evidence $x3Pre
 
-    # ---- X4: parsedMonitors disagree with the token list ----
-    $x4Pre = & $writeCapture 'x4-pre.json' $tokensA 3 $true $true $tid $true $preUtc `
-        @('path:OTHER/9&ZZZ&0&UID5555', 'path:OTHER/9&ZZZ&0&UID5556')
-    $x4Post = & $writeCapture 'x4-post.json' $tokensA 3 $true $true $tid $true $postUtc `
-        @('path:OTHER/9&ZZZ&0&UID5555', 'path:OTHER/9&ZZZ&0&UID5556')
+    $x4Pre = & $writeCapture 'x4-pre.json' $tokensA 3 $true $true $tid $true $preUtc @('path:OTHER/9&ZZZ&0&UID5555', 'path:OTHER/9&ZZZ&0&UID5556')
+    $x4Post = & $writeCapture 'x4-post.json' $tokensA 3 $true $true $tid $true $postUtc @('path:OTHER/9&ZZZ&0&UID5555', 'path:OTHER/9&ZZZ&0&UID5556')
     $x4 = Get-P9HE1Verdict -PreCapturePath $x4Pre -PostCapturePath $x4Post -ObserverLogPath $logGood `
         -TargetSessionId 3 -TargetUser 'qauser' -TargetLogonTime $logon -TrialId $tid
     Add-P9HTestResult -Id 'X4' -Title 'Monitor records disagreeing with the token list cannot PASS' `
@@ -1121,10 +1208,8 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} agrees={1}" -f $x4.Verdict, $x4.SubObservations['tokenListAgreesWithRecords']) `
         -Pass ($x4.Verdict -ne 'PASS') -Evidence $x4Pre
 
-    # ---- X5: identical summaries, different mappings ----
     $x5Pre = & $writeCapture 'x5-pre.json' $tokensA 3 $true $true $tid $true $preUtc
-    $x5Post = & $writeCapture 'x5-post.json' $tokensA 3 $true $true $tid $true $postUtc `
-        $null @('x=0 y=0 w=1920 h=1080', 'x=-2560 y=-999 w=2560 h=1440')
+    $x5Post = & $writeCapture 'x5-post.json' $tokensA 3 $true $true $tid $true $postUtc $null @('x=0 y=0 w=1920 h=1080', 'x=-2560 y=-999 w=2560 h=1440')
     $x5 = Get-P9HE1Verdict -PreCapturePath $x5Pre -PostCapturePath $x5Post -ObserverLogPath $logGood `
         -TargetSessionId 3 -TargetUser 'qauser' -TargetLogonTime $logon -TrialId $tid
     Add-P9HTestResult -Id 'X5' -Title 'Different token-to-rectangle mappings cannot PASS' `
@@ -1132,7 +1217,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} pairsEqual={1}" -f $x5.Verdict, $x5.SubObservations['tokenRectPairsEqual']) `
         -Pass ($x5.Verdict -ne 'PASS') -Evidence $x5Post
 
-    # ---- X6: capture omitting trialId ----
     $x6Pre = & $writeCapture 'x6-pre.json' $tokensA 3 $true $true '' $true $preUtc
     $x6Post = & $writeCapture 'x6-post.json' $tokensA 3 $true $true '' $true $postUtc
     $x6 = Get-P9HE1Verdict -PreCapturePath $x6Pre -PostCapturePath $x6Post -ObserverLogPath $logGood `
@@ -1142,7 +1226,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} present={1}" -f $x6.Verdict, $x6.SubObservations['trialProvenancePresent']) `
         -Pass ($x6.Verdict -ne 'PASS') -Evidence $x6Pre
 
-    # ---- X7: different trial ids ----
     $x7Pre = & $writeCapture 'x7-pre.json' $tokensA 3 $true $true $tid $true $preUtc
     $x7Post = & $writeCapture 'x7-post.json' $tokensA 3 $true $true 'p9h-other-trial-11111111' $true $postUtc
     $x7 = Get-P9HE1Verdict -PreCapturePath $x7Pre -PostCapturePath $x7Post -ObserverLogPath $logGood `
@@ -1152,7 +1235,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} agrees={1}" -f $x7.Verdict, $x7.SubObservations['trialProvenanceAgrees']) `
         -Pass ($x7.Verdict -ne 'PASS') -Evidence $x7Post
 
-    # ---- X8: pre-capture timestamp after the disconnect observation ----
     $futurePre = (Get-Date).ToUniversalTime().AddHours(2).ToString('o')
     $x8Pre = & $writeCapture 'x8-pre.json' $tokensA 3 $true $true $tid $true $futurePre
     $x8Post = & $writeCapture 'x8-post.json' $tokensA 3 $true $true $tid $true ((Get-Date).ToUniversalTime().AddHours(3).ToString('o'))
@@ -1163,7 +1245,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} brackets={1}" -f $x8.Verdict, $x8.SubObservations['captureBracketsTransition']) `
         -Pass ($x8.Verdict -ne 'PASS') -Evidence $x8Pre
 
-    # ---- X9: post-capture timestamp before the reconnect observation ----
     $pastPost = (Get-Date).ToUniversalTime().AddHours(-3).ToString('o')
     $x9Pre = & $writeCapture 'x9-pre.json' $tokensA 3 $true $true $tid $true ((Get-Date).ToUniversalTime().AddHours(-4).ToString('o'))
     $x9Post = & $writeCapture 'x9-post.json' $tokensA 3 $true $true $tid $true $pastPost
@@ -1174,7 +1255,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} brackets={1}" -f $x9.Verdict, $x9.SubObservations['captureBracketsTransition']) `
         -Pass ($x9.Verdict -ne 'PASS') -Evidence $x9Post
 
-    # ---- X10: reversed pre/post capture ordering ----
     $x10Pre = & $writeCapture 'x10-pre.json' $tokensA 3 $true $true $tid $true $postUtc
     $x10Post = & $writeCapture 'x10-post.json' $tokensA 3 $true $true $tid $true $preUtc
     $x10 = Get-P9HE1Verdict -PreCapturePath $x10Pre -PostCapturePath $x10Post -ObserverLogPath $logGood `
@@ -1184,7 +1264,6 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} chronologyOk={1}" -f $x10.Verdict, $x10.SubObservations['captureChronologyOk']) `
         -Pass ($x10.Verdict -ne 'PASS') -Evidence $x10Pre
 
-    # ---- X11: malformed timestamp ----
     $x11Pre = & $writeCapture 'x11-pre.json' $tokensA 3 $true $true $tid $true 'not-a-timestamp'
     $x11Post = & $writeCapture 'x11-post.json' $tokensA 3 $true $true $tid $true $postUtc
     $x11 = Get-P9HE1Verdict -PreCapturePath $x11Pre -PostCapturePath $x11Post -ObserverLogPath $logGood `
@@ -1194,12 +1273,18 @@ function Invoke-P9HVerdictTests {
         -Actual ("Verdict={0} valid={1}" -f $x11.Verdict, $x11.SubObservations['captureTimestampsValid']) `
         -Pass ($x11.Verdict -ne 'PASS') -Evidence $x11Pre
 
-    # ---- X12: valid raw captures with matching topology => PASS ----
     $x12 = Get-P9HE1Verdict -PreCapturePath $prePath -PostCapturePath $postPath -ObserverLogPath $logGood `
         -TargetSessionId 3 -TargetUser 'qauser' -TargetLogonTime $logon -TrialId $tid
     Add-P9HTestResult -Id 'X12' -Title 'Valid raw captures with matching topology are eligible for PASS' `
         -Input 'authoritative records, one trial, bracketing timestamps' -Expected 'PASS' `
         -Actual ("Verdict={0}" -f $x12.Verdict) -Pass ($x12.Verdict -eq 'PASS') -Evidence $prePath
+
+    # X14 (Stage 2.3): missing PRE-window inventory must not become an empty baseline.
+    $x14 = Try-N2 @{ PreWindowPath = (Join-Path $dir 'no-such-pre.json') }
+    Add-P9HTestResult -Id 'X14' -Title 'A missing pre-window inventory cannot be treated as an empty baseline' `
+        -Input 'absent pre-window observation' -Expected 'N2A not PASS, preObserved=false' `
+        -Actual ("N2A={0} preObserved={1}" -f $x14.N2A.Verdict, $x14.N2A.PreStateObserved) `
+        -Pass ($x14.N2A.Verdict -ne 'PASS' -and -not $x14.N2A.PreStateObserved) -Evidence $null
 }
 
 function Invoke-P9HSafetyGateTests {
@@ -1293,8 +1378,77 @@ function Invoke-P9HDateHandlingTests {
         -Pass ($inv.StartOk -gt 0 -and $inv.Outcome -ne 'degraded') -Evidence $null
 }
 
+function Test-P9HTestRegistry {
+    # Automated registry guard.
+    #
+    # Purpose: a future edit must not be able to SILENTLY drop registered cases.
+    # Stage 2.2 lost the whole N-series this way: the function was replaced and the
+    # total happened to rise, so nothing complained.
+    #
+    # Two independent checks:
+    #   1. RUNTIME - the results actually produced by this run (unique ids, count
+    #      matches the declared baseline, every series present).
+    #   2. SOURCE  - the registered `-Id '<x>'` literals in this file (unique ids,
+    #      count, no missing series), so a case that never runs is still noticed.
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Results,
+        [Parameter(Mandatory)][int]$ExpectedCount,
+        [Parameter(Mandatory)][string[]]$RequiredSeries
+    )
+
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $observed = @($Results | ForEach-Object { [string]$_.id })
+
+    # --- runtime checks ---
+    $runtimeDups = @($observed | Group-Object | Where-Object { $_.Count -gt 1 })
+    foreach ($d in $runtimeDups) { $problems.Add('runtime-duplicate-id:' + $d.Name + ' x' + $d.Count) }
+
+    if ($observed.Count -ne $ExpectedCount) {
+        $problems.Add(('runtime-count:{0}-expected-{1}' -f $observed.Count, $ExpectedCount))
+    }
+
+    foreach ($series in $RequiredSeries) {
+        $prefixCount = @($observed | Where-Object { $_ -match ('^' + [regex]::Escape($series) + '\d+$') }).Count
+        if ($prefixCount -eq 0) { $problems.Add('runtime-series-missing:' + $series) }
+    }
+
+    # --- source checks ---
+    $sourceIds = @([regex]::Matches((Get-Content -LiteralPath $PSCommandPath -Raw), "-Id\s+'([A-Za-z0-9]+)'") |
+        ForEach-Object { $_.Groups[1].Value })
+
+    $sourceDups = @($sourceIds | Group-Object | Where-Object { $_.Count -gt 1 })
+    foreach ($d in $sourceDups) { $problems.Add('source-duplicate-id:' + $d.Name + ' x' + $d.Count) }
+
+    if ($sourceIds.Count -ne $ExpectedCount) {
+        $problems.Add(('source-count:{0}-expected-{1}' -f $sourceIds.Count, $ExpectedCount))
+    }
+
+    foreach ($series in $RequiredSeries) {
+        $prefixCount = @($sourceIds | Where-Object { $_ -match ('^' + [regex]::Escape($series) + '\d+$') }).Count
+        if ($prefixCount -eq 0) { $problems.Add('source-series-missing:' + $series) }
+    }
+
+    # Every declared source case must have produced a runtime result.
+    $notRun = @($sourceIds | Where-Object { $observed -notcontains $_ })
+    foreach ($n in $notRun) { $problems.Add('registered-but-not-run:' + $n) }
+
+    return [pscustomobject][ordered]@{
+        Ok            = ($problems.Count -eq 0)
+        Problems      = @($problems)
+        RuntimeCount  = $observed.Count
+        SourceCount   = $sourceIds.Count
+        ExpectedCount = $ExpectedCount
+        Duplicates    = ($runtimeDups.Count + $sourceDups.Count)
+        Series        = @($RequiredSeries)
+    }
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
+    #
+    # The registry guard runs AFTER the groups so it can compare what actually ran
+    # against what is declared. A failure here fails the run exactly like a case
+    # failure would, because a missing case is a coverage regression.
     param([Parameter(Mandatory)][string]$SandboxRoot)
 
     Invoke-P9HExitRecorderTests -SandboxRoot $SandboxRoot
@@ -1304,5 +1458,28 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HSafetyGateTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
 
-    return @($script:P9HTestResults)
+    $results = @($script:P9HTestResults)
+
+    # The registry report is NOT one of the registered cases; it is the guard's
+    # own verdict, so its id is computed and is deliberately not a source literal.
+    $registryReportId = 'R1'
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 100 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'G', 'D')
+
+    if (-not $registry.Ok) {
+        Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `
+            -Input ('expected=' + $registry.ExpectedCount + ' runtime=' + $registry.RuntimeCount + ' source=' + $registry.SourceCount) `
+            -Expected 'no duplicates, no missing series, every registered case ran' `
+            -Actual (($registry.Problems) -join ' | ') -Pass $false -Evidence $null
+        $results = @($script:P9HTestResults)
+    }
+    else {
+        Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `
+            -Input ('runtime=' + $registry.RuntimeCount + ' source=' + $registry.SourceCount) `
+            -Expected ('exactly ' + $registry.ExpectedCount + ' unique ids across all series') `
+            -Actual ('ok: ' + $registry.RuntimeCount + ' cases, 0 duplicates') -Pass $true -Evidence $null
+        $results = @($script:P9HTestResults)
+    }
+
+    return $results
 }
