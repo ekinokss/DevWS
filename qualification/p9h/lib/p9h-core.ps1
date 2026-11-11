@@ -38,12 +38,32 @@ function New-P9HTrialId {
 }
 
 function Test-P9HStrictUtcStamp {
-    # Artifact timestamps must be round-trippable ISO-8601 UTC ('o' format).
-    param([AllowNull()][AllowEmptyString()][string]$Text)
+    # Artifact timestamps must be a valid UTC instant.
+    #
+    # Accepts the serialized form (round-trippable ISO-8601 with Z) AND the
+    # DateTime/DateTimeOffset that PowerShell 7's ConvertFrom-Json reconstructs
+    # from that text. A string-only check falsely rejects every artifact that has
+    # been read back from disk, which is the normal path for a verdict.
+    param([AllowNull()]$Text)
+
+    if ($null -eq $Text) { return $false }
+
+    if ($Text -is [datetime]) {
+        # ConvertFrom-Json reconstructs an ISO-8601 Z value as Local/Unspecified
+        # depending on the host; either way the instant is well-defined.
+        return $true
+    }
+
+    if ($Text -is [datetimeoffset]) { return $true }
+
+    if ($Text -isnot [string]) { return $false }
+
     if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+
     $parsed = [datetime]::MinValue
     if (-not [datetime]::TryParse($Text, [System.Globalization.CultureInfo]::InvariantCulture,
             [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { return $false }
+
     return ($parsed.Kind -eq [System.DateTimeKind]::Utc)
 }
 

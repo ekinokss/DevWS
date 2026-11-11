@@ -21,6 +21,32 @@ bookkeeping defects, not product defects, and each is closed structurally here.
 | N2-5 | Post-launch serialization hung | Stages are bounded and independently journaled |
 | N2-6 | Final result file never written | Exit record is the first artifact, atomically persisted |
 
+### Stage 2.1 corrections (independent review of PR #21)
+
+Stage 2 passed 42 synthetic tests yet contained paths where the instrumentation either could
+not execute the intended sequence or could issue an unsupported verdict. Each is fixed and
+guarded by a test that fails when the defect is reintroduced.
+
+| Defect | Consequence in Stage 2 | Correction |
+| --- | --- | --- |
+| Circular reconnect gate | `Assert-P9HReconnectPermitted` used the FINAL proof, which required the post-reconnect record — impossible before reconnecting. The replay could never pass its own gate. | Proof split into A (pre-reconnect authorization: pre Active + target state 4, no post required) and B (final transition proof). Verified: reintroducing the defect makes `A1` fail while `F1` still passes. |
+| Session identity not end to end | The matcher understood a logon time, but the parser produced only 4 fields, so real records never carried one and identity silently degraded to (session, user). | Raw line carries an optional `logon=` field; the v2 observation schema persists the observed logon **and its source**; matching, persistence, readback, authorization and verdict all consume the same pinned identity. Missing/unverifiable logon **fails closed**. |
+| `negativeOrigin` not in the predicate | A topology with no negative-origin monitor could still PASS. | Added to `$tokensSatisfied`, computed from per-monitor rectangles on both sides. |
+| Session check only "not 0" | Captures from an unrelated non-zero session could PASS. | Captures must bind to the target session id and to each other; `sessionMatchesTarget` and `sessionConsistent` are required. |
+| Asserted booleans trusted | `tokenSetBytes`/`tokenRectBytes`/`identityComplete` were accepted without the raw observations. | Capture schema validated; tokens must be present and non-empty; rect/negative-origin derived from `parsedMonitors` when available; timestamp and trial provenance are blocking. |
+| `windowsAttributed` unused + `.Count -ge 0` | The tautology meant N2-B could PASS with no attributable window or process. | Process attribution (new process with a recovered start time) and window attribution (`Select-P9HAttributableWindow`) are now first-class PASS inputs. |
+| N2-A `$fallbackApplied = $false` initialiser | An unreadable post-window artifact read as "fallback not applied", allowing PASS on absent evidence. | Tri-state (`$null` = not observed) plus `PostStateObserved`; nothing is inferred from a missing observation. |
+| Malformed trace lines silently skipped | A partial trace could be claimed as a whole transaction. | Any malformed trace line fails the trace as a whole. |
+| Foreign trace trial id recorded but not blocking | A trace from another trial could contribute to a PASS. | `trace-trial-mismatch` is now a blocking condition. |
+
+Two defects were found while *writing* these fixes, and are also covered:
+
+- `ConvertFrom-Json` reconstructs ISO-8601 text as `DateTime`, so string-only comparisons produced
+  a false `pre-logon-mismatch` and a false `disconnect-timestamp-invalid`. Logon and timestamp
+  comparisons now normalize `DateTime`/`DateTimeOffset`/string before comparing.
+- `[Parameter(Mandatory)]` with a default value **prompts** interactively instead of failing. Three
+  such parameters were reintroduced during this correction and were removed again.
+
 ## Layout
 
 ```

@@ -218,8 +218,9 @@ function Wait-P9HTargetDisconnected {
                     User      = $_.targetUser
                     State     = $_.targetState
                     StationName = $_.targetStation
+                    LogonTime = $_.targetObservedLogon
                 }
-            }) -SessionId $TargetSessionId -User $TargetUser
+            }) -SessionId $TargetSessionId -User $TargetUser -LogonTime $TargetLogonTime -RequireLogonTime
 
         if ($judged.Disconnected) {
             return [pscustomobject][ordered]@{
@@ -250,19 +251,27 @@ function Wait-P9HTargetDisconnected {
 function Assert-P9HReconnectPermitted {
     # The single authority for 'may we reconnect now?'.
     #
-    # Requires the disconnect proof to be re-derived from the PERSISTED log at
-    # call time. Passing a boolean captured earlier is not accepted, because that
-    # boolean could outlive the file it was derived from.
+    # Stage 2.1 correction: this MUST use the pre-reconnect authorization proof,
+    # which does not require a post-reconnect record. The Stage 2 version called
+    # Get-P9HDisconnectProof, whose own requirement for a post-reconnect Active
+    # observation made the gate circular and the replay sequence impossible.
+    #
+    # The proof is re-derived from the PERSISTED log at call time; passing a
+    # boolean captured earlier is not accepted, because that boolean could
+    # outlive the file it was derived from.
     param(
         [Parameter(Mandatory)][string]$ObserverLogPath,
         [Parameter(Mandatory)][int]$TargetSessionId,
-        [Parameter(Mandatory)][string]$TargetUser
+        [Parameter(Mandatory)][string]$TargetUser,
+        [string]$TrialId = '',
+        [AllowNull()][string]$TargetLogonTime = $null
     )
 
-    $proof = Get-P9HDisconnectProof -ObserverLogPath $ObserverLogPath -SessionId $TargetSessionId -User $TargetUser
+    $proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $ObserverLogPath -TrialId $TrialId `
+        -SessionId $TargetSessionId -User $TargetUser -LogonTime $TargetLogonTime
 
     if (-not $proof.Proven) {
-        throw ("P9-H: reconnect refused - the persisted observer log does not prove the target session disconnected ({0})." -f $proof.Reason)
+        throw ("P9-H: reconnect refused - the persisted observer log does not authorize the target session disconnect ({0})." -f $proof.Reason)
     }
 
     return $proof
