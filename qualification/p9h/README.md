@@ -47,6 +47,38 @@ Two defects were found while *writing* these fixes, and are also covered:
 - `[Parameter(Mandatory)]` with a default value **prompts** interactively instead of failing. Three
   such parameters were reintroduced during this correction and were removed again.
 
+### Stage 2.2 corrections (independent review of PR #21 @ 75ed689)
+
+Stage 2.1 fixed the circular gate, but several verdict predicates still allowed an authoritative
+PASS without the evidence they claimed to require. Each counterexample below was reproduced against
+`75ed689` and now rejects.
+
+| False-PASS path on 2.1 | Reproduction | Correction |
+| --- | --- | --- |
+| `$traceOk` computed but never required by the N2-B predicate | all required events valid + one malformed line → **N2B=PASS** | `Test-P9HLaunchTrace` validates the whole trace (parse, required-event presence and uniqueness, causal order, single planId, single trialId, clean completion) and `trace.Ok` is a required PASS term |
+| Duplicate / contradicting finalization events | two `stage2-terminal-final` with different outcomes → **PASS** | a repeated lifecycle event fails as `trace-duplicate-event` |
+| Invalid event order | `terminal-final` before `broker-ready` → **PASS** | rank-ordered causal check → `trace-order-invalid` |
+| Incompatible plan ids | four different `planId` values → **PASS** | one planId required → `trace-plan-id-conflict` |
+| Process attribution by "new non-cmd process with a start time" | unrelated `WindowsTerminal.exe` opened by the user → **PASS** | `Get-P9HLaunchAttribution` requires the launch identity in argv (`-SetId`, `-TerminalId`, `-WindowId`) **and** a recovered start time |
+| `-WindowRequired 'no'` caller bypass | zero observed windows still → **PASS** | parameter removed; window evidence is unconditional |
+| E1 fell back to asserted `tokenRectBytes` | fabricated `x=-9999` summary, no monitor records → **PASS** | `parsedMonitors` are the authoritative source; a summary-only capture is rejected |
+| Capture omitting `trialId` bypassed provenance | absent field on both captures → **PASS** | trial id is required, identical across pre/post/observer, and must match the trial under test |
+| No capture↔transition chronology | pre-capture timestamped three hours in the future → **PASS** | the pre-capture must precede the persisted disconnect and the post-capture must follow the post-reconnect observation |
+
+**Attribution model (source-backed).** A terminal is created through the elevated broker, so it is
+*not* a direct child of the `cmd.exe` launcher; parentage is neither assumed nor inferred from
+process names. The product itself supplies the authoritative links
+(`src/lib/devws-terminal.ps1`, `devws-terminal-launch.ps1`): the broker plans each terminal by its
+`windowId`, and the child shell is launched with explicit
+`-SetId / -TerminalId / -WindowId / -SessionId / -PublicationPath` arguments — the same identity the
+product validates before trusting a tracked tab. Attribution therefore requires all three ids in the
+observed command line plus a recovered creation time; the window must then belong to that attributed
+PID and be absent from the pre-launch inventory.
+
+**Test totals: 70 → 87.** New: W1–W14 (trace validity and causal attribution, including the positive
+detached-terminal case) and X1–X12 (window-omission, raw-monitor contract, trial and timestamp
+provenance). All 70 Stage 2.1 cases are retained unchanged.
+
 ## Layout
 
 ```

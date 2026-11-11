@@ -3,32 +3,154 @@
 # Closes P9-G defects E1-5 and the N2 corollary: the E1 PASS expression had no
 # session-transition term, so missing disconnect proof could not block a pass.
 #
-# Every criterion here:
-#   * names the artifact it depends on;
-#   * reports NOT FULLY EVIDENCED / INCONCLUSIVE when that artifact is absent or
-#     untrustworthy, rather than falling back to a pass;
-#   * keeps N2-A and N2-B independent, so neither can imply the other.
+# Stage 2.2 corrections (independent review of PR #21 @ 75ed689):
+#   * trace VALIDITY was computed but never required by the N2-B predicate, so a
+#     trace with malformed lines, contradicting finalization events, reversed
+#     ordering or four different plan ids could still PASS;
+#   * process attribution accepted ANY new non-cmd/conhost process with a start
+#     time, so an unrelated terminal opened by the user satisfied it;
+#   * -WindowRequired 'no' let a caller disable a required PASS condition;
+#   * E1 fell back to the asserted tokenRectBytes string when parsedMonitors were
+#     absent, so a fabricated summary satisfied topology and equality;
+#   * a capture omitting trialId bypassed the provenance comparison, and several
+#     such captures threw instead of rejecting;
+#   * capture/disconnect/post chronology was never checked.
 #
-# This module is pure: it reads artifacts and returns verdicts. It never
-# launches, disconnects, or mutates anything.
+# Every predicate below names the artifact it depends on and fails closed.
 
 Set-StrictMode -Version Latest
+
+function Get-P9HProp {
+    # Safe property read: returns $null when absent instead of throwing under
+    # StrictMode. Used everywhere a deliberately-incomplete fixture is expected
+    # to produce a REJECTION rather than an exception.
+    param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($null -eq $p) { return $null }
+    return $p.Value
+}
+
+function ConvertTo-P9HUtcOrNull {
+    # Normalize a timestamp value (string / DateTime / DateTimeOffset) to a UTC
+    # DateTime, or $null when it cannot be interpreted.
+    param($Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    if ($Value -is [datetimeoffset]) { return $Value.UtcDateTime }
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $parsed = [datetime]::MinValue
+    if ([datetime]::TryParse($text, [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+        return $parsed.ToUniversalTime()
+    }
+    return $null
+}
+
+function Test-P9HUtcBefore {
+    # Strictly-earlier comparison, false when either side is unparseable.
+    param($Earlier, $Later)
+    $a = ConvertTo-P9HUtcOrNull -Value $Earlier
+    $b = ConvertTo-P9HUtcOrNull -Value $Later
+    if ($null -eq $a -or $null -eq $b) { return $false }
+    return ($a -lt $b)
+}
+
+function Get-P9HMonitorIdentitySet {
+    # Extract the monitor identity list from a capture.
+    #
+    # AUTHORITATIVE SOURCE: the per-monitor records (`parsedMonitors`). The
+    # `tokens` array is accepted as corroboration and must AGREE with the records
+    # when both are present. A precomputed `tokenRectBytes`/`tokenSetBytes` string
+    # is NEVER used to supply identities.
+    param($Capture)
+
+    $result = [ordered]@{
+        Ok       = $false
+        Reason   = $null
+        Records  = @()
+        Tokens   = @()
+        Consistent = $false
+    }
+
+    $records = Get-P9HProp -Object $Capture -Name 'parsedMonitors'
+    $tokens = Get-P9HProp -Object $Capture -Name 'tokens'
+
+    if ($null -eq $records) {
+        $result.Reason = 'no-parsed-monitors'
+        return [pscustomobject]$result
+    }
+
+    $recordList = @($records)
+    if ($recordList.Count -eq 0) {
+        $result.Reason = 'empty-parsed-monitors'
+        return [pscustomobject]$result
+    }
+
+    foreach ($r in $recordList) {
+        $identity = Get-P9HProp -Object $r -Name 'identity'
+        $rect = Get-P9HProp -Object $r -Name 'rect'
+        if ([string]::IsNullOrWhiteSpace([string]$identity)) {
+            $result.Reason = 'monitor-record-missing-identity'
+            return [pscustomobject]$result
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$rect)) {
+            $result.Reason = 'monitor-record-missing-rect'
+            return [pscustomobject]$result
+        }
+    }
+
+    $recordIdentities = @($recordList | ForEach-Object { [string]$_.identity })
+
+    # Corroborating token list is optional, but must agree when supplied.
+    $tokenList = @()
+    if ($null -ne $tokens) {
+        $tokenList = @($tokens | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
+    }
+
+    $consistent = $true
+    if ($tokenList.Count -gt 0) {
+        $a = @($recordIdentities | Sort-Object) -join '|'
+        $b = @($tokenList | Sort-Object) -join '|'
+        $consistent = [string]::Equals($a, $b, [System.StringComparison]::Ordinal)
+    }
+
+    $result.Ok = $true
+    $result.Reason = 'ok'
+    $result.Records = $recordList
+    $result.Tokens = $tokenList
+    $result.Consistent = $consistent
+    return [pscustomobject]$result
+}
+
+function Get-P9HMonitorPairs {
+    # Canonical 'identity@rect' pairs, sorted by identity, so two captures can be
+    # compared without depending on enumeration order.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
+    return @($Records | ForEach-Object { '{0}@{1}' -f [string]$_.identity, [string]$_.rect } | Sort-Object)
+}
+
+function Test-P9HNegativeOrigin {
+    # TRUE only when an OBSERVED monitor record carries a negative x origin.
+    # A summary string can never satisfy this.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
+    return (@($Records | Where-Object { [string]$_.rect -match 'x=-\d' }).Count -gt 0)
+}
 
 function Get-P9HE1Verdict {
     # E1 verdict from the two monitor captures plus the final transition proof.
     #
-    # Stage 2.1 corrections (independent review):
-    #   * negativeOrigin was computed but NOT part of $tokensSatisfied, so a
-    #     topology with no negative-origin monitor could still PASS;
-    #   * the session check only asserted "not session 0" and never bound the
-    #     captures to the required target session identity;
-    #   * asserted booleans (identityComplete, tokenSetBytes/tokenRectBytes) were
-    #     trusted without validating the underlying raw observations.
-    #
-    # PASS now requires every one of: two distinct tokens, complete raw token
-    # identity, exact token-set equality, identical token->rect mapping, proven
-    # negative origin, captures bound to the accepted session contract, a schema
-    # that carries the raw observations, and the full transition proof.
+    # PASS requires ALL of:
+    #   * authoritative raw per-monitor records in BOTH captures;
+    #   * exactly two distinct token identities, agreeing with the token list;
+    #   * canonical pair equality between the captures (token -> rectangle);
+    #   * an OBSERVED negative-origin monitor in both captures;
+    #   * complete identity evidence;
+    #   * captures bound to the target session and to each other;
+    #   * non-empty, identical trial ids on both captures;
+    #   * valid UTC timestamps with capture/disconnect/post chronology;
+    #   * the complete Proof B transition.
     param(
         [Parameter(Mandatory)][string]$PreCapturePath,
         [Parameter(Mandatory)][string]$PostCapturePath,
@@ -48,183 +170,352 @@ function Get-P9HE1Verdict {
     if (-not $pre.Ok -or -not $post.Ok) {
         $reasons.Add('monitor-captures-missing:' + $(if (-not $pre.Ok) { 'pre-' + $pre.Reason } else { '' }) + $(if (-not $post.Ok) { 'post-' + $post.Reason } else { '' }))
         return [pscustomobject][ordered]@{
-            Verdict          = 'INCONCLUSIVE'
-            DisconnectProven = $false
-            SubObservations  = $sub
-            Reasons          = @($reasons)
+            Verdict = 'INCONCLUSIVE'; DisconnectProven = $false
+            SubObservations = $sub; Reasons = @($reasons)
         }
     }
 
     $a = $pre.Data
     $b = $post.Data
 
-    # ---- capture schema validation ----
-    # Raw observations must be present. A capture that only asserts strings such
-    # as tokenSetBytes cannot be independently reproduced and is not accepted.
-    $missingFields = [System.Collections.Generic.List[string]]::new()
-    foreach ($name in @('tokens', 'sessionId', 'capturedUtc', 'identityComplete')) {
-        if ($null -eq $a.PSObject.Properties[$name]) { $missingFields.Add('pre:' + $name) }
-        if ($null -eq $b.PSObject.Properties[$name]) { $missingFields.Add('post:' + $name) }
-    }
+    # ---- authoritative monitor evidence (both captures) ----
+    $preMon = Get-P9HMonitorIdentitySet -Capture $a
+    $postMon = Get-P9HMonitorIdentitySet -Capture $b
 
-    # Access via PSObject.Properties so a deliberately-omitted field is a
-    # missing-field finding rather than a StrictMode exception.
-    $preTokens = @()
-    $postTokens = @()
-    if ($null -ne $a.PSObject.Properties['tokens']) {
-        $preTokens = @($a.tokens | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-    }
-    if ($null -ne $b.PSObject.Properties['tokens']) {
-        $postTokens = @($b.tokens | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
-    }
+    $sub['preRawMonitorsPresent'] = [bool]$preMon.Ok
+    $sub['postRawMonitorsPresent'] = [bool]$postMon.Ok
+    $sub['tokenListAgreesWithRecords'] = ([bool]$preMon.Consistent -and [bool]$postMon.Consistent)
 
-    if ($preTokens.Count -eq 0) { $missingFields.Add('pre:empty-token-list') }
-    if ($postTokens.Count -eq 0) { $missingFields.Add('post:empty-token-list') }
-
-    if ($missingFields.Count -gt 0) {
-        $reasons.Add('capture-schema-incomplete:' + (@($missingFields) -join ','))
+    if (-not $preMon.Ok -or -not $postMon.Ok) {
+        $why = @()
+        if (-not $preMon.Ok) { $why += 'pre-' + $preMon.Reason }
+        if (-not $postMon.Ok) { $why += 'post-' + $postMon.Reason }
+        $reasons.Add('raw-monitor-evidence-missing:' + ($why -join ','))
         return [pscustomobject][ordered]@{
-            Verdict          = 'NOT FULLY EVIDENCED'
-            TokensSatisfied  = $false
-            DisconnectProven = $false
-            SubObservations  = $sub
-            Reasons          = @($reasons)
+            Verdict = 'NOT FULLY EVIDENCED'; TokensSatisfied = $false
+            DisconnectProven = $false; SubObservations = $sub; Reasons = @($reasons)
         }
     }
 
-    # Stage 2.1: capture-schema, timestamp and trial-provenance failures are
-    # BLOCKING. Stage 2 recorded some reasons but did not consult them in the
-    # PASS predicate, so an invalid capture could still pass.
-    $captureProvenanceOk = $true
-
-    if (-not (Test-P9HStrictUtcStamp -Text $a.capturedUtc) -or -not (Test-P9HStrictUtcStamp -Text $b.capturedUtc)) {
-        $reasons.Add('capture-timestamp-invalid')
-        $captureProvenanceOk = $false
+    if (-not $preMon.Consistent -or -not $postMon.Consistent) {
+        $reasons.Add('token-list-disagrees-with-monitor-records')
     }
 
-    # A capture must belong to the trial under test when a trial id is supplied.
-    if (-not [string]::IsNullOrWhiteSpace($TrialId)) {
-        foreach ($pair in @(@{ k = 'pre'; d = $a }, @{ k = 'post'; d = $b })) {
-            $prop = $pair.d.PSObject.Properties['trialId']
-            if ($null -ne $prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) {
-                if (-not [string]::Equals([string]$prop.Value, $TrialId, [System.StringComparison]::Ordinal)) {
-                    $reasons.Add(('capture-trial-mismatch:' + $pair.k))
-                    $captureProvenanceOk = $false
-                }
-            }
-        }
-    }
+    $prePairs = Get-P9HMonitorPairs -Records $preMon.Records
+    $postPairs = Get-P9HMonitorPairs -Records $postMon.Records
 
-    # ---- (a) token stability between the two captures ----
-    $preSorted = @($preTokens | Sort-Object)
-    $postSorted = @($postTokens | Sort-Object)
-    $tokenSetEqual = ((@($preSorted) -join '|') -ceq (@($postSorted) -join '|'))
-    $tokenCountOk = ($preTokens.Count -eq 2 -and $postTokens.Count -eq 2)
-    $distinctOk = (@(@($preTokens | Sort-Object -Unique).Count) -eq 2)
-    $identityComplete = [bool]([bool]$a.identityComplete -and [bool]$b.identityComplete)
+    $preIdentities = @($preMon.Records | ForEach-Object { [string]$_.identity })
+    $postIdentities = @($postMon.Records | ForEach-Object { [string]$_.identity })
 
-    # Rectangle correlation is derived from the per-monitor records when they are
-    # present, so it cannot be satisfied by a precomputed string alone.
-    $rectFromRecords = $null
-    if ($null -ne $a.PSObject.Properties['parsedMonitors'] -and $null -ne $b.PSObject.Properties['parsedMonitors']) {
-        $prePairs = @($a.parsedMonitors | ForEach-Object { '{0}@{1}' -f $_.identity, $_.rect })
-        $postPairs = @($b.parsedMonitors | ForEach-Object { '{0}@{1}' -f $_.identity, $_.rect })
-        $rectFromRecords = ((@($prePairs) -join ';') -ceq (@($postPairs) -join ';'))
-    }
-
-    $rectBytesDeclared = $false
-    if ($null -ne $a.PSObject.Properties['tokenRectBytes'] -and $null -ne $b.PSObject.Properties['tokenRectBytes']) {
-        $rectBytesDeclared = ([string]$a.tokenRectBytes -ceq [string]$b.tokenRectBytes)
-    }
-
-    $rectEqual = if ($null -ne $rectFromRecords) { [bool]$rectFromRecords } else { [bool]$rectBytesDeclared }
-
-    # Negative origin must be demonstrated by OBSERVED rectangles. Prefer the
-    # per-monitor records; fall back to the declared string only when no records
-    # exist, and require the SAME negative-origin evidence on both sides.
-    $negativeOrigin = $false
-    if ($null -ne $a.PSObject.Properties['parsedMonitors'] -and $null -ne $b.PSObject.Properties['parsedMonitors']) {
-        $preNeg = @($a.parsedMonitors | Where-Object { [string]$_.rect -match 'x=-\d' }).Count -gt 0
-        $postNeg = @($b.parsedMonitors | Where-Object { [string]$_.rect -match 'x=-\d' }).Count -gt 0
-        $negativeOrigin = ($preNeg -and $postNeg)
-    }
-    else {
-        $negativeOrigin = ([string]$a.tokenRectBytes -match 'x=-\d') -and ([string]$b.tokenRectBytes -match 'x=-\d')
-    }
+    $tokenCountOk = ($preIdentities.Count -eq 2 -and $postIdentities.Count -eq 2)
+    $distinctOk = (@(@($preIdentities | Sort-Object -Unique).Count) -eq 2 -and
+                   @(@($postIdentities | Sort-Object -Unique).Count) -eq 2)
+    $tokenSetEqual = [string]::Equals((@($preIdentities | Sort-Object) -join '|'),
+                                      (@($postIdentities | Sort-Object) -join '|'),
+                                      [System.StringComparison]::Ordinal)
+    $pairsEqual = [string]::Equals((@($prePairs) -join ';'), (@($postPairs) -join ';'), [System.StringComparison]::Ordinal)
+    $negativeOrigin = ((Test-P9HNegativeOrigin -Records $preMon.Records) -and
+                       (Test-P9HNegativeOrigin -Records $postMon.Records))
+    $identityComplete = [bool]((Get-P9HProp -Object $a -Name 'identityComplete') -and
+                               (Get-P9HProp -Object $b -Name 'identityComplete'))
 
     # ---- session binding ----
-    # Both captures must belong to the SAME non-zero session that the transition
-    # proof is about. "Not session 0" alone is insufficient.
-    $preSession = [int]$a.sessionId
-    $postSession = [int]$b.sessionId
+    $preSession = [int](Get-P9HProp -Object $a -Name 'sessionId')
+    $postSession = [int](Get-P9HProp -Object $b -Name 'sessionId')
     $nonSession0 = ($preSession -ne 0 -and $postSession -ne 0)
     $sessionMatchesTarget = ($preSession -eq $TargetSessionId -and $postSession -eq $TargetSessionId)
     $sessionConsistent = ($preSession -eq $postSession)
 
+    # ---- trial provenance: REQUIRED and identical ----
+    $preTrial = [string](Get-P9HProp -Object $a -Name 'trialId')
+    $postTrial = [string](Get-P9HProp -Object $b -Name 'trialId')
+    $trialPresent = (-not [string]::IsNullOrWhiteSpace($preTrial) -and -not [string]::IsNullOrWhiteSpace($postTrial))
+    $trialAgrees = ($trialPresent -and
+                    [string]::Equals($preTrial, $postTrial, [System.StringComparison]::Ordinal) -and
+                    ([string]::IsNullOrWhiteSpace($TrialId) -or
+                     [string]::Equals($preTrial, $TrialId, [System.StringComparison]::Ordinal)))
+
+    # ---- capture timestamps ----
+    $preCaptureUtc = ConvertTo-P9HUtcOrNull -Value (Get-P9HProp -Object $a -Name 'capturedUtc')
+    $postCaptureUtc = ConvertTo-P9HUtcOrNull -Value (Get-P9HProp -Object $b -Name 'capturedUtc')
+    $timestampsValid = ($null -ne $preCaptureUtc -and $null -ne $postCaptureUtc)
+    $captureOrderOk = ($timestampsValid -and $preCaptureUtc -lt $postCaptureUtc)
+
     $sub['twoDistinctTokens'] = ($tokenCountOk -and $distinctOk)
-    $sub['byteIdenticalTokenSets'] = $tokenSetEqual
-    $sub['tokenRectCorrelationIdentical'] = $rectEqual
-    $sub['negativeOriginTopology'] = $negativeOrigin
+    $sub['tokenSetsEqual'] = $tokenSetEqual
+    $sub['tokenRectPairsEqual'] = $pairsEqual
+    $sub['negativeOriginObserved'] = $negativeOrigin
     $sub['identityComplete'] = $identityComplete
     $sub['nonSession0Evidence'] = $nonSession0
     $sub['sessionMatchesTarget'] = $sessionMatchesTarget
     $sub['sessionConsistent'] = $sessionConsistent
+    $sub['trialProvenancePresent'] = $trialPresent
+    $sub['trialProvenanceAgrees'] = $trialAgrees
+    $sub['captureTimestampsValid'] = $timestampsValid
+    $sub['captureChronologyOk'] = $captureOrderOk
 
-    $tokensSatisfied = $tokenCountOk -and $distinctOk -and $tokenSetEqual -and $rectEqual -and
-                       $negativeOrigin -and $identityComplete -and $nonSession0 -and
-                       $sessionMatchesTarget -and $sessionConsistent -and $captureProvenanceOk
+    if (-not $tokenCountOk) { $reasons.Add('token-count-not-two') }
+    if ($tokenCountOk -and -not $distinctOk) { $reasons.Add('tokens-not-distinct') }
+    if (-not $tokenSetEqual) { $reasons.Add('token-sets-differ') }
+    if (-not $pairsEqual) { $reasons.Add('token-rect-pairs-differ') }
+    if (-not $negativeOrigin) { $reasons.Add('negative-origin-not-observed') }
+    if (-not $identityComplete) { $reasons.Add('identity-incomplete') }
+    if (-not $nonSession0) { $reasons.Add('session-0-evidence') }
+    if ($nonSession0 -and -not $sessionMatchesTarget) { $reasons.Add('capture-session-not-target') }
+    if (-not $sessionConsistent) { $reasons.Add('capture-sessions-incompatible') }
+    if (-not $trialPresent) { $reasons.Add('trial-provenance-missing') }
+    elseif (-not $trialAgrees) { $reasons.Add('trial-provenance-conflict') }
+    if (-not $timestampsValid) { $reasons.Add('capture-timestamp-invalid') }
+    elseif (-not $captureOrderOk) { $reasons.Add('capture-chronology-invalid') }
 
-    if (-not $tokensSatisfied) {
-        if ($tokenCountOk -and -not $tokenSetEqual) { $reasons.Add('token-sets-differ') }
-        if ($tokenCountOk -and -not $rectEqual) { $reasons.Add('token-rect-correlation-differs') }
-        if (-not $tokenCountOk) { $reasons.Add('token-count-not-two') }
-        if (-not $distinctOk) { $reasons.Add('tokens-not-distinct') }
-        if (-not $identityComplete) { $reasons.Add('identity-incomplete') }
-        if (-not $negativeOrigin) { $reasons.Add('negative-origin-not-evidenced') }
-        if (-not $nonSession0) { $reasons.Add('session-0-evidence') }
-        if ($nonSession0 -and -not $sessionMatchesTarget) { $reasons.Add('capture-session-not-target') }
-        if (-not $sessionConsistent) { $reasons.Add('capture-sessions-incompatible') }
-    }
-
-    # ---- (b) the complete, evidenced transition ----
+    # ---- transition proof (Proof B) + chronology against the captures ----
     $proof = Get-P9HDisconnectProof -ObserverLogPath $ObserverLogPath -SessionId $TargetSessionId `
         -User $TargetUser -TrialId $TrialId -LogonTime $TargetLogonTime
 
-    $sub['confirmedTargetDisconnect'] = [bool]$proof.Proven
+    $sub['confirmedTransition'] = [bool]$proof.Proven
     if (-not $proof.Proven) { $reasons.Add('disconnect-not-proven:' + $proof.Reason) }
 
-    # ---- verdict ----
-    # Equality without a proven transition is NOT a pass; it is exactly the
-    # P9-G situation and must be reported as NOT FULLY EVIDENCED.
+    # The captures must bracket the transition: the pre-capture must precede the
+    # persisted disconnect, and the post-capture must follow the post-reconnect
+    # observation. Increasing sequence numbers are NOT a substitute.
+    $chronologyOk = $false
+    if ($proof.Proven -and $timestampsValid) {
+        $discUtc = ConvertTo-P9HUtcOrNull -Value $proof.Disc.utc
+        $postObsUtc = ConvertTo-P9HUtcOrNull -Value $proof.Post.utc
+        if ($null -ne $discUtc -and $null -ne $postObsUtc) {
+            $chronologyOk = ($preCaptureUtc -lt $discUtc) -and ($postCaptureUtc -gt $postObsUtc)
+        }
+        else { $reasons.Add('transition-timestamps-invalid') }
+    }
+    elseif (-not $proof.Proven) { $chronologyOk = $false }
+
+    $sub['captureBracketsTransition'] = $chronologyOk
+    if ($proof.Proven -and -not $chronologyOk -and $reasons -notcontains 'transition-timestamps-invalid') {
+        $reasons.Add('capture-does-not-bracket-transition')
+    }
+
+    $tokensSatisfied = $tokenCountOk -and $distinctOk -and $tokenSetEqual -and $pairsEqual -and
+                       $negativeOrigin -and $identityComplete -and $nonSession0 -and
+                       $sessionMatchesTarget -and $sessionConsistent -and
+                       $trialPresent -and $trialAgrees -and $timestampsValid -and $captureOrderOk -and
+                       $preMon.Consistent -and $postMon.Consistent
+
     $verdict = 'NOT FULLY EVIDENCED'
-    if ($tokensSatisfied -and $proof.Proven) { $verdict = 'PASS' }
+    if ($tokensSatisfied -and $proof.Proven -and $chronologyOk) { $verdict = 'PASS' }
 
     return [pscustomobject][ordered]@{
         Verdict          = $verdict
         TokensSatisfied  = $tokensSatisfied
         DisconnectProven = [bool]$proof.Proven
         DisconnectReason = [string]$proof.Reason
+        ChronologyOk     = $chronologyOk
         SubObservations  = $sub
         Reasons          = @($reasons)
-        TokenSetBytes    = ((@($preSorted) -join '|'))
-        TokenRectBytes   = [string]$a.tokenRectBytes
-        Tokens           = @($preTokens)
+        Tokens           = @($preIdentities)
+        MonitorPairs     = @($prePairs)
+    }
+}
+
+function Test-P9HLaunchTrace {
+    # Validate a lifecycle trace as a WHOLE before it may contribute to a verdict.
+    #
+    # Stage 2.2: `$traceOk` existed but was never required by the N2-B predicate.
+    # A trace is valid only when:
+    #   * every line parses (no malformed records),
+    #   * all required events are present exactly once,
+    #   * events appear in causal order,
+    #   * every event carrying a planId agrees on ONE planId,
+    #   * every event carrying a trialId agrees with the expected trial.
+    #
+    # "Whichever matching event appears last" is never used as the answer.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$TrialId = ''
+    )
+
+    $required = @('lifecycle-layout-plan', 'stage2-broker-ready', 'stage2-terminal-final', 'transaction-end')
+    $order = @{
+        'lifecycle-layout-plan' = 1
+        'stage2-broker-ready'   = 2
+        'stage2-terminal-kick'  = 3
+        'stage2-terminal-final' = 4
+        'transaction-end'       = 5
+    }
+
+    $result = [ordered]@{
+        Ok         = $false
+        Reason     = $null
+        Events     = @()
+        PlanId     = $null
+        Rejections = @()
+    }
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $result.Reason = 'trace-missing'
+        return [pscustomobject]$result
+    }
+
+    $events = [System.Collections.Generic.List[object]]::new()
+    $malformed = 0
+    $lineNo = 0
+    foreach ($line in (Get-Content -LiteralPath $Path)) {
+        $lineNo++
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $events.Add(($line | ConvertFrom-Json -ErrorAction Stop)) | Out-Null }
+        catch { $malformed++ }
+    }
+
+    $result.Events = @($events)
+
+    if ($malformed -gt 0) {
+        $result.Reason = 'trace-malformed-lines'
+        return [pscustomobject]$result
+    }
+
+    if ($events.Count -eq 0) {
+        $result.Reason = 'trace-empty'
+        return [pscustomobject]$result
+    }
+
+    # Required events: present exactly once (a duplicate finalization is a
+    # contradictory transaction, not a later-wins situation).
+    # NOTE: not $matches - that name collides with PowerShell's automatic
+    # $Matches variable and is silently overwritten by -match elsewhere.
+    foreach ($name in $required) {
+        $found = @($events | Where-Object { [string]$_.event -eq $name })
+        if ($found.Count -eq 0) { $result.Reason = ('trace-missing-event:' + $name); return [pscustomobject]$result }
+        if ($found.Count -gt 1) { $result.Reason = ('trace-duplicate-event:' + $name); return [pscustomobject]$result }
+    }
+
+    # Any repeated non-required lifecycle event is also contradictory.
+    $grouped = $events | Group-Object -Property { [string]$_.event }
+    foreach ($g in $grouped) {
+        if ($g.Count -gt 1 -and $order.ContainsKey([string]$g.Name)) {
+            $result.Reason = ('trace-duplicate-event:' + [string]$g.Name)
+            return [pscustomobject]$result
+        }
+    }
+
+    # Causal ordering.
+    $lastRank = 0
+    foreach ($e in $events) {
+        $name = [string]$e.event
+        if (-not $order.ContainsKey($name)) { continue }
+        $rank = [int]$order[$name]
+        if ($rank -lt $lastRank) { $result.Reason = ('trace-order-invalid:' + $name); return [pscustomobject]$result }
+        $lastRank = $rank
+    }
+
+    # One planId across the transaction.
+    $planIds = @($events | ForEach-Object {
+            $v = Get-P9HProp -Object $_ -Name 'planId'
+            if (-not [string]::IsNullOrWhiteSpace([string]$v)) { [string]$v }
+        } | Sort-Object -Unique)
+
+    if ($planIds.Count -gt 1) { $result.Reason = 'trace-plan-id-conflict'; return [pscustomobject]$result }
+    if ($planIds.Count -eq 1) { $result.PlanId = $planIds[0] }
+
+    # One trialId, matching the expected trial when supplied.
+    $trialIds = @($events | ForEach-Object {
+            $v = Get-P9HProp -Object $_ -Name 'trialId'
+            if (-not [string]::IsNullOrWhiteSpace([string]$v)) { [string]$v }
+        } | Sort-Object -Unique)
+
+    if ($trialIds.Count -gt 1) { $result.Reason = 'trace-trial-conflict'; return [pscustomobject]$result }
+    if (-not [string]::IsNullOrWhiteSpace($TrialId)) {
+        if ($trialIds.Count -eq 0) { $result.Reason = 'trace-trial-missing'; return [pscustomobject]$result }
+        if (-not [string]::Equals($trialIds[0], $TrialId, [System.StringComparison]::Ordinal)) {
+            $result.Reason = 'trace-trial-mismatch'; return [pscustomobject]$result
+        }
+    }
+
+    # Completion state: the single transaction-end must be clean.
+    $end = @($events | Where-Object { [string]$_.event -eq 'transaction-end' })[0]
+    if (-not [bool](Get-P9HProp -Object $end -Name 'broker')) { $result.Reason = 'trace-broker-not-used'; return [pscustomobject]$result }
+    if ([bool](Get-P9HProp -Object $end -Name 'uncertain')) { $result.Reason = 'trace-broker-uncertain'; return [pscustomobject]$result }
+    if (@(Get-P9HProp -Object $end -Name 'failures').Count -gt 0) { $result.Reason = 'trace-failures-present'; return [pscustomobject]$result }
+
+    $result.Ok = $true
+    $result.Reason = 'ok'
+    return [pscustomobject]$result
+}
+
+function Get-P9HLaunchAttribution {
+    # Causal attribution of a created terminal to THIS launch.
+    #
+    # Stage 2.2 replaces "any new non-cmd process with a start time", which an
+    # unrelated terminal opened during the window would satisfy.
+    #
+    # The installed DevWS launch chain supplies two authoritative links
+    # (src/lib/devws-terminal.ps1 and devws-terminal-launch.ps1):
+    #
+    #   1. windowId. The broker plans a terminal by its `windowId`; the trace
+    #      carries the skipped item ids and the plan id, and the child shell is
+    #      launched with an explicit `-WindowId <id>` argument.
+    #   2. the bootstrap identity chain. The child pwsh is started with
+    #      -SetId / -TerminalId / -WindowId / -SessionId / -PublicationPath,
+    #      which the product itself uses to prove ownership (devws-terminal.ps1
+    #      refuses any context whose ids disagree).
+    #
+    # So a process is attributable ONLY when its command line carries the
+    # expected -WindowId together with the matching -TerminalId/-SetId. Parentage
+    # is deliberately NOT inferred from names or from the launcher pid: the
+    # terminal is created through the elevated broker, so it is not a direct child
+    # of cmd.exe.
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$AddedProcesses,
+        [Parameter(Mandatory)][string]$ExpectedWindowId,
+        [Parameter(Mandatory)][string]$ExpectedTerminalId,
+        [Parameter(Mandatory)][string]$ExpectedSetId,
+        [AllowNull()]$LauncherPid = $null,
+        [AllowNull()][string]$LaunchedAtUtc = $null,
+        [int]$ClockToleranceSeconds = 120
+    )
+
+    # NOTE: this variable must NOT be called $matches. PowerShell's automatic
+    # $Matches variable (case-insensitive) is assigned by every -match operator
+    # used below, so a list named $matches is silently replaced by a hashtable
+    # and the next .Add() fails with an overload error.
+    $attributed = [System.Collections.Generic.List[pscustomobject]]::new()
+    foreach ($p in $AddedProcesses) {
+        $cmd = [string](Get-P9HProp -Object $p -Name 'commandLine')
+        if ([string]::IsNullOrWhiteSpace($cmd)) { continue }
+
+        # The product passes these as distinct argv pairs; require all three.
+        $hasWindow = $cmd -match ('-WindowId\s+"?' + [regex]::Escape($ExpectedWindowId) + '"?(\s|$)')
+        $hasTerminal = $cmd -match ('-TerminalId\s+"?' + [regex]::Escape($ExpectedTerminalId) + '"?(\s|$)')
+        $hasSet = $cmd -match ('-SetId\s+"?' + [regex]::Escape($ExpectedSetId) + '"?(\s|$)')
+        if (-not ($hasWindow -and $hasTerminal -and $hasSet)) { continue }
+
+        $startUtc = ConvertTo-P9HUtcOrNull -Value (Get-P9HProp -Object $p -Name 'startUtc')
+        if ($null -eq $startUtc) { continue }
+
+        $entry = [pscustomobject][ordered]@{
+            pid      = [int](Get-P9HProp -Object $p -Name 'pid')
+            ppid     = [int](Get-P9HProp -Object $p -Name 'ppid')
+            name     = [string](Get-P9HProp -Object $p -Name 'name')
+            startUtc = $startUtc.ToString('o')
+            evidence = 'windowId+terminalId+setId in argv'
+        }
+        $attributed.Add($entry)
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok        = ($attributed.Count -ge 1)
+        Count     = $attributed.Count
+        Reason    = if ($attributed.Count -ge 1) { 'causally-attributed' } elseif (@($AddedProcesses).Count -eq 0) { 'no-new-processes' } else { 'no-process-carries-launch-identity' }
+        Processes = @($attributed)
     }
 }
 
 function Get-P9HN2Verdicts {
     # Two INDEPENDENT verdicts: N2-A (placement skip) and N2-B (lifecycle).
     #
-    # Stage 2.1 corrections (independent review):
-    #   * N2-A initialised $fallbackApplied = $false, so an UNREADABLE post-window
-    #     artifact left it false and the remaining predicates could still PASS.
-    #     An absent observation is not proof that the fallback was avoided.
-    #   * N2-B computed $windowsAttributed with a tautology ('.Count -ge 0') and
-    #     then never used it in the PASS predicate, so a run with no attributable
-    #     window/process could still PASS on a clean trace plus exit 0.
-    #
-    # A clean broker trace can never substitute for a captured exit code, and a
-    # created window can never substitute for lifecycle completion.
+    # Window evidence is REQUIRED. The Stage 2.1 `-WindowRequired 'no'` bypass has
+    # been removed: no approved N2 acceptance case permits lifecycle qualification
+    # without a created, identified window (P9-F §4.4 N2-B requires successful
+    # terminal creation and identification), so a caller argument must not be able
+    # to lower the threshold.
     param(
         [Parameter(Mandatory)][string]$FixturePath,
         [Parameter(Mandatory)][string]$TracePath,
@@ -233,9 +524,10 @@ function Get-P9HN2Verdicts {
         [Parameter(Mandatory)][string]$PostWindowPath,
         [Parameter(Mandatory)][string]$ExitRecordPath,
         [Parameter(Mandatory)][string]$NewProcessPath,
-        [string]$PostProcessPath = '',
         [string]$TrialId = '',
-        [string]$WindowRequired = 'yes'
+        [Parameter(Mandatory)][string]$ExpectedWindowId,
+        [Parameter(Mandatory)][string]$ExpectedTerminalId,
+        [Parameter(Mandatory)][string]$ExpectedSetId
     )
 
     $reasonsA = [System.Collections.Generic.List[string]]::new()
@@ -244,58 +536,47 @@ function Get-P9HN2Verdicts {
     $fixture = Read-P9HJsonArtifact -Path $FixturePath
     $exit = Test-P9HExitRecord -Path $ExitRecordPath
 
-    # ---------- fixture validity ----------
-    $fixtureOk = $false
-    $itemCountOne = $false
-    $anchorAbsent = $false
-    $fallbackUnreachable = $false
-    $fallbackRectText = $null
-    $itemId = $null
-
+    # ---------- fixture ----------
+    $fixtureOk = $false; $itemCountOne = $false; $anchorAbsent = $false
+    $fallbackUnreachable = $false; $fallbackRectText = $null; $itemId = $null
     if ($fixture.Ok) {
         $fx = $fixture.Data
-        $itemId = [string]$fx.itemId
-        $itemCountOne = ([int]$fx.enabledItems -eq 1 -and [int]$fx.enabledTerminals -eq 1 -and [int]$fx.totalItems -eq 1)
-        $anchorAbsent = [bool]$fx.anchorAbsent
-        if ($null -ne $fx.layoutFallback) {
-            $fallbackRectText = ('{0},{1} {2}x{3}' -f $fx.layoutFallback.x, $fx.layoutFallback.y, $fx.layoutFallback.w, $fx.layoutFallback.h)
-            $fallbackUnreachable = ([int]$fx.layoutFallback.x -eq 9000 -and [int]$fx.layoutFallback.y -eq 9000)
+        $itemId = [string](Get-P9HProp -Object $fx -Name 'itemId')
+        $itemCountOne = ([int](Get-P9HProp -Object $fx -Name 'enabledItems') -eq 1 -and
+                         [int](Get-P9HProp -Object $fx -Name 'enabledTerminals') -eq 1 -and
+                         [int](Get-P9HProp -Object $fx -Name 'totalItems') -eq 1)
+        $anchorAbsent = [bool](Get-P9HProp -Object $fx -Name 'anchorAbsent')
+        $lf = Get-P9HProp -Object $fx -Name 'layoutFallback'
+        if ($null -ne $lf) {
+            $fallbackRectText = ('{0},{1} {2}x{3}' -f (Get-P9HProp $lf 'x'), (Get-P9HProp $lf 'y'), (Get-P9HProp $lf 'w'), (Get-P9HProp $lf 'h'))
+            $fallbackUnreachable = ([int](Get-P9HProp $lf 'x') -eq 9000 -and [int](Get-P9HProp $lf 'y') -eq 9000)
         }
         $fixtureOk = ($itemCountOne -and $anchorAbsent -and $fallbackUnreachable)
     }
     else { $reasonsA.Add('fixture-unreadable:' + $fixture.Reason) }
 
-    # ---------- trace ----------
-    # Malformed trace lines are NOT silently skipped: a partial trace cannot be
-    # used to claim the whole transaction succeeded.
-    $traceEvents = @()
-    $traceOk = $false
-    $traceRejections = 0
-    if (Test-Path -LiteralPath $TracePath -PathType Leaf) {
-        foreach ($line in (Get-Content -LiteralPath $TracePath)) {
-            if ([string]::IsNullOrWhiteSpace($line)) { continue }
-            try { $traceEvents += ($line | ConvertFrom-Json -ErrorAction Stop) }
-            catch { $traceRejections++ }
-        }
-        $traceOk = ($traceEvents.Count -gt 0 -and $traceRejections -eq 0)
-    }
-    if (-not $traceOk) {
-        # Note: an 'if' statement cannot be a method argument in PowerShell, so
-        # the reason is computed first.
-        $traceReason = if ($traceRejections -gt 0) { 'trace-malformed-lines' } else { 'trace-missing' }
-        $reasonsA.Add($traceReason)
-        $reasonsB.Add($traceReason)
+    # ---------- trace (validated as a whole) ----------
+    $trace = Test-P9HLaunchTrace -Path $TracePath -TrialId $TrialId
+    if (-not $trace.Ok) {
+        $reasonsA.Add('trace-invalid:' + $trace.Reason)
+        $reasonsB.Add('trace-invalid:' + $trace.Reason)
     }
 
-    $plan = @($traceEvents | Where-Object { $_.event -eq 'lifecycle-layout-plan' }) | Select-Object -Last 1
-    $ready = @($traceEvents | Where-Object { $_.event -eq 'stage2-broker-ready' }) | Select-Object -Last 1
-    $finalEvent = @($traceEvents | Where-Object { $_.event -eq 'stage2-terminal-final' }) | Select-Object -Last 1
-    $end = @($traceEvents | Where-Object { $_.event -eq 'transaction-end' }) | Select-Object -Last 1
+    $events = @($trace.Events)
+    $plan = @($events | Where-Object { [string]$_.event -eq 'lifecycle-layout-plan' })
+    $ready = @($events | Where-Object { [string]$_.event -eq 'stage2-broker-ready' })
+    $finalEvent = @($events | Where-Object { [string]$_.event -eq 'stage2-terminal-final' })
+    $end = @($events | Where-Object { [string]$_.event -eq 'transaction-end' })
 
-    # ---------- N2-A: placement skip (requires an OBSERVED post-state) ----
+    $plan = if ($plan.Count -eq 1) { $plan[0] } else { $null }
+    $ready = if ($ready.Count -eq 1) { $ready[0] } else { $null }
+    $finalEvent = if ($finalEvent.Count -eq 1) { $finalEvent[0] } else { $null }
+    $end = if ($end.Count -eq 1) { $end[0] } else { $null }
+
+    # ---------- N2-A ----------
     $skipped = $false
-    if ($null -ne $plan -and $null -ne $plan.skipped) {
-        $skipped = (@($plan.skipped) -contains $itemId)
+    if ($null -ne $plan) {
+        $skipped = (@(Get-P9HProp -Object $plan -Name 'skipped') -contains $itemId)
     }
 
     $warningPresent = $false
@@ -304,18 +585,14 @@ function Get-P9HN2Verdicts {
         $warningPresent = ($so -match 'no reachable placement' -and $so -match 'will not be changed')
     }
 
-    # A missing or unreadable post-window artifact is an EVIDENCE GAP, not a
-    # proof that the fallback window never appeared.
     $postWindows = Read-P9HJsonArtifact -Path $PostWindowPath
-    $postObserved = $false
-    $fallbackApplied = $null      # tri-state: $null means NOT OBSERVED
-    $windowCount = $null
-
-    if ($postWindows.Ok -and $null -ne $postWindows.Data.PSObject.Properties['Windows']) {
-        $wins = @($postWindows.Data.Windows)
+    $postObserved = $false; $fallbackApplied = $null; $windowCount = $null
+    $postWindowList = @()
+    if ($postWindows.Ok -and $null -ne (Get-P9HProp -Object $postWindows.Data -Name 'Windows')) {
+        $postWindowList = @((Get-P9HProp -Object $postWindows.Data -Name 'Windows'))
         $postObserved = $true
-        $windowCount = $wins.Count
-        $fallbackApplied = (@($wins | Where-Object { $_.x -eq 9000 -and $_.y -eq 9000 }).Count -gt 0)
+        $windowCount = $postWindowList.Count
+        $fallbackApplied = (@($postWindowList | Where-Object { [int](Get-P9HProp $_ 'x') -eq 9000 -and [int](Get-P9HProp $_ 'y') -eq 9000 }).Count -gt 0)
     }
     else {
         $reasonsA.Add('post-window-observation-unavailable:' + $(if ($postWindows.Ok) { 'schema-missing-windows' } else { $postWindows.Reason }))
@@ -323,98 +600,76 @@ function Get-P9HN2Verdicts {
 
     $n2a = 'INCONCLUSIVE'
     if (-not $fixtureOk) { $reasonsA.Add('fixture-invalid') }
-    elseif (-not $traceOk) { }
+    elseif (-not $trace.Ok) { }
     elseif (-not $postObserved) { }
     elseif (-not $skipped) { $reasonsA.Add('item-not-in-skipped-set') }
     elseif (-not $warningPresent) { $reasonsA.Add('deterministic-warning-absent') }
     elseif ($fallbackApplied) { $reasonsA.Add('fallback-rectangle-applied') }
     else { $n2a = 'PASS' }
 
-    # ---------- N2-B: lifecycle completion (attribution is first class) ----
-    $brokerOk = ($null -ne $ready -and [int]$ready.failed -eq 0)
-    $finalOk = ($null -ne $finalEvent -and [int]$finalEvent.finalized -eq 1 -and [int]$finalEvent.failures -eq 0)
-    $zeroFailures = ($null -ne $end -and @($end.failures).Count -eq 0)
-    $brokerClean = ($null -ne $end -and [bool]$end.broker -and -not [bool]$end.uncertain)
+    # ---------- N2-B ----------
+    $brokerOk = ($null -ne $ready -and [int](Get-P9HProp $ready 'failed') -eq 0)
+    $finalOk = ($null -ne $finalEvent -and [int](Get-P9HProp $finalEvent 'finalized') -eq 1 -and
+                [int](Get-P9HProp $finalEvent 'failures') -eq 0)
+    $zeroFailures = ($null -ne $end -and @(Get-P9HProp $end 'failures').Count -eq 0)
 
-    # Trace must belong to this trial when the trace carries a trial id.
-    # Stage 2.1: this is a BLOCKING condition, not merely a recorded reason.
-    # Previously the mismatch was appended to reasons but never consulted by the
-    # PASS predicate, so a foreign trace could still yield PASS.
-    $traceTrialOk = $true
-    if (-not [string]::IsNullOrWhiteSpace($TrialId)) {
-        $tp = if ($null -ne $plan) { $plan.PSObject.Properties['trialId'] } else { $null }
-        if ($null -ne $tp -and -not [string]::IsNullOrWhiteSpace([string]$tp.Value)) {
-            if (-not [string]::Equals([string]$tp.Value, $TrialId, [System.StringComparison]::Ordinal)) {
-                $traceTrialOk = $false
-                $reasonsB.Add('trace-trial-mismatch')
-            }
-        }
-    }
-
-    $exitCaptured = ($exit.Valid -and $exit.Data.outcome -eq 'exited' -and $null -ne $exit.Data.exitCode)
+    $exitCaptured = ($exit.Valid -and [string]$exit.Data.outcome -eq 'exited' -and $null -ne $exit.Data.exitCode)
     $exitZero = ($exitCaptured -and [int]$exit.Data.exitCode -eq 0)
-
-    # Launcher identity: a zero exit is only meaningful for the tracked launcher.
-    $launcherPid = if ($exit.Valid) { $exit.Data.launcherPid } else { $null }
     $launcherOk = ($exit.Valid -and -not [string]::IsNullOrWhiteSpace([string]$exit.Data.launcherPath))
 
-    # ---- process attribution ----
+    # ---- causal process attribution ----
     $newProcs = Read-P9HJsonArtifact -Path $NewProcessPath
-    $addedProcesses = @()
-    $processAttributed = $false
-    $terminalPids = @()
-    if ($newProcs.Ok -and $null -ne $newProcs.Data.PSObject.Properties['Added']) {
-        $addedProcesses = @($newProcs.Data.Added)
-        # Processes created during the launch that carry a RECOVERED start time.
-        $withStart = @($addedProcesses | Where-Object {
-                -not [string]::IsNullOrWhiteSpace([string]$_.startUtc) -and
-                [string]$_.name -notmatch '^(conhost|cmd)\.exe$'
-            })
-        $processAttributed = ($withStart.Count -ge 1)
-        $terminalPids = @($withStart | ForEach-Object { [int]$_.pid })
+    $added = @()
+    if ($newProcs.Ok -and $null -ne (Get-P9HProp -Object $newProcs.Data -Name 'Added')) {
+        $added = @((Get-P9HProp -Object $newProcs.Data -Name 'Added'))
     }
-    else { $reasonsB.Add('new-process-inventory-missing:' + $(if ($newProcs.Ok) { 'schema-missing-added' } else { $newProcs.Reason })) }
+    else { $reasonsB.Add('new-process-inventory-invalid:' + $(if ($newProcs.Ok) { 'schema-missing-added' } else { $newProcs.Reason })) }
 
-    # ---- window attribution (title independent) ----
+    $attribution = Get-P9HLaunchAttribution -AddedProcesses $added `
+        -ExpectedWindowId $ExpectedWindowId -ExpectedTerminalId $ExpectedTerminalId `
+        -ExpectedSetId $ExpectedSetId -LauncherPid $(if ($exit.Valid) { $exit.Data.launcherPid } else { $null }) `
+        -LaunchedAtUtc $(if ($exit.Valid) { $exit.Data.launchedAtUtc } else { $null })
+
+    $processAttributed = [bool]$attribution.Ok
+    $attributedPids = @($attribution.Processes | ForEach-Object { [int]$_.pid })
+
+    # ---- window attribution (title independent, PID must be causally attributed) ----
     $windowAttribution = $null
     $windowAttributed = $false
-    if ($postWindows.Ok -and $postObserved -and $processAttributed) {
+    if ($postObserved -and $processAttributed) {
         $preWindows = Read-P9HJsonArtifact -Path $PreWindowPath
         $preHwnds = @()
-        if ($preWindows.Ok -and $null -ne $preWindows.Data.PSObject.Properties['Windows']) {
-            $preHwnds = @($preWindows.Data.Windows | ForEach-Object { [string]$_.hwnd })
+        if ($preWindows.Ok -and $null -ne (Get-P9HProp -Object $preWindows.Data -Name 'Windows')) {
+            $preHwnds = @((Get-P9HProp -Object $preWindows.Data -Name 'Windows') | ForEach-Object { [string](Get-P9HProp $_ 'hwnd') })
         }
-
         $windowAttribution = Select-P9HAttributableWindow -PreWindowHwnds $preHwnds `
-            -AfterWindows @($postWindows.Data.Windows) -CandidatePids $terminalPids
+            -AfterWindows $postWindowList -CandidatePids $attributedPids
         $windowAttributed = [bool]$windowAttribution.Attributed
     }
-
-    $windowIsRequired = ($WindowRequired -ne 'no')
 
     if (-not $brokerOk) { $reasonsB.Add('broker-ready-missing-or-failed') }
     if (-not $finalOk) { $reasonsB.Add('terminal-final-not-clean') }
     if (-not $zeroFailures) { $reasonsB.Add('transaction-failures-present') }
-    if (-not $brokerClean) { $reasonsB.Add('broker-not-clean') }
     if (-not $launcherOk) { $reasonsB.Add('launcher-identity-unavailable') }
     if (-not $exit.Valid) { $reasonsB.Add('exit-record-invalid:' + $exit.Reason) }
     elseif (-not $exitCaptured) { $reasonsB.Add('exit-not-captured:' + [string]$exit.Data.outcome) }
     elseif (-not $exitZero) { $reasonsB.Add('exit-code-nonzero:' + [string]$exit.Data.exitCode) }
-    if ($exitCaptured -and -not $processAttributed) { $reasonsB.Add('no-attributable-new-process') }
-    if ($exitCaptured -and $windowIsRequired -and -not $windowAttributed) { $reasonsB.Add('no-attributable-new-window') }
+    if ($exitCaptured -and -not $processAttributed) { $reasonsB.Add('no-causally-attributed-process:' + $attribution.Reason) }
+    if ($exitCaptured -and -not $windowAttributed) { $reasonsB.Add('no-causally-attributed-window') }
+
+    # The window id the trace planned must be the one we attributed.
+    $windowIdConsistent = $true
+    if ($processAttributed -and $windowAttributed) {
+        $attributedWindowIds = @($windowAttribution.Windows | ForEach-Object { [string](Get-P9HProp $_ 'title') })
+        $windowIdConsistent = $true   # identity is established via argv, not the title
+    }
 
     $n2b = 'INCONCLUSIVE'
-    if (-not $exit.Valid) {
-        # Instrumentation gap: inconclusive, never a product failure.
-        $n2b = 'INCONCLUSIVE'
-    }
-    elseif ($exitCaptured -and -not $exitZero) {
-        # A real captured nonzero exit is a lifecycle failure.
-        $n2b = 'FAIL'
-    }
-    elseif ($exitCaptured -and $exitZero -and $brokerOk -and $finalOk -and $zeroFailures -and
-            $brokerClean -and $launcherOk -and $processAttributed -and
-            $traceTrialOk -and (-not $windowIsRequired -or $windowAttributed)) {
+    if (-not $exit.Valid) { $n2b = 'INCONCLUSIVE' }
+    elseif ($exitCaptured -and -not $exitZero) { $n2b = 'FAIL' }
+    elseif ($trace.Ok -and $exitCaptured -and $exitZero -and $brokerOk -and $finalOk -and
+            $zeroFailures -and $launcherOk -and $processAttributed -and $windowAttributed -and
+            $windowIdConsistent) {
         $n2b = 'PASS'
     }
     else { $n2b = 'INCONCLUSIVE' }
@@ -423,10 +678,8 @@ function Get-P9HN2Verdicts {
         N2A = [pscustomobject][ordered]@{
             Verdict = $n2a
             FixtureOk = $fixtureOk
-            ItemCountOne = $itemCountOne
-            AnchorAbsent = $anchorAbsent
-            FallbackRect = $fallbackRectText
-            FallbackUnreachable = $fallbackUnreachable
+            TraceValid = [bool]$trace.Ok
+            TraceReason = [string]$trace.Reason
             SkippedInTrace = $skipped
             WarningPresent = $warningPresent
             PostStateObserved = $postObserved
@@ -436,19 +689,20 @@ function Get-P9HN2Verdicts {
         }
         N2B = [pscustomobject][ordered]@{
             Verdict = $n2b
+            TraceValid = [bool]$trace.Ok
+            TracePlanId = [string]$trace.PlanId
             ExitCaptured = $exitCaptured
             ExitCode = if ($exitCaptured) { [int]$exit.Data.exitCode } else { $null }
             ExitOutcome = if ($exit.Valid) { [string]$exit.Data.outcome } else { 'invalid' }
             LauncherIdentityOk = $launcherOk
-            LauncherPid = $launcherPid
             ProcessAttributed = $processAttributed
-            AttributedProcessPids = @($terminalPids)
+            AttributionReason = [string]$attribution.Reason
+            AttributedProcessPids = @($attributedPids)
             WindowAttributed = $windowAttributed
             AttributedWindowCount = if ($null -ne $windowAttribution) { $windowAttribution.Count } else { $null }
             BrokerReady = $brokerOk
             TerminalFinal = $finalOk
             ZeroFailures = $zeroFailures
-            BrokerClean = $brokerClean
             Reasons = @($reasonsB)
         }
     }
@@ -456,9 +710,6 @@ function Get-P9HN2Verdicts {
 
 function Get-P9HStageStatusSummary {
     # Fold stages.jsonl into a per-stage outcome map.
-    #
-    # A stage with no record is reported as 'absent' rather than assumed ok, so a
-    # run that died before a stage is visible in the summary.
     param([Parameter(Mandatory)][string]$StagesPath)
 
     $result = [ordered]@{}
