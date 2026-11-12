@@ -128,7 +128,8 @@ configuration.
 - **SYNTHETICALLY VERIFIED:** exit recording (0, 7, nonzero, timeout, detached child, large
   output, spaces, unicode, quoted args), fault containment (throwing inventory, hanging
   serializer, malformed and missing records), WTS predicate strictness (12 cases), verdict
-  rules (8 cases), date handling (3 cases).
+  rules (8 cases), cross-trial evidence binding (8 cases), shared provenance and artifact-index
+  integrity (11 cases), date handling (3 cases).
 - **NOT YET PHYSICALLY VERIFIED:** `tsdiscon` behaviour against a real session, PowerShell
   Direct capture from a Hyper-V host, real Terminal Services event delivery, and real
   installed-`ws` launch behaviour. Those require a separately authorized guest replay.
@@ -268,3 +269,77 @@ window) remains required; the binding adds provenance, not a replacement.
 **Limitation, stated plainly:** this proves the artifacts a verdict reads are the ones the collector
 captured for that trial. It does **not** prove they were captured from a live guest — that is the
 Stage 3 live collector's job, which must write the same index through `Add-P9HArtifactRole`.
+
+### Stage 2.4.1 corrections (shared provenance, fail-closed)
+
+Three narrow defects remained after Stage 2.4. Each is a false-PASS path, so each is closed rather
+than documented.
+
+#### N2-A did not consult the binding
+
+Stage 2.4 gated **N2-B** on `$binding.Ok`, but the **N2-A** (placement) chain never read it. A
+placement result could therefore become authoritative on artifacts that were never attributed to
+the trial.
+
+```
+N2-A measurement otherwise valid, artifact index ABSENT
+  before: N2A=PASS
+  after : N2A=INCONCLUSIVE  artifact-binding:artifact-index-not-supplied
+
+N2-A measurement otherwise valid, artifact index from ANOTHER trial
+  before: N2A=PASS
+  after : N2A=INCONCLUSIVE  artifact-binding:binding-mismatch:<role>:trial=<foreign-id>
+```
+
+Both verdicts now consult **one** shared gate, `Get-P9HTrialProvenance`, instead of duplicating
+slightly different trial-binding logic. The gate checks provenance and trial identity **only** — it
+never reads the exit code, terminal finalization or any other lifecycle success signal. That is what
+keeps the two measurements independent:
+
+```
+N2-A measurement valid, captured exit code 3, complete same-trial binding
+  N2A=PASS   (placement is still independently evaluated)
+  N2B=FAIL   (lifecycle outcome is not success)
+```
+
+An exit-record outcome other than success therefore never automatically implies a failed placement
+measurement. Historical P9-G measurements are **not** retroactively reclassified.
+
+#### An empty `trialId` in a required index entry was not a mismatch
+
+The verifier compared the recorded trial id only when it was non-empty, so a blank id silently
+satisfied the binding. Every required entry must now carry a **nonempty** id that equals the
+requested trial exactly:
+
+| Recorded `trialId` | Before | Now |
+| --- | --- | --- |
+| property absent | accepted | `trial-id-missing` |
+| `""` | accepted | `trial-id-missing` |
+| `"   "` | accepted | `trial-id-missing` |
+| another trial's id | rejected | `foreign-trial` |
+| exactly the requested id | accepted | accepted |
+
+Each surfaces as `binding-mismatch:<role>:trial-missing` or `binding-mismatch:<role>:trial=<id>`.
+
+#### Malformed index records were skipped silently
+
+The parser caught a malformed JSONL record and continued, so uninterpretable provenance disappeared
+from a verdict. A malformed record is now an explicit failure that names the line and the reason:
+
+```
+artifact-index-malformed:line 1
+```
+
+The raw index is preserved byte-for-byte. Nothing is truncated, rewritten or repaired, so a
+historical index is evidence rather than an input to be sanitized.
+
+| Counterexample | Result |
+| --- | --- |
+| Truncated JSON before the seven valid entries | `artifact-index-malformed:line 1` |
+| Truncated JSON appended after the valid entries | `artifact-index-malformed:line 8` |
+| A required role absent | `binding-incomplete:trace` |
+| All seven roles valid and same-trial | accepted, 7/7 verified |
+
+These are covered by the P-series (P1–P11), which also proves the N2-A/N2-B independence above and
+retains the N2-B cross-trial protection. The registry guard now covers **119** registered cases
+(108 from Stage 2.4 plus 11 P-series cases); the full run executes 120 including the R1 guard.

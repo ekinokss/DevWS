@@ -207,29 +207,35 @@ function Add-P9HArtifactRole {
 }
 
 function Get-P9HArtifactBinding {
-    # Verify that the artifacts a verdict depends on still match the digests the
-    # collector recorded, and that all of them belong to ONE trial.
+    # Verify that the artifacts a verdict depends on are the ones the collector
+    # captured for THIS trial.
     #
-    # Returns an explicit result per role. A missing entry, a missing file, a
-    # digest mismatch, or a record from a different trial all FAIL CLOSED.
+    # Stage 2.4.1: integrity is explicit and fail-closed.
+    #   * EVERY required role must carry a NONEMPTY trialId that equals the
+    #     requested trial. A missing, empty, whitespace or foreign id is a
+    #     mismatch - never silently accepted.
+    #   * A malformed index line is a HARD failure reported with its line number.
+    #     The raw index is preserved as-is; nothing is truncated, rewritten or
+    #     repaired.
+    #   * The caller's path for each role must equal the recorded path, so a
+    #     substituted artifact cannot borrow another artifact's digest.
     param(
         [Parameter(Mandatory)][string]$TrialId,
         [Parameter(Mandatory)][string]$ArtifactIndexPath,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$RequiredRoles,
-        # Optional role -> expected path map. When a role is present here, the
-        # recorded path must match it, so substitution at a different path fails
-        # even if some other artifact's digest would verify.
         [AllowNull()][hashtable]$ExpectedPaths = $null
     )
 
     $result = [ordered]@{
-        Ok            = $false
-        Reason        = $null
-        TrialId       = $TrialId
-        IndexPresent  = $false
-        Roles         = @()
-        MissingRoles  = @()
-        Mismatches    = @()
+        Ok           = $false
+        Reason       = $null
+        TrialId      = $TrialId
+        IndexPresent = $false
+        IndexLines   = 0
+        BadLines     = @()
+        Roles        = @()
+        MissingRoles = @()
+        Mismatches   = @()
     }
 
     if ([string]::IsNullOrWhiteSpace($TrialId)) {
@@ -243,14 +249,37 @@ function Get-P9HArtifactBinding {
     }
     $result.IndexPresent = $true
 
+    # ---- index integrity: a bad line is a hard failure, not a skip ----
+    $rawLines = @(Get-Content -LiteralPath $ArtifactIndexPath)
+    $result.IndexLines = $rawLines.Count
+    $parsed = [System.Collections.Generic.List[object]]::new()
+    $bad = [System.Collections.Generic.List[string]]::new()
+
+    for ($i = 0; $i -lt $rawLines.Count; $i++) {
+        $line = $rawLines[$i]
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try {
+            $rec = $line | ConvertFrom-Json -ErrorAction Stop
+            if ($null -eq $rec) { throw 'null record' }
+            $parsed.Add($rec) | Out-Null
+        }
+        catch {
+            $bad.Add(('line {0}: {1}' -f ($i + 1), $_.Exception.Message))
+        }
+    }
+
+    $result.BadLines = @($bad)
+    if ($bad.Count -gt 0) {
+        $result.Reason = 'artifact-index-malformed:' + (($bad | ForEach-Object { ($_ -split ':')[0] }) -join ',')
+        return [pscustomobject]$result
+    }
+
     # Latest entry wins for a role, which is what an append-only index means.
     $byRole = @{}
-    foreach ($line in (Get-Content -LiteralPath $ArtifactIndexPath)) {
-        if ([string]::IsNullOrWhiteSpace($line)) { continue }
-        try { $e = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
-        $r = [string](Get-P9HProp -Object $e -Name 'role')
+    foreach ($rec in $parsed) {
+        $r = [string](Get-P9HProp -Object $rec -Name 'role')
         if ([string]::IsNullOrWhiteSpace($r)) { continue }
-        $byRole[$r] = $e
+        $byRole[$r] = $rec
     }
 
     $rows = [System.Collections.Generic.List[object]]::new()
@@ -264,17 +293,24 @@ function Get-P9HArtifactBinding {
             continue
         }
 
-        $e = $byRole[$role]
-        $recordedTrial = [string](Get-P9HProp -Object $e -Name 'trialId')
-        $recordedPath = [string](Get-P9HProp -Object $e -Name 'path')
-        $recordedSha = [string](Get-P9HProp -Object $e -Name 'sha256')
+        $rec = $byRole[$role]
+        $recordedTrial = [string](Get-P9HProp -Object $rec -Name 'trialId')
 
-        if (-not [string]::IsNullOrWhiteSpace($recordedTrial) -and
-            -not [string]::Equals($recordedTrial, $TrialId, [System.StringComparison]::Ordinal)) {
-            $mismatch.Add(('{0}:trial={1}' -f $role, $recordedTrial))
-            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'foreign-trial'; path = $recordedPath; expected = $TrialId; actual = $recordedTrial })
+        # Nonempty AND exactly equal. Whitespace-only is treated as absent.
+        if ([string]::IsNullOrWhiteSpace($recordedTrial)) {
+            $mismatch.Add(('{0}:trial-missing' -f $role))
+            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'trial-id-missing'; path = $null; expected = $TrialId; actual = $recordedTrial })
             continue
         }
+
+        if (-not [string]::Equals($recordedTrial, $TrialId, [System.StringComparison]::Ordinal)) {
+            $mismatch.Add(('{0}:trial={1}' -f $role, $recordedTrial))
+            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'foreign-trial'; path = $null; expected = $TrialId; actual = $recordedTrial })
+            continue
+        }
+
+        $recordedPath = [string](Get-P9HProp -Object $rec -Name 'path')
+        $recordedSha = [string](Get-P9HProp -Object $rec -Name 'sha256')
 
         if ([string]::IsNullOrWhiteSpace($recordedSha)) {
             $missing.Add(('{0}:no-digest' -f $role))
@@ -285,7 +321,7 @@ function Get-P9HArtifactBinding {
         # Path pinning: the caller must be using the artifact the collector bound.
         if ($null -ne $ExpectedPaths -and $ExpectedPaths.ContainsKey($role)) {
             $expectedPath = [string]$ExpectedPaths[$role]
-            if (-not [string]::IsNullOrWhiteSpace($expectedPath)) {
+            if (-not [string]::IsNullOrWhiteSpace($expectedPath) -and -not [string]::IsNullOrWhiteSpace($recordedPath)) {
                 $expectedFull = [System.IO.Path]::GetFullPath($expectedPath)
                 $recordedFull = [System.IO.Path]::GetFullPath($recordedPath)
                 if (-not [string]::Equals($expectedFull, $recordedFull, [System.StringComparison]::OrdinalIgnoreCase)) {

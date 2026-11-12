@@ -820,12 +820,19 @@ function Invoke-P9HVerdictTests {
         -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $dir `
         -LaunchedAtUtc $launchStart.ToString('o') -ExitedAtUtc $launchEnd.ToString('o')
     $null = Write-P9HExitRecord -Path $exitV5 -Record $recV5
+    # Stage 2.4.1: the exit record must ALSO be attributed to this trial, exactly
+    # as a real collector would record it. Only the lifecycle OUTCOME differs
+    # here, so the independence proof stays isolated to the exit code; the index
+    # is append-only, so the latest entry for the role wins and is restored below.
+    $null = Add-P9HArtifactRole -Context $bindCtx -Path $exitV5 -Role 'exit-record'
     $nv5 = Try-N2 @{ ExitRecordPath = $exitV5 }
     Add-P9HTestResult -Id 'V5' -Title 'N2-A PASS does not imply N2-B PASS' `
         -Input 'valid trace and window evidence, captured nonzero exit code 3' `
         -Expected 'N2A=PASS and N2B!=PASS' `
         -Actual ("N2A={0} N2B={1}" -f $nv5.N2A.Verdict, $nv5.N2B.Verdict) `
         -Pass ($nv5.N2A.Verdict -eq 'PASS' -and $nv5.N2B.Verdict -ne 'PASS') -Evidence $exitV5
+    # Restore the shared good binding (append-only: the latest role entry wins).
+    $null = Add-P9HArtifactRole -Context $bindCtx -Path $exitPath -Role 'exit-record'
 
     $nv2 = Try-N2 @{}
     Add-P9HTestResult -Id 'V6' -Title 'Complete evidence passes N2-B (real detached architecture)' `
@@ -1643,6 +1650,235 @@ function Invoke-P9HTrialBindingTests {
         -Actual ("N2B={0} binding={1}" -f $m8.N2B.Verdict, $m8.N2B.ArtifactBindingReason) `
         -Pass ($m8.N2B.Verdict -ne 'PASS') -Evidence $A.Index
 }
+function Invoke-P9HProvenanceTests {
+    # P-series: shared trial provenance and artifact-index integrity (Stage 2.4.1).
+    #
+    # Stage 2.4 gated N2-B on the artifact binding but left N2-A ungated, so a
+    # placement PASS could rest on unattributed artifacts. Both verdicts now
+    # consult ONE shared gate that checks provenance only - never exit code - so
+    # the two measurements stay independent.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $windowId = 'DevWS-main-p9h-item'
+    $terminalId = 'p9h-item'
+    $setId = 'main'
+
+    function New-ProvTrial {
+        param([string]$kind, [int]$exitCode = 0)
+        $ctx = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind selftest
+        $d = $ctx.Directory
+        $tid = $ctx.TrialId
+
+        $fx = Join-Path $d 'fx.json'
+        Write-P9HArtifact -Path $fx -Lines @(([ordered]@{
+                    itemId = $terminalId; enabledItems = 1; enabledTerminals = 1; totalItems = 1
+                    anchorAbsent = $true
+                    layoutFallback = [ordered]@{ x = 9000; y = 9000; w = 640; h = 480 }
+                } | ConvertTo-Json -Depth 5))
+
+        $so = Join-Path $d 'o.txt'
+        Write-P9HArtifact -Path $so -Lines @('main/p9h-item: relative layout has no reachable placement (anchor-missing: identity-not-found); the item will be handled normally but its window position will not be changed.')
+
+        $pre = Join-Path $d 'pre.json'
+        Write-P9HArtifact -Path $pre -Lines @('{"Windows":[]}')
+
+        $post = Join-Path $d 'post.json'
+        Write-P9HArtifact -Path $post -Lines @(([ordered]@{
+                    Windows = @([ordered]@{ hwnd = '0xA1'; pid = 4242; visible = $true; class = 'CASCADIA_HOSTING_WINDOW_CLASS'; x = 44; y = 52; width = 1129; height = 635; title = $windowId })
+                } | ConvertTo-Json -Depth 5))
+
+        $bs = 'pwsh.exe -NoExit -File x ' +
+            "-SetId $setId -TerminalId $terminalId -WindowId $windowId -TabIndex 0 -SessionId s1"
+        $np = Join-Path $d 'np.json'
+        Write-P9HArtifact -Path $np -Lines @(([ordered]@{
+                    Added = @([ordered]@{ pid = 4242; ppid = 4240; name = 'pwsh.exe'; startUtc = (Get-Date).ToUniversalTime().ToString('o'); commandLine = $bs })
+                } | ConvertTo-Json -Depth 5))
+
+        $ls = (Get-Date).ToUniversalTime().AddMinutes(-1)
+        $le = (Get-Date).ToUniversalTime().AddMinutes(1)
+        $ex = Join-Path $d 'exit.json'
+        $rec = New-P9HExitRecord -TrialId $tid -Outcome 'exited' -ExitCode $exitCode -LauncherPid 4240 `
+            -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 's' -WorkingDirectory $d `
+            -LaunchedAtUtc $ls.ToString('o') -ExitedAtUtc $le.ToString('o')
+        $null = Write-P9HExitRecord -Path $ex -Record $rec
+
+        $n = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $mkE = {
+            param([string]$e, [hashtable]$x, [long]$o)
+            $h = @{ event = $e; utcMs = ($n + $o); pid = 1 }
+            foreach ($k in $x.Keys) { $h[$k] = $x[$k] }
+            return ($h | ConvertTo-Json -Compress)
+        }
+        $tr = Join-Path $d ("trace-$kind.jsonl")
+        Write-P9HArtifact -Path $tr -Lines @(
+            (& $mkE 'lifecycle-layout-plan' @{ set = $setId; profileAware = $false; source = 'relative'; profileId = ''; fingerprint = 'X'; skipped = @($terminalId) } 0)
+            (& $mkE 'stage2-broker-ready' @{ planId = 'plan-1'; elapsedMs = 1; present = 0; missing = 1; ambiguous = 0; failed = 0 } 30)
+            (& $mkE 'stage2-terminal-final' @{ finalized = 1; failures = 0 } 60)
+            (& $mkE 'transaction-end' @{ set = $setId; broker = $true; uncertain = $false; layoutSource = 'relative'; profileId = ''; failures = @() } 70)
+        )
+
+        return [pscustomobject]@{
+            Context = $ctx; TrialId = $tid; Directory = $d
+            Fixture = $fx; Stdout = $so; PreWindow = $pre; PostWindow = $post
+            ExitRecord = $ex; NewProcess = $np; Trace = $tr
+            Index = (Join-Path $d 'artifact-index.jsonl')
+        }
+    }
+
+    function Bind-ProvTrial($t, $trialIdOverride = $null) {
+        $roles = @(
+            @{ p = $t.Fixture; r = 'fixture' }
+            @{ p = $t.Stdout; r = 'stdout' }
+            @{ p = $t.PreWindow; r = 'pre-windows' }
+            @{ p = $t.PostWindow; r = 'post-windows' }
+            @{ p = $t.ExitRecord; r = 'exit-record' }
+            @{ p = $t.NewProcess; r = 'new-processes' }
+            @{ p = $t.Trace; r = 'trace' }
+        )
+        foreach ($x in $roles) {
+            if ($null -eq $trialIdOverride) {
+                $null = Add-P9HArtifactRole -Context $t.Context -Path $x.p -Role $x.r
+            }
+            else {
+                # Write a record with a deliberately wrong/blank trial id.
+                $full = (Resolve-Path -LiteralPath $x.p).Path
+                $entry = [ordered]@{
+                    utc = Get-P9HUtcStamp; trialId = $trialIdOverride; role = $x.r
+                    file = [System.IO.Path]::GetFileName($x.p); path = $full
+                    bytes = (Get-Item -LiteralPath $x.p).Length
+                    sha256 = Get-P9HFileSha256 -Path $x.p; present = $true
+                }
+                Add-P9HArtifactLine -Path $t.Index -Line ($entry | ConvertTo-Json -Compress -Depth 4)
+            }
+        }
+    }
+
+    function Invoke-ProvN2($t, [hashtable]$over) {
+        $a = @{
+            FixturePath = $t.Fixture; TracePath = $t.Trace; StdoutPath = $t.Stdout
+            PreWindowPath = $t.PreWindow; PostWindowPath = $t.PostWindow
+            ExitRecordPath = $t.ExitRecord; NewProcessPath = $t.NewProcess
+            TrialId = $t.TrialId
+            ExpectedWindowId = $windowId; ExpectedTerminalId = $terminalId; ExpectedSetId = $setId
+            ArtifactIndexPath = $t.Index
+        }
+        foreach ($k in $over.Keys) { $a[$k] = $over[$k] }
+        return Get-P9HN2Verdicts @a
+    }
+
+    $good = New-ProvTrial -kind 'good'
+    Bind-ProvTrial $good
+
+    $foreign = New-ProvTrial -kind 'foreign'
+    Bind-ProvTrial $foreign
+
+    # ---- P1: N2-A otherwise valid, binding ABSENT ----
+    $p1 = Invoke-ProvN2 $good @{ ArtifactIndexPath = '' }
+    Add-P9HTestResult -Id 'P1' -Title 'N2-A cannot PASS without an artifact binding' `
+        -Input 'measurement valid, no artifact index' -Expected 'N2A not PASS' `
+        -Actual ("N2A={0} reasons={1}" -f $p1.N2A.Verdict, ($p1.N2A.Reasons -join ',')) `
+        -Pass ($p1.N2A.Verdict -ne 'PASS') -Evidence $null
+
+    # ---- P2: N2-A otherwise valid, FOREIGN trial index ----
+    $p2 = Invoke-ProvN2 $good @{ ArtifactIndexPath = $foreign.Index }
+    Add-P9HTestResult -Id 'P2' -Title 'N2-A cannot PASS on another trial artifact index' `
+        -Input ('good trial evaluated against ' + $foreign.Index) -Expected 'N2A not PASS' `
+        -Actual ("N2A={0} reasons={1}" -f $p2.N2A.Verdict, ($p2.N2A.Reasons -join ',')) `
+        -Pass ($p2.N2A.Verdict -ne 'PASS') -Evidence $foreign.Index
+
+    # ---- P3: N2-A complete valid binding ----
+    $p3 = Invoke-ProvN2 $good @{}
+    Add-P9HTestResult -Id 'P3' -Title 'N2-A PASS with a complete valid same-trial binding' `
+        -Input 'all seven roles bound and verified' -Expected 'N2A=PASS' `
+        -Actual ("N2A={0} N2B={1}" -f $p3.N2A.Verdict, $p3.N2B.Verdict) `
+        -Pass ($p3.N2A.Verdict -eq 'PASS') -Evidence $good.Index
+
+    # ---- P4: N2-A independence from a nonzero lifecycle exit ----
+    $nonzero = New-ProvTrial -kind 'nonzero' -exitCode 3
+    Bind-ProvTrial $nonzero
+    $p4 = Invoke-ProvN2 $nonzero @{}
+    Add-P9HTestResult -Id 'P4' -Title 'N2-A remains independent of a nonzero lifecycle exit' `
+        -Input 'captured exit code 3, complete valid binding' `
+        -Expected 'N2A=PASS and N2B=FAIL' `
+        -Actual ("N2A={0} N2B={1}" -f $p4.N2A.Verdict, $p4.N2B.Verdict) `
+        -Pass ($p4.N2A.Verdict -eq 'PASS' -and $p4.N2B.Verdict -eq 'FAIL') -Evidence $nonzero.Index
+
+    # ---- P5: blank / whitespace trial ids in required entries ----
+    $blank = New-ProvTrial -kind 'blank'
+    Bind-ProvTrial $blank -trialIdOverride ''
+    $p5 = Invoke-ProvN2 $blank @{}
+    Add-P9HTestResult -Id 'P5' -Title 'Blank trial ids in required index entries are rejected' `
+        -Input 'artifact-index entries carry trialId="" ' -Expected 'not PASS, binding fails' `
+        -Actual ("N2A={0} N2B={1}" -f $p5.N2A.Verdict, $p5.N2B.Verdict) `
+        -Pass ($p5.N2A.Verdict -ne 'PASS' -and $p5.N2B.Verdict -ne 'PASS') -Evidence $blank.Index
+
+    # ---- P6: whitespace-only trial id ----
+    $ws = New-ProvTrial -kind 'ws'
+    Bind-ProvTrial $ws -trialIdOverride '   '
+    $p6 = Invoke-ProvN2 $ws @{}
+    Add-P9HTestResult -Id 'P6' -Title 'Whitespace-only trial ids in required entries are rejected' `
+        -Input 'artifact-index entries carry trialId="   " ' -Expected 'not PASS' `
+        -Actual ("N2A={0} N2B={1}" -f $p6.N2A.Verdict, $p6.N2B.Verdict) `
+        -Pass ($p6.N2A.Verdict -ne 'PASS' -and $p6.N2B.Verdict -ne 'PASS') -Evidence $ws.Index
+
+    # ---- P7: malformed line BEFORE the valid entries ----
+    $malPre = New-ProvTrial -kind 'malpre'
+    $idxPre = $malPre.Index
+    $existing = @(Get-Content -LiteralPath $idxPre -ErrorAction SilentlyContinue)
+    $rawPre = @('{"trialId": "broken", "role": ') + $existing
+    Write-P9HArtifact -Path $idxPre -Lines $rawPre
+    Bind-ProvTrial $malPre
+    $p7 = Invoke-ProvN2 $malPre @{}
+    Add-P9HTestResult -Id 'P7' -Title 'A malformed index line before valid entries is rejected' `
+        -Input 'truncated JSON prepended to the index' -Expected 'not PASS' `
+        -Actual ("N2A={0} N2B={1}" -f $p7.N2A.Verdict, $p7.N2B.Verdict) `
+        -Pass ($p7.N2A.Verdict -ne 'PASS' -and $p7.N2B.Verdict -ne 'PASS') -Evidence $idxPre
+
+    # ---- P8: malformed line APPENDED after all seven valid entries ----
+    $malPost = New-ProvTrial -kind 'malpost'
+    Bind-ProvTrial $malPost
+    Add-P9HArtifactLine -Path $malPost.Index -Line '{"trialId": "tail", "role":'
+    $p8 = Invoke-ProvN2 $malPost @{}
+    Add-P9HTestResult -Id 'P8' -Title 'A malformed index line appended after valid entries is rejected' `
+        -Input 'truncated JSON appended to a complete index' -Expected 'not PASS' `
+        -Actual ("N2A={0} N2B={1}" -f $p8.N2A.Verdict, $p8.N2B.Verdict) `
+        -Pass ($p8.N2A.Verdict -ne 'PASS' -and $p8.N2B.Verdict -ne 'PASS') -Evidence $malPost.Index
+
+    # ---- P9: a required role missing from the index ----
+    $missingRole = New-ProvTrial -kind 'missing'
+    foreach ($x in @(
+            @{ p = $missingRole.Fixture; r = 'fixture' }
+            @{ p = $missingRole.Stdout; r = 'stdout' }
+            @{ p = $missingRole.PreWindow; r = 'pre-windows' }
+            @{ p = $missingRole.PostWindow; r = 'post-windows' }
+            @{ p = $missingRole.ExitRecord; r = 'exit-record' }
+            @{ p = $missingRole.NewProcess; r = 'new-processes' }
+        )) {
+        $null = Add-P9HArtifactRole -Context $missingRole.Context -Path $x.p -Role $x.r
+    }
+    $p9 = Invoke-ProvN2 $missingRole @{}
+    Add-P9HTestResult -Id 'P9' -Title 'A missing required role is rejected' `
+        -Input 'trace role absent from the index' -Expected 'not PASS' `
+        -Actual ("N2A={0} N2B={1}" -f $p9.N2A.Verdict, $p9.N2B.Verdict) `
+        -Pass ($p9.N2A.Verdict -ne 'PASS' -and $p9.N2B.Verdict -ne 'PASS') -Evidence $missingRole.Index
+
+    # ---- P10: complete valid seven-role index accepted ----
+    $p10 = Invoke-ProvN2 $good @{}
+    $roles = @($p10.N2B.ArtifactBindingRoles)
+    $verified = @($roles | Where-Object { $_.status -eq 'verified' }).Count
+    Add-P9HTestResult -Id 'P10' -Title 'A complete correct seven-role index is accepted' `
+        -Input 'fixture, stdout, pre/post windows, exit record, new processes, trace' `
+        -Expected 'PASS with 7/7 roles verified' `
+        -Actual ("N2A={0} N2B={1} roles={2} verified={3}" -f $p10.N2A.Verdict, $p10.N2B.Verdict, $roles.Count, $verified) `
+        -Pass ($p10.N2A.Verdict -eq 'PASS' -and $p10.N2B.Verdict -eq 'PASS' -and $verified -eq 7) -Evidence $good.Index
+
+    # ---- P11: N2-B cross-trial protection retained ----
+    $p11 = Invoke-ProvN2 $good @{ ExitRecordPath = $foreign.ExitRecord }
+    Add-P9HTestResult -Id 'P11' -Title 'N2-B cross-trial exit-record protection is retained' `
+        -Input ('good trial with ' + $foreign.TrialId + ' exit record') -Expected 'N2B not PASS' `
+        -Actual ("N2B={0} trialMatches={1}" -f $p11.N2B.Verdict, $p11.N2B.TrialIdentityMatches) `
+        -Pass ($p11.N2B.Verdict -ne 'PASS') -Evidence $foreign.ExitRecord
+}
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -1657,6 +1893,7 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HVerdictTests -SandboxRoot $SandboxRoot
     Invoke-P9HSafetyGateTests -SandboxRoot $SandboxRoot
     Invoke-P9HTrialBindingTests -SandboxRoot $SandboxRoot
+    Invoke-P9HProvenanceTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
@@ -1664,8 +1901,8 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 108 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'G', 'D')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 119 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'G', 'D')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

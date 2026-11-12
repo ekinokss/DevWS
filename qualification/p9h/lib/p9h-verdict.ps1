@@ -525,6 +525,63 @@ function Get-P9HLaunchAttribution {
     }
 }
 
+function Get-P9HTrialProvenance {
+    # SHARED provenance gate for both N2 verdicts.
+    #
+    # Stage 2.4.1: N2-B required the artifact binding but N2-A did not, so a
+    # placement PASS could rest on artifacts that were never attributed to the
+    # trial. Attribution is a property of the EVIDENCE, not of which measurement
+    # consumed it, so both verdicts now consult this single gate.
+    #
+    # Independence is preserved: this gate checks ONLY provenance and trial
+    # identity. It never inspects the exit code, terminal finalization or any
+    # lifecycle success signal, so N2-A cannot inherit an N2-B failure.
+    param(
+        [string]$TrialId,
+        [string]$ArtifactIndexPath,
+        $ExitRecordValidation,
+        [AllowNull()][hashtable]$ExpectedPaths = $null
+    )
+
+    $trialIdPresent = -not [string]::IsNullOrWhiteSpace($TrialId)
+    $exitTrial = if ($null -ne $ExitRecordValidation -and $ExitRecordValidation.Valid) {
+        [string](Get-P9HProp -Object $ExitRecordValidation.Data -Name 'trialId')
+    } else { $null }
+    $exitTrialPresent = -not [string]::IsNullOrWhiteSpace($exitTrial)
+    $exitTrialMatches = ($trialIdPresent -and $exitTrialPresent -and
+                         [string]::Equals($exitTrial, $TrialId, [System.StringComparison]::Ordinal))
+
+    if ([string]::IsNullOrWhiteSpace($ArtifactIndexPath)) {
+        # The binding is MANDATORY for an authoritative PASS. An absent index is
+        # an evidence gap, not a reason to skip the check: without it there is no
+        # way to know the trace and inventories belong to this trial at all.
+        $binding = [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'artifact-index-not-supplied'; Roles = @()
+            MissingRoles = @('artifact-index'); Mismatches = @(); BadLines = @()
+        }
+    }
+    else {
+        $binding = Get-P9HArtifactBinding -TrialId $TrialId -ArtifactIndexPath $ArtifactIndexPath `
+            -RequiredRoles @('fixture', 'stdout', 'pre-windows', 'post-windows', 'exit-record', 'new-processes', 'trace') `
+            -ExpectedPaths $ExpectedPaths
+    }
+
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    if (-not $trialIdPresent) { $reasons.Add('trial-id-missing') }
+    elseif (-not $exitTrialPresent) { $reasons.Add('exit-record-trial-id-missing') }
+    elseif (-not $exitTrialMatches) { $reasons.Add('exit-record-trial-mismatch:' + [string]$exitTrial) }
+    if (-not $binding.Ok) { $reasons.Add('artifact-binding:' + $binding.Reason) }
+
+    return [pscustomobject][ordered]@{
+        Ok                 = ($reasons.Count -eq 0)
+        Reasons            = @($reasons)
+        TrialIdPresent     = $trialIdPresent
+        TrialIdFromExit    = $exitTrial
+        TrialIdMatches     = $exitTrialMatches
+        Binding            = $binding
+    }
+}
+
 function Get-P9HN2Verdicts {
     # Two INDEPENDENT verdicts: N2-A (placement skip) and N2-B (lifecycle).
     #
@@ -558,42 +615,25 @@ function Get-P9HN2Verdicts {
     $fixture = Read-P9HJsonArtifact -Path $FixturePath
     $exit = Test-P9HExitRecord -Path $ExitRecordPath
 
-    # ---- trial identity + artifact binding (Stage 2.4) ----
-    # A verdict must be about ONE trial. The exit record s own trialId is
-    # compared explicitly, because Test-P9HExitRecord only checks that the
-    # field is PRESENT, not that it matches the trial being evaluated.
-    $trialIdPresent = -not [string]::IsNullOrWhiteSpace($TrialId)
-    $exitTrial = if ($exit.Valid) { [string](Get-P9HProp -Object $exit.Data -Name 'trialId') } else { $null }
-    $exitTrialPresent = -not [string]::IsNullOrWhiteSpace($exitTrial)
-    $exitTrialMatches = ($trialIdPresent -and $exitTrialPresent -and
-                         [string]::Equals($exitTrial, $TrialId, [System.StringComparison]::Ordinal))
-
-    # The binding is MANDATORY for an authoritative PASS. An absent index is an
-    # evidence gap, not a reason to skip the check: without it there is no way to
-    # know the trace and inventories belong to this trial at all.
-    $binding = $null
-    if ([string]::IsNullOrWhiteSpace($ArtifactIndexPath)) {
-        $binding = [pscustomobject][ordered]@{
-            Ok = $false; Reason = 'artifact-index-not-supplied'; Roles = @()
-            MissingRoles = @('artifact-index'); Mismatches = @()
+    # ---- SHARED trial provenance (Stage 2.4.1) ----
+    # One gate, consulted by BOTH verdicts. It verifies only that the evidence
+    # is attributed to this trial; it never inspects lifecycle success, so N2-A
+    # stays independent of exit code and terminal finalization.
+    $provenance = Get-P9HTrialProvenance -TrialId $TrialId -ArtifactIndexPath $ArtifactIndexPath `
+        -ExitRecordValidation $exit -ExpectedPaths @{
+            'fixture'       = $FixturePath
+            'stdout'        = $StdoutPath
+            'pre-windows'   = $PreWindowPath
+            'post-windows'  = $PostWindowPath
+            'exit-record'   = $ExitRecordPath
+            'new-processes' = $NewProcessPath
+            'trace'         = $TracePath
         }
-    }
-    else {
-        # ExpectedPaths pins each role to the exact artifact the caller supplied,
-        # so a substituted file at a different path cannot borrow another
-        # artifact s verified digest.
-        $binding = Get-P9HArtifactBinding -TrialId $TrialId -ArtifactIndexPath $ArtifactIndexPath `
-            -RequiredRoles @('fixture', 'stdout', 'pre-windows', 'post-windows', 'exit-record', 'new-processes', 'trace') `
-            -ExpectedPaths @{
-                'fixture'       = $FixturePath
-                'stdout'        = $StdoutPath
-                'pre-windows'   = $PreWindowPath
-                'post-windows'  = $PostWindowPath
-                'exit-record'   = $ExitRecordPath
-                'new-processes' = $NewProcessPath
-                'trace'         = $TracePath
-            }
-    }
+    $trialIdPresent = $provenance.TrialIdPresent
+    $exitTrial = $provenance.TrialIdFromExit
+    $exitTrialPresent = -not [string]::IsNullOrWhiteSpace([string]$exitTrial)
+    $exitTrialMatches = $provenance.TrialIdMatches
+    $binding = $provenance.Binding
 
     # ---------- fixture ----------
     $fixtureOk = $false; $itemCountOne = $false; $anchorAbsent = $false
@@ -699,7 +739,13 @@ function Get-P9HN2Verdicts {
     }
 
     $n2a = 'INCONCLUSIVE'
+    # Provenance is required for an AUTHORITATIVE placement result, exactly as
+    # it is for lifecycle. It does not depend on exit code: a nonzero exit can
+    # still leave the placement measurement valid, so this gate deliberately
+    # reads only evidence attribution and never the lifecycle outcome.
+    if (-not $provenance.Ok) { foreach ($r in @($provenance.Reasons)) { $reasonsA.Add($r) } }
     if (-not $fixtureOk) { $reasonsA.Add('fixture-invalid') }
+    elseif (-not $provenance.Ok) { }   # reasons already recorded above
     elseif (-not $trace.Ok) { }
     elseif (-not $preObserved -or -not $postObserved) { }
     elseif (-not $processAttributed) { }
