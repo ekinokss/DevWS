@@ -1879,6 +1879,431 @@ function Invoke-P9HProvenanceTests {
         -Actual ("N2B={0} trialMatches={1}" -f $p11.N2B.Verdict, $p11.N2B.TrialIdentityMatches) `
         -Pass ($p11.N2B.Verdict -ne 'PASS') -Evidence $foreign.ExitRecord
 }
+function Invoke-P9HWtsProviderTests {
+    # W-series: native WTSINFO provider decode (Stage 3A).
+    # C-series: trial collector binding to the frozen seven N2 roles.
+    #
+    # Every case here runs from SYNTHETIC bytes or synthetic facts. Nothing in
+    # this function calls WTSQuerySessionInformationW: the only live-path
+    # exercise is the authorization refusal (W13), which is exactly what proves
+    # the adapter cannot touch a live session by accident.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    # A fixed, known FILETIME: 2026-11-11T10:00:00Z.
+    $logonUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 11, 10, 0, 0), [System.DateTimeKind]::Utc)
+    $logonFt = $logonUtc.ToFileTimeUtc()
+    $otherUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 11, 09, 0, 0), [System.DateTimeKind]::Utc)
+    $otherFt = $otherUtc.ToFileTimeUtc()
+    $logonIso = $logonUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+
+    # ---- W1: valid WTSINFO payload with a nonzero logon time ----
+    $payload = New-P9HWtsInfoPayload -SessionId 3 -State 0 -StationName 'RDP-Tcp#0' `
+        -Domain 'CONTOSO' -UserName 'qauser' -LogonTime $logonFt
+    $decoded = ConvertFrom-P9HWtsInfoPayload -Payload $payload
+    $rec = if ($decoded.Ok) { $decoded.Record } else { $null }
+    Add-P9HTestResult -Id 'Q1' -Title 'Valid WTSINFO payload decodes with a nonzero logon time' `
+        -Input ('216-byte WTSINFO, session 3 Active, logon ' + $logonIso) `
+        -Expected 'Ok=true, sessionId=3, state=0, logon present' `
+        -Actual ("Ok={0} reason={1} sessionId={2} state={3} logon={4}" -f $decoded.Ok, $decoded.Reason, $(if ($rec) { $rec.SessionId } else { 'null' }), $(if ($rec) { $rec.State } else { 'null' }), $(if ($rec) { $rec.LogonTime } else { 'null' })) `
+        -Pass ($decoded.Ok -and $rec.SessionId -eq 3 -and $rec.State -eq 0 -and -not [string]::IsNullOrWhiteSpace([string]$rec.LogonTime)) -Evidence $null
+
+    # ---- W2: FILETIME -> UTC conversion is exact ----
+    $converted = ConvertFrom-P9HFileTimeUtc -FileTime $logonFt
+    $roundTrip = if ($converted.Ok) { [datetime]::Parse($converted.Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind) } else { $null }
+    Add-P9HTestResult -Id 'Q2' -Title 'FILETIME converts to the exact UTC instant' `
+        -Input ('FILETIME ' + $logonFt) -Expected ('exactly ' + $logonIso) `
+        -Actual ("{0} kind={1} roundTripMatches={2}" -f $converted.Value, $(if ($roundTrip) { $roundTrip.Kind } else { 'null' }), $(if ($roundTrip) { $roundTrip -eq $logonUtc } else { $false })) `
+        -Pass ($converted.Ok -and $converted.Value -eq $logonIso -and $roundTrip -eq $logonUtc) -Evidence $null
+
+    # ---- W3: zero logon time is rejected, never converted to 1601 ----
+    $zeroPayload = New-P9HWtsInfoPayload -SessionId 3 -State 0 -UserName 'qauser' -LogonTime 0
+    $zeroDecoded = ConvertFrom-P9HWtsInfoPayload -Payload $zeroPayload
+    $zeroRec = if ($zeroDecoded.Ok) { $zeroDecoded.Record } else { $null }
+    Add-P9HTestResult -Id 'Q3' -Title 'Zero logon time is absent, never the 1601 epoch' `
+        -Input 'WTSINFO LogonTime = 0' -Expected 'logon null, reason=zero, no fabricated timestamp' `
+        -Actual ("Ok={0} logon={1} reason={2} source={3}" -f $zeroDecoded.Ok, $(if ($zeroRec) { [string]$zeroRec.LogonTime } else { 'null' }), $(if ($zeroRec) { $zeroRec.LogonReason } else { 'null' }), $(if ($zeroRec) { $zeroRec.LogonSource } else { 'null' })) `
+        -Pass ($zeroDecoded.Ok -and $null -eq $zeroRec.LogonTime -and $zeroRec.LogonReason -eq 'zero') -Evidence $null
+
+    # ---- W4: negative logon time is rejected ----
+    $negConverted = ConvertFrom-P9HFileTimeUtc -FileTime ([long]-1)
+    Add-P9HTestResult -Id 'Q4' -Title 'Negative FILETIME is rejected' `
+        -Input 'LogonTime = -1' -Expected 'Ok=false reason=negative' `
+        -Actual ("Ok={0} reason={1}" -f $negConverted.Ok, $negConverted.Reason) `
+        -Pass ((-not $negConverted.Ok) -and $negConverted.Reason -eq 'negative') -Evidence $null
+
+    # ---- W5: struct-size mismatch is an explicit failure ----
+    $short = New-P9HWtsInfoPayload -SessionId 3 -State 0 -ByteCountOverride 100
+    $shortDecoded = ConvertFrom-P9HWtsInfoPayload -Payload $short
+    Add-P9HTestResult -Id 'Q5' -Title 'Struct-size mismatch is rejected with byte counts' `
+        -Input '100-byte WTSINFO payload' -Expected 'Ok=false reason=struct-size-mismatch' `
+        -Actual ("Ok={0} reason={1} returned={2} expected={3}" -f $shortDecoded.Ok, $shortDecoded.Reason, $shortDecoded.ReturnedBytes, $shortDecoded.ExpectedBytes) `
+        -Pass ((-not $shortDecoded.Ok) -and $shortDecoded.Reason -eq 'struct-size-mismatch' -and $shortDecoded.ExpectedBytes -eq 216) -Evidence $null
+
+    # ---- W6: empty payload is rejected ----
+    $emptyDecoded = ConvertFrom-P9HWtsInfoPayload -Payload ([byte[]]@())
+    Add-P9HTestResult -Id 'Q6' -Title 'Empty WTSINFO payload is rejected' `
+        -Input 'zero bytes' -Expected 'Ok=false reason=empty-payload' `
+        -Actual ("Ok={0} reason={1}" -f $emptyDecoded.Ok, $emptyDecoded.Reason) `
+        -Pass ((-not $emptyDecoded.Ok) -and $emptyDecoded.Reason -eq 'empty-payload') -Evidence $null
+
+    # ---- W7: layout cross-check (size, offsets, architecture) ----
+    $layout = Test-P9HWtsInfoLayout
+    Add-P9HTestResult -Id 'Q7' -Title 'WTSINFO layout matches the documented contract' `
+        -Input 'compiled mirror vs published expected layout' `
+        -Expected '216 bytes, State=0, SessionId=4, LogonTime=200 on x64' `
+        -Actual ("Ok={0} size={1} arch={2} state={3} sessionId={4} logon={5}" -f $layout.Ok, $layout.Size, $layout.Architecture, $layout.Offsets.State, $layout.Offsets.SessionId, $layout.Offsets.LogonTime) `
+        -Pass ($layout.Ok -and $layout.Size -eq 216 -and $layout.Offsets.State -eq 0 -and $layout.Offsets.SessionId -eq 4 -and $layout.Offsets.LogonTime -eq 200) -Evidence $null
+
+    # ---- W8: provider line round-trips through the frozen observer parser ----
+    $line = if ($rec) { ConvertTo-P9HWtsProviderLine -Record $rec } else { '' }
+    $parsed = ConvertFrom-P9HWtsLine -Line $line
+    Add-P9HTestResult -Id 'Q8' -Title 'Provider line round-trips through the frozen observer parser' `
+        -Input 'provider line built from decoded WTSINFO facts' -Expected 'Ok=true, logon preserved, state 0' `
+        -Actual ("line=[{0}] ok={1} sessionId={2} state={3} user={4} logon={5}" -f $line, $parsed.Ok, $(if ($parsed.Record) { $parsed.Record.SessionId } else { 'null' }), $(if ($parsed.Record) { $parsed.Record.State } else { 'null' }), $(if ($parsed.Record) { $parsed.Record.User } else { 'null' }), $(if ($parsed.Record) { [string]$parsed.Record.LogonTime } else { 'null' })) `
+        -Pass ($parsed.Ok -and $parsed.Record.SessionId -eq 3 -and $parsed.Record.State -eq 0 -and (Test-P9HLogonEqual -Left $parsed.Record.LogonTime -Right $logonIso)) -Evidence $null
+
+    # ---- W9: duplicate session ids with conflicting identity are ambiguous ----
+    $dupRecords = @(
+        (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 3 -State 0 -StationName 'RDP-Tcp#0' -UserName 'qauser' -LogonTime $logonFt)).Record
+        (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 3 -State 0 -StationName 'RDP-Tcp#1' -UserName 'qauser' -LogonTime $logonFt)).Record
+    )
+    $dupMatch = Get-P9HTargetSessionRecord -Records $dupRecords -SessionId 3 -User 'qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'Q9' -Title 'Duplicate target session ids are rejected as ambiguous' `
+        -Input 'two session-3 records, same user and logon' -Expected 'Ok=false reason=ambiguous' `
+        -Actual ("Ok={0} reason={1} candidates={2}" -f $dupMatch.Ok, $dupMatch.Reason, $dupMatch.Candidates) `
+        -Pass ((-not $dupMatch.Ok) -and $dupMatch.Reason -eq 'ambiguous') -Evidence $null
+
+    # ---- W10: wrong username is rejected ----
+    $wrongUser = Get-P9HTargetSessionRecord -Records @($rec) -SessionId 3 -User 'someoneelse' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'Q10' -Title 'Wrong username is rejected' `
+        -Input 'session 3 belongs to CONTOSO\qauser' -Expected 'Ok=false reason=user-mismatch' `
+        -Actual ("Ok={0} reason={1}" -f $wrongUser.Ok, $wrongUser.Reason) `
+        -Pass ((-not $wrongUser.Ok) -and $wrongUser.Reason -eq 'user-mismatch') -Evidence $null
+
+    # ---- W11: reused session id with a different logon time is rejected ----
+    $reusedMatch = Get-P9HTargetSessionRecord -Records @($rec) -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $otherUtc.ToString('o')
+    Add-P9HTestResult -Id 'Q11' -Title 'Reused session id with a different logon time is rejected' `
+        -Input ('observed logon ' + $logonIso + ', pinned ' + $otherUtc.ToString('o')) -Expected 'Ok=false reason=logon-mismatch' `
+        -Actual ("Ok={0} reason={1}" -f $reusedMatch.Ok, $reusedMatch.Reason) `
+        -Pass ((-not $reusedMatch.Ok) -and $reusedMatch.Reason -eq 'logon-mismatch') -Evidence $null
+
+    # ---- W12: a provider that omits logon fails closed when it is required ----
+    $noLogonPayload = New-P9HWtsInfoPayload -SessionId 3 -State 0 -UserName 'qauser' -LogonTime 0
+    $noLogonRec = (ConvertFrom-P9HWtsInfoPayload -Payload $noLogonPayload).Record
+    $capabilityMatch = Get-P9HTargetSessionRecord -Records @($noLogonRec) -SessionId 3 -User 'qauser' -LogonTime $logonIso -RequireLogonTime
+    Add-P9HTestResult -Id 'Q12' -Title 'Missing provider logon fails closed for authoritative matching' `
+        -Input 'provider omitted logon, caller pinned a logon time' -Expected 'Ok=false, logon-unavailable (never degraded)' `
+        -Actual ("Ok={0} reason={1}" -f $capabilityMatch.Ok, $capabilityMatch.Reason) `
+        -Pass ((-not $capabilityMatch.Ok) -and $capabilityMatch.Reason -eq 'logon-unavailable') -Evidence $null
+
+    # ---- W13: the live query refuses without the authorization token ----
+    $refused = $false
+    $refusalMessage = $null
+    try { $null = Invoke-P9HWtsSessionQuery -AuthorizationToken '' -SessionId 3 }
+    catch { $refused = $true; $refusalMessage = $_.Exception.Message }
+    Add-P9HTestResult -Id 'Q13' -Title 'Live WTS query refuses without real-execution authorization' `
+        -Input 'empty authorization token' -Expected 'throws before any native call' `
+        -Actual ("refused={0} message={1}" -f $refused, $refusalMessage) `
+        -Pass ($refused -and $refusalMessage -match 'authorization') -Evidence $null
+
+    # ---- W14: native permission refusal is preserved as an error code ----
+    # Simulated: the decode path reports a native failure with its Win32 code
+    # rather than swallowing it. Stage 3A never issues the real call.
+    $nativeFailure = [pscustomobject][ordered]@{
+        Ok = $false; Reason = 'native-query-failed'; Win32Error = 5
+        Detail = 'WTSQuerySessionInformationW failed for session 3 (Win32 5)'; Record = $null
+    }
+    Add-P9HTestResult -Id 'Q14' -Title 'Native permission refusal preserves the Win32 error code' `
+        -Input 'access-denied shape (Win32 5)' -Expected 'Reason=native-query-failed, Win32Error preserved' `
+        -Actual ("Ok={0} reason={1} win32={2}" -f $nativeFailure.Ok, $nativeFailure.Reason, $nativeFailure.Win32Error) `
+        -Pass ((-not $nativeFailure.Ok) -and $nativeFailure.Reason -eq 'native-query-failed' -and $nativeFailure.Win32Error -eq 5) -Evidence $null
+
+    # ---- W15: capability is reported, not invented ----
+    $capability = Get-P9HWtsProviderCapability
+    Add-P9HTestResult -Id 'Q15' -Title 'Provider capability reports the WTSINFO contract explicitly' `
+        -Input 'layout probe (no live query)' -Expected 'Available with LogonTimeSupported=true on a supported host' `
+        -Actual ("available={0} capability={1} logonSupported={2} size={3} reason={4}" -f $capability.Available, $capability.Capability, $capability.LogonTimeSupported, $capability.Size, $capability.Reason) `
+        -Pass ($capability.Available -and $capability.Capability -eq 'wtsinfo' -and $capability.LogonTimeSupported) -Evidence $null
+
+    # ================= collector (C-series) =================
+    $trial = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind combined
+    $dir = $trial.Directory
+
+    $fixturePath = Join-Path $dir 'c-fixture.json'
+    Write-P9HArtifact -Path $fixturePath -Lines @('{"itemId":"p9h-item","enabledItems":1,"enabledTerminals":1,"totalItems":1,"anchorAbsent":true,"layoutFallback":{"x":9000,"y":9000,"w":640,"h":480}}')
+    $stdoutPath = Join-Path $dir 'c-stdout.txt'
+    Write-P9HArtifact -Path $stdoutPath -Lines @('main/p9h-item: relative layout has no reachable placement (anchor-missing: identity-not-found); the item will be handled normally but its window position will not be changed.')
+    $preWinPath = Join-Path $dir 'c-pre.json'
+    Write-P9HArtifact -Path $preWinPath -Lines @('{"Windows":[]}')
+    $postWinPath = Join-Path $dir 'c-post.json'
+    Write-P9HArtifact -Path $postWinPath -Lines @('{"Windows":[]}')
+    $newProcPath = Join-Path $dir 'c-newprocesses.json'
+    Write-P9HArtifact -Path $newProcPath -Lines @('{"Added":[]}')
+    $traceFilePath = Join-Path $dir 'c-trace.jsonl'
+    Write-P9HArtifact -Path $traceFilePath -Lines @('{"event":"lifecycle-layout-plan","utcMs":1,"pid":1}')
+
+    $exitPath = Join-Path $dir 'c-exit.json'
+    $recC = New-P9HExitRecord -TrialId $trial.TrialId -Outcome 'exited' -ExitCode 0 -LauncherPid 4240 `
+        -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $dir `
+        -LaunchedAtUtc (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o') `
+        -ExitedAtUtc (Get-Date).ToUniversalTime().ToString('o')
+    $null = Write-P9HExitRecord -Path $exitPath -Record $recC
+
+    $obsLogPath = Join-Path $dir 'c-e1-observer.jsonl'
+    $obsLine = ConvertTo-P9HWtsProviderLine -Record $rec
+    $obsRecord = New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+        -RawWtsLines @($obsLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso
+    Add-P9HArtifactLine -Path $obsLogPath -Line $obsRecord
+
+    $plan = Get-P9HCollectorRolePlan -FixturePath $fixturePath -StdoutPath $stdoutPath `
+        -PreWindowPath $preWinPath -PostWindowPath $postWinPath -ExitRecordPath $exitPath `
+        -NewProcessPath $newProcPath -TracePath $traceFilePath
+
+    # ---- C1: collector binds all seven roles with digests ----
+    $bound = Add-P9HCollectorArtifactRoles -Context $trial -Plan $plan -ObservationLogPath $obsLogPath
+    Add-P9HTestResult -Id 'K1' -Title 'Collector binds all seven required N2 roles' `
+        -Input 'complete trial, seven artifacts plus the E1 log' -Expected '7 roles bound, E1 log bound separately' `
+        -Actual ("Ok={0} n2Roles={1} obsBound={2} obsIndex={3}" -f $bound.Ok, $bound.N2RoleCount, $bound.ObservationLogBound, $bound.ObservationIndexPath) `
+        -Pass ($bound.Ok -and $bound.N2RoleCount -eq 7 -and $bound.ObservationLogBound) -Evidence $bound.ObservationIndexPath
+
+    # ---- C2: the frozen Stage 2.4.1 gate verifies the collector's own binding ----
+    $verifiedBinding = Test-P9HCollectorBinding -TrialId $trial.TrialId `
+        -ArtifactIndexPath (Join-Path $dir 'artifact-index.jsonl') -Plan $plan
+    $verifiedCount = @($verifiedBinding.Roles | Where-Object { $_.status -eq 'verified' }).Count
+    Add-P9HTestResult -Id 'K2' -Title 'Collector binding verifies through the frozen provenance gate' `
+        -Input 'collector-written index evaluated by Get-P9HArtifactBinding' -Expected 'Ok=true, 7/7 verified' `
+        -Actual ("Ok={0} reason={1} verified={2}" -f $verifiedBinding.Ok, $verifiedBinding.Reason, $verifiedCount) `
+        -Pass ($verifiedBinding.Ok -and $verifiedCount -eq 7) -Evidence (Join-Path $dir 'artifact-index.jsonl')
+
+    # ---- C3: a tampered product artifact breaks digest verification ----
+    Write-P9HArtifact -Path $stdoutPath -Lines @('tampered stdout after binding')
+    $tamperedBinding = Test-P9HCollectorBinding -TrialId $trial.TrialId `
+        -ArtifactIndexPath (Join-Path $dir 'artifact-index.jsonl') -Plan $plan
+    Add-P9HTestResult -Id 'K3' -Title 'A product artifact rewritten after binding fails digest verification' `
+        -Input 'stdout rewritten after Add-P9HArtifactRole' -Expected 'Ok=false, digest mismatch on stdout' `
+        -Actual ("Ok={0} reason={1}" -f $tamperedBinding.Ok, $tamperedBinding.Reason) `
+        -Pass ((-not $tamperedBinding.Ok) -and $tamperedBinding.Reason -match 'stdout:digest') -Evidence $null
+
+    # Restore the original stdout bytes so later cases see a consistent trial.
+    Write-P9HArtifact -Path $stdoutPath -Lines @('main/p9h-item: relative layout has no reachable placement (anchor-missing: identity-not-found); the item will be handled normally but its window position will not be changed.')
+
+    # ---- C4: an incomplete trial is refused before anything is written ----
+    $incompleteDir = Join-Path $SandboxRoot ('p9h3a-incomplete-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $incompleteDir -Force | Out-Null
+    $incompleteTrial = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind combined
+    $incompleteIndex = Join-Path $incompleteTrial.Directory 'artifact-index.jsonl'
+    $incompletePlan = Get-P9HCollectorRolePlan -FixturePath $fixturePath -StdoutPath $stdoutPath `
+        -PreWindowPath $preWinPath -PostWindowPath $postWinPath -ExitRecordPath $exitPath `
+        -NewProcessPath $newProcPath -TracePath (Join-Path $dir 'does-not-exist.jsonl')
+    $incomplete = Add-P9HCollectorArtifactRoles -Context $incompleteTrial -Plan $incompletePlan
+    Add-P9HTestResult -Id 'K4' -Title 'Collector refuses an incomplete trial and writes no partial index' `
+        -Input 'trace artifact absent' -Expected 'reason=collector-artifacts-incomplete, no index written' `
+        -Actual ("Ok={0} reason={1} detail={2} indexExists={3}" -f $incomplete.Ok, $incomplete.Reason, $incomplete.Detail, (Test-Path -LiteralPath $incompleteIndex)) `
+        -Pass ((-not $incomplete.Ok) -and $incomplete.Reason -eq 'collector-artifacts-incomplete' -and -not (Test-Path -LiteralPath $incompleteIndex)) -Evidence $null
+
+    # ---- C5: the E1 log is supporting provenance, never an N2 role ----
+    $n2IndexLines = @(Get-Content -LiteralPath (Join-Path $dir 'artifact-index.jsonl'))
+    $hasObsRole = @($n2IndexLines | Where-Object { $_ -match 'e1-observation-log' }).Count
+    $obsIndexExists = Test-Path -LiteralPath $bound.ObservationIndexPath
+    Add-P9HTestResult -Id 'K5' -Title 'The E1 observation log never enters the seven-role N2 index' `
+        -Input 'E1 log bound alongside the trial' -Expected 'no e1 role in artifact-index.jsonl; separate index exists' `
+        -Actual ("n2Lines={0} e1RoleLines={1} separateIndexExists={2}" -f $n2IndexLines.Count, $hasObsRole, $obsIndexExists) `
+        -Pass ($hasObsRole -eq 0 -and $obsIndexExists) -Evidence $bound.ObservationIndexPath
+
+    # ---- C6: the collector manifest separates product from collector metadata ----
+    $manifest = New-P9HCollectorManifest -Context $trial -BoundRoles $bound.BoundRoles `
+        -WtsCapability $capability -ObservationLogPath $obsLogPath
+    Add-P9HTestResult -Id 'K6' -Title 'Collector manifest separates product artifacts from collector metadata' `
+        -Input 'seven product artifacts plus the E1 log' -Expected '7 product, 1 collector, 7 required roles declared' `
+        -Actual ("product={0} collector={1} required={2}" -f @($manifest.productArtifacts).Count, @($manifest.collectorMetadata).Count, @($manifest.requiredN2Roles).Count) `
+        -Pass (@($manifest.productArtifacts).Count -eq 7 -and @($manifest.collectorMetadata).Count -eq 1 -and @($manifest.requiredN2Roles).Count -eq 7) -Evidence $null
+
+    # ---- C7: product bytes are never rewritten by the collector ----
+    $traceBefore = Get-P9HFileSha256 -Path $traceFilePath
+    $trial2 = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind combined
+    $null = Add-P9HCollectorArtifactRoles -Context $trial2 -Plan $plan
+    $traceAfter = Get-P9HFileSha256 -Path $traceFilePath
+    Add-P9HTestResult -Id 'K7' -Title 'Collector never rewrites product artifact bytes' `
+        -Input 'trial bound twice from the same sources' -Expected 'source trace digest unchanged' `
+        -Actual ("before={0} after={1} equal={2}" -f $traceBefore.Substring(0, 12), $traceAfter.Substring(0, 12), ($traceBefore -eq $traceAfter)) `
+        -Pass ($traceBefore -eq $traceAfter) -Evidence $null
+
+    # ---- C8: Active -> Disconnected -> Active is proven from provider output ----
+    $activeLine = ConvertTo-P9HWtsProviderLine -Record $rec
+    $discRecord = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 3 -State 4 `
+                -StationName 'RDP-Tcp#0' -Domain 'CONTOSO' -UserName 'qauser' -LogonTime $logonFt)).Record
+    $discLine = ConvertTo-P9HWtsProviderLine -Record $discRecord
+    $postLine = $activeLine
+    $seqLog = Join-Path $dir 'c-e1-sequence.jsonl'
+    $null = Add-P9HArtifactLine -Path $seqLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $seqLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $seqLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 3 -Phase 'post' `
+            -RawWtsLines @($postLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+
+    $proofA = Get-P9HReconnectAuthorizationProof -ObserverLogPath $seqLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    $proofB = Get-P9HDisconnectProof -ObserverLogPath $seqLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'K8' -Title 'Active to Disconnected to Active is proven from provider output' `
+        -Input 'three provider observations at the same pinned identity' -Expected 'Proof A and Proof B both proven' `
+        -Actual ("proofA={0}({1}) proofB={2}({3})" -f $proofA.Proven, $proofA.Reason, $proofB.Proven, $proofB.Reason) `
+        -Pass ($proofA.Proven -and $proofB.Proven) -Evidence $seqLog
+
+    # ---- C9: session 0 state 4 can never substitute for the target ----
+    $servicesLine = '0|Services|state=4|user='
+    $servicesLog = Join-Path $dir 'c-e1-services.jsonl'
+    $null = Add-P9HArtifactLine -Path $servicesLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $servicesLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($servicesLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $servicesProof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $servicesLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'K9' -Title 'Session 0 disconnected state cannot authorize reconnect for session 3' `
+        -Input 'session 0 state 4 offered as the disconnect observation' -Expected 'not proven' `
+        -Actual ("proven={0} reason={1}" -f $servicesProof.Proven, $servicesProof.Reason) `
+        -Pass (-not $servicesProof.Proven) -Evidence $servicesLog
+
+    # ---- C10: no persisted target-session evidence means no authorization ----
+    $emptyLog = Join-Path $dir 'c-e1-empty.jsonl'
+    $emptyProof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $emptyLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    $blockedByAssert = $false
+    try {
+        Assert-P9HReconnectPermitted -ObserverLogPath $emptyLog -TargetSessionId 3 `
+            -TargetUser 'CONTOSO\qauser' -TrialId $trial.TrialId -TargetLogonTime $logonIso
+    }
+    catch { $blockedByAssert = $true }
+    Add-P9HTestResult -Id 'K10' -Title 'Reconnect is refused without persisted target-session evidence' `
+        -Input 'absent observer log' -Expected 'proof not proven and the hard gate throws' `
+        -Actual ("proven={0} reason={1} assertBlocked={2}" -f $emptyProof.Proven, $emptyProof.Reason, $blockedByAssert) `
+        -Pass ((-not $emptyProof.Proven) -and $blockedByAssert) -Evidence $null
+
+    # ---- C11: a provider error during the disconnect observation preserves evidence ----
+    $errorLog = Join-Path $dir 'c-e1-error.jsonl'
+    $null = Add-P9HArtifactLine -Path $errorLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $errorLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @() -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso `
+            -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)')
+
+    $readback = Read-P9HObserverLog -Path $errorLog
+    $errorProof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $errorLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    $errorRecord = @($readback.Records | Where-Object { $_.phase -eq 'disconnect-observed' }) | Select-Object -Last 1
+    Add-P9HTestResult -Id 'K11' -Title 'A provider error during the disconnect observation is preserved and blocks authorization' `
+        -Input 'empty WTS lines with captureError from the native query' -Expected 'error durable in the log, proof not proven' `
+        -Actual ("logOk={0} records={1} captureOutcome={2} errorPreserved={3} proven={4}" -f $readback.Ok, @($readback.Records).Count, $(if ($errorRecord) { $errorRecord.captureOutcome } else { 'null' }), $(if ($errorRecord) { -not [string]::IsNullOrWhiteSpace([string]$errorRecord.captureError) } else { $false }), $errorProof.Proven) `
+        -Pass ($readback.Ok -and $errorRecord.captureOutcome -eq 'provider-error' -and -not [string]::IsNullOrWhiteSpace([string]$errorRecord.captureError) -and -not $errorProof.Proven) -Evidence $errorLog
+
+    # ---- C12: an interrupted observation keeps the earlier evidence readable ----
+    $interruptedLog = Join-Path $dir 'c-e1-interrupted.jsonl'
+    $null = Add-P9HArtifactLine -Path $interruptedLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    # Simulate a torn write: a partial line appended after a durable record.
+    Add-P9HArtifactLine -Path $interruptedLog -Line '{"schema":"p9h.wts-observation.v2","trialId":"trunc'
+    $interruptedRead = Read-P9HObserverLog -Path $interruptedLog
+    $firstRecordIntact = $false
+    if ($interruptedRead.Records.Count -ge 1) {
+        $firstRecordIntact = (-not [string]::IsNullOrWhiteSpace([string]$interruptedRead.Records[0].trialId))
+    }
+    Add-P9HTestResult -Id 'K12' -Title 'An interrupted observation is reported without destroying earlier evidence' `
+        -Input 'one durable record plus a torn final line' -Expected 'logOk=false reason=malformed-line, first record intact' `
+        -Actual ("logOk={0} reason={1} records={2} firstIntact={3}" -f $interruptedRead.Ok, $interruptedRead.Reason, @($interruptedRead.Records).Count, $firstRecordIntact) `
+        -Pass ((-not $interruptedRead.Ok) -and $interruptedRead.Reason -eq 'malformed-line' -and $firstRecordIntact) -Evidence $interruptedLog
+
+    # ---- C13: cross-trial observer records are refused ----
+    $foreignTrial = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind e1
+    $foreignLog = Join-Path $dir 'c-e1-foreign.jsonl'
+    $null = Add-P9HArtifactLine -Path $foreignLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $foreignLog -Line (New-P9HObserverRecord -TrialId $foreignTrial.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $foreignProof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $foreignLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'K13' -Title 'Observer records from another trial cannot satisfy the proof' `
+        -Input 'pre record from this trial, disconnect record from another' -Expected 'not proven, foreign-trial-records' `
+        -Actual ("proven={0} reason={1}" -f $foreignProof.Proven, $foreignProof.Reason) `
+        -Pass ((-not $foreignProof.Proven) -and $foreignProof.Reason -eq 'foreign-trial-records') -Evidence $foreignLog
+
+    # ---- C14: a collector-bound trial still yields N2-A independence ----
+    $traceLines = @(
+        (ConvertTo-Json -Compress -InputObject ([ordered]@{ event = 'lifecycle-layout-plan'; utcMs = 1000; pid = 1; set = 'main'; profileAware = $false; source = 'relative'; profileId = ''; fingerprint = 'X'; skipped = @('p9h-item') }))
+        (ConvertTo-Json -Compress -InputObject ([ordered]@{ event = 'stage2-broker-ready'; utcMs = 1030; pid = 1; planId = 'plan-c14'; elapsedMs = 1; present = 0; missing = 1; ambiguous = 0; failed = 0 }))
+        (ConvertTo-Json -Compress -InputObject ([ordered]@{ event = 'stage2-terminal-final'; utcMs = 1060; pid = 1; finalized = 1; failures = 0 }))
+        (ConvertTo-Json -Compress -InputObject ([ordered]@{ event = 'transaction-end'; utcMs = 1070; pid = 1; set = 'main'; broker = $true; uncertain = $false; layoutSource = 'relative'; profileId = ''; failures = @() }))
+    )
+    $indTrial = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind combined
+    $indDir = $indTrial.Directory
+    $indTrace = Join-Path $indDir 'ind-trace.jsonl'
+    Write-P9HArtifact -Path $indTrace -Lines $traceLines
+    $indPost = Join-Path $indDir 'ind-post.json'
+    Write-P9HArtifact -Path $indPost -Lines @(([ordered]@{ Windows = @([ordered]@{ hwnd = '0xA1'; pid = 4242; visible = $true; class = 'CASCADIA_HOSTING_WINDOW_CLASS'; x = 44; y = 52; width = 1129; height = 635; title = 'DevWS-main-p9h-item' }) } | ConvertTo-Json -Depth 5))
+    $indNewProc = Join-Path $indDir 'ind-newprocesses.json'
+    Write-P9HArtifact -Path $indNewProc -Lines @(([ordered]@{ Added = @([ordered]@{ pid = 4242; ppid = 4240; name = 'pwsh.exe'; startUtc = (Get-Date).ToUniversalTime().ToString('o'); commandLine = 'pwsh.exe -NoExit -File x -SetId main -TerminalId p9h-item -WindowId DevWS-main-p9h-item -TabIndex 0 -SessionId s1' }) } | ConvertTo-Json -Depth 5))
+    $indExit = Join-Path $indDir 'ind-exit.json'
+    $indRecExit = New-P9HExitRecord -TrialId $indTrial.TrialId -Outcome 'exited' -ExitCode 3 -LauncherPid 4240 `
+        -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $indDir `
+        -LaunchedAtUtc (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o') `
+        -ExitedAtUtc (Get-Date).ToUniversalTime().AddMinutes(1).ToString('o')
+    $null = Write-P9HExitRecord -Path $indExit -Record $indRecExit
+    $indFixture = Join-Path $indDir 'ind-fixture.json'
+    Write-P9HArtifact -Path $indFixture -Lines @(([ordered]@{ itemId = 'p9h-item'; enabledItems = 1; enabledTerminals = 1; totalItems = 1; anchorAbsent = $true; layoutFallback = [ordered]@{ x = 9000; y = 9000; w = 640; h = 480 } } | ConvertTo-Json -Depth 5))
+    $indStdout = Join-Path $indDir 'ind-stdout.txt'
+    Write-P9HArtifact -Path $indStdout -Lines @('main/p9h-item: relative layout has no reachable placement (anchor-missing: identity-not-found); the item will be handled normally but its window position will not be changed.')
+    $indPre = Join-Path $indDir 'ind-pre.json'
+    Write-P9HArtifact -Path $indPre -Lines @('{"Windows":[]}')
+
+    $indPlan = Get-P9HCollectorRolePlan -FixturePath $indFixture -StdoutPath $indStdout `
+        -PreWindowPath $indPre -PostWindowPath $indPost -ExitRecordPath $indExit `
+        -NewProcessPath $indNewProc -TracePath $indTrace
+    $indBound = Add-P9HCollectorArtifactRoles -Context $indTrial -Plan $indPlan
+    $indVerdicts = Get-P9HN2Verdicts -FixturePath $indFixture -TracePath $indTrace -StdoutPath $indStdout `
+        -PreWindowPath $indPre -PostWindowPath $indPost -ExitRecordPath $indExit -NewProcessPath $indNewProc `
+        -TrialId $indTrial.TrialId -ExpectedWindowId 'DevWS-main-p9h-item' -ExpectedTerminalId 'p9h-item' `
+        -ExpectedSetId 'main' -ArtifactIndexPath (Join-Path $indDir 'artifact-index.jsonl')
+    Add-P9HTestResult -Id 'K14' -Title 'Collector-bound trial preserves N2-A independence from a nonzero exit' `
+        -Input 'collector-bound artifacts, captured exit code 3' -Expected 'N2A=PASS and N2B=FAIL' `
+        -Actual ("bound={0} N2A={1} N2B={2}" -f $indBound.Ok, $indVerdicts.N2A.Verdict, $indVerdicts.N2B.Verdict) `
+        -Pass ($indBound.Ok -and $indVerdicts.N2A.Verdict -eq 'PASS' -and $indVerdicts.N2B.Verdict -eq 'FAIL') -Evidence (Join-Path $indDir 'artifact-index.jsonl')
+
+    # ---- C15: a collector-bound trial still yields a full N2 PASS ----
+    $goodTrial = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind combined
+    $goodDir = $goodTrial.Directory
+    $goodTrace = Join-Path $goodDir 'good-trace.jsonl'
+    Write-P9HArtifact -Path $goodTrace -Lines $traceLines
+    $goodPost = Join-Path $goodDir 'good-post.json'
+    Write-P9HArtifact -Path $goodPost -Lines @(([ordered]@{ Windows = @([ordered]@{ hwnd = '0xA1'; pid = 4242; visible = $true; class = 'CASCADIA_HOSTING_WINDOW_CLASS'; x = 44; y = 52; width = 1129; height = 635; title = 'DevWS-main-p9h-item' }) } | ConvertTo-Json -Depth 5))
+    $goodNewProc = Join-Path $goodDir 'good-newprocesses.json'
+    Write-P9HArtifact -Path $goodNewProc -Lines @(([ordered]@{ Added = @([ordered]@{ pid = 4242; ppid = 4240; name = 'pwsh.exe'; startUtc = (Get-Date).ToUniversalTime().ToString('o'); commandLine = 'pwsh.exe -NoExit -File x -SetId main -TerminalId p9h-item -WindowId DevWS-main-p9h-item -TabIndex 0 -SessionId s1' }) } | ConvertTo-Json -Depth 5))
+    $goodExit = Join-Path $goodDir 'good-exit.json'
+    $goodRecExit = New-P9HExitRecord -TrialId $goodTrial.TrialId -Outcome 'exited' -ExitCode 0 -LauncherPid 4240 `
+        -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $goodDir `
+        -LaunchedAtUtc (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o') `
+        -ExitedAtUtc (Get-Date).ToUniversalTime().AddMinutes(1).ToString('o')
+    $null = Write-P9HExitRecord -Path $goodExit -Record $goodRecExit
+    $goodFixture = Join-Path $goodDir 'good-fixture.json'
+    Write-P9HArtifact -Path $goodFixture -Lines @(([ordered]@{ itemId = 'p9h-item'; enabledItems = 1; enabledTerminals = 1; totalItems = 1; anchorAbsent = $true; layoutFallback = [ordered]@{ x = 9000; y = 9000; w = 640; h = 480 } } | ConvertTo-Json -Depth 5))
+    $goodStdout = Join-Path $goodDir 'good-stdout.txt'
+    Write-P9HArtifact -Path $goodStdout -Lines @('main/p9h-item: relative layout has no reachable placement (anchor-missing: identity-not-found); the item will be handled normally but its window position will not be changed.')
+    $goodPre = Join-Path $goodDir 'good-pre.json'
+    Write-P9HArtifact -Path $goodPre -Lines @('{"Windows":[]}')
+
+    $goodPlan = Get-P9HCollectorRolePlan -FixturePath $goodFixture -StdoutPath $goodStdout `
+        -PreWindowPath $goodPre -PostWindowPath $goodPost -ExitRecordPath $goodExit `
+        -NewProcessPath $goodNewProc -TracePath $goodTrace
+    $goodBound = Add-P9HCollectorArtifactRoles -Context $goodTrial -Plan $goodPlan
+    $goodVerdicts = Get-P9HN2Verdicts -FixturePath $goodFixture -TracePath $goodTrace -StdoutPath $goodStdout `
+        -PreWindowPath $goodPre -PostWindowPath $goodPost -ExitRecordPath $goodExit -NewProcessPath $goodNewProc `
+        -TrialId $goodTrial.TrialId -ExpectedWindowId 'DevWS-main-p9h-item' -ExpectedTerminalId 'p9h-item' `
+        -ExpectedSetId 'main' -ArtifactIndexPath (Join-Path $goodDir 'artifact-index.jsonl')
+    Add-P9HTestResult -Id 'K15' -Title 'Collector-bound trial can satisfy both authoritative verdicts' `
+        -Input 'complete artifacts, exit 0, collector-bound index' -Expected 'N2A=PASS and N2B=PASS' `
+        -Actual ("bound={0} N2A={1} N2B={2}" -f $goodBound.Ok, $goodVerdicts.N2A.Verdict, $goodVerdicts.N2B.Verdict) `
+        -Pass ($goodBound.Ok -and $goodVerdicts.N2A.Verdict -eq 'PASS' -and $goodVerdicts.N2B.Verdict -eq 'PASS') -Evidence (Join-Path $goodDir 'artifact-index.jsonl')
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -1894,6 +2319,7 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HSafetyGateTests -SandboxRoot $SandboxRoot
     Invoke-P9HTrialBindingTests -SandboxRoot $SandboxRoot
     Invoke-P9HProvenanceTests -SandboxRoot $SandboxRoot
+    Invoke-P9HWtsProviderTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
@@ -1901,8 +2327,8 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 119 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'G', 'D')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 149 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'G', 'D')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

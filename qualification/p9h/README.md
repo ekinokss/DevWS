@@ -93,6 +93,8 @@ qualification/p9h/
     p9h-n2-inventory.ps1      process/window inventory, delta, attribution
     p9h-verdict.ps1           E1 and N2-A/N2-B verdict rules
     p9h-evidence.ps1          trial context, stage journal, artifact index
+    p9h-wts-provider.ps1      WTSINFO layout/decode, FILETIME->UTC, provider lines
+    p9h-collector.ps1         trial collector: seven N2 roles + E1 provenance
     p9h-fault.ps1             fault-injection harness
     p9h-selftest.ps1          the test cases
 ```
@@ -340,6 +342,98 @@ historical index is evidence rather than an input to be sanitized.
 | A required role absent | `binding-incomplete:trace` |
 | All seven roles valid and same-trial | accepted, 7/7 verified |
 
-These are covered by the P-series (P1–P11), which also proves the N2-A/N2-B independence above and
-retains the N2-B cross-trial protection. The registry guard now covers **119** registered cases
-(108 from Stage 2.4 plus 11 P-series cases); the full run executes 120 including the R1 guard.
+These are covered by the P-series (P1-P11), which also proves the N2-A/N2-B independence above and
+retains the N2-B cross-trial protection.
+
+## Stage 3A — offline WTS provider and collector integration
+
+Stage 3A connects a native `WTSINFO` provider to the frozen evidence contract. **No live session
+query, RDP action, `tsdiscon`, PowerShell Direct call or installed-product launch occurs in this
+stage**; every assertion runs from synthetic bytes or synthetic facts.
+
+### Provider contract (documented APIs only)
+
+| API | Use |
+| --- | --- |
+| `WTSEnumerateSessionsW` | session ids and station names |
+| `WTSQuerySessionInformationW` (`WTSInfo`, class 24) | one `WTSINFO` structure |
+| `WTSFreeMemory` | release every buffer the API allocated |
+
+`WTSINFO` is modelled with the documented field order and the `winsrv.h` array lengths *including*
+their terminators (`WINSTATIONNAME_LENGTH` 32, `DOMAIN_LENGTH` 17, `USERNAME_LENGTH + 1` 21). On x64
+that is **216 bytes**, with `State` at 0, `SessionId` at 4, `WinStationName` at 32, `Domain` at 96,
+`UserName` at 130, `ConnectTime` at 176 and `LogonTime` at 200.
+
+The layout is cross-checked rather than assumed: `Test-P9HWtsInfoLayout` compares the published
+offsets against `Marshal.SizeOf` / `Marshal.OffsetOf` results for the *current* process architecture
+and distinguishes three failures — `layout-unsupported`, `layout-size-mismatch` and
+`layout-offset-mismatch`. A host that cannot describe `WTSINFO` reports an explicit capability gap
+(`Get-P9HWtsProviderCapability` → `Capability = 'unsupported'`) instead of inventing a logon time.
+
+### FILETIME conversion
+
+`LogonTime` is a `FILETIME`: 100-nanosecond intervals since 1601-01-01Z. **Zero is the Win32
+"not available" sentinel, not the epoch.** Converting it blindly would turn a missing logon time into
+a plausible 1601 timestamp and defeat the identity check, so zero, negative and out-of-range values
+are rejected explicitly and the record carries `LogonSource = 'wtsinfo-zero'` (or the specific
+reason) rather than a fabricated value.
+
+### Provider → observer integration
+
+`ConvertTo-P9HWtsProviderLine` is the only integration point. It emits the line format the frozen
+observer has always parsed:
+
+```
+<id>|<station>|state=<n>|user=<account>[|logon=<ISO-8601 UTC>]
+```
+
+When a logon time is unavailable the trailing `|logon=` segment is **omitted**, which
+`ConvertFrom-P9HLogonTimeField` already reports as `absent`. That keeps the capability gap visible.
+No observer function was modified: `ConvertFrom-P9HWtsLine`, `Get-P9HTargetSessionRecord`,
+`New-P9HObserverRecord`, `Get-P9HReconnectAuthorizationProof` and `Get-P9HDisconnectProof` are
+unchanged, and every E1 predicate still fails closed on missing provider evidence.
+
+### Collector integration
+
+`Add-P9HCollectorArtifactRoles` binds the seven required N2 roles through the **existing**
+`Add-P9HArtifactRole` mechanism — no second manifest, no new binding rule, same schema and digests:
+
+```
+fixture, stdout, pre-windows, post-windows, exit-record, new-processes, trace
+```
+
+Two provenance classes are kept distinct and reported by `New-P9HCollectorManifest`:
+
+- **product** — bytes the product emitted. The collector records only role/path/digest; it never
+  rewrites them, never invents a product event, and never invents a product trial id.
+- **collector** — metadata the collector authors about the trial.
+
+The E1 observation log is bound as **supporting provenance only**, into a separate
+`e1-observation-index.jsonl`. It is deliberately *not* written into `artifact-index.jsonl`, whose
+seven-role contract is closed: a separate file makes it structurally impossible for an E1 record to
+be counted as N2 evidence.
+
+A trial with any missing artifact is refused **before** anything is written
+(`collector-artifacts-incomplete`), so a partial index can never be mistaken for a complete binding.
+
+### Tests: Q1–Q15 (provider) and K1–K15 (collector)
+
+| Series | Coverage |
+| --- | --- |
+| Q1–Q2 | valid payload with nonzero logon; exact UTC round-trip |
+| Q3–Q6 | zero, negative, empty payload, struct-size mismatch |
+| Q7 | published layout vs measured native mirror |
+| Q8 | provider line round-trips through the frozen parser |
+| Q9–Q11 | duplicate ids (ambiguous), wrong user, reused id with different logon |
+| Q12 | missing provider logon fails closed for authoritative matching |
+| Q13–Q14 | live query refused without authorization; Win32 error preserved |
+| Q15 | capability reported explicitly |
+| K1–K3 | seven roles bound; verified by the frozen gate; tamper detected |
+| K4–K5 | incomplete trial refused; E1 log never enters the N2 index |
+| K6–K7 | manifest separates provenance; product bytes never rewritten |
+| K8–K9 | Active → Disconnected → Active proven; session 0 cannot substitute |
+| K10–K13 | no authorization without persisted evidence; provider error and interrupted writes preserved; cross-trial refused |
+| K14–K15 | collector-bound trial preserves N2-A independence and can satisfy both verdicts |
+
+The registry guard now covers **149** registered cases; the full run executes 150 including `R1`.
+All Stage 2.x cases are retained unchanged.

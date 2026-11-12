@@ -20,6 +20,8 @@ $script:P9HModuleFiles = @(
     'p9h-n2-inventory.ps1'
     'p9h-verdict.ps1'
     'p9h-evidence.ps1'
+    'p9h-wts-provider.ps1'
+    'p9h-collector.ps1'
     'p9h-fault.ps1'
 )
 
