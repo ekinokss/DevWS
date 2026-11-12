@@ -358,6 +358,16 @@ function New-P9HObserverRecord {
     # per-record logon time with its provenance, so every downstream consumer
     # (authorization, readback, final verdict) evaluates the SAME identity
     # without re-deriving it from a different source.
+    #
+    # Stage 3A.2 adds the CAPTURE AUTHORITY fields. A syntactically perfect set
+    # of lines is not evidence if the capture pipeline rejected the table:
+    #   captureAuthoritative  - may this observation be authoritative evidence?
+    #   captureAuthorityReason - why not, when it may not
+    #   captureRejection      - the resolver/capture rejection, preserved
+    #   captureWin32Errors    - preserved native diagnostics
+    # `captureOutcome` stays the raw diagnostic outcome ('ok' / 'provider-error'),
+    # so a rejected-but-successful read is never rewritten into an error, and an
+    # error is never rewritten into 'ok'.
     param(
         [Parameter(Mandatory)][string]$TrialId,
         [Parameter(Mandatory)][int]$Sequence,
@@ -370,7 +380,13 @@ function New-P9HObserverRecord {
         [AllowNull()][string]$QuserText = $null,
         [AllowNull()][string]$CaptureOutcome = 'ok',
         [AllowNull()][string]$CaptureError = $null,
-        [AllowNull()][string]$Corroboration = $null
+        [AllowNull()][string]$Corroboration = $null,
+        # Capture authority (Stage 3A.2). Default TRUE so a direct/simple caller
+        # is unaffected; the table-capture path passes the resolver's verdict.
+        [bool]$CaptureAuthoritative = $true,
+        [AllowNull()][string]$CaptureAuthorityReason = $null,
+        [AllowNull()][string]$CaptureRejection = $null,
+        [AllowNull()][AllowEmptyCollection()][int[]]$CaptureWin32Errors = $null
     )
 
     $table = ConvertFrom-P9HWtsTable -Lines $RawWtsLines
@@ -384,6 +400,19 @@ function New-P9HObserverRecord {
         [pscustomobject][ordered]@{ Ok = $false; Reason = $table.Reason; Record = $null }
     }
 
+    # An observation may only be authoritative when the caller asserts capture
+    # authority AND the table itself parsed cleanly.
+    #
+    # Deliberately EXCLUDES target matching: "was this capture accepted?" and
+    # "does it describe the pinned target?" are separate questions, and the
+    # target checks downstream already fail closed with precise reasons
+    # (pre-not-active, logon-unavailable, user-mismatch, ...). Folding them in
+    # here would mask those diagnostics behind a generic authority rejection.
+    $authoritative = ($CaptureAuthoritative -and $table.Ok)
+    $authorityReason = if ($authoritative) { $null }
+    elseif (-not $CaptureAuthoritative) { if ([string]::IsNullOrWhiteSpace($CaptureAuthorityReason)) { 'capture-not-authoritative' } else { $CaptureAuthorityReason } }
+    else { 'table-not-ok:' + [string]$table.Reason }
+
     $record = [ordered]@{
         schema           = 'p9h.wts-observation.v2'
         trialId          = $TrialId
@@ -396,6 +425,10 @@ function New-P9HObserverRecord {
         targetLogonTime  = $TargetLogonTime
         captureOutcome   = $CaptureOutcome
         captureError     = $CaptureError
+        captureAuthoritative = $authoritative
+        captureAuthorityReason = $authorityReason
+        captureRejection = $CaptureRejection
+        captureWin32Errors = @($CaptureWin32Errors)
         rawWts           = @($RawWtsLines)
         tableOk          = $table.Ok
         tableRejections  = @($table.Rejections)
@@ -536,6 +569,17 @@ function Get-P9HReconnectAuthorizationProof {
         return [pscustomobject][ordered]@{ Proven = $false; Reason = 'no-pre-record'; Detail = $null; Pre = $null; Disc = $null }
     }
 
+    # Stage 3A.2: an observation whose CAPTURE was not authoritative can never
+    # be evidence of a transition, however clean its parsed target line looks.
+    if ($null -ne $pre.PSObject.Properties['captureAuthoritative'] -and -not [bool]$pre.captureAuthoritative) {
+        return [pscustomobject][ordered]@{
+            Proven = $false
+            Reason = 'pre-capture-not-authoritative'
+            Detail = if ($null -ne $pre.PSObject.Properties['captureAuthorityReason']) { [string]$pre.captureAuthorityReason } else { $null }
+            Pre    = $pre; Disc = $null
+        }
+    }
+
     if ([int]$pre.targetSessionId -ne $SessionId) {
         return [pscustomobject][ordered]@{ Proven = $false; Reason = 'pre-session-mismatch'; Detail = $null; Pre = $pre; Disc = $null }
     }
@@ -554,8 +598,21 @@ function Get-P9HReconnectAuthorizationProof {
 
     # The disconnected observation must be the same trial, same session, same
     # user, same logon, state 4, and sequenced after the pre record.
+    #
+    # Stage 3A.2: it must ALSO be authoritative. A record whose capture was
+    # rejected (inconsistent table, failed per-session query, ambiguous
+    # enumeration, provider error) is a raw diagnostic, not transition evidence.
+    # `captureAuthoritative` absent means a pre-3A.2 record, which is accepted
+    # only when its raw capture actually succeeded.
     $discCandidates = @($records | Where-Object {
+            $isAuthoritative = if ($null -ne $_.PSObject.Properties['captureAuthoritative']) {
+                [bool]$_.captureAuthoritative
+            }
+            else {
+                ([string]$_.captureOutcome -eq 'ok') -and [bool]$_.tableOk
+            }
             $_.phase -eq 'disconnect-observed' -and
+            $isAuthoritative -and
             [int]$_.targetSessionId -eq $SessionId -and
             [string]::Equals([string]$_.targetUser, $User, [System.StringComparison]::OrdinalIgnoreCase) -and
             (Test-P9HLogonEqual -Left $_.targetObservedLogon -Right $LogonTime) -and
@@ -564,11 +621,28 @@ function Get-P9HReconnectAuthorizationProof {
 
     if ($discCandidates.Count -eq 0) {
         # Explain WHY nothing qualified, using the most informative observation.
+        # A non-authoritative capture is reported as such rather than as a plain
+        # "no target record", so an operator can tell a rejected capture from an
+        # observation that simply disagreed.
         $anyDiscPhase = @($records | Where-Object { $_.phase -eq 'disconnect-observed' })
         $reason = 'no-target-disconnected-record'
         if ($anyDiscPhase.Count -gt 0) {
             $last = $anyDiscPhase | Select-Object -Last 1
-            if (-not $last.targetMatched) { $reason = 'disconnect-unmatched:' + [string]$last.targetMatchReason }
+            $lastAuthoritative = if ($null -ne $last.PSObject.Properties['captureAuthoritative']) {
+                [bool]$last.captureAuthoritative
+            }
+            else { ([string]$last.captureOutcome -eq 'ok') -and [bool]$last.tableOk }
+
+            $searchText = @($anyDiscPhase | ForEach-Object {
+                    [string]$_.captureAuthorityReason + ' ' + [string]$_.captureOutcome + ' ' + [string]$_.captureRejection
+                }) -join ' '
+
+            if ($searchText -match 'state-changed|state-changed-during-collection') { $reason = 'disconnect-capture-state-changed' }
+            elseif ($searchText -match 'ambiguous') { $reason = 'disconnect-capture-ambiguous' }
+            elseif ($searchText -match 'target-not-resolved|no-target') { $reason = 'disconnect-capture-target-missing' }
+            elseif ($searchText -match 'incomplete|native-query-failed|Win32') { $reason = 'disconnect-capture-incomplete' }
+            elseif (-not $lastAuthoritative) { $reason = 'disconnect-capture-not-authoritative' }
+            elseif (-not $last.targetMatched) { $reason = 'disconnect-unmatched:' + [string]$last.targetMatchReason }
             elseif ([int]$last.targetState -ne 4) { $reason = 'disconnect-target-active:' + [string]$last.targetStateName }
         }
         return [pscustomobject][ordered]@{ Proven = $false; Reason = $reason; Detail = $null; Pre = $pre; Disc = $null }
@@ -640,6 +714,23 @@ function Get-P9HDisconnectProof {
 
     if (-not $post.targetMatched -or [int]$post.targetState -ne 0) {
         return [pscustomobject][ordered]@{ Proven = $false; Reason = 'post-not-active'; Detail = $post.targetMatchReason; Pre = $auth.Pre; Disc = $auth.Disc; Post = $post }
+    }
+
+    # Stage 3A.2: the FINAL transition proof likewise requires the post-reconnect
+    # observation itself to be authoritative. A provider error or a rejected
+    # capture during the post observation is not evidence the session came back.
+    $postAuthoritative = if ($null -ne $post.PSObject.Properties['captureAuthoritative']) {
+        [bool]$post.captureAuthoritative
+    }
+    else { ([string]$post.captureOutcome -eq 'ok') -and [bool]$post.tableOk }
+
+    if (-not $postAuthoritative) {
+        return [pscustomobject][ordered]@{
+            Proven = $false
+            Reason = 'post-capture-not-authoritative'
+            Detail = if ($null -ne $post.PSObject.Properties['captureAuthorityReason']) { [string]$post.captureAuthorityReason } else { [string]$post.captureOutcome }
+            Pre    = $auth.Pre; Disc = $auth.Disc; Post = $post
+        }
     }
 
     if ([int]$post.targetSessionId -ne $SessionId) {

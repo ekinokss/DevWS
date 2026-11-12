@@ -545,3 +545,82 @@ described as product-generated.
 
 The registry guard now covers **165** registered cases; the full run executes 166 including `R1`.
 All 149 Stage 3A cases are retained unchanged.
+
+## Stage 3A.2 — session-table evidence authority gate
+
+Independent review found that a **rejected** session table could still become authoritative
+transition evidence. This is the most serious finding since Stage 2.4.1, because it is a false
+reconnect authorization rather than a reporting inaccuracy.
+
+### The defect, reproduced
+
+`Get-P9HWtsProviderTableCapture` accepted only `-Rows`, and `New-P9HObserverRecord` took
+`captureOutcome` as an unconditional `'ok'`. So a resolver result with `Ok = $false` still produced a
+clean-looking provider line table, and Proof A/B accepted it.
+
+Reproduced against `969e362`:
+
+| Counterexample | Before | Now |
+| --- | --- | --- |
+| Enumerated Active, queried Disconnected (table moved) | **Proof A proven** | `disconnect-capture-state-changed` |
+| Non-target session query failed (Win32 5) | **Proof A proven** | rejected, Win32 preserved |
+| `captureOutcome='provider-error'` with a valid target line | **Proof A proven** | `disconnect-capture-not-authoritative` |
+| `provider-error` on the post observation | **Proof B proven** | `post-capture-not-authoritative` |
+| Target absent from a successful enumeration | **resolver `Ok=true`** | `target-not-resolved:no-target` |
+
+### Authority propagation
+
+The capture now consumes the **complete resolved result**, not just its rows, and carries the verdict
+forward:
+
+```
+Resolve-P9HWtsSessionTable  ->  Get-P9HWtsProviderTableCapture -Result
+                            ->  New-P9HObserverRecordFromTableCapture
+                            ->  Get-P9HReconnectAuthorizationProof / Get-P9HDisconnectProof
+```
+
+Three properties are now distinct and all are preserved:
+
+- **raw observations** (`Lines`, `rawWts`) — every fact actually seen, kept even when rejected;
+- **accepted facts** (`Authoritative`) — whether those observations may be used as evidence;
+- **diagnostics** (`RejectionReason`, `Win32Errors`, `ResolverReason`) — why not.
+
+A rejected capture is never discarded and never upgraded. `-Rows` alone is explicitly **not**
+authoritative (`capture-rows-without-resolver-status`), because without the resolver verdict there is
+no evidence the table was complete or consistent.
+
+### The gate at Proof A and Proof B
+
+Both proofs now require the observation's capture to be authoritative:
+
+| Proof | New rejection |
+| --- | --- |
+| A | `pre-capture-not-authoritative`, and non-authoritative disconnect records are excluded from candidacy |
+| B | `post-capture-not-authoritative` |
+
+`Wait-P9HTargetDisconnected` previously hardcoded `-CaptureOutcome 'ok'`; it now consumes the
+provider's `Authoritative`/`RejectionReason`/`CaptureOutcome`/`Win32Errors`, persists rejected samples
+with their diagnostics, and keeps polling rather than authorizing on a rejected reading.
+
+**Deliberately excluded from `captureAuthoritative`:** target matching. "Was this capture accepted?"
+and "does it describe the pinned target?" are separate questions; folding them together would mask
+the precise downstream diagnostics (`pre-not-active`, `logon-unavailable`, `user-mismatch`). This is
+why A10 still reports `pre-not-active`/`logon-unavailable` rather than a generic authority failure.
+
+No E1 acceptance threshold was relaxed. Every change **rejects** evidence that previously qualified.
+
+### Tests: B1–B9 (authority) and S1–S6 (capture contract)
+
+| ID | Coverage |
+| --- | --- |
+| B1–B3 | inconsistent state, failed per-session query, ambiguous table cannot authorize |
+| B4–B5 | provider-error records cannot satisfy Proof A or Proof B |
+| B6 | missing target yields explicit non-success |
+| B7–B8 | **positive controls**: valid Active→Disc authorizes; Active→Disc→Active satisfies Proof B |
+| B9 | raw diagnostics survive a rejected evaluation byte-for-byte |
+| S1–S3 | accepted capture authoritative; rows-alone never; rejected capture keeps raw table |
+| S4 | five distinct, non-authoritative rejection reasons |
+| S5–S6 | the wait gate persists rejected samples without upgrading them and is never satisfied by them |
+
+The registry guard now covers **180** registered cases; the full run executes 181 including `R1`.
+All 165 Stage 3A.1 cases are retained unchanged.

@@ -2629,6 +2629,354 @@ function Invoke-P9HWtsEnumerationTests {
         -Pass ($proofA.Proven -and $proofB.Proven) -Evidence $seqLog
 }
 
+function Invoke-P9HAuthorityGateTests {
+    # B-series: session-table evidence AUTHORITY propagation into Proof A/B.
+    # S-series: the capture interface's own status contract.
+    #
+    # Stage 3A.2. The defect: Get-P9HWtsProviderTableCapture accepted only -Rows,
+    # so the rows of a REJECTED resolution produced a clean-looking line table,
+    # and New-P9HObserverRecord recorded captureOutcome='ok' unconditionally.
+    # A rejected table therefore became authoritative transition evidence.
+    #
+    # Everything here is synthetic: no live WTS call is made.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $logonUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 11, 10, 0, 0), [System.DateTimeKind]::Utc)
+    $logonFt = $logonUtc.ToFileTimeUtc()
+    $logonIso = $logonUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    $user = 'CONTOSO\qauser'
+
+    function New-AuthInfo {
+        param([int]$Id, [int]$State)
+        return (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId $Id -State $State `
+                    -StationName 'RDP-Tcp#0' -Domain 'CONTOSO' -UserName 'qauser' -LogonTime $logonFt)).Record
+    }
+
+    function New-AuthServices {
+        return (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 0 -State 4 `
+                    -StationName 'Services' -UserName '' -LogonTime 0)).Record
+    }
+
+    function New-AuthEnum {
+        param([int]$TargetState, [switch]$WithoutTarget, [switch]$DuplicateTarget)
+        $sessions = if ($WithoutTarget) {
+            @(@{ SessionId = 0; StationName = 'Services'; State = 4 }, @{ SessionId = 2; StationName = 'Console'; State = 1 })
+        }
+        elseif ($DuplicateTarget) {
+            @(@{ SessionId = 3; StationName = 'RDP-Tcp#0'; State = $TargetState }, @{ SessionId = 3; StationName = 'RDP-Tcp#1'; State = $TargetState })
+        }
+        else {
+            @(@{ SessionId = 0; StationName = 'Services'; State = 4 }, @{ SessionId = 3; StationName = 'RDP-Tcp#0'; State = $TargetState })
+        }
+        $built = New-P9HWtsSessionInfoPayload -Sessions $sessions
+        return (ConvertFrom-P9HWtsSessionInfoPayload -Payload $built.Payload -ReportedCount $built.ReportedCount -Layout $built.Layout)
+    }
+
+    function New-AuthTrial {
+        param([string]$Name)
+        $root = Join-Path $SandboxRoot ('p9h3a2-' + $Name + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        return (New-P9HTrialContext -RootDirectory $root -Kind e1)
+    }
+
+    $activeEnum = New-AuthEnum -TargetState 0
+    $discEnum = New-AuthEnum -TargetState 4
+    $cleanActiveQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthServices) }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthInfo -Id 3 -State 0) }
+    }
+    $cleanDiscQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthServices) }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthInfo -Id 3 -State 4) }
+    }
+
+    $cleanActive = Resolve-P9HWtsSessionTable -EnumeratedSessions $activeEnum.Records -QueryResults $cleanActiveQueries -TargetSessionId 3
+    $cleanActiveCap = Get-P9HWtsProviderTableCapture -Result $cleanActive -TargetSessionId 3
+    $cleanDisc = Resolve-P9HWtsSessionTable -EnumeratedSessions $discEnum.Records -QueryResults $cleanDiscQueries -TargetSessionId 3
+    $cleanDiscCap = Get-P9HWtsProviderTableCapture -Result $cleanDisc -TargetSessionId 3
+
+    # ================= B-series =================
+
+    # ---- B1: inconsistent enumeration/query state cannot authorize reconnect ----
+    # Enumerated Active but queried Disconnected: the table moved underneath the
+    # collector, so the "disconnected" reading is an evidence gap.
+    $inconsistentQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthServices) }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthInfo -Id 3 -State 4) }
+    }
+    $inconsistent = Resolve-P9HWtsSessionTable -EnumeratedSessions $activeEnum.Records -QueryResults $inconsistentQueries -TargetSessionId 3
+    $inconsistentCap = Get-P9HWtsProviderTableCapture -Result $inconsistent -TargetSessionId 3
+    $b1Trial = New-AuthTrial -Name 'b1'
+    $b1Log = Join-Path $b1Trial.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $b1Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b1Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b1Log -Line (New-P9HObserverRecordFromTableCapture -Capture $inconsistentCap -TrialId $b1Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
+    $b1Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b1Log -TrialId $b1Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'B1' -Title 'Inconsistent enumeration/query target state cannot authorize reconnect' `
+        -Input 'enumerated Active, queried Disconnected, complete table' `
+        -Expected 'capture not authoritative, Proof A not proven' `
+        -Actual ("resolverOk={0}({1}) capAuthoritative={2} rejection={3} proven={4} reason={5}" -f $inconsistent.Ok, $inconsistent.Reason, $inconsistentCap.Authoritative, $inconsistentCap.RejectionReason, $b1Proof.Proven, $b1Proof.Reason) `
+        -Pass ((-not $inconsistent.Ok) -and (-not $inconsistentCap.Authoritative) -and (-not $b1Proof.Proven)) -Evidence $b1Log
+
+    # ---- B2: a failed non-target query cannot authorize reconnect ----
+    # The target itself looks perfectly disconnected, but the table is
+    # incomplete, so session 0's state was never established.
+    $failedNonTargetQueries = @{
+        0 = [pscustomobject]@{ Ok = $false; Reason = 'native-query-failed'; Detail = 'Win32 5'; Record = $null; Win32Error = 5 }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthInfo -Id 3 -State 4) }
+    }
+    $failedNonTarget = Resolve-P9HWtsSessionTable -EnumeratedSessions $discEnum.Records -QueryResults $failedNonTargetQueries -TargetSessionId 3
+    $failedNonTargetCap = Get-P9HWtsProviderTableCapture -Result $failedNonTarget -TargetSessionId 3
+    $b2Trial = New-AuthTrial -Name 'b2'
+    $b2Log = Join-Path $b2Trial.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $b2Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b2Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b2Log -Line (New-P9HObserverRecordFromTableCapture -Capture $failedNonTargetCap -TrialId $b2Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
+    $b2Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b2Log -TrialId $b2Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    $b2Record = @(Read-P9HObserverLog -Path $b2Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    Add-P9HTestResult -Id 'B2' -Title 'A failed per-session query cannot authorize reconnect' `
+        -Input 'session 0 query failed Win32 5, target 3 reads Disconnected' `
+        -Expected 'capture not authoritative, Proof A not proven, Win32 preserved' `
+        -Actual ("capAuthoritative={0} rejection={1} win32={2} outcome={3} proven={4}" -f $failedNonTargetCap.Authoritative, $failedNonTargetCap.RejectionReason, (@($b2Record.captureWin32Errors) -join ','), $b2Record.captureOutcome, $b2Proof.Proven) `
+        -Pass ((-not $failedNonTargetCap.Authoritative) -and (-not $b2Proof.Proven) -and (@($b2Record.captureWin32Errors) -contains 5)) -Evidence $b2Log
+
+    # ---- B3: incomplete table with apparently valid target data ----
+    # Duplicate target rows: the target line parses fine and says Disconnected,
+    # but the table is ambiguous.
+    $dupEnum = New-AuthEnum -DuplicateTarget -TargetState 4
+    $dupQueries = @{ 3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthInfo -Id 3 -State 4) } }
+    $dupResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $dupEnum.Records -QueryResults $dupQueries -TargetSessionId 3
+    $dupCap = Get-P9HWtsProviderTableCapture -Result $dupResolved -TargetSessionId 3
+    $b3Trial = New-AuthTrial -Name 'b3'
+    $b3Log = Join-Path $b3Trial.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $b3Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b3Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b3Log -Line (New-P9HObserverRecordFromTableCapture -Capture $dupCap -TrialId $b3Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
+    $b3Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b3Log -TrialId $b3Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'B3' -Title 'An incomplete/ambiguous table with valid target data cannot authorize reconnect' `
+        -Input 'duplicate session-3 records, target line reads Disconnected' `
+        -Expected 'capture not authoritative, Proof A not proven' `
+        -Actual ("resolverOk={0}({1}) capAuthoritative={2} rejection={3} proven={4} reason={5}" -f $dupResolved.Ok, $dupResolved.Reason, $dupCap.Authoritative, $dupCap.RejectionReason, $b3Proof.Proven, $b3Proof.Reason) `
+        -Pass ((-not $dupResolved.Ok) -and (-not $dupCap.Authoritative) -and (-not $b3Proof.Proven)) -Evidence $b3Log
+
+    # ---- B4: a provider-error record cannot satisfy Proof A ----
+    # The raw line is a syntactically perfect Disconnected target line, but the
+    # capture was declared a provider error.
+    $b4Trial = New-AuthTrial -Name 'b4'
+    $b4Log = Join-Path $b4Trial.Directory 'e1.jsonl'
+    $perfectDiscLine = '3|RDP-Tcp#0|state=4|user=' + $user + '|logon=' + $logonIso
+    $null = Add-P9HArtifactLine -Path $b4Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b4Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b4Log -Line (New-P9HObserverRecord -TrialId $b4Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($perfectDiscLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+            -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)' `
+            -CaptureAuthoritative $false -CaptureAuthorityReason 'provider-error')
+    $b4Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b4Log -TrialId $b4Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    $b4Record = @(Read-P9HObserverLog -Path $b4Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    Add-P9HTestResult -Id 'B4' -Title 'A provider-error observer record cannot satisfy Proof A' `
+        -Input 'valid Disconnected target line whose capture was a provider error' `
+        -Expected 'record keeps its raw line and error, Proof A not proven' `
+        -Actual ("captureOutcome={0} captureAuthoritative={1} targetState={2} proven={3} reason={4}" -f $b4Record.captureOutcome, $b4Record.captureAuthoritative, $b4Record.targetState, $b4Proof.Proven, $b4Proof.Reason) `
+        -Pass ($b4Record.captureOutcome -eq 'provider-error' -and (-not $b4Record.captureAuthoritative) -and [int]$b4Record.targetState -eq 4 -and (-not $b4Proof.Proven)) -Evidence $b4Log
+
+    # ---- B5: a provider-error post observation cannot satisfy Proof B ----
+    $b5Trial = New-AuthTrial -Name 'b5'
+    $b5Log = Join-Path $b5Trial.Directory 'e1.jsonl'
+    $perfectActiveLine = '3|RDP-Tcp#0|state=0|user=' + $user + '|logon=' + $logonIso
+    $null = Add-P9HArtifactLine -Path $b5Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b5Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b5Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanDiscCap -TrialId $b5Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b5Log -Line (New-P9HObserverRecord -TrialId $b5Trial.TrialId -Sequence 3 -Phase 'post' `
+            -RawWtsLines @($perfectActiveLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+            -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)' `
+            -CaptureAuthoritative $false -CaptureAuthorityReason 'provider-error')
+    $b5ProofA = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b5Log -TrialId $b5Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    $b5ProofB = Get-P9HDisconnectProof -ObserverLogPath $b5Log -TrialId $b5Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'B5' -Title 'A provider-error post observation cannot satisfy Proof B' `
+        -Input 'authoritative pre/disconnect plus a provider-error post reading Active' `
+        -Expected 'Proof A proven, Proof B NOT proven' `
+        -Actual ("proofA={0}({1}) proofB={2}({3})" -f $b5ProofA.Proven, $b5ProofA.Reason, $b5ProofB.Proven, $b5ProofB.Reason) `
+        -Pass ($b5ProofA.Proven -and (-not $b5ProofB.Proven) -and $b5ProofB.Reason -eq 'post-capture-not-authoritative') -Evidence $b5Log
+
+    # ---- B6: a missing target yields explicit non-success ----
+    $absentEnum = New-AuthEnum -TargetState 0 -WithoutTarget
+    $absentQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthServices) }
+        2 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthInfo -Id 2 -State 1) }
+    }
+    $absent = Resolve-P9HWtsSessionTable -EnumeratedSessions $absentEnum.Records -QueryResults $absentQueries -TargetSessionId 3
+    $absentCap = Get-P9HWtsProviderTableCapture -Result $absent -TargetSessionId 3
+    Add-P9HTestResult -Id 'B6' -Title 'A missing target yields explicit non-success from the resolver' `
+        -Input 'successful enumeration of sessions 0 and 2, target 3 absent' `
+        -Expected 'resolver Ok=false reason=target-not-resolved, capture not authoritative' `
+        -Actual ("resolverOk={0} reason={1} targetOk={2} targetReason={3} capAuthoritative={4} rejection={5}" -f $absent.Ok, $absent.Reason, $absent.TargetOk, $absent.TargetReason, $absentCap.Authoritative, $absentCap.RejectionReason) `
+        -Pass ((-not $absent.Ok) -and $absent.Reason -eq 'target-not-resolved' -and (-not $absent.TargetOk) -and $absent.TargetReason -eq 'no-target' -and (-not $absentCap.Authoritative)) -Evidence $null
+
+    # ---- B7: valid complete Active -> Disconnected authorizes reconnect ----
+    # MANDATORY positive: the gate must remain executable.
+    $b7Trial = New-AuthTrial -Name 'b7'
+    $b7Log = Join-Path $b7Trial.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $b7Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b7Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b7Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanDiscCap -TrialId $b7Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
+    $b7Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b7Log -TrialId $b7Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    $b7AssertOk = $false
+    try {
+        $null = Assert-P9HReconnectPermitted -ObserverLogPath $b7Log -TargetSessionId 3 -TargetUser $user `
+            -TrialId $b7Trial.TrialId -TargetLogonTime $logonIso
+        $b7AssertOk = $true
+    }
+    catch { }
+    Add-P9HTestResult -Id 'B7' -Title 'A valid complete Active to Disconnected table authorizes reconnect' `
+        -Input 'authoritative pre Active and authoritative disconnect Disconnected' `
+        -Expected 'Proof A proven, hard gate permits' `
+        -Actual ("preAuth={0} discAuth={1} proven={2} reason={3} assertPermitted={4}" -f $cleanActiveCap.Authoritative, $cleanDiscCap.Authoritative, $b7Proof.Proven, $b7Proof.Reason, $b7AssertOk) `
+        -Pass ($cleanActiveCap.Authoritative -and $cleanDiscCap.Authoritative -and $b7Proof.Proven -and $b7AssertOk) -Evidence $b7Log
+
+    # ---- B8: valid Active -> Disconnected -> Active satisfies final Proof B ----
+    $b8Trial = New-AuthTrial -Name 'b8'
+    $b8Log = Join-Path $b8Trial.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $b8Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b8Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b8Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanDiscCap -TrialId $b8Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b8Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b8Trial.TrialId -Sequence 3 -Phase 'post' -TargetUser $user -TargetLogonTime $logonIso)
+    $b8ProofB = Get-P9HDisconnectProof -ObserverLogPath $b8Log -TrialId $b8Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'B8' -Title 'A valid Active to Disconnected to Active sequence satisfies final Proof B' `
+        -Input 'three authoritative observations at the same pinned identity' `
+        -Expected 'Proof B proven' `
+        -Actual ("proven={0} reason={1} postState={2}" -f $b8ProofB.Proven, $b8ProofB.Reason, $(if ($b8ProofB.Post) { $b8ProofB.Post.targetState } else { 'null' })) `
+        -Pass ($b8ProofB.Proven -and $b8ProofB.Reason -eq 'target-disconnect-reconnect-observed') -Evidence $b8Log
+
+    # ---- B9: raw diagnostics survive a rejected evaluation unchanged ----
+    $b9Trial = New-AuthTrial -Name 'b9'
+    $b9Log = Join-Path $b9Trial.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $b9Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b9Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $b9Log -Line (New-P9HObserverRecordFromTableCapture -Capture $failedNonTargetCap -TrialId $b9Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
+    $b9Before = Get-P9HFileSha256 -Path $b9Log
+    $null = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b9Log -TrialId $b9Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    $b9After = Get-P9HFileSha256 -Path $b9Log
+    $b9Record = @(Read-P9HObserverLog -Path $b9Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    Add-P9HTestResult -Id 'B9' -Title 'Raw diagnostic observations survive a rejected evaluation unchanged' `
+        -Input 'rejected capture with a preserved Win32 failure' `
+        -Expected 'log bytes identical, raw lines and diagnostics still present' `
+        -Actual ("hashUnchanged={0} rawLines={1} rejection={2} win32={3} outcome={4}" -f ($b9Before -eq $b9After), @($b9Record.rawWts).Count, [string]$b9Record.captureRejection, (@($b9Record.captureWin32Errors) -join ','), $b9Record.captureOutcome) `
+        -Pass (($b9Before -eq $b9After) -and @($b9Record.rawWts).Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]$b9Record.captureRejection) -and (@($b9Record.captureWin32Errors) -contains 5)) -Evidence $b9Log
+
+    # ================= S-series (capture status contract) =================
+
+    # ---- S1: an accepted resolution yields an authoritative capture ----
+    Add-P9HTestResult -Id 'S1' -Title 'An accepted resolution yields an authoritative capture' `
+        -Input 'complete consistent table' -Expected 'Ok=true, Authoritative=true, no rejection' `
+        -Actual ("Ok={0} authoritative={1} reason={2} rejection={3} lines={4}" -f $cleanDiscCap.Ok, $cleanDiscCap.Authoritative, $cleanDiscCap.Reason, [string]$cleanDiscCap.RejectionReason, $cleanDiscCap.LineCount) `
+        -Pass ($cleanDiscCap.Ok -and $cleanDiscCap.Authoritative -and [string]::IsNullOrWhiteSpace([string]$cleanDiscCap.RejectionReason) -and $cleanDiscCap.LineCount -eq 2) -Evidence $null
+
+    # ---- S2: rows alone are never authoritative ----
+    $rowsOnlyCap = Get-P9HWtsProviderTableCapture -Rows $cleanDisc.Rows -TargetSessionId 3
+    Add-P9HTestResult -Id 'S2' -Title 'A row set without resolver status is never authoritative' `
+        -Input 'valid rows passed without the resolved result' -Expected 'Authoritative=false, explicit reason' `
+        -Actual ("authoritative={0} reason={1} lines={2}" -f $rowsOnlyCap.Authoritative, $rowsOnlyCap.RejectionReason, $rowsOnlyCap.LineCount) `
+        -Pass ((-not $rowsOnlyCap.Authoritative) -and $rowsOnlyCap.RejectionReason -eq 'capture-rows-without-resolver-status') -Evidence $null
+
+    # ---- S3: a rejected capture still preserves the full raw table ----
+    Add-P9HTestResult -Id 'S3' -Title 'A rejected capture preserves its complete raw observations' `
+        -Input 'inconsistent table rejected by the resolver' `
+        -Expected 'authoritative=false but both raw lines still emitted' `
+        -Actual ("authoritative={0} lines={1} rowCount={2} resolverReason={3}" -f $inconsistentCap.Authoritative, $inconsistentCap.LineCount, $inconsistentCap.RowCount, $inconsistentCap.ResolverReason) `
+        -Pass ((-not $inconsistentCap.Authoritative) -and $inconsistentCap.LineCount -eq 2 -and $inconsistentCap.RowCount -eq 2 -and -not [string]::IsNullOrWhiteSpace([string]$inconsistentCap.ResolverReason)) -Evidence $null
+
+    # ---- S4: each resolver failure mode names its own rejection ----
+    $mismatchQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthServices) }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthInfo -Id 7 -State 0) }
+    }
+    $mismatch = Resolve-P9HWtsSessionTable -EnumeratedSessions $activeEnum.Records -QueryResults $mismatchQueries -TargetSessionId 3
+    $mismatchCap = Get-P9HWtsProviderTableCapture -Result $mismatch -TargetSessionId 3
+    $missingLogonQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (New-AuthServices) }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 3 -State 4 -StationName 'RDP-Tcp#0' -Domain 'CONTOSO' -UserName 'qauser' -LogonTime 0)).Record }
+    }
+    $missingLogon = Resolve-P9HWtsSessionTable -EnumeratedSessions $discEnum.Records -QueryResults $missingLogonQueries -TargetSessionId 3
+    $missingLogonCap = Get-P9HWtsProviderTableCapture -Result $missingLogon -TargetSessionId 3
+    Add-P9HTestResult -Id 'S4' -Title 'Each rejection mode produces its own explicit authority reason' `
+        -Input 'ambiguous, id-mismatch, state-change, target-absent, failed-query' `
+        -Expected 'five distinct rejection reasons, none authoritative' `
+        -Actual ("ambiguous={0} mismatch={1} stateChanged={2} absent={3} failedQuery={4}" -f $dupCap.RejectionReason, $mismatchCap.RejectionReason, $inconsistentCap.RejectionReason, $absentCap.RejectionReason, $failedNonTargetCap.RejectionReason) `
+        -Pass ($dupCap.RejectionReason -eq 'target-not-resolved:ambiguous-enumeration' -and
+            $mismatchCap.RejectionReason -eq 'target-not-resolved:target-session-id-mismatch' -and
+            $inconsistentCap.RejectionReason -eq 'target-state-changed-during-collection' -and
+            $absentCap.RejectionReason -eq 'target-not-resolved:no-target' -and
+            $failedNonTargetCap.RejectionReason -eq 'resolver-rejected:incomplete-session-table' -and
+            (@(@($dupCap.RejectionReason, $mismatchCap.RejectionReason, $inconsistentCap.RejectionReason, $absentCap.RejectionReason, $failedNonTargetCap.RejectionReason) | Select-Object -Unique).Count -eq 5) -and
+            (-not $dupCap.Authoritative) -and (-not $mismatchCap.Authoritative) -and
+            (-not $inconsistentCap.Authoritative) -and (-not $absentCap.Authoritative) -and
+            (-not $failedNonTargetCap.Authoritative)) -Evidence $null
+
+    # ---- S5: a rejected sample is persisted and never upgraded to ok ----
+    # Drives the real integration path (Wait-P9HTargetDisconnected) with a
+    # provider that reports a rejected capture, then a provider that succeeds.
+    $s5Root = Join-Path $SandboxRoot ('p9h3a2-s5-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+    New-Item -ItemType Directory -Path $s5Root -Force | Out-Null
+    $s5Trial = New-P9HTrialContext -RootDirectory $s5Root -Kind e1
+    $s5Log = Join-Path $s5Trial.Directory 'e1.jsonl'
+
+    $script:s5Calls = 0
+    $s5Provider = {
+        $script:s5Calls++
+        if ($script:s5Calls -eq 1) {
+            # Rejected capture with a syntactically perfect Disconnected line.
+            return [pscustomobject]@{
+                RawWtsLines     = @($perfectDiscLine)
+                Authoritative   = $false
+                AuthorityReason = 'target-state-changed-during-collection'
+                RejectionReason = 'target-state-changed-during-collection'
+                CaptureOutcome  = 'ok'
+                Win32Errors     = @()
+            }
+        }
+        return [pscustomobject]@{
+            RawWtsLines   = $cleanDiscCap.Lines
+            Authoritative = $true
+        }
+    }
+
+    $s5Wait = Wait-P9HTargetDisconnected -TrialId $s5Trial.TrialId -SequenceStart 1 `
+        -ObserverLogPath $s5Log -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+        -Provider $s5Provider -TimeoutSeconds 8 -PollIntervalMs 10
+
+    $s5Records = @(Read-P9HObserverLog -Path $s5Log).Records
+    $s5First = @($s5Records | Where-Object { [int]$_.sequence -eq 1 }) | Select-Object -First 1
+    Add-P9HTestResult -Id 'S5' -Title 'A rejected sample is persisted with its reason and never upgraded to ok' `
+        -Input 'provider reports a rejected capture, then an authoritative one' `
+        -Expected 'first sample durable and non-authoritative, later sample authorizes' `
+        -Actual ("calls={0} waitProven={1} firstAuth={2} firstReason={3} firstOutcome={4} records={5}" -f $script:s5Calls, $s5Wait.Proven, $s5First.captureAuthoritative, [string]$s5First.captureAuthorityReason, $s5First.captureOutcome, $s5Records.Count) `
+        -Pass ($s5Wait.Proven -and $s5Records.Count -ge 2 -and (-not $s5First.captureAuthoritative) -and
+            $s5First.captureAuthorityReason -eq 'target-state-changed-during-collection' -and
+            $s5First.captureOutcome -eq 'ok') -Evidence $s5Log
+
+    # ---- S6: the wait gate cannot be satisfied by rejected samples alone ----
+    $s6Root = Join-Path $SandboxRoot ('p9h3a2-s6-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+    New-Item -ItemType Directory -Path $s6Root -Force | Out-Null
+    $s6Trial = New-P9HTrialContext -RootDirectory $s6Root -Kind e1
+    $s6Log = Join-Path $s6Trial.Directory 'e1.jsonl'
+
+    $s6Provider = {
+        return [pscustomobject]@{
+            RawWtsLines     = @($perfectDiscLine)
+            Authoritative   = $false
+            AuthorityReason = 'provider-error'
+            RejectionReason = 'resolver-rejected:incomplete-session-table'
+            CaptureOutcome  = 'provider-error'
+            CaptureError    = 'WTSQuerySessionInformationW failed (Win32 5)'
+            Win32Errors     = @(5)
+        }
+    }
+
+    $s6Wait = Wait-P9HTargetDisconnected -TrialId $s6Trial.TrialId -SequenceStart 1 `
+        -ObserverLogPath $s6Log -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+        -Provider $s6Provider -TimeoutSeconds 2 -PollIntervalMs 50
+
+    $s6Records = @(Read-P9HObserverLog -Path $s6Log).Records
+    $s6AllNonAuth = @($s6Records | Where-Object { -not $_.captureAuthoritative }).Count
+    Add-P9HTestResult -Id 'S6' -Title 'A wait gate is never satisfied by rejected samples alone' `
+        -Input 'provider always reports a provider-error capture' `
+        -Expected 'wait not proven, every persisted sample non-authoritative' `
+        -Actual ("waitProven={0} reason={1} records={2} nonAuthoritative={3}" -f $s6Wait.Proven, $s6Wait.Reason, $s6Records.Count, $s6AllNonAuth) `
+        -Pass ((-not $s6Wait.Proven) -and $s6Records.Count -gt 0 -and $s6AllNonAuth -eq $s6Records.Count) -Evidence $s6Log
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -2646,6 +2994,7 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HProvenanceTests -SandboxRoot $SandboxRoot
     Invoke-P9HWtsProviderTests -SandboxRoot $SandboxRoot
     Invoke-P9HWtsEnumerationTests -SandboxRoot $SandboxRoot
+    Invoke-P9HAuthorityGateTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
@@ -2653,8 +3002,8 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 165 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'G', 'D')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 180 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'G', 'D')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

@@ -180,12 +180,42 @@ function Wait-P9HTargetDisconnected {
         $quser = $null
         if ($null -ne $sample.PSObject.Properties['QuserText']) { $quser = [string]$sample.QuserText }
 
+        # Stage 3A.2: consume the provider's CAPTURE AUTHORITY when it supplies
+        # one. Previously this loop hardcoded -CaptureOutcome 'ok', so a provider
+        # whose session table was rejected (inconsistent, ambiguous, incomplete,
+        # provider error) still produced an authoritative-looking observation.
+        #
+        # `Authoritative` defaults to TRUE only for a provider that says nothing
+        # about capture status, which preserves the simple-caller contract; a
+        # provider that reports a rejection is propagated verbatim and can never
+        # be upgraded here.
+        $providedAuthoritative = $true
+        $authorityReason = $null
+        $rejection = $null
+        $win32 = @()
+        $outcome = 'ok'
+        $captureError = $null
+
+        if ($null -ne $sample.PSObject.Properties['Authoritative']) {
+            $providedAuthoritative = [bool]$sample.Authoritative
+        }
+        if ($null -ne $sample.PSObject.Properties['RejectionReason']) { $rejection = [string]$sample.RejectionReason }
+        if ($null -ne $sample.PSObject.Properties['AuthorityReason']) { $authorityReason = [string]$sample.AuthorityReason }
+        if ($null -ne $sample.PSObject.Properties['Win32Errors']) { $win32 = @($sample.Win32Errors) }
+        if ($null -ne $sample.PSObject.Properties['CaptureOutcome']) { $outcome = [string]$sample.CaptureOutcome }
+        if ($null -ne $sample.PSObject.Properties['CaptureError']) { $captureError = [string]$sample.CaptureError }
+
         # Persist EVERY sample: the evidence of what was seen when matters, not
-        # just the sample that finally matched.
+        # just the sample that finally matched. A rejected sample is persisted
+        # with its diagnostics, and simply never authorizes.
         $line = New-P9HObserverRecord -TrialId $TrialId -Sequence $sequence -Phase 'disconnect-observed' `
             -RawWtsLines $rawLines -TargetSessionId $TargetSessionId -TargetUser $TargetUser `
             -TargetLogonTime $TargetLogonTime -GuestIdentity $GuestIdentity -QuserText $quser `
-            -CaptureOutcome 'ok' -CaptureError $null
+            -CaptureOutcome $outcome -CaptureError $captureError `
+            -CaptureAuthoritative $providedAuthoritative `
+            -CaptureAuthorityReason $authorityReason `
+            -CaptureRejection $rejection `
+            -CaptureWin32Errors $win32
         Add-P9HArtifactLine -Path $ObserverLogPath -Line $line
 
         $readBack = Read-P9HObserverLog -Path $ObserverLogPath
@@ -210,6 +240,25 @@ function Wait-P9HTargetDisconnected {
                 Sequence    = $sequence
                 Observation = $null
             }
+        }
+
+        # A persisted record whose CAPTURE was rejected can never prove a
+        # disconnect, even if its parsed target line looks perfectly clean.
+        $persistedAuthoritative = if ($null -ne $persisted.PSObject.Properties['captureAuthoritative']) {
+            [bool]$persisted.captureAuthoritative
+        }
+        else { ([string]$persisted.captureOutcome -eq 'ok') -and [bool]$persisted.tableOk }
+
+        if (-not $persistedAuthoritative) {
+            $lastReason = if ($null -ne $persisted.PSObject.Properties['captureAuthorityReason'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$persisted.captureAuthorityReason)) {
+                'capture-not-authoritative:' + [string]$persisted.captureAuthorityReason
+            }
+            else { 'capture-not-authoritative' }
+            # Keep polling: a later sample may be authoritative.
+            $sequence++
+            Start-Sleep -Milliseconds $PollIntervalMs
+            continue
         }
 
         $judged = Test-P9HTargetDisconnected -Records @($persisted | ForEach-Object {

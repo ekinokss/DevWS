@@ -1282,6 +1282,9 @@ function Resolve-P9HWtsSessionTable {
 
         if (-not $query.Ok) {
             $errors.Add(('{0}:{1}' -f $id, $query.Reason)) | Out-Null
+            # Stage 3A.2: preserve the native diagnostic with the row so a
+            # rejected capture can still report WHICH Win32 error occurred.
+            $rowWin32 = if ($null -ne $query.PSObject.Properties['Win32Error'] -and $null -ne $query.Win32Error) { [int]$query.Win32Error } else { $null }
             $rows.Add([pscustomobject][ordered]@{
                     SessionId = $id; StationName = [string]$session.StationName
                     EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
@@ -1289,6 +1292,7 @@ function Resolve-P9HWtsSessionTable {
                     InfoSessionId = $null; InfoState = $null; InfoStateName = $null
                     User = $null; LogonTime = $null; LogonSource = $null
                     SessionIdConsistent = $false; StateConsistent = $null
+                    Win32Error = $rowWin32
                     Detail = [string]$query.Detail
                 }) | Out-Null
             continue
@@ -1314,6 +1318,7 @@ function Resolve-P9HWtsSessionTable {
                 User = [string]$info.User
                 LogonTime = [string]$info.LogonTime; LogonSource = [string]$info.LogonSource
                 SessionIdConsistent = $idConsistent; StateConsistent = $stateConsistent
+                Win32Error = if ($null -ne $query.PSObject.Properties['Win32Error'] -and $null -ne $query.Win32Error) { [int]$query.Win32Error } else { $null }
                 Detail = $null
             }) | Out-Null
     }
@@ -1350,17 +1355,29 @@ function Resolve-P9HWtsSessionTable {
     # not a disconnect proof and not a reconnect proof.
     $targetStateChanged = ($targets.Count -eq 1 -and $targets[0].StateConsistent -eq $false)
 
+    # Stage 3A.2: `Ok` must also require that the TARGET resolved. Previously a
+    # table whose only defect was an absent target reported Ok=True with
+    # TargetOk=False, which let a caller treat "the target was not even in the
+    # table" as a successful authoritative result.
     $ok = (
         $errors.Count -eq 0 -and
         -not $dupCheck.HasDuplicates -and
         -not $targetStateChanged -and
-        ($stateChanges.Count -eq 0)
+        ($stateChanges.Count -eq 0) -and
+        $targetOk
     )
+
+    $reason = if ($ok) { 'ok' }
+    elseif ($dupCheck.HasDuplicates) { 'ambiguous-enumeration' }
+    elseif ($stateChanges.Count -gt 0) { 'state-changed-during-collection' }
+    elseif ($errors.Count -gt 0) { 'incomplete-session-table' }
+    elseif (-not $targetOk) { 'target-not-resolved' }
+    else { 'ok' }
 
     return [pscustomobject][ordered]@{
         Ok                = $ok
-        Reason            = if ($ok) { 'ok' } elseif ($dupCheck.HasDuplicates) { 'ambiguous-enumeration' } elseif ($stateChanges.Count -gt 0) { 'state-changed-during-collection' } elseif ($errors.Count -gt 0) { 'incomplete-session-table' } else { 'ok' }
-        Detail            = if ($errors.Count -gt 0) { ($errors -join '; ') } elseif ($stateChanges.Count -gt 0) { ($stateChanges -join '; ') } else { $null }
+        Reason            = $reason
+        Detail            = if (-not $targetOk) { [string]$targetReason } elseif ($errors.Count -gt 0) { ($errors -join '; ') } elseif ($stateChanges.Count -gt 0) { ($stateChanges -join '; ') } else { $null }
         Rows              = @($rows)
         RowCount          = $rows.Count
         Errors            = @($errors)
@@ -1376,23 +1393,140 @@ function Resolve-P9HWtsSessionTable {
     }
 }
 
-function Get-P9HWtsProviderTableCapture {
-    # Build the COMPLETE provider line table from resolved session facts, and
-    # separate the target rows from the rest.
+function New-P9HObserverRecordFromTableCapture {
+    # Build an observer record DIRECTLY from a resolved table capture, carrying
+    # its authority verdict forward.
     #
-    # This is the full-table counterpart of Get-P9HWtsProviderCapture: every
-    # enumerated session emits a line, so the frozen parser sees the same table
-    # a live E1 observation would, including session 0.
+    # Stage 3A.2: this is the intended path from the WTS session table into the
+    # frozen observer log. Calling New-P9HObserverRecord by hand with only
+    # `Lines` silently discards the resolver's verdict, which is precisely the
+    # defect this stage closes; this wrapper cannot forget it.
+    #
+    # The record ALWAYS preserves the raw lines, the resolver rejection and the
+    # Win32 diagnostics, whether or not the capture was authoritative. A failed
+    # capture is evidence of what happened; it is simply not evidence of a
+    # transition.
     param(
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,
+        [Parameter(Mandatory)]$Capture,
+        [Parameter(Mandatory)][string]$TrialId,
+        [Parameter(Mandatory)][int]$Sequence,
+        [Parameter(Mandatory)][ValidateSet('pre', 'disconnect-requested', 'disconnect-observed', 'reconnect-requested', 'post')][string]$Phase,
+        [Parameter(Mandatory)][string]$TargetUser,
+        [AllowNull()][string]$TargetLogonTime = $null,
+        [AllowNull()][string]$GuestIdentity = $null,
+        [AllowNull()][string]$QuserText = $null,
+        [AllowNull()][string]$Corroboration = $null
+    )
+
+    # `captureOutcome` reports the RAW diagnostic outcome only. A rejected
+    # capture stays 'ok' when the read itself succeeded - the rejection is
+    # carried by captureAuthoritative/captureRejection instead - because
+    # rewriting it to an error would misreport what the host actually did.
+    $outcome = 'ok'
+    $errorText = $null
+    if ([int]$Capture.FailedCount -gt 0 -or @($Capture.Win32Errors).Count -gt 0) {
+        $outcome = 'provider-error'
+        $errorText = if (-not [string]::IsNullOrWhiteSpace([string]$Capture.ResolverDetail)) {
+            [string]$Capture.ResolverDetail
+        }
+        else { 'one or more per-session WTS queries failed' }
+    }
+
+    return New-P9HObserverRecord -TrialId $TrialId -Sequence $Sequence -Phase $Phase `
+        -RawWtsLines @($Capture.Lines) -TargetSessionId ([int]$Capture.TargetSessionId) `
+        -TargetUser $TargetUser -TargetLogonTime $TargetLogonTime -GuestIdentity $GuestIdentity `
+        -QuserText $QuserText -Corroboration $Corroboration `
+        -CaptureOutcome $outcome -CaptureError $errorText `
+        -CaptureAuthoritative ([bool]$Capture.Authoritative) `
+        -CaptureAuthorityReason $(if ([string]::IsNullOrWhiteSpace([string]$Capture.RejectionReason)) { $null } else { [string]$Capture.RejectionReason }) `
+        -CaptureRejection ([string]$Capture.RejectionReason) `
+        -CaptureWin32Errors @($Capture.Win32Errors)
+}
+
+function Get-P9HWtsProviderTableCapture {
+    # Build the COMPLETE provider line table from a RESOLVED session-table
+    # result, and carry that result's AUTHORITY forward.
+    #
+    # Stage 3A.2 correction (independent review): this function previously took
+    # only `-Rows`, so a caller could hand it the rows of a REJECTED resolution
+    # and receive a well-formed line table with no indication that the resolver
+    # had refused it. A rejected resolution then became authoritative transition
+    # evidence in Proof A / Proof B. The capture now consumes the whole resolved
+    # result, and `Authoritative` is false whenever the resolver was incomplete,
+    # ambiguous, inconsistent, missing the target, or otherwise not Ok.
+    #
+    # Two things are deliberately kept separate:
+    #   * RAW OBSERVATIONS (`Lines`) - every fact we actually saw, including the
+    #     complete table, so a failed capture still preserves its diagnostics;
+    #   * ACCEPTED FACTS (`Authoritative` + `RejectionReason`) - whether those
+    #     observations may be used as authoritative transition evidence.
+    # A failed capture is never discarded, and never silently upgraded.
+    #
+    # `-Rows` remains accepted for callers that genuinely only have rows, but an
+    # unattributed row set is NOT authoritative: without the resolver verdict
+    # there is no evidence the table was complete or consistent.
+    param(
+        [AllowNull()]$Result = $null,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Rows = $null,
         [Parameter(Mandatory)][int]$TargetSessionId
     )
+
+    $rowsIn = $null
+    $authoritative = $false
+    $rejectionReason = 'capture-not-from-resolved-result'
+    $resolverReason = $null
+    $resolverDetail = $null
+    $win32Errors = @()
+    $targetStateChanged = $false
+
+    if ($null -ne $Result) {
+        $rowsIn = @($Result.Rows)
+        $resolverReason = [string]$Result.Reason
+        $resolverDetail = if ($null -ne $Result.PSObject.Properties['Detail']) { [string]$Result.Detail } else { $null }
+        $targetStateChanged = [bool]$Result.TargetStateChanged
+
+        # Authoritative ONLY when the resolver says the whole table is usable AND
+        # the target itself resolved consistently.
+        if ([bool]$Result.Ok -and [bool]$Result.TargetOk -and -not $targetStateChanged) {
+            $authoritative = $true
+            $rejectionReason = $null
+        }
+        else {
+            $rejectionReason = if (-not [bool]$Result.TargetOk) {
+                'target-not-resolved:' + [string]$Result.TargetReason
+            }
+            elseif ($targetStateChanged) { 'target-state-changed-during-collection' }
+            else { 'resolver-rejected:' + $resolverReason }
+        }
+
+        # Preserve Win32 diagnostics for any failed per-session query.
+        $win32Errors = @(foreach ($r in @($Result.Rows)) {
+                if ($null -ne $r.PSObject.Properties['Win32Error'] -and $null -ne $r.Win32Error) { [int]$r.Win32Error }
+            })
+    }
+    elseif ($null -ne $Rows) {
+        $rowsIn = @($Rows)
+        $authoritative = $false
+        $rejectionReason = 'capture-rows-without-resolver-status'
+    }
+    else {
+        return [pscustomobject][ordered]@{
+            Ok = $false; Authoritative = $false
+            Reason = 'capture-input-missing'; RejectionReason = 'capture-input-missing'
+            Detail = 'Get-P9HWtsProviderTableCapture requires a resolved result or a row set'
+            Lines = @(); LineCount = 0
+            TargetRecords = @(); TargetCount = 0
+            FailedQueries = @(); FailedCount = 0
+            RowCount = 0; TargetSessionId = $TargetSessionId
+            IsAtomicSnapshot = $false; Win32Errors = @()
+        }
+    }
 
     $lines = [System.Collections.Generic.List[string]]::new()
     $targets = [System.Collections.Generic.List[object]]::new()
     $failed = [System.Collections.Generic.List[object]]::new()
 
-    foreach ($row in @($Rows)) {
+    foreach ($row in @($rowsIn)) {
         if ($null -eq $row) { continue }
 
         if (-not $row.QueryOk) {
@@ -1425,14 +1559,23 @@ function Get-P9HWtsProviderTableCapture {
     }
 
     return [pscustomobject][ordered]@{
-        Lines          = @($lines)
-        LineCount      = $lines.Count
-        TargetRecords  = @($targets)
-        TargetCount    = $targets.Count
-        FailedQueries  = @($failed)
-        FailedCount    = $failed.Count
-        RowCount       = @($Rows).Count
-        TargetSessionId = $TargetSessionId
+        # `Ok` answers "was this an accepted, authoritative capture?".
+        Ok               = $authoritative
+        Authoritative    = $authoritative
+        Reason           = if ($authoritative) { 'authoritative' } else { 'capture-rejected' }
+        RejectionReason  = $rejectionReason
+        ResolverReason   = $resolverReason
+        ResolverDetail   = $resolverDetail
+        TargetStateChanged = $targetStateChanged
+        Win32Errors      = @($win32Errors)
+        Lines            = @($lines)
+        LineCount        = $lines.Count
+        TargetRecords    = @($targets)
+        TargetCount      = $targets.Count
+        FailedQueries    = @($failed)
+        FailedCount      = $failed.Count
+        RowCount         = @($rowsIn).Count
+        TargetSessionId  = $TargetSessionId
         IsAtomicSnapshot = $false
     }
 }
