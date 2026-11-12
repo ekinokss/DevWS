@@ -540,10 +540,16 @@ function Get-P9HN2Verdicts {
         [Parameter(Mandatory)][string]$PostWindowPath,
         [Parameter(Mandatory)][string]$ExitRecordPath,
         [Parameter(Mandatory)][string]$NewProcessPath,
-        [string]$TrialId = '',
+        # Trial identity is REQUIRED for an authoritative verdict. An empty
+        # value is an evidence gap, never an implicit "any trial".
+        [Parameter(Mandatory)][string]$TrialId,
         [Parameter(Mandatory)][string]$ExpectedWindowId,
         [Parameter(Mandatory)][string]$ExpectedTerminalId,
-        [Parameter(Mandatory)][string]$ExpectedSetId
+        [Parameter(Mandatory)][string]$ExpectedSetId,
+        # Trial artifact binding (Stage 2.4). When supplied, every required
+        # artifact must be recorded in that trial artifact index with a digest
+        # that still matches the bytes on disk.
+        [string]$ArtifactIndexPath = ''
     )
 
     $reasonsA = [System.Collections.Generic.List[string]]::new()
@@ -551,6 +557,43 @@ function Get-P9HN2Verdicts {
 
     $fixture = Read-P9HJsonArtifact -Path $FixturePath
     $exit = Test-P9HExitRecord -Path $ExitRecordPath
+
+    # ---- trial identity + artifact binding (Stage 2.4) ----
+    # A verdict must be about ONE trial. The exit record s own trialId is
+    # compared explicitly, because Test-P9HExitRecord only checks that the
+    # field is PRESENT, not that it matches the trial being evaluated.
+    $trialIdPresent = -not [string]::IsNullOrWhiteSpace($TrialId)
+    $exitTrial = if ($exit.Valid) { [string](Get-P9HProp -Object $exit.Data -Name 'trialId') } else { $null }
+    $exitTrialPresent = -not [string]::IsNullOrWhiteSpace($exitTrial)
+    $exitTrialMatches = ($trialIdPresent -and $exitTrialPresent -and
+                         [string]::Equals($exitTrial, $TrialId, [System.StringComparison]::Ordinal))
+
+    # The binding is MANDATORY for an authoritative PASS. An absent index is an
+    # evidence gap, not a reason to skip the check: without it there is no way to
+    # know the trace and inventories belong to this trial at all.
+    $binding = $null
+    if ([string]::IsNullOrWhiteSpace($ArtifactIndexPath)) {
+        $binding = [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'artifact-index-not-supplied'; Roles = @()
+            MissingRoles = @('artifact-index'); Mismatches = @()
+        }
+    }
+    else {
+        # ExpectedPaths pins each role to the exact artifact the caller supplied,
+        # so a substituted file at a different path cannot borrow another
+        # artifact s verified digest.
+        $binding = Get-P9HArtifactBinding -TrialId $TrialId -ArtifactIndexPath $ArtifactIndexPath `
+            -RequiredRoles @('fixture', 'stdout', 'pre-windows', 'post-windows', 'exit-record', 'new-processes', 'trace') `
+            -ExpectedPaths @{
+                'fixture'       = $FixturePath
+                'stdout'        = $StdoutPath
+                'pre-windows'   = $PreWindowPath
+                'post-windows'  = $PostWindowPath
+                'exit-record'   = $ExitRecordPath
+                'new-processes' = $NewProcessPath
+                'trace'         = $TracePath
+            }
+    }
 
     # ---------- fixture ----------
     $fixtureOk = $false; $itemCountOne = $false; $anchorAbsent = $false
@@ -682,6 +725,10 @@ function Get-P9HN2Verdicts {
         $identityConsistent = ($skipped -and $newWindowCount -eq 1)
     }
 
+    if (-not $trialIdPresent) { $reasonsB.Add('trial-id-missing') }
+    elseif (-not $exitTrialPresent) { $reasonsB.Add('exit-record-trial-id-missing') }
+    elseif (-not $exitTrialMatches) { $reasonsB.Add('exit-record-trial-mismatch:' + [string]$exitTrial) }
+    if (-not $binding.Ok) { $reasonsB.Add('artifact-binding:' + $binding.Reason) }
     if (-not $brokerOk) { $reasonsB.Add('trace-plan-id-unavailable') }
     if (-not $launcherOk) { $reasonsB.Add('launcher-identity-unavailable') }
     if (-not $exit.Valid) { $reasonsB.Add('exit-record-invalid:' + $exit.Reason) }
@@ -698,7 +745,8 @@ function Get-P9HN2Verdicts {
     elseif ($exitCaptured -and -not $exitZero) { $n2b = 'FAIL' }
     elseif ($trace.Ok -and $exitCaptured -and $exitZero -and $brokerOk -and $launcherOk -and
             $finalOk -and $zeroFailures -and $processAttributed -and $windowAttributed -and
-            $identityConsistent) {
+            $identityConsistent -and $trialIdPresent -and $exitTrialMatches -and
+            $binding.Ok) {
         $n2b = 'PASS'
     }
     else { $n2b = 'INCONCLUSIVE' }
@@ -736,6 +784,12 @@ function Get-P9HN2Verdicts {
             WindowAttributed = $windowAttributed
             AttributedWindowCount = $newWindowCount
             IdentityConsistent = $identityConsistent
+            TrialIdRequested = $TrialId
+            TrialIdFromExitRecord = $exitTrial
+            TrialIdentityMatches = $exitTrialMatches
+            ArtifactBindingOk = if ($null -ne $binding) { [bool]$binding.Ok } else { $null }
+            ArtifactBindingReason = if ($null -ne $binding) { [string]$binding.Reason } else { 'not-supplied' }
+            ArtifactBindingRoles = if ($null -ne $binding) { @($binding.Roles) } else { @() }
             BrokerReady = $brokerOk
             TerminalFinal = $finalOk
             ZeroFailures = $zeroFailures

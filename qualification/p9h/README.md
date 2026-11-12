@@ -218,3 +218,53 @@ every **real** production trace invalid.
   `@()` yields `@()` (falsy). A valid but empty `Windows` array therefore looked like a missing
   inventory and blocked every attribution path. Presence is now tested on the property object
   (`Test-P9HHasProperty`).
+
+### Stage 2.4 corrections (cross-trial evidence binding)
+
+`Test-P9HExitRecord` verified that an exit record **has** a `trialId` field, never that it equals the
+trial being evaluated. A verdict about trial B could therefore PASS on trial A's exit record.
+
+| Counterexample | Stage 2.3 | Now |
+| --- | --- | --- |
+| Exit record from trial A, evaluating trial B | **N2B=PASS** | `exit-record-trial-mismatch:<id>` |
+| `TrialId` omitted from the invocation | **N2B=PASS** | refused by the binder / `trial-id-missing` |
+
+`TrialId` is now `[Parameter(Mandatory)]` on the N2 verdict, and the exit record's own id is compared
+explicitly.
+
+#### Binding a product trace that carries no trial identity
+
+DevWS emits **no** per-event `trialId` (verified against every `Write-DevWSLaunchTrace` call site).
+Rather than invent a product field, the binding is authored by the **collector** in the artifact index
+that already exists for each trial — there is no second manifest:
+
+```
+Add-P9HArtifactRole -Context <trial> -Path <artifact> -Role fixture|stdout|pre-windows|
+                                                  post-windows|exit-record|new-processes|trace
+```
+
+Each entry records the role, the **absolute path**, the byte count and the SHA-256 of the captured
+bytes. Before a verdict can PASS, `Get-P9HArtifactBinding` re-reads that index and requires, for all
+seven roles:
+
+1. the role is recorded;
+2. the record belongs to **this** trial;
+3. the caller is using the **recorded path** (`ExpectedPaths` pinning);
+4. the file still exists; and
+5. its current SHA-256 **equals** the recorded digest.
+
+| Counterexample | Result |
+| --- | --- |
+| Trace substituted from another trial | `binding-mismatch:trace:path` or `digest` |
+| Artifact rewritten after binding | `binding-mismatch:trace:digest` |
+| Another trial's artifact index supplied | `binding-mismatch:*:trial` |
+| No index supplied | `artifact-index-not-supplied` → INCONCLUSIVE |
+
+A missing, incomplete or mismatched binding yields **INCONCLUSIVE**, never PASS. Existing source-backed
+correlation (`planId` on `stage2-broker-ready` vs `stage2-broker-replanned`, `set` across the plan and
+`transaction-end`, `-SetId`/`-TerminalId`/`-WindowId` in the child argv, creation time inside the launch
+window) remains required; the binding adds provenance, not a replacement.
+
+**Limitation, stated plainly:** this proves the artifacts a verdict reads are the ones the collector
+captured for that trial. It does **not** prove they were captured from a live guest — that is the
+Stage 3 live collector's job, which must write the same index through `Add-P9HArtifactRole`.

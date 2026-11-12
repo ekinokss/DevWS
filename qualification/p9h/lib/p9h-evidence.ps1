@@ -143,3 +143,182 @@ function Write-P9HArtifactIndex {
     Write-P9HArtifact -Path (Join-Path $Context.Directory 'SHA256SUMS.txt') -Lines @($lines)
     return @($lines).Count
 }
+
+# =====================================================================
+# Trial artifact binding (Stage 2.4)
+#
+# The product trace carries NO trial identity: DevWS emits `event`, `utcMs`,
+# `pid` plus per-event data, and nothing else (verified against every
+# Write-DevWSLaunchTrace call site). A verdict therefore cannot learn which
+# trial a trace belongs to from the trace itself.
+#
+# The binding is instead RECORDED BY THE COLLECTOR, in the artifact index that
+# already exists for every trial (`artifact-index.jsonl`), and VERIFIED before a
+# verdict may PASS:
+#   * the collector records, per artifact, an explicit role and the SHA-256 of
+#     the bytes it captured;
+#   * the evaluator re-hashes the same paths at verdict time and requires
+#     equality, so a trace (or exit record) swapped in from another trial no
+#     longer matches its recorded digest;
+#   * the recorded trial identity is the trial directory itself, which is also
+#     the identity written into the exit record.
+#
+# This is deliberately the SAME index used by Write-P9HArtifactIndex, so there
+# is exactly one manifest per trial.
+# =====================================================================
+
+$script:P9HArtifactRoles = @(
+    'fixture'
+    'stdout'
+    'pre-windows'
+    'post-windows'
+    'exit-record'
+    'new-processes'
+    'trace'
+)
+
+function Add-P9HArtifactRole {
+    # Record one artifact's ROLE, absolute path and digest in the existing
+    # artifact index. Collector-authored: no product field is invented.
+    param(
+        [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('fixture', 'stdout', 'pre-windows', 'post-windows', 'exit-record', 'new-processes', 'trace')][string]$Role
+    )
+
+    $full = if (Test-Path -LiteralPath $Path -PathType Leaf) { (Resolve-Path -LiteralPath $Path).Path } else { [System.IO.Path]::GetFullPath($Path) }
+    $present = Test-Path -LiteralPath $Path -PathType Leaf
+
+    $entry = [ordered]@{
+        utc     = Get-P9HUtcStamp
+        trialId = $Context.TrialId
+        role    = $Role
+        file    = [System.IO.Path]::GetFileName($Path)
+        path    = $full
+        bytes   = if ($present) { (Get-Item -LiteralPath $Path).Length } else { $null }
+        sha256  = if ($present) { Get-P9HFileSha256 -Path $Path } else { $null }
+        present = $present
+    }
+
+    Add-P9HArtifactLine -Path (Join-Path $Context.Directory 'artifact-index.jsonl') `
+        -Line ($entry | ConvertTo-Json -Compress -Depth 4)
+
+    return $entry
+}
+
+function Get-P9HArtifactBinding {
+    # Verify that the artifacts a verdict depends on still match the digests the
+    # collector recorded, and that all of them belong to ONE trial.
+    #
+    # Returns an explicit result per role. A missing entry, a missing file, a
+    # digest mismatch, or a record from a different trial all FAIL CLOSED.
+    param(
+        [Parameter(Mandatory)][string]$TrialId,
+        [Parameter(Mandatory)][string]$ArtifactIndexPath,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$RequiredRoles,
+        # Optional role -> expected path map. When a role is present here, the
+        # recorded path must match it, so substitution at a different path fails
+        # even if some other artifact's digest would verify.
+        [AllowNull()][hashtable]$ExpectedPaths = $null
+    )
+
+    $result = [ordered]@{
+        Ok            = $false
+        Reason        = $null
+        TrialId       = $TrialId
+        IndexPresent  = $false
+        Roles         = @()
+        MissingRoles  = @()
+        Mismatches    = @()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($TrialId)) {
+        $result.Reason = 'trial-id-missing'
+        return [pscustomobject]$result
+    }
+
+    if (-not (Test-Path -LiteralPath $ArtifactIndexPath -PathType Leaf)) {
+        $result.Reason = 'artifact-index-missing'
+        return [pscustomobject]$result
+    }
+    $result.IndexPresent = $true
+
+    # Latest entry wins for a role, which is what an append-only index means.
+    $byRole = @{}
+    foreach ($line in (Get-Content -LiteralPath $ArtifactIndexPath)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        try { $e = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        $r = [string](Get-P9HProp -Object $e -Name 'role')
+        if ([string]::IsNullOrWhiteSpace($r)) { continue }
+        $byRole[$r] = $e
+    }
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $missing = [System.Collections.Generic.List[string]]::new()
+    $mismatch = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($role in $RequiredRoles) {
+        if (-not $byRole.ContainsKey($role)) {
+            $missing.Add($role)
+            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'not-recorded'; path = $null; expected = $null; actual = $null })
+            continue
+        }
+
+        $e = $byRole[$role]
+        $recordedTrial = [string](Get-P9HProp -Object $e -Name 'trialId')
+        $recordedPath = [string](Get-P9HProp -Object $e -Name 'path')
+        $recordedSha = [string](Get-P9HProp -Object $e -Name 'sha256')
+
+        if (-not [string]::IsNullOrWhiteSpace($recordedTrial) -and
+            -not [string]::Equals($recordedTrial, $TrialId, [System.StringComparison]::Ordinal)) {
+            $mismatch.Add(('{0}:trial={1}' -f $role, $recordedTrial))
+            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'foreign-trial'; path = $recordedPath; expected = $TrialId; actual = $recordedTrial })
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($recordedSha)) {
+            $missing.Add(('{0}:no-digest' -f $role))
+            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'no-recorded-digest'; path = $recordedPath; expected = $null; actual = $null })
+            continue
+        }
+
+        # Path pinning: the caller must be using the artifact the collector bound.
+        if ($null -ne $ExpectedPaths -and $ExpectedPaths.ContainsKey($role)) {
+            $expectedPath = [string]$ExpectedPaths[$role]
+            if (-not [string]::IsNullOrWhiteSpace($expectedPath)) {
+                $expectedFull = [System.IO.Path]::GetFullPath($expectedPath)
+                $recordedFull = [System.IO.Path]::GetFullPath($recordedPath)
+                if (-not [string]::Equals($expectedFull, $recordedFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $mismatch.Add(('{0}:path' -f $role))
+                    $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'path-mismatch'; path = $expectedFull; expected = $recordedFull; actual = $expectedFull })
+                    continue
+                }
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($recordedPath) -or -not (Test-Path -LiteralPath $recordedPath -PathType Leaf)) {
+            $missing.Add(('{0}:file-missing' -f $role))
+            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'file-missing'; path = $recordedPath; expected = $recordedSha; actual = $null })
+            continue
+        }
+
+        $actual = Get-P9HFileSha256 -Path $recordedPath
+        if (-not [string]::Equals($actual, $recordedSha, [System.StringComparison]::Ordinal)) {
+            $mismatch.Add(('{0}:digest' -f $role))
+            $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'digest-mismatch'; path = $recordedPath; expected = $recordedSha; actual = $actual })
+            continue
+        }
+
+        $rows.Add([pscustomobject][ordered]@{ role = $role; status = 'verified'; path = $recordedPath; expected = $recordedSha; actual = $actual })
+    }
+
+    $result.Roles = @($rows)
+    $result.MissingRoles = @($missing)
+    $result.Mismatches = @($mismatch)
+
+    if ($missing.Count -gt 0) { $result.Reason = 'binding-incomplete:' + ($missing -join ',') }
+    elseif ($mismatch.Count -gt 0) { $result.Reason = 'binding-mismatch:' + ($mismatch -join ',') }
+    else { $result.Ok = $true; $result.Reason = 'verified' }
+
+    return [pscustomobject]$result
+}
