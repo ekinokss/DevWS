@@ -2110,13 +2110,45 @@ function Invoke-P9HWtsProviderTests {
         -Actual ("n2Lines={0} e1RoleLines={1} separateIndexExists={2}" -f $n2IndexLines.Count, $hasObsRole, $obsIndexExists) `
         -Pass ($hasObsRole -eq 0 -and $obsIndexExists) -Evidence $bound.ObservationIndexPath
 
-    # ---- C6: the collector manifest separates product from collector metadata ----
+    # ---- K6: per-role origin classification, not a bare count ----
+    # Stage 3A asserted only that seven artifacts were "product" and one was
+    # "collector", which was both a weak assertion and a factually wrong model.
+    # This asserts the CORRECT origin and capturedBy of every role.
     $manifest = New-P9HCollectorManifest -Context $trial -BoundRoles $bound.BoundRoles `
         -WtsCapability $capability -ObservationLogPath $obsLogPath
-    Add-P9HTestResult -Id 'K6' -Title 'Collector manifest separates product artifacts from collector metadata' `
-        -Input 'seven product artifacts plus the E1 log' -Expected '7 product, 1 collector, 7 required roles declared' `
-        -Actual ("product={0} collector={1} required={2}" -f @($manifest.productArtifacts).Count, @($manifest.collectorMetadata).Count, @($manifest.requiredN2Roles).Count) `
-        -Pass (@($manifest.productArtifacts).Count -eq 7 -and @($manifest.collectorMetadata).Count -eq 1 -and @($manifest.requiredN2Roles).Count -eq 7) -Evidence $null
+
+    $expectedPerRole = @{
+        'fixture'       = @('fixture', 'qualification-launcher')
+        'stdout'        = @('product', 'qualification-launcher')
+        'pre-windows'   = @('operating-system', 'qualification-observer')
+        'post-windows'  = @('operating-system', 'qualification-observer')
+        'exit-record'   = @('qualification', 'qualification-recorder')
+        'new-processes' = @('operating-system', 'qualification-observer')
+        'trace'         = @('product', 'qualification-capture')
+    }
+
+    $k6Problems = [System.Collections.Generic.List[string]]::new()
+    foreach ($role in $expectedPerRole.Keys) {
+        $entry = @($manifest.roleClassification | Where-Object { $_.role -eq $role })
+        if ($entry.Count -ne 1) { $k6Problems.Add("$role:missing") | Out-Null; continue }
+        if ($entry[0].origin -ne $expectedPerRole[$role][0]) { $k6Problems.Add("$role:origin=$($entry[0].origin)") | Out-Null }
+        if ($entry[0].capturedBy -ne $expectedPerRole[$role][1]) { $k6Problems.Add("$role:capturedBy=$($entry[0].capturedBy)") | Out-Null }
+    }
+
+    # The specific misclassification this stage corrects: the exit record is
+    # authored by the qualification recorder, never by the product.
+    $exitEntry = @($manifest.roleClassification | Where-Object { $_.role -eq 'exit-record' })[0]
+    $exitNotProduct = ($exitEntry.origin -ne 'product' -and
+                       @($manifest.byOrigin.product | Where-Object { $_.role -eq 'exit-record' }).Count -eq 0)
+
+    $productOriginCount = @($manifest.byOrigin.product).Count
+    $osOriginCount = @($manifest.byOrigin.'operating-system').Count
+
+    Add-P9HTestResult -Id 'K6' -Title 'Collector manifest reports the correct origin of every artifact role' `
+        -Input 'seven bound N2 artifacts plus the E1 log' `
+        -Expected 'fixture=fixture, stdout/trace=product, windows/new-processes=operating-system, exit-record=qualification' `
+        -Actual ("problems={0} exitOrigin={1} productOrigin={2} osOrigin={3} exitNotProduct={4}" -f $(if ($k6Problems.Count -eq 0) { 'none' } else { $k6Problems -join ',' }), $exitEntry.origin, $productOriginCount, $osOriginCount, $exitNotProduct) `
+        -Pass ($k6Problems.Count -eq 0 -and $exitNotProduct -and $productOriginCount -eq 2 -and $osOriginCount -eq 3 -and @($manifest.requiredN2Roles).Count -eq 7) -Evidence $null
 
     # ---- C7: product bytes are never rewritten by the collector ----
     $traceBefore = Get-P9HFileSha256 -Path $traceFilePath
@@ -2304,6 +2336,299 @@ function Invoke-P9HWtsProviderTests {
         -Pass ($goodBound.Ok -and $goodVerdicts.N2A.Verdict -eq 'PASS' -and $goodVerdicts.N2B.Verdict -eq 'PASS') -Evidence (Join-Path $goodDir 'artifact-index.jsonl')
 }
 
+function Invoke-P9HWtsEnumerationTests {
+    # Y-series: complete session-table enumeration and correlation (Stage 3A.1).
+    # Z-series: corrected artifact origin classification (Stage 3A.1).
+    #
+    # Every case runs from SYNTHETIC WTS_SESSION_INFO bytes and synthetic WTSINFO
+    # payloads. Nothing here calls WTSEnumerateSessionsW or
+    # WTSQuerySessionInformationW: the only live-path exercise is the
+    # authorization refusal (R15), which is what proves the adapters cannot touch
+    # a live session by accident.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $logonUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 11, 10, 0, 0), [System.DateTimeKind]::Utc)
+    $logonFt = $logonUtc.ToFileTimeUtc()
+    $logonIso = $logonUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    $otherUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 11, 09, 0, 0), [System.DateTimeKind]::Utc)
+    $otherFt = $otherUtc.ToFileTimeUtc()
+
+    # ---- shared two-session table: target 3 Active, session 0 Disconnected ----
+    $twoSession = New-P9HWtsSessionInfoPayload -Sessions @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 3; StationName = 'RDP-Tcp#0'; State = 0 }
+    )
+    $twoDecoded = ConvertFrom-P9HWtsSessionInfoPayload -Payload $twoSession.Payload `
+        -ReportedCount $twoSession.ReportedCount -Layout $twoSession.Layout
+
+    $targetActive = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 3 -State 0 `
+                -StationName 'RDP-Tcp#0' -Domain 'CONTOSO' -UserName 'qauser' -LogonTime $logonFt)).Record
+    $servicesDisc = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 0 -State 4 `
+                -StationName 'Services' -UserName '' -LogonTime 0)).Record
+
+    $goodQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $servicesDisc }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $targetActive }
+    }
+
+    # ---- R1: full two-session enumeration, target plus session 0 ----
+    Add-P9HTestResult -Id 'Y1' -Title 'Full enumeration decodes both the target and session 0' `
+        -Input 'WTS_SESSION_INFO with sessions 0 (Services, 4) and 3 (RDP-Tcp#0, 0)' `
+        -Expected 'Ok=true, two records, station names preserved' `
+        -Actual ("Ok={0} reason={1} records={2} ids={3}" -f $twoDecoded.Ok, $twoDecoded.Reason, @($twoDecoded.Records).Count, (@($twoDecoded.Records | ForEach-Object { $_.SessionId }) -join ',')) `
+        -Pass ($twoDecoded.Ok -and @($twoDecoded.Records).Count -eq 2 -and @($twoDecoded.Records | Where-Object { $_.SessionId -eq 0 -and $_.StationName -eq 'Services' -and $_.State -eq 4 }).Count -eq 1 -and @($twoDecoded.Records | Where-Object { $_.SessionId -eq 3 -and $_.StationName -eq 'RDP-Tcp#0' -and $_.State -eq 0 }).Count -eq 1) -Evidence $null
+
+    # ---- R2: target Active with session 0 Disconnected yields NO target disconnect proof ----
+    $table2 = Resolve-P9HWtsSessionTable -EnumeratedSessions $twoDecoded.Records -QueryResults $goodQueries -TargetSessionId 3
+    $capture2 = Get-P9HWtsProviderTableCapture -Rows $table2.Rows -TargetSessionId 3
+    $parsedTable2 = ConvertFrom-P9HWtsTable -Lines $capture2.Lines
+    $targetDisc = Test-P9HTargetDisconnected -Records $parsedTable2.Records -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'Y2' -Title 'Session 0 disconnected cannot prove the target disconnected' `
+        -Input 'target 3 Active, session 0 state 4, complete table' -Expected 'target Disconnected=false' `
+        -Actual ("tableOk={0} lines={1} targetDisconnected={2} reason={3}" -f $parsedTable2.Ok, $capture2.LineCount, $targetDisc.Disconnected, $targetDisc.Reason) `
+        -Pass ($parsedTable2.Ok -and $capture2.LineCount -eq 2 -and -not $targetDisc.Disconnected) -Evidence $null
+
+    # ---- R3: target genuinely Disconnected yields correct target evidence ----
+    $discTable = New-P9HWtsSessionInfoPayload -Sessions @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 3; StationName = 'RDP-Tcp#0'; State = 4 }
+    )
+    $discDecoded = ConvertFrom-P9HWtsSessionInfoPayload -Payload $discTable.Payload `
+        -ReportedCount $discTable.ReportedCount -Layout $discTable.Layout
+    $targetDisconnectedRecord = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 3 -State 4 `
+                -StationName 'RDP-Tcp#0' -Domain 'CONTOSO' -UserName 'qauser' -LogonTime $logonFt)).Record
+    $discQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $servicesDisc }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $targetDisconnectedRecord }
+    }
+    $discResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $discDecoded.Records -QueryResults $discQueries -TargetSessionId 3
+    $discCapture = Get-P9HWtsProviderTableCapture -Rows $discResolved.Rows -TargetSessionId 3
+    $discParsed = ConvertFrom-P9HWtsTable -Lines $discCapture.Lines
+    $discJudged = Test-P9HTargetDisconnected -Records $discParsed.Records -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'Y3' -Title 'A genuinely disconnected target yields correct target evidence' `
+        -Input 'target 3 state 4 with its own logon identity' -Expected 'target Disconnected=true, matched to session 3 only' `
+        -Actual ("targetDisconnected={0} reason={1} matchedIsTarget={2}" -f $discJudged.Disconnected, $discJudged.Reason, ($null -ne $discJudged.Record -and [int]$discJudged.Record.SessionId -eq 3)) `
+        -Pass ($discJudged.Disconnected -and $null -ne $discJudged.Record -and [int]$discJudged.Record.SessionId -eq 3) -Evidence $null
+
+    # ---- R4: enumeration failure preserves the Win32 error ----
+    $enumFailure = [pscustomobject][ordered]@{
+        Ok = $false; Reason = 'native-enumerate-failed'; Capability = 'wtsinfo'
+        Detail = 'WTSEnumerateSessionsW failed (Win32 5)'; Sessions = @(); Win32Error = 5; ReportedCount = 0
+    }
+    Add-P9HTestResult -Id 'Y4' -Title 'Enumeration failure preserves the Win32 error code' `
+        -Input 'access-denied shape (Win32 5)' -Expected 'Ok=false reason=native-enumerate-failed, Win32Error=5' `
+        -Actual ("Ok={0} reason={1} win32={2}" -f $enumFailure.Ok, $enumFailure.Reason, $enumFailure.Win32Error) `
+        -Pass ((-not $enumFailure.Ok) -and $enumFailure.Reason -eq 'native-enumerate-failed' -and $enumFailure.Win32Error -eq 5) -Evidence $null
+
+    # ---- R5: duplicate target session ids fail closed as ambiguous ----
+    $dupTable = New-P9HWtsSessionInfoPayload -Sessions @(
+        @{ SessionId = 3; StationName = 'RDP-Tcp#0'; State = 0 }
+        @{ SessionId = 3; StationName = 'RDP-Tcp#1'; State = 0 }
+    )
+    $dupDecoded = ConvertFrom-P9HWtsSessionInfoPayload -Payload $dupTable.Payload `
+        -ReportedCount $dupTable.ReportedCount -Layout $dupTable.Layout
+    $dupQueries = @{ 3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $targetActive } }
+    $dupResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $dupDecoded.Records -QueryResults $dupQueries -TargetSessionId 3
+    Add-P9HTestResult -Id 'Y5' -Title 'Duplicate target session ids are rejected as ambiguous' `
+        -Input 'two enumerated records both claiming session 3' -Expected 'Ok=false, ambiguous-enumeration, duplicate reported' `
+        -Actual ("Ok={0} reason={1} targetOk={2} dups={3}" -f $dupResolved.Ok, $dupResolved.Reason, $dupResolved.TargetOk, (@($dupResolved.DuplicateSessionIds) -join ',')) `
+        -Pass ((-not $dupResolved.Ok) -and $dupResolved.Reason -eq 'ambiguous-enumeration' -and -not $dupResolved.TargetOk -and @($dupResolved.DuplicateSessionIds) -contains 3) -Evidence $null
+
+    # ---- R6: enumerated id vs WTSINFO id mismatch fails closed ----
+    $mismatchQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $servicesDisc }
+        # Enumerated as 3, but the query answers about session 7.
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 7 -State 0 -StationName 'RDP-Tcp#0' -Domain 'CONTOSO' -UserName 'qauser' -LogonTime $logonFt)).Record }
+    }
+    $mismatchResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $twoDecoded.Records -QueryResults $mismatchQueries -TargetSessionId 3
+    Add-P9HTestResult -Id 'Y6' -Title 'Enumerated/WTSINFO session-id mismatch fails closed' `
+        -Input 'enumerated session 3, WTSINFO returned session 7' -Expected 'Ok=false, target not ok, mismatch recorded' `
+        -Actual ("Ok={0} reason={1} targetOk={2} targetReason={3}" -f $mismatchResolved.Ok, $mismatchResolved.Reason, $mismatchResolved.TargetOk, $mismatchResolved.TargetReason) `
+        -Pass ((-not $mismatchResolved.Ok) -and -not $mismatchResolved.TargetOk -and $mismatchResolved.TargetReason -eq 'target-session-id-mismatch') -Evidence $null
+
+    # ---- R7: missing target logon time remains blocking ----
+    $noLogonTarget = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId 3 -State 0 `
+                -StationName 'RDP-Tcp#0' -Domain 'CONTOSO' -UserName 'qauser' -LogonTime 0)).Record
+    $noLogonQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $servicesDisc }
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $noLogonTarget }
+    }
+    $noLogonResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $twoDecoded.Records -QueryResults $noLogonQueries -TargetSessionId 3
+    $noLogonCapture = Get-P9HWtsProviderTableCapture -Rows $noLogonResolved.Rows -TargetSessionId 3
+    $noLogonParsed = ConvertFrom-P9HWtsTable -Lines $noLogonCapture.Lines
+    $noLogonMatch = Get-P9HTargetSessionRecord -Records $noLogonParsed.Records -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso -RequireLogonTime
+    Add-P9HTestResult -Id 'Y7' -Title 'A missing target logon time still blocks authoritative matching' `
+        -Input 'target WTSINFO with LogonTime=0, caller pinned a logon' -Expected 'logon-unavailable, never degraded' `
+        -Actual ("tableOk={0} matchOk={1} reason={2}" -f $noLogonResolved.Ok, $noLogonMatch.Ok, $noLogonMatch.Reason) `
+        -Pass ((-not $noLogonMatch.Ok) -and $noLogonMatch.Reason -eq 'logon-unavailable') -Evidence $null
+
+    # ---- R8: per-session query failure preserved without losing other observations ----
+    $failedQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $servicesDisc }
+        3 = [pscustomobject]@{ Ok = $false; Reason = 'native-query-failed'; Detail = 'WTSQuerySessionInformationW failed (Win32 5)'; Record = $null; Win32Error = 5 }
+    }
+    $failedResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $twoDecoded.Records -QueryResults $failedQueries -TargetSessionId 3
+    $failedCapture = Get-P9HWtsProviderTableCapture -Rows $failedResolved.Rows -TargetSessionId 3
+    $failedRowsKept = @($failedResolved.Rows | Where-Object { $_.SessionId -eq 0 -and $_.QueryOk }).Count
+    $failureRecorded = @($failedResolved.Rows | Where-Object { $_.SessionId -eq 3 -and -not $_.QueryOk -and $_.QueryReason -eq 'native-query-failed' }).Count
+    Add-P9HTestResult -Id 'Y8' -Title 'A per-session query failure is preserved without losing other observations' `
+        -Input 'target query failed with Win32 5, session 0 succeeded' -Expected 'failure recorded, session 0 still observed, no target proof' `
+        -Actual ("rows={0} failedRows={1} session0Kept={2} failureRecorded={3} targetOk={4} targetLines={5}" -f $failedResolved.RowCount, $failedCapture.FailedCount, $failedRowsKept, $failureRecorded, $failedResolved.TargetOk, $failedCapture.LineCount) `
+        -Pass ($failedRowsKept -eq 1 -and $failureRecorded -eq 1 -and -not $failedResolved.TargetOk -and $failedCapture.LineCount -eq 1 -and $failedCapture.FailedCount -eq 1) -Evidence $null
+
+    # ---- R9: a state change during enumeration/query is an evidence gap ----
+    $changedQueries = @{
+        0 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $servicesDisc }
+        # Enumerated Active, but the later query reports Disconnected.
+        3 = [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $targetDisconnectedRecord }
+    }
+    $changedResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $twoDecoded.Records -QueryResults $changedQueries -TargetSessionId 3
+    $changedCapture = Get-P9HWtsProviderTableCapture -Rows $changedResolved.Rows -TargetSessionId 3
+    $changedParsed = ConvertFrom-P9HWtsTable -Lines $changedCapture.Lines
+    $changedProof = Get-P9HReconnectAuthorizationProof -ObserverLogPath (Join-Path $SandboxRoot 'does-not-exist-r9.jsonl') `
+        -TrialId 'r9' -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'Y9' -Title 'A state change during collection is an evidence gap, not a transition' `
+        -Input 'enumerated Active, queried Disconnected for the same session' -Expected 'Ok=false, state-changed-during-collection, no atomic claim' `
+        -Actual ("Ok={0} reason={1} targetStateChanged={2} isAtomic={3}" -f $changedResolved.Ok, $changedResolved.Reason, $changedResolved.TargetStateChanged, $changedResolved.IsAtomicSnapshot) `
+        -Pass ((-not $changedResolved.Ok) -and $changedResolved.Reason -eq 'state-changed-during-collection' -and $changedResolved.TargetStateChanged -and -not $changedResolved.IsAtomicSnapshot) -Evidence $null
+
+    # ---- R10: layout mismatch blocks the native path ----
+    $sessLayout = Test-P9HWtsSessionInfoLayout
+    $layoutBlock = [pscustomobject][ordered]@{
+        Ok = $false; Reason = 'layout-size-mismatch'; Capability = 'unsupported'
+        Detail = 'documented 24 bytes, measured 16 bytes'
+        Sessions = @(); Win32Error = $null; ReportedCount = $null
+    }
+    Add-P9HTestResult -Id 'Y10' -Title 'A layout mismatch prevents any native enumeration' `
+        -Input 'simulated layout-size-mismatch capability result' -Expected 'supported layout here; a mismatch refuses natively' `
+        -Actual ("liveLayoutOk={0} size={1} arch={2} simulatedReason={3} capability={4}" -f $sessLayout.Ok, $sessLayout.Size, $sessLayout.Architecture, $layoutBlock.Reason, $layoutBlock.Capability) `
+        -Pass ($sessLayout.Ok -and $sessLayout.Size -eq 24 -and $sessLayout.SessionIdOffset -eq 0 -and $sessLayout.NameOffset -eq 8 -and $sessLayout.StateOffset -eq 16 -and $layoutBlock.Capability -eq 'unsupported') -Evidence $null
+
+    # ---- R11: a successful call returning an empty/invalid buffer is explicit ----
+    $emptyDecoded = ConvertFrom-P9HWtsSessionInfoPayload -Payload ([byte[]]@()) -ReportedCount 2 -Layout $sessLayout
+    $zeroCountDecoded = ConvertFrom-P9HWtsSessionInfoPayload -Payload $twoSession.Payload -ReportedCount 0 -Layout $sessLayout
+    $tooSmallDecoded = ConvertFrom-P9HWtsSessionInfoPayload -Payload $twoSession.Payload -ReportedCount 9 -Layout $sessLayout
+    $emptyQueryShape = [pscustomobject][ordered]@{
+        Ok = $false; Reason = 'empty-native-response'; Capability = 'wtsinfo'
+        Detail = 'WTSQuerySessionInformationW succeeded for session 3 but returned no bytes'; SessionId = 3; Win32Error = 0; Record = $null
+    }
+    Add-P9HTestResult -Id 'Y11' -Title 'Empty or invalid successful buffers are explicit, distinct failures' `
+        -Input 'empty payload, zero count, undersized buffer, empty WTSINFO response' `
+        -Expected 'four distinct explicit reasons' `
+        -Actual ("empty={0} zeroCount={1} tooSmall={2} emptyQuery={3}(win32={4})" -f $emptyDecoded.Reason, $zeroCountDecoded.Reason, $tooSmallDecoded.Reason, $emptyQueryShape.Reason, $emptyQueryShape.Win32Error) `
+        -Pass ($emptyDecoded.Reason -eq 'empty-enumeration' -and $zeroCountDecoded.Reason -eq 'invalid-session-count' -and $tooSmallDecoded.Reason -eq 'enumeration-buffer-too-small' -and $emptyQueryShape.Reason -eq 'empty-native-response' -and $emptyQueryShape.Win32Error -eq 0) -Evidence $null
+
+    # ---- R12: per-role origin classification is exact ----
+    $expectedOrigin = [ordered]@{
+        'fixture'       = @('fixture', 'qualification-launcher')
+        'stdout'        = @('product', 'qualification-launcher')
+        'pre-windows'   = @('operating-system', 'qualification-observer')
+        'post-windows'  = @('operating-system', 'qualification-observer')
+        'exit-record'   = @('qualification', 'qualification-recorder')
+        'new-processes' = @('operating-system', 'qualification-observer')
+        'trace'         = @('product', 'qualification-capture')
+    }
+    $model = Get-P9HArtifactOriginModel
+    $mismatches = [System.Collections.Generic.List[string]]::new()
+    foreach ($role in $expectedOrigin.Keys) {
+        $got = @($model | Where-Object { $_.Role -eq $role })
+        if ($got.Count -ne 1) { $mismatches.Add("$role:missing") | Out-Null; continue }
+        if ($got[0].Origin -ne $expectedOrigin[$role][0]) { $mismatches.Add("$role:origin=$($got[0].Origin)") | Out-Null }
+        if ($got[0].CapturedBy -ne $expectedOrigin[$role][1]) { $mismatches.Add("$role:capturedBy=$($got[0].CapturedBy)") | Out-Null }
+    }
+    Add-P9HTestResult -Id 'Y12' -Title 'Every N2 role carries the correct per-role origin classification' `
+        -Input 'origin model compared against the required mapping' -Expected 'no mismatches across seven roles' `
+        -Actual ("roles={0} mismatches={1}" -f @($model).Count, $(if ($mismatches.Count -eq 0) { 'none' } else { $mismatches -join ',' })) `
+        -Pass (@($model).Count -eq 7 -and $mismatches.Count -eq 0) -Evidence $null
+
+    # ---- R13: the exit record is NOT described as product-generated ----
+    $trial = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind combined
+    $dir = $trial.Directory
+    $fx = Join-Path $dir 'r13-fixture.json'
+    Write-P9HArtifact -Path $fx -Lines @('{"itemId":"p9h-item","enabledItems":1,"enabledTerminals":1,"totalItems":1,"anchorAbsent":true,"layoutFallback":{"x":9000,"y":9000,"w":640,"h":480}}')
+    $so = Join-Path $dir 'r13-stdout.txt'
+    Write-P9HArtifact -Path $so -Lines @('main/p9h-item: relative layout has no reachable placement (anchor-missing: identity-not-found); the item will be handled normally but its window position will not be changed.')
+    $pre = Join-Path $dir 'r13-pre.json'
+    Write-P9HArtifact -Path $pre -Lines @('{"Windows":[]}')
+    $post = Join-Path $dir 'r13-post.json'
+    Write-P9HArtifact -Path $post -Lines @('{"Windows":[]}')
+    $np = Join-Path $dir 'r13-newprocesses.json'
+    Write-P9HArtifact -Path $np -Lines @('{"Added":[]}')
+    $tr = Join-Path $dir 'r13-trace.jsonl'
+    Write-P9HArtifact -Path $tr -Lines @('{"event":"lifecycle-layout-plan","utcMs":1,"pid":1}')
+    $ex = Join-Path $dir 'r13-exit.json'
+    $exRec = New-P9HExitRecord -TrialId $trial.TrialId -Outcome 'exited' -ExitCode 0 -LauncherPid 4240 `
+        -LauncherPath 'C:\synthetic\ws.cmd' -InvocationDisplay 'synthetic' -WorkingDirectory $dir `
+        -LaunchedAtUtc (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o') `
+        -ExitedAtUtc (Get-Date).ToUniversalTime().ToString('o')
+    $null = Write-P9HExitRecord -Path $ex -Record $exRec
+
+    $plan = Get-P9HCollectorRolePlan -FixturePath $fx -StdoutPath $so -PreWindowPath $pre `
+        -PostWindowPath $post -ExitRecordPath $ex -NewProcessPath $np -TracePath $tr
+    $bound = Add-P9HCollectorArtifactRoles -Context $trial -Plan $plan
+    $manifest = New-P9HCollectorManifest -Context $trial -BoundRoles $bound.BoundRoles
+
+    $exitClass = @($manifest.roleClassification | Where-Object { $_.role -eq 'exit-record' })[0]
+    $traceClass = @($manifest.roleClassification | Where-Object { $_.role -eq 'trace' })[0]
+    $originGroups = $manifest.byOrigin
+
+    Add-P9HTestResult -Id 'Y13' -Title 'The collector exit record is never described as product-generated' `
+        -Input 'collector-bound trial with manifest classification' `
+        -Expected 'exit-record origin=qualification, trace origin=product' `
+        -Actual ("exitOrigin={0} exitCaptured={1} exitInProductGroup={2} traceOrigin={3}" -f $exitClass.origin, $exitClass.capturedBy, (@($originGroups.product | Where-Object { $_.role -eq 'exit-record' }).Count), $traceClass.origin) `
+        -Pass ($exitClass.origin -eq 'qualification' -and $exitClass.capturedBy -eq 'qualification-recorder' -and @($originGroups.product | Where-Object { $_.role -eq 'exit-record' }).Count -eq 0 -and $traceClass.origin -eq 'product') -Evidence $null
+
+    # ---- R14: E1 observation log stays out of the N2 index; digests still bind ----
+    $obsLog = Join-Path $dir 'r14-e1-observer.jsonl'
+    $obsLineRecord = New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+        -RawWtsLines $capture2.Lines -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso
+    Add-P9HArtifactLine -Path $obsLog -Line $obsLineRecord
+
+    $trial2 = New-P9HTrialContext -RootDirectory $SandboxRoot -Kind combined
+    $bound2 = Add-P9HCollectorArtifactRoles -Context $trial2 -Plan $plan -ObservationLogPath $obsLog
+    $n2Lines = @(Get-Content -LiteralPath (Join-Path $trial2.Directory 'artifact-index.jsonl'))
+    $e1InN2 = @($n2Lines | Where-Object { $_ -match 'e1-observation-log' }).Count
+    $separateExists = Test-Path -LiteralPath $bound2.ObservationIndexPath
+    $verify2 = Test-P9HCollectorBinding -TrialId $trial2.TrialId `
+        -ArtifactIndexPath (Join-Path $trial2.Directory 'artifact-index.jsonl') -Plan $plan
+    $verified2 = @($verify2.Roles | Where-Object { $_.status -eq 'verified' }).Count
+
+    Add-P9HTestResult -Id 'Y14' -Title 'E1 provenance stays separate while the seven-role digest binding holds' `
+        -Input 'trial bound with an E1 observation log present' `
+        -Expected 'no e1 role in the N2 index, separate index exists, 7/7 verified' `
+        -Actual ("n2Lines={0} e1InN2={1} separateIndex={2} verifyOk={3} verified={4}" -f $n2Lines.Count, $e1InN2, $separateExists, $verify2.Ok, $verified2) `
+        -Pass ($e1InN2 -eq 0 -and $separateExists -and $verify2.Ok -and $verified2 -eq 7) -Evidence $bound2.ObservationIndexPath
+
+    # ---- R15: the live enumeration refuses without authorization ----
+    $enumRefused = $false
+    $enumMessage = $null
+    try { $null = Invoke-P9HWtsSessionEnumerate -AuthorizationToken '' }
+    catch { $enumRefused = $true; $enumMessage = $_.Exception.Message }
+    Add-P9HTestResult -Id 'Y15' -Title 'Live session enumeration refuses without real-execution authorization' `
+        -Input 'empty authorization token' -Expected 'throws before any native call' `
+        -Actual ("refused={0} message={1}" -f $enumRefused, $enumMessage) `
+        -Pass ($enumRefused -and $enumMessage -match 'authorization') -Evidence $null
+
+    # ---- R16: a full-table capture reproduces the frozen E1 sequence end to end ----
+    $seqLog = Join-Path $dir 'r16-e1-sequence.jsonl'
+    $null = Add-P9HArtifactLine -Path $seqLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines $capture2.Lines -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $seqLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines $discCapture.Lines -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $seqLog -Line (New-P9HObserverRecord -TrialId $trial.TrialId -Sequence 3 -Phase 'post' `
+            -RawWtsLines $capture2.Lines -TargetSessionId 3 -TargetUser 'CONTOSO\qauser' -TargetLogonTime $logonIso)
+
+    $proofA = Get-P9HReconnectAuthorizationProof -ObserverLogPath $seqLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    $proofB = Get-P9HDisconnectProof -ObserverLogPath $seqLog -TrialId $trial.TrialId `
+        -SessionId 3 -User 'CONTOSO\qauser' -LogonTime $logonIso
+    Add-P9HTestResult -Id 'Y16' -Title 'Full-table provider output drives the frozen E1 proofs end to end' `
+        -Input 'pre/post from the complete table, disconnect from the disconnected table' `
+        -Expected 'Proof A and Proof B both proven' `
+        -Actual ("proofA={0}({1}) proofB={2}({3})" -f $proofA.Proven, $proofA.Reason, $proofB.Proven, $proofB.Reason) `
+        -Pass ($proofA.Proven -and $proofB.Proven) -Evidence $seqLog
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -2320,6 +2645,7 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HTrialBindingTests -SandboxRoot $SandboxRoot
     Invoke-P9HProvenanceTests -SandboxRoot $SandboxRoot
     Invoke-P9HWtsProviderTests -SandboxRoot $SandboxRoot
+    Invoke-P9HWtsEnumerationTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
@@ -2327,8 +2653,8 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 149 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'G', 'D')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 165 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'G', 'D')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

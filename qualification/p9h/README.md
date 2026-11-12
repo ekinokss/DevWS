@@ -93,8 +93,8 @@ qualification/p9h/
     p9h-n2-inventory.ps1      process/window inventory, delta, attribution
     p9h-verdict.ps1           E1 and N2-A/N2-B verdict rules
     p9h-evidence.ps1          trial context, stage journal, artifact index
-    p9h-wts-provider.ps1      WTSINFO layout/decode, FILETIME->UTC, provider lines
-    p9h-collector.ps1         trial collector: seven N2 roles + E1 provenance
+    p9h-wts-provider.ps1      WTSINFO/WTS_SESSION_INFO layout, enumeration, decode, provider lines
+    p9h-collector.ps1         trial collector: seven N2 roles, origin model, E1 provenance
     p9h-fault.ps1             fault-injection harness
     p9h-selftest.ps1          the test cases
 ```
@@ -437,3 +437,111 @@ A trial with any missing artifact is refused **before** anything is written
 
 The registry guard now covers **149** registered cases; the full run executes 150 including `R1`.
 All Stage 2.x cases are retained unchanged.
+
+## Stage 3A.1 — complete enumeration and provenance corrections
+
+Independent review of Stage 3A found three defects. All three are closed.
+
+### 1. `WTSEnumerateSessionsW` was documented but not implemented
+
+Stage 3A declared the enumeration API in prose and implemented only the single-session query. The
+E1 contract needs the **complete** session table, because a table containing only the target cannot
+demonstrate that session 0's disconnected state is not the target's state.
+
+`Invoke-P9HWtsSessionEnumerate` now implements it against the documented `WTS_SESSION_INFO` record:
+
+```
+DWORD SessionId;
+LPWSTR pWinStationName;          // pointer: 8 bytes on x64, 4 on x86
+WTS_CONNECTSTATE_CLASS State;
+```
+
+The pointer forces 8-byte alignment, so the record is **24 bytes on x64** (`SessionId` 0,
+`pWinStationName` 8, `State` 16) and **12 bytes on x86**. The stride is derived from the pointer size
+and then **measured** with `Marshal.SizeOf`/`OffsetOf`; `Test-P9HWtsSessionInfoLayout` distinguishes
+`layout-unsupported`, `layout-size-mismatch` and `layout-offset-mismatch`.
+
+Decoding rejects, explicitly: a zero or negative count, a buffer too small for the reported count, a
+station-name pointer outside the buffer, and an unreadable name. A malformed record makes the **whole
+capture** unusable rather than silently dropping the entry a verdict might depend on.
+
+`Resolve-P9HWtsSessionTable` correlates the enumeration with per-session `WTSINFO` results:
+
+| Rule | Failure |
+| --- | --- |
+| Enumerated id must equal its `WTSINFO` id | `target-session-id-mismatch` |
+| Duplicate ids make the table ambiguous | `ambiguous-enumeration` |
+| A failed per-session query is recorded, never dropped | `incomplete-session-table` |
+| The target must be present | `no-target` |
+| A state that moved between enumeration and query | `state-changed-during-collection` |
+
+**Stated limitation:** a sequence of sequential WTS queries is **not** an atomic Windows session
+snapshot. `IsAtomicSnapshot` is always `false`, and a state change is classified as an **evidence
+gap**, never as a successful transition. The observer is therefore required to treat instability as
+instability.
+
+`Get-P9HWtsProviderTableCapture` emits one provider line for **every** enumerated session, so the
+frozen parser sees the same table a live observation would — including session 0.
+
+### 2. Layout verification now gates the live query
+
+Stage 3A had `Test-P9HWtsInfoLayout` but the live path never called it. `Invoke-P9HWtsSessionQuery`
+now:
+
+1. validates the layout **before** any interop and refuses with an explicit capability status;
+2. rejects a returned byte count that does not equal the measured `WTSINFO` size **before** decode;
+3. rejects a decoded `SessionId` that does not equal the requested id;
+4. distinguishes a native failure (Win32 code preserved) from a successful-but-empty response
+   (`empty-native-response`).
+
+Passing the local layout check is **not** evidence that the live API works; it only proves this build
+can describe the structure. Zero, negative and out-of-range FILETIME rejection is unchanged.
+
+### 3. Artifact origin was misclassified
+
+Stage 3A labelled all seven N2 roles `product`, which is factually wrong: the exit record is written
+by the qualification recorder, the inventories are OS facts the qualification tooling observes, and
+the fixture is a qualification-defined input.
+
+The model now separates **who produced** the content from **who captured** it:
+
+| Role | `origin` | `capturedBy` |
+| --- | --- | --- |
+| `fixture` | `fixture` | `qualification-launcher` |
+| `stdout` | `product` | `qualification-launcher` |
+| `pre-windows` | `operating-system` | `qualification-observer` |
+| `post-windows` | `operating-system` | `qualification-observer` |
+| `exit-record` | `qualification` | `qualification-recorder` |
+| `new-processes` | `operating-system` | `qualification-observer` |
+| `trace` | `product` | `qualification-capture` |
+
+This is a **reporting** correction only. The seven required roles, their SHA-256 binding and their
+acceptance meaning are unchanged, and no verdict reads these fields. `New-P9HCollectorManifest`
+reports the classification per role and grouped by origin, and K6 now asserts each role's origin
+instead of a bare count — including the specific proof that a collector-authored exit record is never
+described as product-generated.
+
+### Tests: Y1–Y16 (plus a rewritten K6)
+
+| ID | Coverage |
+| --- | --- |
+| Y1 | full two-session enumeration with session 0 present |
+| Y2 | target Active + session 0 Disconnected yields no target disconnect proof |
+| Y3 | genuinely disconnected target yields correct target evidence |
+| Y4 | enumeration failure preserves the Win32 error |
+| Y5 | duplicate target session ids rejected as ambiguous |
+| Y6 | enumerated/`WTSINFO` session-id mismatch fails closed |
+| Y7 | missing target logon time still blocks authoritative matching |
+| Y8 | per-session query failure preserved without losing other observations |
+| Y9 | a state change during collection is an evidence gap |
+| Y10 | layout mismatch prevents the native path |
+| Y11 | empty/invalid successful buffers are explicit, distinct failures |
+| Y12 | exact per-role origin classification |
+| Y13 | the collector exit record is never described as product |
+| Y14 | E1/N2 index separation with the seven-role digest binding intact |
+| Y15 | live enumeration refuses without authorization |
+| Y16 | full-table output drives the frozen E1 proofs end to end |
+| K6 | per-role origin assertions (replacing the count-only check) |
+
+The registry guard now covers **165** registered cases; the full run executes 166 including `R1`.
+All 149 Stage 3A cases are retained unchanged.

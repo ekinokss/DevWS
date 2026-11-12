@@ -13,9 +13,16 @@
 #   while still exercising the exact decode path a live query would use.
 #
 # DOCUMENTED CONTRACT (wtsapi32.h / winsrv.h)
-#   WTSEnumerateSessionsW       enumerate session ids + station names
+#   WTSEnumerateSessionsW        enumerate the COMPLETE session table
 #   WTSQuerySessionInformationW  return a WTSINFO structure (WTS_INFO_CLASS 24)
-#   WTSFreeMemory               release every buffer the WTS API allocated
+#   WTSFreeMemory                release every buffer the WTS API allocated
+#
+#   WTS_SESSION_INFO (also wtsapi32.h) is the enumeration record:
+#       DWORD SessionId;
+#       LPWSTR pWinStationName;          // pointer: 8 bytes on x64, 4 on x86
+#       WTS_CONNECTSTATE_CLASS State;
+#   On x64 the pointer forces 8-byte alignment: 4 + 4 pad + 8 + 4 + 4 pad = 24
+#   bytes. On x86 it is 12 bytes. The layout is measured, never assumed.
 #
 #   typedef struct _WTSINFO {
 #       WTS_CONNECTSTATE_CLASS State;      // 4 bytes
@@ -539,43 +546,70 @@ function Get-P9HWtsProviderCapability {
     }
 }
 
-function Invoke-P9HWtsSessionQuery {
-    # LIVE WTS query. Refuses unless the operator supplies the literal
-    # real-execution token.
+function Get-P9HWtsApiInteropSource {
+    # The gated native surface, as source text.
     #
-    # Stage 3A never calls this. Its only Stage 3A exercise is the refusal path,
-    # which is what guarantees the adapter cannot touch a live session by
-    # accident. Native buffers are released on EVERY path: the WTSINFO block is
-    # freed with WTSFreeMemory in a finally block inside the interop helper, so
-    # it is released for success, failure and a partial success alike.
-    param(
-        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$AuthorizationToken,
-        [Parameter(Mandatory)][int]$SessionId,
-        [string]$Action = 'WTS session query'
-    )
-
-    $null = Assert-P9HRealExecutionAuthorized -AuthorizationToken $AuthorizationToken -Action $Action
-
-    if (-not ([System.Management.Automation.PSTypeName]'P9HWtsApi').Type) {
-        Add-Type -TypeDefinition @'
+    # Kept in one place so the query and the enumeration share a single audited
+    # interop declaration rather than duplicating P/Invoke signatures.
+    #
+    # Memory contract, stated once:
+    #   * WTSQuerySessionInformationW returns a buffer the caller owns and must
+    #     release with WTSFreeMemory;
+    #   * WTSEnumerateSessionsW returns a buffer the caller owns and must release
+    #     with WTSFreeMemory;
+    #   * both are released in a finally block, so success, failure and partial
+    #     success all free exactly once;
+    #   * a successful call that yields zero bytes is reported with
+    #     win32Error = 0 so the caller can distinguish it from a real failure
+    #     (the Stage 3A version conflated the two).
+    return @'
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class P9HWtsApi
 {
+    // Documented WTS_SESSION_INFO (wtsapi32.h):
+    //   DWORD SessionId;
+    //   LPWSTR pWinStationName;   // pointer - architecture dependent
+    //   WTS_CONNECTSTATE_CLASS State;
+    // On x64 the pointer forces 8-byte alignment: 4 bytes SessionId, 4 bytes
+    // padding, 8 bytes pointer, 4 bytes State, 4 bytes tail padding => 24 bytes.
+    // On x86 it is 12 bytes (4 + 4 + 4). The mirror below lets the caller
+    // measure the real value rather than assume it.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct WtsSessionInfoMirror
+    {
+        public int SessionId;
+        public IntPtr pWinStationName;
+        public int State;
+    }
+
     [DllImport("wtsapi32.dll", SetLastError = true)]
     private static extern bool WTSQuerySessionInformationW(
         IntPtr hServer, int sessionId, int wtsInfoClass,
         out IntPtr ppBuffer, out int pBytesReturned);
 
+    [DllImport("wtsapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool WTSEnumerateSessionsW(
+        IntPtr hServer, int reserved, int version,
+        out IntPtr ppSessionInfo, out int pCount);
+
     [DllImport("wtsapi32.dll")]
     private static extern void WTSFreeMemory(IntPtr pMemory);
 
-    // Returns the raw WTSINFO bytes for one session, or null with the Win32
-    // error code. The buffer is released on every path.
-    public static byte[] QueryWtsInfo(int sessionId, int wtsInfoClass, out int win32Error)
+    public static int SessionInfoSize() { return Marshal.SizeOf(typeof(WtsSessionInfoMirror)); }
+
+    public static int SessionInfoOffset(string fieldName)
+    {
+        return (int)Marshal.OffsetOf(typeof(WtsSessionInfoMirror), fieldName);
+    }
+
+    // ---- single-session WTSINFO ----
+    public static byte[] QueryWtsInfo(int sessionId, int wtsInfoClass, out int win32Error, out int reportedBytes)
     {
         win32Error = 0;
+        reportedBytes = 0;
         IntPtr buffer = IntPtr.Zero;
         int bytes = 0;
 
@@ -587,6 +621,7 @@ public static class P9HWtsApi
                 return null;
             }
 
+            reportedBytes = bytes;
             if (buffer == IntPtr.Zero || bytes <= 0) { return null; }
 
             byte[] payload = new byte[bytes];
@@ -595,28 +630,811 @@ public static class P9HWtsApi
         }
         finally
         {
-            // Documented release for every buffer this API returns.
+            if (buffer != IntPtr.Zero) { WTSFreeMemory(buffer); }
+        }
+    }
+
+    // ---- session enumeration ----
+    // Returns one packed record per enumerated session:
+    //   sessionId, stationName, reportedState
+    // or null with the Win32 error code. The enumeration buffer is released on
+    // every path, including a successful call that reports zero sessions.
+    public sealed class EnumeratedSession
+    {
+        public int SessionId;
+        public string StationName;
+        public int State;
+    }
+
+    public static EnumeratedSession[] EnumerateSessions(out int win32Error, out int reportedCount)
+    {
+        win32Error = 0;
+        reportedCount = 0;
+        IntPtr buffer = IntPtr.Zero;
+        int count = 0;
+
+        try
+        {
+            if (!WTSEnumerateSessionsW(IntPtr.Zero, 0, 1, out buffer, out count))
+            {
+                win32Error = Marshal.GetLastWin32Error();
+                return null;
+            }
+
+            reportedCount = count;
+            if (buffer == IntPtr.Zero || count <= 0) { return null; }
+
+            int stride = Marshal.SizeOf(typeof(WtsSessionInfoMirror));
+            EnumeratedSession[] result = new EnumeratedSession[count];
+
+            for (int i = 0; i < count; i++)
+            {
+                IntPtr at = new IntPtr(buffer.ToInt64() + (i * stride));
+                WtsSessionInfoMirror raw =
+                    (WtsSessionInfoMirror)Marshal.PtrToStructure(at, typeof(WtsSessionInfoMirror));
+
+                string name = "";
+                if (raw.pWinStationName != IntPtr.Zero)
+                {
+                    name = Marshal.PtrToStringUni(raw.pWinStationName);
+                    if (name == null) { name = ""; }
+                }
+
+                result[i] = new EnumeratedSession();
+                result[i].SessionId = raw.SessionId;
+                result[i].StationName = name;
+                result[i].State = raw.State;
+            }
+
+            return result;
+        }
+        finally
+        {
             if (buffer != IntPtr.Zero) { WTSFreeMemory(buffer); }
         }
     }
 }
-'@ -ErrorAction Stop
-    }
+'@
+}
 
-    $win32Error = 0
-    $payload = [P9HWtsApi]::QueryWtsInfo($SessionId, $script:P9HWtsInfoClassInfo, [ref]$win32Error)
+function Invoke-P9HWtsSessionQuery {
+    # LIVE WTS WTSINFO query for ONE session. Refuses unless the operator
+    # supplies the literal real-execution token.
+    #
+    # Stage 3A.1 hardening (independent review): Stage 3A had a layout test that
+    # the live path never consulted. The layout is now a PRECONDITION of the
+    # native call:
+    #   1. layout cross-check FIRST - an unsupported layout is refused before
+    #      any interop, with an explicit capability status;
+    #   2. the returned byte count must equal the measured WTSINFO size BEFORE
+    #      decode (a short or long buffer is never reinterpreted);
+    #   3. the decoded SessionId must equal the requested id - a provider that
+    #      answers about a different session is a mismatch, not a success;
+    #   4. a native failure is reported with its Win32 code, distinctly from a
+    #      successful-but-empty response, which gets its own reason.
+    #
+    # Passing the local layout check is NOT evidence the live API works: it only
+    # proves this build can describe the structure. Stage 3B exercises the call
+    # itself.
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$AuthorizationToken,
+        [Parameter(Mandatory)][int]$SessionId,
+        [string]$Action = 'WTS session query'
+    )
 
-    if ($null -eq $payload) {
+    $null = Assert-P9HRealExecutionAuthorized -AuthorizationToken $AuthorizationToken -Action $Action
+
+    # ---- (1) layout precondition ----
+    $layoutCheck = Test-P9HWtsInfoLayout
+    if (-not $layoutCheck.Ok) {
         return [pscustomobject][ordered]@{
-            Ok         = $false
-            Reason     = 'native-query-failed'
-            Win32Error = $win32Error
-            Detail     = ('WTSQuerySessionInformationW failed for session {0} (Win32 {1})' -f $SessionId, $win32Error)
-            Record     = $null
+            Ok           = $false
+            Reason       = 'layout-unsupported'
+            Capability   = 'unsupported'
+            LayoutReason = $layoutCheck.Reason
+            SessionId    = $SessionId
+            Win32Error   = $null
+            Detail       = ('refusing the native query: WTSINFO layout is not supported here ({0}: {1})' -f $layoutCheck.Reason, $layoutCheck.Detail)
+            Record       = $null
         }
     }
 
-    return ConvertFrom-P9HWtsInfoPayload -Payload $payload -Layout (Get-P9HWtsInfoNativeLayout)
+    $layout = Get-P9HWtsInfoNativeLayout
+
+    if (-not ([System.Management.Automation.PSTypeName]'P9HWtsApi').Type) {
+        Add-Type -TypeDefinition (Get-P9HWtsApiInteropSource) -ErrorAction Stop
+    }
+
+    $win32Error = 0
+    $reportedBytes = 0
+    $payload = [P9HWtsApi]::QueryWtsInfo($SessionId, $script:P9HWtsInfoClassInfo, [ref]$win32Error, [ref]$reportedBytes)
+
+    # ---- (2)/(4) native failure vs successful-but-empty ----
+    if ($null -eq $payload) {
+        if ($win32Error -ne 0) {
+            return [pscustomobject][ordered]@{
+                Ok            = $false
+                Reason        = 'native-query-failed'
+                Capability    = 'wtsinfo'
+                LayoutReason  = $layoutCheck.Reason
+                SessionId     = $SessionId
+                Win32Error    = $win32Error
+                ReportedBytes = $reportedBytes
+                Detail        = ('WTSQuerySessionInformationW failed for session {0} (Win32 {1})' -f $SessionId, $win32Error)
+                Record        = $null
+            }
+        }
+
+        return [pscustomobject][ordered]@{
+            Ok            = $false
+            Reason        = 'empty-native-response'
+            Capability    = 'wtsinfo'
+            LayoutReason  = $layoutCheck.Reason
+            SessionId     = $SessionId
+            Win32Error    = 0
+            ReportedBytes = $reportedBytes
+            Detail        = ('WTSQuerySessionInformationW succeeded for session {0} but returned no bytes' -f $SessionId)
+            Record        = $null
+        }
+    }
+
+    # ---- (2) size must match BEFORE decode ----
+    if (@($payload).Length -ne [int]$layout.Size) {
+        return [pscustomobject][ordered]@{
+            Ok            = $false
+            Reason        = 'struct-size-mismatch'
+            Capability    = 'wtsinfo'
+            LayoutReason  = $layoutCheck.Reason
+            SessionId     = $SessionId
+            Win32Error    = 0
+            ReportedBytes = @($payload).Length
+            ExpectedBytes = [int]$layout.Size
+            Detail        = ('returned {0} bytes, WTSINFO is {1} bytes on {2}' -f @($payload).Length, $layout.Size, $layout.Architecture)
+            Record        = $null
+        }
+    }
+
+    $decoded = ConvertFrom-P9HWtsInfoPayload -Payload $payload -Layout $layout
+    if (-not $decoded.Ok) {
+        return [pscustomobject][ordered]@{
+            Ok            = $false
+            Reason        = ('decode-' + $decoded.Reason)
+            Capability    = 'wtsinfo'
+            LayoutReason  = $layoutCheck.Reason
+            SessionId     = $SessionId
+            Win32Error    = 0
+            ReportedBytes = @($payload).Length
+            ExpectedBytes = [int]$layout.Size
+            Detail        = $decoded.Detail
+            Record        = $null
+        }
+    }
+
+    # ---- (3) the provider must answer about the session we asked for ----
+    if ([int]$decoded.Record.SessionId -ne $SessionId) {
+        return [pscustomobject][ordered]@{
+            Ok                = $false
+            Reason            = 'session-id-mismatch'
+            Capability        = 'wtsinfo'
+            LayoutReason      = $layoutCheck.Reason
+            SessionId         = $SessionId
+            ReturnedSessionId = [int]$decoded.Record.SessionId
+            Win32Error        = 0
+            ReportedBytes     = @($payload).Length
+            ExpectedBytes     = [int]$layout.Size
+            Detail            = ('requested session {0} but WTSINFO reported {1}' -f $SessionId, [int]$decoded.Record.SessionId)
+            Record            = $decoded.Record
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok            = $true
+        Reason        = 'ok'
+        Capability    = 'wtsinfo'
+        LayoutReason  = $layoutCheck.Reason
+        SessionId     = $SessionId
+        Win32Error    = 0
+        ReportedBytes = @($payload).Length
+        ExpectedBytes = [int]$layout.Size
+        Detail        = $null
+        Record        = $decoded.Record
+    }
+}
+
+
+function Get-P9HWtsSessionInfoExpectedLayout {
+    # Published WTS_SESSION_INFO layout for the running architecture.
+    #
+    # Sequential layout:
+    #   x64: DWORD SessionId(0) + 4 pad + LPWSTR(8) + DWORD State(16) + 4 tail pad = 24
+    #   x86: DWORD SessionId(0) + LPWSTR(4) + DWORD State(8)                       = 12
+    # Derived from the pointer size rather than hardcoded, so the expectation is
+    # architecture-aware instead of asserting one ABI.
+    $pointer = [IntPtr]::Size
+    $sessionIdOffset = 0
+    $nameOffset = if ($pointer -eq 8) { 8 } else { 4 }
+    $stateOffset = $nameOffset + $pointer
+    # The struct aligns to its largest member (the pointer).
+    $raw = $stateOffset + 4
+    $size = [int]([Math]::Ceiling($raw / $pointer) * $pointer)
+
+    return [pscustomobject][ordered]@{
+        Size          = $size
+        SessionIdOffset = $sessionIdOffset
+        NameOffset    = $nameOffset
+        StateOffset   = $stateOffset
+        PointerSize   = $pointer
+        Architecture  = if ($pointer -eq 8) { 'x64' } else { 'x86' }
+    }
+}
+
+function Get-P9HWtsSessionInfoNativeLayout {
+    # Measured WTS_SESSION_INFO layout for THIS process.
+    Initialize-P9HWtsProviderNative
+    if (-not ([System.Management.Automation.PSTypeName]'P9HWtsApi').Type) {
+        Add-Type -TypeDefinition (Get-P9HWtsApiInteropSource) -ErrorAction Stop
+    }
+
+    return [pscustomobject][ordered]@{
+        Size            = [P9HWtsApi]::SessionInfoSize()
+        SessionIdOffset = [P9HWtsApi]::SessionInfoOffset('SessionId')
+        NameOffset      = [P9HWtsApi]::SessionInfoOffset('pWinStationName')
+        StateOffset     = [P9HWtsApi]::SessionInfoOffset('State')
+        PointerSize     = [IntPtr]::Size
+        Architecture    = if ([IntPtr]::Size -eq 8) { 'x64' } else { 'x86' }
+    }
+}
+
+function Test-P9HWtsSessionInfoLayout {
+    # Cross-check the published WTS_SESSION_INFO layout against the mirror.
+    #
+    # Same three-way distinction as the WTSINFO check, so an unsupported or
+    # unexpectedly packed ABI is reported rather than mis-decoded.
+    try {
+        $native = Get-P9HWtsSessionInfoNativeLayout
+    }
+    catch {
+        return [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'layout-unsupported'; Detail = $_.Exception.Message
+            Expected = $null; Measured = $null
+        }
+    }
+
+    $expected = Get-P9HWtsSessionInfoExpectedLayout
+
+    if ($native.Size -ne $expected.Size) {
+        return [pscustomobject][ordered]@{
+            Ok = $false
+            Reason = 'layout-size-mismatch'
+            Detail = ('documented {0} bytes, measured {1} bytes on {2}' -f $expected.Size, $native.Size, $native.Architecture)
+            Expected = $expected.Size; Measured = $native.Size
+            Architecture = $native.Architecture
+        }
+    }
+
+    foreach ($check in @(
+            @{ Property = 'SessionIdOffset'; Expected = $expected.SessionIdOffset; Label = 'SessionId' }
+            @{ Property = 'NameOffset'; Expected = $expected.NameOffset; Label = 'pWinStationName' }
+            @{ Property = 'StateOffset'; Expected = $expected.StateOffset; Label = 'State' }
+        )) {
+        $measured = [int]$native.($check.Property)
+        if ($measured -ne [int]$check.Expected) {
+            return [pscustomobject][ordered]@{
+                Ok = $false
+                Reason = 'layout-offset-mismatch'
+                Detail = ('{0} at {1}, documented {2}' -f $check.Label, $measured, $check.Expected)
+                Expected = $check.Expected; Measured = $measured
+                Architecture = $native.Architecture
+            }
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok = $true; Reason = 'ok'
+        Detail = ('WTS_SESSION_INFO verified at {0} bytes on {1}' -f $native.Size, $native.Architecture)
+        Size = $native.Size; Architecture = $native.Architecture
+        SessionIdOffset = $native.SessionIdOffset
+        NameOffset = $native.NameOffset
+        StateOffset = $native.StateOffset
+    }
+}
+
+function New-P9HWtsSessionInfoPayload {
+    # Build a synthetic ensemble of WTS_SESSION_INFO records.
+    #
+    # Test-facing. Encodes each record at the MEASURED offsets for this
+    # architecture, with the station name stored in a UTF-16 region appended
+    # after the record array, so the decode path handles real pointer chasing
+    # rather than a flattened approximation.
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Sessions,
+        # Deliberately break the count to prove the count check fires.
+        [int]$CountOverride = -1,
+        # Report a byte/stride inconsistency.
+        [int]$RecordSizeOverride = 0
+    )
+
+    Initialize-P9HWtsProviderNative
+    if (-not ([System.Management.Automation.PSTypeName]'P9HWtsApi').Type) {
+        Add-Type -TypeDefinition (Get-P9HWtsApiInteropSource) -ErrorAction Stop
+    }
+
+    $layoutCheck = Test-P9HWtsSessionInfoLayout
+    if (-not $layoutCheck.Ok) {
+        throw "P9-H: cannot build a synthetic WTS_SESSION_INFO payload: layout is not supported ($($layoutCheck.Reason): $($layoutCheck.Detail))."
+    }
+
+    $stride = if ($RecordSizeOverride -gt 0) { $RecordSizeOverride } else { [int]$layoutCheck.Size }
+    $count = @($Sessions).Count
+    $nameBase = $stride * [Math]::Max($count, 1)
+
+    $nameBytes = [System.Collections.Generic.List[byte]]::new()
+    $records = [System.Collections.Generic.List[object]]::new()
+
+    $index = 0
+    foreach ($s in @($Sessions)) {
+        $text = [string]$s.StationName
+        if ([string]::IsNullOrEmpty($text)) { $text = '' }
+        $nameOffset = $nameBase + $nameBytes.Count
+        foreach ($ch in $text.ToCharArray()) {
+            $code = [int]$ch
+            $nameBytes.Add([byte]($code -band 0xFF)) | Out-Null
+            $nameBytes.Add([byte](($code -shr 8) -band 0xFF)) | Out-Null
+        }
+        # NUL terminator
+        $nameBytes.Add(0) | Out-Null
+        $nameBytes.Add(0) | Out-Null
+        $records.Add([pscustomobject]@{ SessionId = [int]$s.SessionId; State = [int]$s.State; NameOffset = $nameOffset }) | Out-Null
+        $index++
+    }
+
+    # One extra guard byte so a name pointer is never at the very end.
+    $nameBytes.Add(0) | Out-Null
+    $nameBytes.Add(0) | Out-Null
+
+    $total = $nameBase + $nameBytes.Count
+    $buffer = [byte[]]::new($total)
+
+    for ($i = 0; $i -lt $records.Count; $i++) {
+        $r = $records[$i]
+        $at = $i * $stride
+        [Array]::Copy([BitConverter]::GetBytes([int]$r.SessionId), 0, $buffer, $at + [int]$layoutCheck.SessionIdOffset, 4)
+
+        # The name is a POINTER to the UTF-16 region; emit it at pointer width.
+        $namePtr = [IntPtr]$r.NameOffset
+        if ([IntPtr]::Size -eq 8) {
+            [Array]::Copy([BitConverter]::GetBytes([long]$namePtr.ToInt64()), 0, $buffer, $at + [int]$layoutCheck.NameOffset, 8)
+        }
+        else {
+            [Array]::Copy([BitConverter]::GetBytes([int]$namePtr.ToInt32()), 0, $buffer, $at + [int]$layoutCheck.NameOffset, 4)
+        }
+
+        [Array]::Copy([BitConverter]::GetBytes([int]$r.State), 0, $buffer, $at + [int]$layoutCheck.StateOffset, 4)
+    }
+
+    for ($i = 0; $i -lt $nameBytes.Count; $i++) { $buffer[$nameBase + $i] = $nameBytes[$i] }
+
+    return [pscustomobject][ordered]@{
+        Payload      = $buffer
+        RecordCount  = $count
+        ReportedCount = if ($CountOverride -ge 0) { $CountOverride } else { $count }
+        Stride       = $stride
+        Layout       = $layoutCheck
+        NameBase     = $nameBase
+    }
+}
+
+function ConvertFrom-P9HWtsSessionInfoPayload {
+    # Decode a WTS_SESSION_INFO array into per-session facts.
+    #
+    # Rejects, explicitly and without discarding anything:
+    #   * a count that is zero, negative or whose byte size does not divide by
+    #     the record stride (a truncated or padded block);
+    #   * a short buffer for the reported count;
+    #   * a record whose station-name pointer lands outside the buffer;
+    #   * an unreadable or unterminated station name.
+    # A malformed record makes the WHOLE capture unusable rather than silently
+    # dropping the one entry a verdict might depend on.
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyCollection()][byte[]]$Payload,
+        [Parameter(Mandatory)][int]$ReportedCount,
+        [AllowNull()]$Layout = $null
+    )
+
+    if ($null -eq $Layout) { $Layout = Test-P9HWtsSessionInfoLayout }
+    if (-not $Layout.Ok) {
+        return [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'layout-unsupported'; Detail = $Layout.Detail
+            Records = @(); Rejections = @(); ReportedCount = $ReportedCount
+        }
+    }
+
+    if ($null -eq $Payload -or @($Payload).Length -eq 0) {
+        return [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'empty-enumeration'; Detail = $null
+            Records = @(); Rejections = @(); ReportedCount = $ReportedCount
+        }
+    }
+
+    $stride = [int]$Layout.Size
+    $bytes = @($Payload).Length
+
+    if ($ReportedCount -le 0) {
+        return [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'invalid-session-count'; Detail = ('reported count {0}' -f $ReportedCount)
+            Records = @(); Rejections = @(); ReportedCount = $ReportedCount
+        }
+    }
+
+    if ($bytes -lt ($ReportedCount * $stride)) {
+        return [pscustomobject][ordered]@{
+            Ok = $false
+            Reason = 'enumeration-buffer-too-small'
+            Detail = ('{0} bytes cannot hold {1} records of {2} bytes' -f $bytes, $ReportedCount, $stride)
+            Records = @(); Rejections = @(); ReportedCount = $ReportedCount
+        }
+    }
+
+    $records = [System.Collections.Generic.List[object]]::new()
+    $rejections = [System.Collections.Generic.List[string]]::new()
+
+    $readString = {
+        param([long]$at)
+        if ($at -lt 0 -or ($at + 1) -ge $bytes) { return $null }
+        $chars = [System.Collections.Generic.List[char]]::new()
+        $p = $at
+        while (($p + 1) -lt $bytes) {
+            $code = [int]$Payload[$p] -bor ([int]$Payload[$p + 1] -shl 8)
+            if ($code -eq 0) { break }
+            $chars.Add([char]$code) | Out-Null
+            $p += 2
+        }
+        return (-join $chars)
+    }
+
+    for ($i = 0; $i -lt $ReportedCount; $i++) {
+        $at = $i * $stride
+
+        $sessionId = [BitConverter]::ToInt32($Payload, $at + [int]$Layout.SessionIdOffset)
+        $state = [BitConverter]::ToInt32($Payload, $at + [int]$Layout.StateOffset)
+
+        $nameAt = if ([IntPtr]::Size -eq 8) {
+            [BitConverter]::ToInt64($Payload, $at + [int]$Layout.NameOffset)
+        }
+        else {
+            [long][BitConverter]::ToInt32($Payload, $at + [int]$Layout.NameOffset)
+        }
+
+        if ($nameAt -lt 0 -or $nameAt -ge $bytes) {
+            $rejections.Add(('record {0}: station-name pointer {1} outside the {2}-byte buffer' -f $i, $nameAt, $bytes)) | Out-Null
+            continue
+        }
+
+        $station = & $readString $nameAt
+        if ($null -eq $station) {
+            $rejections.Add(('record {0}: station name unreadable at {1}' -f $i, $nameAt)) | Out-Null
+            continue
+        }
+
+        $records.Add([pscustomobject][ordered]@{
+                SessionId   = $sessionId
+                StationName = $station
+                State       = $state
+                StateName   = if ($script:P9HWtsStateName.ContainsKey($state)) { $script:P9HWtsStateName[$state] } else { "Unknown($state)" }
+            }) | Out-Null
+    }
+
+    if ($rejections.Count -gt 0) {
+        return [pscustomobject][ordered]@{
+            Ok = $false
+            Reason = 'malformed-enumeration-record'
+            Detail = (($rejections) -join '; ')
+            Records = @($records)
+            Rejections = @($rejections)
+            ReportedCount = $ReportedCount
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok = $true; Reason = 'ok'; Detail = $null
+        Records = @($records); Rejections = @()
+        ReportedCount = $ReportedCount
+        Stride = $stride
+        Architecture = $Layout.Architecture
+    }
+}
+
+function Find-P9HWtsDuplicateSessionId {
+    # Duplicate session ids make a table ambiguous: two entries claim the same
+    # identity, so neither can be trusted as THE target record.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
+
+    $dups = [System.Collections.Generic.List[int]]::new()
+    $groups = @($Records | Group-Object { [int]$_.SessionId })
+    foreach ($g in $groups) {
+        if ($g.Count -gt 1) { $dups.Add([int]$g.Name) | Out-Null }
+    }
+
+    return [pscustomobject][ordered]@{
+        HasDuplicates = ($dups.Count -gt 0)
+        SessionIds    = @($dups)
+        Detail        = if ($dups.Count -gt 0) { 'duplicate session ids: ' + ($dups -join ',') } else { $null }
+    }
+}
+
+function Invoke-P9HWtsSessionEnumerate {
+    # LIVE session enumeration. Refuses without the real-execution token.
+    #
+    # Stage 3A.1 adds this: Stage 3A documented WTSEnumerateSessionsW but never
+    # implemented it, so the E1 contract could not obtain the COMPLETE session
+    # table it requires. A table with only the target cannot demonstrate that a
+    # session-0 disconnected state is not the target's state.
+    #
+    # Only the enumeration itself is native. Each entry is then correlated with
+    # a WTSINFO query through Resolve-P9HWtsSessionTable, which is where the
+    # consistency rules live.
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$AuthorizationToken,
+        [string]$Action = 'WTS session enumeration'
+    )
+
+    $null = Assert-P9HRealExecutionAuthorized -AuthorizationToken $AuthorizationToken -Action $Action
+
+    $layoutCheck = Test-P9HWtsSessionInfoLayout
+    if (-not $layoutCheck.Ok) {
+        return [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'layout-unsupported'; Capability = 'unsupported'
+            Detail = ('refusing the native enumeration: WTS_SESSION_INFO layout is not supported here ({0}: {1})' -f $layoutCheck.Reason, $layoutCheck.Detail)
+            Sessions = @(); Win32Error = $null; ReportedCount = $null
+        }
+    }
+
+    if (-not ([System.Management.Automation.PSTypeName]'P9HWtsApi').Type) {
+        Add-Type -TypeDefinition (Get-P9HWtsApiInteropSource) -ErrorAction Stop
+    }
+
+    $win32Error = 0
+    $reportedCount = 0
+    $native = [P9HWtsApi]::EnumerateSessions([ref]$win32Error, [ref]$reportedCount)
+
+    if ($null -eq $native) {
+        if ($win32Error -ne 0) {
+            return [pscustomobject][ordered]@{
+                Ok = $false; Reason = 'native-enumerate-failed'; Capability = 'wtsinfo'
+                Detail = ('WTSEnumerateSessionsW failed (Win32 {0})' -f $win32Error)
+                Sessions = @(); Win32Error = $win32Error; ReportedCount = $reportedCount
+            }
+        }
+        return [pscustomobject][ordered]@{
+            Ok = $false; Reason = 'empty-enumeration'; Capability = 'wtsinfo'
+            Detail = 'WTSEnumerateSessionsW succeeded but reported no sessions'
+            Sessions = @(); Win32Error = 0; ReportedCount = $reportedCount
+        }
+    }
+
+    $sessions = @(foreach ($s in @($native)) {
+            [pscustomobject][ordered]@{
+                SessionId   = [int]$s.SessionId
+                StationName = [string]$s.StationName
+                State       = [int]$s.State
+                StateName   = if ($script:P9HWtsStateName.ContainsKey([int]$s.State)) { $script:P9HWtsStateName[[int]$s.State] } else { "Unknown($([int]$s.State))" }
+            }
+        })
+
+    return [pscustomobject][ordered]@{
+        Ok = $true; Reason = 'ok'; Capability = 'wtsinfo'; Detail = $null
+        Sessions = $sessions
+        Win32Error = 0
+        ReportedCount = $reportedCount
+        LayoutBytes = [int]$layoutCheck.Size
+        Architecture = $layoutCheck.Architecture
+    }
+}
+
+function Resolve-P9HWtsSessionTable {
+    # Correlate an enumerated table with per-session WTSINFO facts.
+    #
+    # Two inputs, two sources of truth:
+    #   * the ENUMERATION supplies the complete set of sessions and their
+    #     reported states (so non-target sessions are present);
+    #   * WTSINFO supplies the per-record logon identity.
+    #
+    # Correlation rules, all fail-closed:
+    #   * every enumerated id must have a WTSINFO result whose id matches it;
+    #   * a failed per-session query is recorded explicitly, never dropped;
+    #   * duplicate target records are ambiguous;
+    #   * the requested target must be present;
+    #   * a state that changes between the enumeration and the query is an
+    #     evidence gap, not a successful transition.
+    #
+    # IMPORTANT LIMITATION, stated plainly: a sequence of sequential queries is
+    # NOT an atomic Windows session snapshot. The table can change underneath the
+    # collector, so the observer must treat a state change as evidence of
+    # instability rather than as proof of a transition.
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$EnumeratedSessions,
+        # SessionId -> query result (Ok/Record/Reason/Detail/Win32Error)
+        [Parameter(Mandatory)][AllowNull()][hashtable]$QueryResults,
+        [Parameter(Mandatory)][int]$TargetSessionId
+    )
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $stateChanges = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($session in @($EnumeratedSessions)) {
+        $id = [int]$session.SessionId
+        $query = if ($QueryResults.ContainsKey($id)) { $QueryResults[$id] } else { $null }
+
+        if ($null -eq $query) {
+            $errors.Add(('{0}:not-queried' -f $id)) | Out-Null
+            $rows.Add([pscustomobject][ordered]@{
+                    SessionId = $id; StationName = [string]$session.StationName
+                    EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
+                    QueryOk = $false; QueryReason = 'not-queried'
+                    InfoSessionId = $null; InfoState = $null; InfoStateName = $null
+                    User = $null; LogonTime = $null; LogonSource = $null
+                    SessionIdConsistent = $false; StateConsistent = $null
+                    Detail = 'no WTSINFO result supplied for this enumerated session'
+                }) | Out-Null
+            continue
+        }
+
+        if (-not $query.Ok) {
+            $errors.Add(('{0}:{1}' -f $id, $query.Reason)) | Out-Null
+            $rows.Add([pscustomobject][ordered]@{
+                    SessionId = $id; StationName = [string]$session.StationName
+                    EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
+                    QueryOk = $false; QueryReason = [string]$query.Reason
+                    InfoSessionId = $null; InfoState = $null; InfoStateName = $null
+                    User = $null; LogonTime = $null; LogonSource = $null
+                    SessionIdConsistent = $false; StateConsistent = $null
+                    Detail = [string]$query.Detail
+                }) | Out-Null
+            continue
+        }
+
+        $info = $query.Record
+        $idConsistent = ([int]$info.SessionId -eq $id)
+        if (-not $idConsistent) {
+            $errors.Add(('{0}:session-id-mismatch({1})' -f $id, [int]$info.SessionId)) | Out-Null
+        }
+
+        $stateConsistent = ([int]$info.State -eq [int]$session.State)
+        if (-not $stateConsistent) {
+            $stateChanges.Add(('{0}:enumerated={1},queried={2}' -f $id, [int]$session.State, [int]$info.State)) | Out-Null
+        }
+
+        $rows.Add([pscustomobject][ordered]@{
+                SessionId = $id; StationName = [string]$session.StationName
+                EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
+                QueryOk = $true; QueryReason = 'ok'
+                InfoSessionId = [int]$info.SessionId
+                InfoState = [int]$info.State; InfoStateName = [string]$info.StateName
+                User = [string]$info.User
+                LogonTime = [string]$info.LogonTime; LogonSource = [string]$info.LogonSource
+                SessionIdConsistent = $idConsistent; StateConsistent = $stateConsistent
+                Detail = $null
+            }) | Out-Null
+    }
+
+    $targets = @($rows | Where-Object { $_.SessionId -eq $TargetSessionId })
+    $dupCheck = Find-P9HWtsDuplicateSessionId -Records @($EnumeratedSessions)
+
+    $targetOk = $false
+    $targetReason = 'no-target'
+    $targetRecord = $null
+
+    if ($dupCheck.HasDuplicates) {
+        $targetReason = 'ambiguous-enumeration'
+    }
+    elseif ($targets.Count -eq 0) {
+        $targetReason = 'no-target'
+    }
+    elseif ($targets.Count -gt 1) {
+        $targetReason = 'ambiguous-target'
+    }
+    elseif (-not $targets[0].QueryOk) {
+        $targetReason = 'target-query-failed'
+    }
+    elseif (-not $targets[0].SessionIdConsistent) {
+        $targetReason = 'target-session-id-mismatch'
+    }
+    else {
+        $targetOk = $true
+        $targetReason = 'ok'
+        $targetRecord = $targets[0]
+    }
+
+    # A target whose state moved during correlation is an EVIDENCE GAP. It is
+    # not a disconnect proof and not a reconnect proof.
+    $targetStateChanged = ($targets.Count -eq 1 -and $targets[0].StateConsistent -eq $false)
+
+    $ok = (
+        $errors.Count -eq 0 -and
+        -not $dupCheck.HasDuplicates -and
+        -not $targetStateChanged -and
+        ($stateChanges.Count -eq 0)
+    )
+
+    return [pscustomobject][ordered]@{
+        Ok                = $ok
+        Reason            = if ($ok) { 'ok' } elseif ($dupCheck.HasDuplicates) { 'ambiguous-enumeration' } elseif ($stateChanges.Count -gt 0) { 'state-changed-during-collection' } elseif ($errors.Count -gt 0) { 'incomplete-session-table' } else { 'ok' }
+        Detail            = if ($errors.Count -gt 0) { ($errors -join '; ') } elseif ($stateChanges.Count -gt 0) { ($stateChanges -join '; ') } else { $null }
+        Rows              = @($rows)
+        RowCount          = $rows.Count
+        Errors            = @($errors)
+        StateChanges      = @($stateChanges)
+        DuplicateSessionIds = @($dupCheck.SessionIds)
+        TargetSessionId   = $TargetSessionId
+        TargetOk          = $targetOk
+        TargetReason      = $targetReason
+        TargetRecord      = $targetRecord
+        TargetStateChanged = $targetStateChanged
+        IsAtomicSnapshot  = $false
+        AtomicityNote     = 'A sequence of sequential WTS queries is not an atomic session snapshot; a state change between the enumeration and a query is an evidence gap.'
+    }
+}
+
+function Get-P9HWtsProviderTableCapture {
+    # Build the COMPLETE provider line table from resolved session facts, and
+    # separate the target rows from the rest.
+    #
+    # This is the full-table counterpart of Get-P9HWtsProviderCapture: every
+    # enumerated session emits a line, so the frozen parser sees the same table
+    # a live E1 observation would, including session 0.
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,
+        [Parameter(Mandatory)][int]$TargetSessionId
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $targets = [System.Collections.Generic.List[object]]::new()
+    $failed = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row) { continue }
+
+        if (-not $row.QueryOk) {
+            # A failed per-session query is preserved explicitly. It is NOT
+            # rendered as a line, because a line would assert a state we do not
+            # have evidence for.
+            $failed.Add($row) | Out-Null
+            if ([int]$row.SessionId -eq $TargetSessionId) {
+                $targets.Add([pscustomobject]@{ SessionId = [int]$row.SessionId; QueryOk = $false; Rendered = $false; Row = $row }) | Out-Null
+            }
+            continue
+        }
+
+        # Prefer the WTSINFO state (it came with the identity) but keep the
+        # enumerated state visible through StateConsistent.
+        $record = [pscustomobject][ordered]@{
+            SessionId   = [int]$row.InfoSessionId
+            StationName = [string]$row.StationName
+            State       = [int]$row.InfoState
+            StateName   = [string]$row.InfoStateName
+            User        = if ($null -ne $row.PSObject.Properties['User']) { [string]$row.User } else { '' }
+            LogonTime   = [string]$row.LogonTime
+        }
+
+        $lines.Add((ConvertTo-P9HWtsProviderLine -Record $record)) | Out-Null
+
+        if ([int]$row.SessionId -eq $TargetSessionId) {
+            $targets.Add([pscustomobject]@{ SessionId = [int]$row.SessionId; QueryOk = $true; Rendered = $true; Row = $row }) | Out-Null
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Lines          = @($lines)
+        LineCount      = $lines.Count
+        TargetRecords  = @($targets)
+        TargetCount    = $targets.Count
+        FailedQueries  = @($failed)
+        FailedCount    = $failed.Count
+        RowCount       = @($Rows).Count
+        TargetSessionId = $TargetSessionId
+        IsAtomicSnapshot = $false
+    }
 }
 
 function Get-P9HWtsProviderCapture {

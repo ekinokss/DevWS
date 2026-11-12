@@ -7,16 +7,29 @@
 # 2.4.1 froze that contract, and this module only decides WHICH paths fill the
 # seven required N2 roles and refuses when one is absent.
 #
-# TWO DISTINCT PROVENANCE CLASSES
-#   * product      - bytes the product itself emitted (trace, stdout, exit
-#                    record, window/process inventories, fixture). The collector
-#                    records only a role, path and digest; it never writes or
-#                    edits these files, and it never invents a product event or
-#                    a product trial id.
-#   * collector    - metadata the collector authors ABOUT the trial (the role
-#                    binding, the E1 observation log reference). This is marked
-#                    explicitly so a reviewer can tell an observation made by the
-#                    collector from one made by the product.
+# ARTIFACT ORIGIN vs CAPTURE (Stage 3A.1 correction)
+#   Stage 3A labelled all seven N2 roles "product", which is factually wrong: the
+#   exit record is written by the qualification recorder, the window and process
+#   inventories are OS facts the qualification tooling observes, and the fixture
+#   is a qualification-defined input. The model below separates WHO PRODUCED the
+#   observation from WHO CAPTURED it:
+#
+#     origin      - the authority that produced the file's content
+#                   fixture | product | operating-system | qualification
+#     capturedBy  - the component that wrote the artifact into the trial
+#                   qualification-launcher | qualification-recorder |
+#                   qualification-observer | qualification-collector
+#
+#   This is a REPORTING correction only. The seven required roles, their
+#   SHA-256 binding, and their acceptance meaning are unchanged, and nothing in
+#   a verdict reads these fields.
+#
+#   * The trace and stdout are product-generated; qualification only captures
+#     them. The collector records role/path/digest and never edits the bytes.
+#   * Window and process inventories are operating-system facts observed by the
+#     qualification tooling: neither "product" nor "collector" describes them.
+#   * The exit record is authored by the qualification recorder, so describing it
+#     as a product-generated file would be inaccurate.
 #
 # The E1 observation log is bound as supporting provenance only. It is NOT one
 # of the seven N2 roles and can never substitute for N2 evidence.
@@ -33,11 +46,88 @@ $script:P9HRequiredN2Roles = @(
     'trace'
 )
 
+# Closed vocabularies, so a typo cannot silently introduce a new category.
+$script:P9HArtifactOrigins = @(
+    'fixture'
+    'product'
+    'operating-system'
+    'qualification'
+)
+
+$script:P9HArtifactCapturers = @(
+    'qualification-launcher'
+    'qualification-recorder'
+    'qualification-observer'
+    'qualification-capture'
+    'qualification-collector'
+)
+
+function Get-P9HArtifactOriginModel {
+    # The authoritative role -> origin/capturedBy mapping.
+    #
+    # Returned as data so the plan, the manifest and the tests all read ONE
+    # table instead of restating the classification in three places.
+    return @(
+        [pscustomobject][ordered]@{
+            Role = 'fixture'; Origin = 'fixture'; CapturedBy = 'qualification-launcher'
+            Why = 'qualification-defined input describing the intended layout state'
+        }
+        [pscustomobject][ordered]@{
+            Role = 'stdout'; Origin = 'product'; CapturedBy = 'qualification-launcher'
+            Why = 'product output captured by the qualification launcher'
+        }
+        [pscustomobject][ordered]@{
+            Role = 'pre-windows'; Origin = 'operating-system'; CapturedBy = 'qualification-observer'
+            Why = 'pre-launch window inventory: an OS fact observed by qualification'
+        }
+        [pscustomobject][ordered]@{
+            Role = 'post-windows'; Origin = 'operating-system'; CapturedBy = 'qualification-observer'
+            Why = 'post-launch window inventory: an OS fact observed by qualification'
+        }
+        [pscustomobject][ordered]@{
+            Role = 'exit-record'; Origin = 'qualification'; CapturedBy = 'qualification-recorder'
+            Why = 'lifecycle exit record authored by the qualification recorder'
+        }
+        [pscustomobject][ordered]@{
+            Role = 'new-processes'; Origin = 'operating-system'; CapturedBy = 'qualification-observer'
+            Why = 'new-process inventory: an OS fact observed by qualification'
+        }
+        [pscustomobject][ordered]@{
+            Role = 'trace'; Origin = 'product'; CapturedBy = 'qualification-capture'
+            Why = 'product-generated events captured by qualification tooling'
+        }
+    )
+}
+
+function Get-P9HArtifactOriginForRole {
+    # Look up the origin model for one role.
+    param([Parameter(Mandatory)][string]$Role)
+
+    $match = @((Get-P9HArtifactOriginModel) | Where-Object { $_.Role -eq $Role })
+    if ($match.Count -ne 1) {
+        return [pscustomobject][ordered]@{
+            Role = $Role; Origin = $null; CapturedBy = $null
+            Why = 'unclassified role'; Known = $false
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Role = $match[0].Role
+        Origin = $match[0].Origin
+        CapturedBy = $match[0].CapturedBy
+        Why = $match[0].Why
+        Known = $true
+    }
+}
+
 function Get-P9HCollectorRolePlan {
-    # The seven required N2 roles, each mapped to an expected path.
+    # The seven required N2 roles, each mapped to an expected path and its
+    # accurate origin/capturedBy classification.
     #
     # Returned as data so a caller can inspect or print the contract before
-    # touching the index. Order is the frozen contract order.
+    # touching the index. Order is the frozen contract order. The origin fields
+    # come from the single origin model, so the plan and the manifest can never
+    # disagree about who produced an artifact.
     param(
         [AllowNull()][string]$FixturePath = $null,
         [AllowNull()][string]$StdoutPath = $null,
@@ -48,15 +138,29 @@ function Get-P9HCollectorRolePlan {
         [AllowNull()][string]$TracePath = $null
     )
 
-    return @(
-        [pscustomobject][ordered]@{ Role = 'fixture'; Path = $FixturePath; Provenance = 'product' }
-        [pscustomobject][ordered]@{ Role = 'stdout'; Path = $StdoutPath; Provenance = 'product' }
-        [pscustomobject][ordered]@{ Role = 'pre-windows'; Path = $PreWindowPath; Provenance = 'product' }
-        [pscustomobject][ordered]@{ Role = 'post-windows'; Path = $PostWindowPath; Provenance = 'product' }
-        [pscustomobject][ordered]@{ Role = 'exit-record'; Path = $ExitRecordPath; Provenance = 'product' }
-        [pscustomobject][ordered]@{ Role = 'new-processes'; Path = $NewProcessPath; Provenance = 'product' }
-        [pscustomobject][ordered]@{ Role = 'trace'; Path = $TracePath; Provenance = 'product' }
-    )
+    $paths = [ordered]@{
+        'fixture'       = $FixturePath
+        'stdout'        = $StdoutPath
+        'pre-windows'   = $PreWindowPath
+        'post-windows'  = $PostWindowPath
+        'exit-record'   = $ExitRecordPath
+        'new-processes' = $NewProcessPath
+        'trace'         = $TracePath
+    }
+
+    $plan = [System.Collections.Generic.List[object]]::new()
+    foreach ($role in $script:P9HRequiredN2Roles) {
+        $origin = Get-P9HArtifactOriginForRole -Role $role
+        $plan.Add([pscustomobject][ordered]@{
+                Role       = $role
+                Path       = $paths[$role]
+                Origin     = $origin.Origin
+                CapturedBy = $origin.CapturedBy
+                OriginNote = $origin.Why
+            }) | Out-Null
+    }
+
+    return @($plan)
 }
 
 function Assert-P9HCollectorArtifactsPresent {
@@ -125,10 +229,12 @@ function Add-P9HCollectorArtifactRoles {
     $rows = [System.Collections.Generic.List[object]]::new()
 
     foreach ($item in @($Plan)) {
+        $origin = Get-P9HArtifactOriginForRole -Role ([string]$item.Role)
         $entry = Add-P9HArtifactRole -Context $Context -Path ([string]$item.Path) -Role ([string]$item.Role)
         $rows.Add([pscustomobject][ordered]@{
                 role       = [string]$item.Role
-                provenance = [string]$item.Provenance
+                origin      = $origin.Origin
+                capturedBy  = $origin.CapturedBy
                 path       = [string]$entry.path
                 sha256     = [string]$entry.sha256
                 bytes      = $entry.bytes
@@ -151,7 +257,8 @@ function Add-P9HCollectorArtifactRoles {
                 utc        = Get-P9HUtcStamp
                 trialId    = [string]$Context.TrialId
                 role       = 'e1-observation-log'
-                provenance = 'collector'
+                origin     = 'qualification'
+                capturedBy = 'qualification-observer'
                 kind       = 'supporting-provenance'
                 file       = [System.IO.Path]::GetFileName($ObservationLogPath)
                 path       = (Resolve-Path -LiteralPath $ObservationLogPath).Path
@@ -161,7 +268,8 @@ function Add-P9HCollectorArtifactRoles {
             Add-P9HArtifactLine -Path $observationPath -Line ($entry | ConvertTo-Json -Compress -Depth 4)
             $rows.Add([pscustomobject][ordered]@{
                     role       = 'e1-observation-log'
-                    provenance = 'collector'
+                    origin     = 'qualification'
+                    capturedBy = 'qualification-observer'
                     path       = [string]$entry.path
                     sha256     = [string]$entry.sha256
                     bytes      = $entry.bytes
@@ -218,19 +326,42 @@ function New-P9HCollectorManifest {
         [AllowNull()][string]$ObservationLogPath = $null
     )
 
-    $product = @($BoundRoles | Where-Object { $_.provenance -eq 'product' })
-    $collector = @($BoundRoles | Where-Object { $_.provenance -eq 'collector' })
+    # Group by WHO PRODUCED the content, then report who captured it. A reviewer
+    # can therefore tell a product-generated trace from a qualification-authored
+    # exit record without inferring it from a role name.
+    $byOrigin = [ordered]@{}
+    foreach ($originName in $script:P9HArtifactOrigins) {
+        $byOrigin[$originName] = @($BoundRoles | Where-Object { $_.origin -eq $originName })
+    }
+
+    # Per-role classification, so the report is explicit rather than aggregated.
+    $roleClassification = @(foreach ($role in $script:P9HRequiredN2Roles) {
+            $model = Get-P9HArtifactOriginForRole -Role $role
+            $bound = @($BoundRoles | Where-Object { $_.role -eq $role }) | Select-Object -First 1
+            [pscustomobject][ordered]@{
+                role       = $role
+                origin     = $model.Origin
+                capturedBy = $model.CapturedBy
+                why        = $model.Why
+                sha256     = if ($bound) { [string]$bound.sha256 } else { $null }
+            }
+        })
+
+    $supporting = @($BoundRoles | Where-Object { $script:P9HRequiredN2Roles -notcontains $_.role })
 
     return [pscustomobject][ordered]@{
-        schema            = 'p9h.collector-manifest.v1'
-        stage             = '3A'
-        trialId           = [string]$Context.TrialId
-        utc               = Get-P9HUtcStamp
-        requiredN2Roles   = @($script:P9HRequiredN2Roles)
-        productArtifacts  = @($product)
-        collectorMetadata = @($collector)
+        schema             = 'p9h.collector-manifest.v2'
+        stage              = '3A.1'
+        trialId            = [string]$Context.TrialId
+        utc                = Get-P9HUtcStamp
+        requiredN2Roles    = @($script:P9HRequiredN2Roles)
+        originVocabulary   = @($script:P9HArtifactOrigins)
+        capturerVocabulary = @($script:P9HArtifactCapturers)
+        roleClassification = @($roleClassification)
+        byOrigin           = [pscustomobject]$byOrigin
+        supportingProvenance = @($supporting)
         observationLogPath = $ObservationLogPath
-        wtsCapability     = $WtsCapability
-        note              = 'Product artifacts are bound by role/path/digest only; the collector never rewrites their bytes, invents product events, or invents a product trial id. The E1 observation log is supporting provenance and is never counted as an N2 role.'
+        wtsCapability      = $WtsCapability
+        note               = 'Origin names who produced the content; capturedBy names the qualification component that wrote it. Product-origin artifacts (stdout, trace) are bound by role/path/digest only: the collector never rewrites their bytes, invents product events, or invents a product trial id. The exit record is qualification-authored, not product-generated. The E1 observation log is supporting provenance and is never counted as an N2 role.'
     }
 }
