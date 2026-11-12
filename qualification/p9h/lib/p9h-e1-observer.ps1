@@ -381,9 +381,16 @@ function New-P9HObserverRecord {
         [AllowNull()][string]$CaptureOutcome = 'ok',
         [AllowNull()][string]$CaptureError = $null,
         [AllowNull()][string]$Corroboration = $null,
-        # Capture authority (Stage 3A.2). Default TRUE so a direct/simple caller
-        # is unaffected; the table-capture path passes the resolver's verdict.
-        [bool]$CaptureAuthoritative = $true,
+        # Capture authority (Stage 3A.2).
+        #
+        # Stage 3B0 correction: this was `[bool]$CaptureAuthoritative = $true`,
+        # so a record that declared captureOutcome='provider-error' still
+        # defaulted to authoritative=True and could satisfy Proof A/B. The value
+        # is now NULLABLE:
+        #   * $null  (omitted) -> DERIVED from CaptureOutcome;
+        #   * $true / $false   -> the caller's assertion, which is then ANDed with
+        #     the outcome so an explicit true can never override a failed capture.
+        [AllowNull()][object]$CaptureAuthoritative = $null,
         [AllowNull()][string]$CaptureAuthorityReason = $null,
         [AllowNull()][string]$CaptureRejection = $null,
         [AllowNull()][AllowEmptyCollection()][int[]]$CaptureWin32Errors = $null
@@ -400,17 +407,38 @@ function New-P9HObserverRecord {
         [pscustomobject][ordered]@{ Ok = $false; Reason = $table.Reason; Record = $null }
     }
 
-    # An observation may only be authoritative when the caller asserts capture
-    # authority AND the table itself parsed cleanly.
+    # An observation may only be authoritative when the capture itself succeeded
+    # AND the table parsed cleanly.
+    #
+    # Stage 3B0 correction: the caller's assertion is ANDed with the observed
+    # outcome rather than trusted on its own, so an omitted flag can never
+    # silently default to authoritative and an explicit `$true` can never
+    # override a failed capture. A provider error is never authoritative.
     #
     # Deliberately EXCLUDES target matching: "was this capture accepted?" and
-    # "does it describe the pinned target?" are separate questions, and the
+    # "does this describe the pinned target?" are separate questions, and the
     # target checks downstream already fail closed with precise reasons
-    # (pre-not-active, logon-unavailable, user-mismatch, ...). Folding them in
-    # here would mask those diagnostics behind a generic authority rejection.
-    $authoritative = ($CaptureAuthoritative -and $table.Ok)
+    # (pre-not-active, logon-unavailable, user-mismatch, ...).
+    $captureSucceeded = ([string]::IsNullOrWhiteSpace($CaptureOutcome) -or $CaptureOutcome -eq 'ok')
+
+    $assertedAuthority = if ($null -eq $CaptureAuthoritative) {
+        # Omitted: derive from the observed outcome. This is the conservative
+        # reading and the fix for the omission defect.
+        $captureSucceeded
+    }
+    else {
+        [bool]$CaptureAuthoritative
+    }
+
+    $authoritative = ($assertedAuthority -and $captureSucceeded -and $table.Ok)
+
     $authorityReason = if ($authoritative) { $null }
-    elseif (-not $CaptureAuthoritative) { if ([string]::IsNullOrWhiteSpace($CaptureAuthorityReason)) { 'capture-not-authoritative' } else { $CaptureAuthorityReason } }
+    elseif (-not $captureSucceeded) {
+        if ([string]::IsNullOrWhiteSpace($CaptureAuthorityReason)) { 'capture-outcome-' + [string]$CaptureOutcome } else { $CaptureAuthorityReason }
+    }
+    elseif (-not $assertedAuthority) {
+        if ([string]::IsNullOrWhiteSpace($CaptureAuthorityReason)) { 'capture-not-authoritative' } else { $CaptureAuthorityReason }
+    }
     else { 'table-not-ok:' + [string]$table.Reason }
 
     $record = [ordered]@{

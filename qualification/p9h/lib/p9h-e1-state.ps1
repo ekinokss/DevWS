@@ -185,25 +185,31 @@ function Wait-P9HTargetDisconnected {
         # whose session table was rejected (inconsistent, ambiguous, incomplete,
         # provider error) still produced an authoritative-looking observation.
         #
-        # `Authoritative` defaults to TRUE only for a provider that says nothing
-        # about capture status, which preserves the simple-caller contract; a
-        # provider that reports a rejection is propagated verbatim and can never
-        # be upgraded here.
-        $providedAuthoritative = $true
+        # Stage 3B0 correction: an OMITTED `Authoritative` no longer implies
+        # true. The provider's reported outcome is passed through and the
+        # observer derives authority from it, so a provider that reports a
+        # provider error without an explicit flag cannot authorize.
+        $outcome = 'ok'
+        $captureError = $null
         $authorityReason = $null
         $rejection = $null
         $win32 = @()
-        $outcome = 'ok'
-        $captureError = $null
 
-        if ($null -ne $sample.PSObject.Properties['Authoritative']) {
-            $providedAuthoritative = [bool]$sample.Authoritative
+        if ($null -ne $sample.PSObject.Properties['CaptureOutcome'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$sample.CaptureOutcome)) {
+            $outcome = [string]$sample.CaptureOutcome
         }
+        if ($null -ne $sample.PSObject.Properties['CaptureError']) { $captureError = [string]$sample.CaptureError }
         if ($null -ne $sample.PSObject.Properties['RejectionReason']) { $rejection = [string]$sample.RejectionReason }
         if ($null -ne $sample.PSObject.Properties['AuthorityReason']) { $authorityReason = [string]$sample.AuthorityReason }
         if ($null -ne $sample.PSObject.Properties['Win32Errors']) { $win32 = @($sample.Win32Errors) }
-        if ($null -ne $sample.PSObject.Properties['CaptureOutcome']) { $outcome = [string]$sample.CaptureOutcome }
-        if ($null -ne $sample.PSObject.Properties['CaptureError']) { $captureError = [string]$sample.CaptureError }
+
+        # $null when the provider is silent, so the observer derives authority
+        # from the outcome instead of assuming success.
+        $providedAuthoritative = $null
+        if ($null -ne $sample.PSObject.Properties['Authoritative'] -and $null -ne $sample.Authoritative) {
+            $providedAuthoritative = [bool]$sample.Authoritative
+        }
 
         # Persist EVERY sample: the evidence of what was seen when matters, not
         # just the sample that finally matched. A rejected sample is persisted

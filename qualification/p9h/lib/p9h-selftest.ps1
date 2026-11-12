@@ -2977,6 +2977,140 @@ function Invoke-P9HAuthorityGateTests {
         -Pass ((-not $s6Wait.Proven) -and $s6Records.Count -gt 0 -and $s6AllNonAuth -eq $s6Records.Count) -Evidence $s6Log
 }
 
+function Invoke-P9HAuthorityOmissionTests {
+    # U-series: OMITTED capture authority (Stage 3B0).
+    #
+    # Supervisor review found that Stage 3A.2 only covered an EXPLICIT
+    # CaptureAuthoritative=$false. Omitting the flag left the record
+    # authoritative, because New-P9HObserverRecord defaulted the parameter to
+    # $true and Wait-P9HTargetDisconnected defaulted a silent provider to
+    # authoritative. A record declaring captureOutcome='provider-error' could
+    # therefore authorize a reconnect.
+    #
+    # These cases cover the OMISSION variants specifically. Everything is
+    # synthetic: no live WTS call is made and no reconnect is executed.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $logonUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 11, 10, 0, 0), [System.DateTimeKind]::Utc)
+    $logonIso = $logonUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    $user = 'CONTOSO\qauser'
+    $discLine = '3|RDP-Tcp#0|state=4|user=' + $user + '|logon=' + $logonIso
+    $activeLine = '3|RDP-Tcp#0|state=0|user=' + $user + '|logon=' + $logonIso
+
+    function New-OmitTrial {
+        param([string]$Name)
+        $root = Join-Path $SandboxRoot ('p9h3b0-' + $Name + '-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        return (New-P9HTrialContext -RootDirectory $root -Kind e1)
+    }
+
+    # ---- U1: omitted authority + provider-error cannot satisfy Proof A ----
+    $u1 = New-OmitTrial 'u1'
+    $u1Log = Join-Path $u1.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $u1Log -Line (New-P9HObserverRecord -TrialId $u1.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $u1Log -Line (New-P9HObserverRecord -TrialId $u1.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+            -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)')
+    $u1Rec = @(Read-P9HObserverLog -Path $u1Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $u1Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $u1Log -TrialId $u1.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'U1' -Title 'An omitted authority flag with a provider error cannot satisfy Proof A' `
+        -Input 'provider-error record, CaptureAuthoritative not supplied' `
+        -Expected 'authority derived false, Proof A not proven' `
+        -Actual ("captureOutcome={0} captureAuthoritative={1} reason={2} proven={3}({4})" -f $u1Rec.captureOutcome, $u1Rec.captureAuthoritative, [string]$u1Rec.captureAuthorityReason, $u1Proof.Proven, $u1Proof.Reason) `
+        -Pass (($u1Rec.captureAuthoritative -eq $false) -and $u1Rec.captureAuthorityReason -eq 'capture-outcome-provider-error' -and (-not $u1Proof.Proven)) -Evidence $u1Log
+
+    # ---- U2: omitted authority + provider-error cannot satisfy Proof B ----
+    $u2 = New-OmitTrial 'u2'
+    $u2Log = Join-Path $u2.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $u2Log -Line (New-P9HObserverRecord -TrialId $u2.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $u2Log -Line (New-P9HObserverRecord -TrialId $u2.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $u2Log -Line (New-P9HObserverRecord -TrialId $u2.TrialId -Sequence 3 -Phase 'post' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+            -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)')
+    $u2Rec = @(Read-P9HObserverLog -Path $u2Log).Records | Where-Object { $_.phase -eq 'post' } | Select-Object -Last 1
+    $u2Proof = Get-P9HDisconnectProof -ObserverLogPath $u2Log -TrialId $u2.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'U2' -Title 'An omitted authority flag with a provider error cannot satisfy Proof B' `
+        -Input 'provider-error post observation, CaptureAuthoritative not supplied' `
+        -Expected 'authority derived false, Proof B not proven' `
+        -Actual ("postAuthority={0} proven={1}({2})" -f $u2Rec.captureAuthoritative, $u2Proof.Proven, $u2Proof.Reason) `
+        -Pass (($u2Rec.captureAuthoritative -eq $false) -and (-not $u2Proof.Proven) -and $u2Proof.Reason -eq 'post-capture-not-authoritative') -Evidence $u2Log
+
+    # ---- U3: an omitted flag with a clean capture still derives true ----
+    # The conservative default must not break the executable positive path.
+    $u3 = New-OmitTrial 'u3'
+    $u3Log = Join-Path $u3.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $u3Log -Line (New-P9HObserverRecord -TrialId $u3.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $u3Log -Line (New-P9HObserverRecord -TrialId $u3.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
+    $u3Rec = @(Read-P9HObserverLog -Path $u3Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $u3Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $u3Log -TrialId $u3.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'U3' -Title 'An omitted authority flag with a clean capture still derives authoritative' `
+        -Input 'clean capture, CaptureAuthoritative not supplied' `
+        -Expected 'authority derived true, Proof A proven' `
+        -Actual ("captureOutcome={0} captureAuthoritative={1} proven={2}" -f $u3Rec.captureOutcome, $u3Rec.captureAuthoritative, $u3Proof.Proven) `
+        -Pass (($u3Rec.captureAuthoritative -eq $true) -and $u3Proof.Proven) -Evidence $u3Log
+
+    # ---- U4: an explicit true cannot override a failed capture ----
+    $u4 = New-OmitTrial 'u4'
+    $u4Log = Join-Path $u4.Directory 'e1.jsonl'
+    $null = Add-P9HArtifactLine -Path $u4Log -Line (New-P9HObserverRecord -TrialId $u4.TrialId -Sequence 1 -Phase 'pre' `
+            -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
+    $null = Add-P9HArtifactLine -Path $u4Log -Line (New-P9HObserverRecord -TrialId $u4.TrialId -Sequence 2 -Phase 'disconnect-observed' `
+            -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+            -CaptureOutcome 'provider-error' -CaptureAuthoritative $true)
+    $u4Rec = @(Read-P9HObserverLog -Path $u4Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $u4Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $u4Log -TrialId $u4.TrialId -SessionId 3 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'U4' -Title 'An explicit authoritative flag cannot override a failed capture outcome' `
+        -Input 'CaptureOutcome=provider-error with CaptureAuthoritative=true' `
+        -Expected 'authority forced false, Proof A not proven' `
+        -Actual ("authoritative={0} reason={1} proven={2}" -f $u4Rec.captureAuthoritative, [string]$u4Rec.captureAuthorityReason, $u4Proof.Proven) `
+        -Pass (($u4Rec.captureAuthoritative -eq $false) -and (-not $u4Proof.Proven)) -Evidence $u4Log
+
+    # ---- U5: the wait gate cannot authorize from a silent, failing provider ----
+    $u5 = New-OmitTrial 'u5'
+    $u5Log = Join-Path $u5.Directory 'e1.jsonl'
+    $u5Provider = {
+        # Reports a provider error but supplies NO Authoritative field: the exact
+        # omission the supervisor flagged.
+        return [pscustomobject]@{
+            RawWtsLines    = @($discLine)
+            CaptureOutcome = 'provider-error'
+            CaptureError   = 'WTSQuerySessionInformationW failed (Win32 5)'
+            Win32Errors    = @(5)
+        }
+    }
+    $u5Wait = Wait-P9HTargetDisconnected -TrialId $u5.TrialId -SequenceStart 1 -ObserverLogPath $u5Log `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+        -Provider $u5Provider -TimeoutSeconds 1 -PollIntervalMs 40
+    $u5Recs = @(Read-P9HObserverLog -Path $u5Log).Records
+    $u5Auth = @($u5Recs | Where-Object { $_.captureAuthoritative }).Count
+    Add-P9HTestResult -Id 'U5' -Title 'A silent failing provider cannot authorize through the wait gate' `
+        -Input 'provider omits Authoritative and reports provider-error' `
+        -Expected 'no authoritative records, wait not proven' `
+        -Actual ("waitProven={0} reason={1} records={2} authoritative={3}" -f $u5Wait.Proven, $u5Wait.Reason, $u5Recs.Count, $u5Auth) `
+        -Pass ((-not $u5Wait.Proven) -and $u5Recs.Count -gt 0 -and $u5Auth -eq 0) -Evidence $u5Log
+
+    # ---- U6: the wait gate still authorizes a silent, clean provider ----
+    $u6 = New-OmitTrial 'u6'
+    $u6Log = Join-Path $u6.Directory 'e1.jsonl'
+    $u6Provider = {
+        return [pscustomobject]@{ RawWtsLines = @($discLine) }
+    }
+    $u6Wait = Wait-P9HTargetDisconnected -TrialId $u6.TrialId -SequenceStart 1 -ObserverLogPath $u6Log `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
+        -Provider $u6Provider -TimeoutSeconds 5 -PollIntervalMs 40
+    $u6Recs = @(Read-P9HObserverLog -Path $u6Log).Records
+    Add-P9HTestResult -Id 'U6' -Title 'A silent clean provider still authorizes through the wait gate' `
+        -Input 'provider omits Authoritative and reports no error' `
+        -Expected 'wait proven, sample authoritative' `
+        -Actual ("waitProven={0} reason={1} records={2} firstAuth={3}" -f $u6Wait.Proven, $u6Wait.Reason, $u6Recs.Count, $(if ($u6Recs.Count -gt 0) { $u6Recs[0].captureAuthoritative } else { 'null' })) `
+        -Pass ($u6Wait.Proven -and $u6Recs.Count -gt 0 -and $u6Recs[0].captureAuthoritative) -Evidence $u6Log
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -2995,6 +3129,7 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HWtsProviderTests -SandboxRoot $SandboxRoot
     Invoke-P9HWtsEnumerationTests -SandboxRoot $SandboxRoot
     Invoke-P9HAuthorityGateTests -SandboxRoot $SandboxRoot
+    Invoke-P9HAuthorityOmissionTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
@@ -3002,8 +3137,8 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 180 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'G', 'D')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 186 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

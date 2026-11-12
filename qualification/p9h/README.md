@@ -624,3 +624,81 @@ No E1 acceptance threshold was relaxed. Every change **rejects** evidence that p
 
 The registry guard now covers **180** registered cases; the full run executes 181 including `R1`.
 All 165 Stage 3A.1 cases are retained unchanged.
+
+## Stage 3B0 — read-only host WTS preflight
+
+The first authorized **read-only** native WTS preflight on the Windows host. No session or VM was
+modified: no `tsdiscon`, no session connect/disconnect, no token manipulation, no service restart, no
+PowerShell Direct, no guest query.
+
+### Host WTS capability — HOST VERIFIED
+
+| Check | Result |
+| --- | --- |
+| `WTSINFO` layout | **216 bytes on x64**, offsets 0/4/32/96/130/176/184/192/200/208 |
+| `WTS_SESSION_INFO` layout | **24 bytes on x64**, `SessionId` 0, `pWinStationName` 8, `State` 16 |
+| `WTSEnumerateSessionsW` | succeeded, `Win32 0`, 2 sessions reported |
+| Returned session count | valid (2), matched the enumerated set |
+| Per-session `WTSINFO` | 2/2 succeeded, returned 216/216 bytes |
+| Session-ID consistency | 2/2 returned ids matched the enumerated ids |
+| State agreement | 2/2 enumeration states matched `WTSINFO` states |
+| `LogonTime` populated | yes for the interactive session (`0x01DB…`) |
+| `LogonTime` unavailable | session 0 reported `logonRaw=0`, reason `zero` — explicitly absent, never 1601 |
+| Native exceptions / crashes | none |
+| Buffers released | `WTSFreeMemory` in `finally` on every path; no leak or crash observed |
+
+Two sessions were observed consistently across **5 bounded read-only observations**: session 0
+(`Services`, Disconnected, no logon) and session 1 (`Console`, Active, logon present).
+
+### Exact conversion validation
+
+```
+rawTicks          134388962797932344
+arithmetic UTC    2026-11-11T18:44:39.7932344Z   (1601 epoch + ticks, independent of adapter)
+FromFileTimeUtc   2026-11-11T18:44:39.7932344Z
+adapter           2026-11-11T18:44:39.7932344Z
+local equivalent  2026-11-11 21:44:39  (Turkey Standard Time, +03:00)
+quser reported    2026-11-11 21:44        -> minute-precision agreement
+```
+
+Sentinel handling re-verified live: `0` → `zero`, `-1` → `negative`, `1` → `epoch-invalid`;
+`116444736000000000` → `1970-01-01T00:00:00Z` (a legitimate FILETIME, correctly accepted).
+
+### Non-atomic snapshot limitation
+
+`IsAtomicSnapshot` is always `false`: a sequence of sequential WTS queries is **not** an atomic
+session snapshot, and a state change between the enumeration and a query is an evidence gap — not a
+transition. Recorded in the preflight report.
+
+### The omitted-authority defect (synthetic-only reproduction)
+
+Stage 3A.2 covered only an **explicit** `CaptureAuthoritative=$false`. Review identified that
+**omitting** the flag left a record authoritative:
+
+| Reproduced case | Before | After |
+| --- | --- | --- |
+| `captureOutcome='provider-error'`, authority flag omitted | **Proof A proven** | authority derived `false` |
+| Same omission on the post observation | **Proof B proven** | `post-capture-not-authoritative` |
+| `Wait-P9HTargetDisconnected`, provider omits `Authoritative` + reports error | **wait proven** | 0 authoritative records, times out |
+
+Two minimal corrections:
+
+1. `New-P9HObserverRecord`: `CaptureAuthoritative` is now nullable. Omitted ⇒ **derived** from
+   `CaptureOutcome`; asserted ⇒ ANDed with the observed outcome, so an explicit `$true` can never
+   override a failed capture. Reason surfaces as `capture-outcome-<outcome>`.
+2. `Wait-P9HTargetDisconnected`: passes the provider's outcome through instead of assuming
+   authoritative when `Authoritative` is absent.
+
+The positive path is preserved: a clean capture with an omitted flag still derives `true` (`U3`, `U6`).
+
+### Tests: U1–U6
+
+| ID | Coverage |
+| --- | --- |
+| U1–U2 | omitted authority + provider error cannot satisfy Proof A / Proof B |
+| U3 | omitted authority + clean capture still derives authoritative |
+| U4 | explicit `true` cannot override a failed capture outcome |
+| U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
+
+The registry guard now covers **186** registered cases; the full run executes 187 including `R1`.
+All 180 Stage 3A.2 cases are retained unchanged.
