@@ -1433,6 +1433,9 @@ function Resolve-P9HWtsSessionTable {
                 InfoState = [int]$info.State; InfoStateName = [string]$info.StateName
                 User = [string]$info.User
                 LogonTime = [string]$info.LogonTime; LogonSource = [string]$info.LogonSource
+                # Stage 3B7B-C1: carry the raw FILETIME through so evidence can pin
+                # the target on the exact native value, not only a formatted string.
+                LogonTimeRaw = if ($null -ne $info.PSObject.Properties['LogonTimeRaw']) { [long]$info.LogonTimeRaw } else { $null }
                 SessionIdConsistent = $idConsistent; StateConsistent = $stateConsistent
                 Win32Error = if ($null -ne $query.PSObject.Properties['Win32Error'] -and $null -ne $query.Win32Error) { [int]$query.Win32Error } else { $null }
                 Detail = $null
