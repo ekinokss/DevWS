@@ -700,8 +700,70 @@ The positive path is preserved: a clean capture with an omitted flag still deriv
 | U4 | explicit `true` cannot override a failed capture outcome |
 | U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
 
-The registry guard now covers **209** registered cases; the full run executes 210 including `R1`.
-All 186 prior cases and `R1` are retained unchanged.
+The registry guard now covers **221** registered cases; the full run executes 222 including `R1`.
+All 209 prior cases and `R1` are retained unchanged.
+
+---
+
+## Stage 3B7C: real-observation bridge for controlled disconnect/reconnect
+
+Stage 3B7C executes one physical Active → Disconnected → Active RDP transition.
+Before that could be attempted, the **real data path** had to be auditable end to
+end. Two defects were found in it and corrected within `qualification/p9h/`.
+
+### Defect 1: no production adapter into `Wait-P9HTargetDisconnected`
+
+`Wait-P9HTargetDisconnected` consumes a `-Provider` scriptblock and reads
+`RawWtsLines`, `CaptureOutcome`, `CaptureError`, `RejectionReason`,
+`AuthorityReason`, `Win32Errors` and `Authoritative` from it. Nothing in the
+product projected `Get-P9HWtsProviderTableCapture` into that shape, so a caller
+had to hand-write a scriptblock - and a hand-written scriptblock is exactly how an
+invented `CaptureOutcome = 'ok'` default could make a rejected capture look
+authoritative.
+
+**Correction.** `ConvertTo-P9HWtsObserverProviderSample` derives every field from
+the resolved result and its capture and invents none:
+
+| Field | Source |
+| --- | --- |
+| `RawWtsLines` | `Capture.Lines` |
+| `CaptureOutcome` | `'provider-error'` **iff** the capture recorded a failed query, else `'ok'` |
+| `Authoritative` | `Capture.Authoritative` (the resolver verdict) |
+| `RejectionReason` | `Capture.RejectionReason` |
+| `AuthorityReason` | rejection when not authoritative, else `null` |
+| `Win32Errors` | `Capture.Win32Errors` (nonzero only) |
+
+Listener inventory (`ListenerCount`, `EnumeratedCount`, `IdentityCoveredCount`)
+stays auditable through the adapter.
+
+### Defect 2: `StateName` omitted from the polled record
+
+`Wait-P9HTargetDisconnected` built a synthetic record for
+`Test-P9HTargetDisconnected` without `StateName`. The disconnected path never
+touches it, so synthetic tests passed - but the **non-disconnected** path
+formats its reason as `'target-state-' + $match.Record.StateName` and threw
+`PropertyNotFoundException`. The first real poll while the target was still
+Active would have crashed the wait loop instead of polling again.
+
+**Correction.** The projected record now carries `StateName` from the persisted
+`targetStateName`.
+
+### Test coverage (C1-C12)
+
+| ID | Coverage |
+| --- | --- |
+| C1 | clean authoritative capture projects to an authoritative sample |
+| C2 | rejected resolver result stays non-authoritative; nonzero Win32 preserved |
+| C3 | rows-only capture keeps outcome `ok` but is never authoritative |
+| C4 | the adapter derives `provider-error` from the capture, never a default |
+| C5 | listener inventory stays auditable through the adapter |
+| C6 | a disconnected session 0 cannot satisfy Proof A |
+| C7 | the adapter drives `Wait` and `Assert-P9HReconnectPermitted` end to end |
+| C8 | a failed non-listener query cannot become authoritative |
+| C9 | a Win32 zero is never reported as a failure |
+| C10 | every polled sample is persisted and read back with increasing sequence |
+| C11 | a listener line can never stand in for a target disconnect |
+| C12 | a different logon time on the same session id cannot prove a disconnect |
 
 ---
 

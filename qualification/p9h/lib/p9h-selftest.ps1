@@ -3544,6 +3544,279 @@ function Invoke-P9HWtsListenerAuthorityTests {
         -Pass ($l23Parse.Ok -and @($l23Parse.Records).Count -eq 2 -and $l23ListenerLines.Count -eq 0) -Evidence $null
 }
 
+function Invoke-P9HObserverBridgeTests {
+    # C-series: capture -> Wait-P9HTargetDisconnected provider adapter
+    # (Stage 3B7C).
+    #
+    # Wait-P9HTargetDisconnected consumes a `-Provider` scriptblock. Before
+    # Stage 3B7C no production function projected a real capture into that shape,
+    # so a caller had to hand-write one. A hand-written scriptblock is precisely
+    # how an invented `CaptureOutcome='ok'` default could make a rejected capture
+    # look authoritative.
+    #
+    # ConvertTo-P9HWtsObserverProviderSample is that adapter. These cases pin that
+    # it DERIVES every field from the resolver/capture and never invents one.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $logonUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 13, 16, 59, 57), [System.DateTimeKind]::Utc)
+    $logonFt = $logonUtc.ToFileTimeUtc()
+    $logonIso = $logonUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    $user = 'P9HNODE\p9hadmin'
+
+    function New-CQueryOk([int]$Sid, [int]$State, [string]$Station, [string]$UserName, [long]$Ft) {
+        $rec = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId $Sid -State $State `
+                    -StationName $Station -Domain 'P9HNODE' -UserName $UserName -LogonTime $Ft)).Record
+        return [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $rec; Win32Error = 0 }
+    }
+    function New-CListener([int]$Sid) {
+        return [pscustomobject]@{ Ok = $false; Reason = 'session-id-mismatch'; Detail = ('requested {0}, reported 0' -f $Sid); Record = $null; Win32Error = 0 }
+    }
+    function New-CEnum([object[]]$Spec) {
+        $p = New-P9HWtsSessionInfoPayload -Sessions $Spec
+        return (ConvertFrom-P9HWtsSessionInfoPayload -Payload $p.Payload -ReportedCount $p.ReportedCount -Layout $p.Layout).Records
+    }
+
+    $spec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 0 }
+        @{ SessionId = 65536; StationName = '31C5CE94259D4006A9E4'; State = 6 }
+    )
+    $enum = New-CEnum $spec
+    $services = New-CQueryOk 0 4 'Services' '' 0
+    $active = New-CQueryOk 2 0 'RDP-Tcp#0' 'p9hadmin' $logonFt
+    $good = @{ 0 = $services; 2 = $active; 65536 = (New-CListener 65536) }
+
+    # ---- C1: clean authoritative capture projects to an authoritative sample ----
+    $r1 = Resolve-P9HWtsSessionTable -EnumeratedSessions $enum -QueryResults $good -TargetSessionId 2
+    $cap1 = Get-P9HWtsProviderTableCapture -Result $r1 -TargetSessionId 2
+    $s1 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap1 -QuserText 'quser-stub'
+    Add-P9HTestResult -Id 'C1' -Title 'A clean authoritative capture projects to an authoritative provider sample' `
+        -Input 'listener-aware complete table, all required queries Ok Win32=0' `
+        -Expected 'Authoritative=true, CaptureOutcome=ok, RawWtsLines=2, Win32Errors empty' `
+        -Actual ("auth={0} outcome={1} raw={2} win32={3} rejection=[{4}]" -f `
+            $s1.Authoritative, $s1.CaptureOutcome, @($s1.RawWtsLines).Count, @($s1.Win32Errors).Count, [string]$s1.RejectionReason) `
+        -Pass ($s1.Authoritative -eq $true -and $s1.CaptureOutcome -eq 'ok' -and @($s1.RawWtsLines).Count -eq 2 -and
+            @($s1.Win32Errors).Count -eq 0 -and [string]::IsNullOrWhiteSpace([string]$s1.RejectionReason)) -Evidence $null
+
+    # ---- C2: rejected resolver result stays non-authoritative through the adapter ----
+    $failQ = @{ 0 = $services; 2 = $active; 65536 = (New-CListener 65536) }
+    $badSpec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 0 }
+        @{ SessionId = 3; StationName = 'RDP-Tcp#1'; State = 1 }
+    )
+    $badEnum = New-CEnum $badSpec
+    $failQ[3] = [pscustomobject]@{ Ok = $false; Reason = 'native-query-failed'; Detail = 'access denied'; Record = $null; Win32Error = 5 }
+    $r2 = Resolve-P9HWtsSessionTable -EnumeratedSessions $badEnum -QueryResults $failQ -TargetSessionId 2
+    $cap2 = Get-P9HWtsProviderTableCapture -Result $r2 -TargetSessionId 2
+    $s2 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap2
+    Add-P9HTestResult -Id 'C2' -Title 'A rejected resolver result stays non-authoritative through the adapter' `
+        -Input 'a real non-target non-listener query fails Win32 5' `
+        -Expected 'Authoritative=false, CaptureOutcome=provider-error, Win32 5 preserved, rejection set' `
+        -Actual ("auth={0} outcome={1} win32=[{2}] rejection=[{3}]" -f `
+            $s2.Authoritative, $s2.CaptureOutcome, (@($s2.Win32Errors) -join ','), [string]$s2.RejectionReason) `
+        -Pass ($s2.Authoritative -eq $false -and $s2.CaptureOutcome -eq 'provider-error' -and
+            (@($s2.Win32Errors) -contains 5) -and -not [string]::IsNullOrWhiteSpace([string]$s2.RejectionReason)) -Evidence $null
+
+    # ---- C3: a rejected-but-successfully-read capture keeps outcome ok, not authoritative ----
+    $rowsOnly = Get-P9HWtsProviderTableCapture -Rows $r1.Rows -TargetSessionId 2
+    $s3 = ConvertTo-P9HWtsObserverProviderSample -Capture $rowsOnly
+    Add-P9HTestResult -Id 'C3' -Title 'A rows-only capture keeps outcome ok but is never authoritative' `
+        -Input 'rows without a resolved result' `
+        -Expected 'CaptureOutcome=ok, Authoritative=false, RejectionReason=capture-rows-without-resolver-status' `
+        -Actual ("outcome={0} auth={1} rejection={2}" -f $s3.CaptureOutcome, $s3.Authoritative, [string]$s3.RejectionReason) `
+        -Pass ($s3.CaptureOutcome -eq 'ok' -and $s3.Authoritative -eq $false -and
+            $s3.RejectionReason -eq 'capture-rows-without-resolver-status') -Evidence $null
+
+    # ---- C4: the adapter never invents default 'ok' when the capture says otherwise ----
+    $synthetic = [pscustomobject][ordered]@{
+        Lines = @('2|RDP-Tcp#0|state=0|user=P9HNODE\p9hadmin'); Authoritative = $false
+        RejectionReason = 'resolver-rejected:incomplete-session-table'; ResolverDetail = 'session 3 failed'
+        Win32Errors = @(5); FailedCount = 1; ListenerCount = 0; EnumeratedCount = 3; IdentityCoveredCount = 2
+        TargetSessionId = 2
+    }
+    $s4 = ConvertTo-P9HWtsObserverProviderSample -Capture $synthetic
+    Add-P9HTestResult -Id 'C4' -Title 'The adapter derives a provider error from the capture, not a default' `
+        -Input 'capture declaring one failed query with Win32 5' `
+        -Expected 'CaptureOutcome=provider-error, CaptureError populated, Authoritative=false' `
+        -Actual ("outcome={0} error=[{1}] auth={2}" -f $s4.CaptureOutcome, [string]$s4.CaptureError, $s4.Authoritative) `
+        -Pass ($s4.CaptureOutcome -eq 'provider-error' -and -not [string]::IsNullOrWhiteSpace([string]$s4.CaptureError) -and
+            $s4.Authoritative -eq $false) -Evidence $null
+
+    # ---- C5: listener inventory stays auditable through the adapter ----
+    $s5 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap1
+    Add-P9HTestResult -Id 'C5' -Title 'Listener inventory stays auditable through the adapter' `
+        -Input 'authoritative listener-aware capture' `
+        -Expected 'ListenerCount=1, EnumeratedCount=3, IdentityCoveredCount=2' `
+        -Actual ("listeners={0} enumerated={1} identity={2}" -f $s5.ListenerCount, $s5.EnumeratedCount, $s5.IdentityCoveredCount) `
+        -Pass ([int]$s5.ListenerCount -eq 1 -and [int]$s5.EnumeratedCount -eq 3 -and [int]$s5.IdentityCoveredCount -eq 2) -Evidence $null
+
+    # ---- C6: a disconnected session 0 cannot satisfy Proof A through the adapter ----
+    $disc0Spec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 0 }
+        @{ SessionId = 65536; StationName = '31C5CE94259D4006A9E4'; State = 6 }
+    )
+    $disc0Enum = New-CEnum $disc0Spec
+    $disc0Q = @{ 0 = $services; 2 = $active; 65536 = (New-CListener 65536) }
+    $r6 = Resolve-P9HWtsSessionTable -EnumeratedSessions $disc0Enum -QueryResults $disc0Q -TargetSessionId 2
+    $cap6 = Get-P9HWtsProviderTableCapture -Result $r6 -TargetSessionId 2
+    $s6 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap6
+
+    $dir6 = Join-Path $SandboxRoot 'c6-session0'
+    New-Item -ItemType Directory -Path $dir6 -Force | Out-Null
+    $log6 = Join-Path $dir6 'observer.jsonl'
+    $pre6 = (New-P9HObserverRecordFromTableCapture -Capture $cap6 -TrialId 'c6-trial' -Sequence 1 -Phase 'pre' `
+            -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE')
+    Add-P9HArtifactLine -Path $log6 -Line $pre6
+
+    # Session 0 is disconnected; the provider still reports the target Active.
+    $wait6 = Wait-P9HTargetDisconnected -TrialId 'c6-trial' -SequenceStart 2 -ObserverLogPath $log6 `
+        -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE' `
+        -Provider { $s6 } -TimeoutSeconds 2 -PollIntervalMs 100
+    $proof6 = Get-P9HReconnectAuthorizationProof -ObserverLogPath $log6 -TrialId 'c6-trial' `
+        -SessionId 2 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'C6' -Title 'A disconnected session 0 cannot satisfy Proof A' `
+        -Input 'session 0 state 4, pinned target session 2 still Active' `
+        -Expected 'Wait never proves, Proof A not proven' `
+        -Actual ("waitProven={0} reason={1} proofA={2}({3})" -f $wait6.Proven, [string]$wait6.Reason, $proof6.Proven, [string]$proof6.Reason) `
+        -Pass ((-not $wait6.Proven) -and (-not $proof6.Proven)) -Evidence $log6
+
+    # ---- C7: the adapter end-to-end drives Wait -> Proof A on a real disconnect ----
+    $discSpec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 4 }
+        @{ SessionId = 65536; StationName = '31C5CE94259D4006A9E4'; State = 6 }
+    )
+    $discEnum = New-CEnum $discSpec
+    $discRecord = New-CQueryOk 2 4 'RDP-Tcp#0' 'p9hadmin' $logonFt
+    $discQ = @{ 0 = $services; 2 = $discRecord; 65536 = (New-CListener 65536) }
+    $r7 = Resolve-P9HWtsSessionTable -EnumeratedSessions $discEnum -QueryResults $discQ -TargetSessionId 2
+    $cap7 = Get-P9HWtsProviderTableCapture -Result $r7 -TargetSessionId 2
+    $s7 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap7
+
+    $dir7 = Join-Path $SandboxRoot 'c7-endtoend'
+    New-Item -ItemType Directory -Path $dir7 -Force | Out-Null
+    $log7 = Join-Path $dir7 'observer.jsonl'
+    $pre7 = (New-P9HObserverRecordFromTableCapture -Capture $cap6 -TrialId 'c7-trial' -Sequence 1 -Phase 'pre' `
+            -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE')
+    Add-P9HArtifactLine -Path $log7 -Line $pre7
+    $wait7 = Wait-P9HTargetDisconnected -TrialId 'c7-trial' -SequenceStart 2 -ObserverLogPath $log7 `
+        -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE' `
+        -Provider { $s7 } -TimeoutSeconds 5 -PollIntervalMs 100
+    $gate7 = $null; $gateReason = 'not-attempted'
+    try {
+        $gate7 = Assert-P9HReconnectPermitted -ObserverLogPath $log7 -TrialId 'c7-trial' `
+            -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso
+        $gateReason = 'permitted'
+    }
+    catch { $gateReason = $_.Exception.Message }
+    Add-P9HTestResult -Id 'C7' -Title 'The adapter drives Wait and the reconnect gate end to end' `
+        -Input 'authoritative pre Active, then an authoritative Disconnected sample' `
+        -Expected 'Wait proves, Assert-P9HReconnectPermitted permits' `
+        -Actual ("waitProven={0} reason={1} gate={2}" -f $wait7.Proven, [string]$wait7.Reason, $gateReason) `
+        -Pass ($wait7.Proven -and $null -ne $gate7 -and $gate7.Proven -and $gateReason -eq 'permitted') -Evidence $log7
+
+    # ---- C8: a failed non-listener query cannot become authoritative via the adapter ----
+    $failQ8 = @{ 0 = $services; 2 = $discRecord; 65536 = (New-CListener 65536) }
+    $bad8Spec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 4 }
+        @{ SessionId = 5; StationName = 'RDP-Tcp#2'; State = 1 }
+    )
+    $bad8Enum = New-CEnum $bad8Spec
+    $failQ8[5] = [pscustomobject]@{ Ok = $false; Reason = 'native-query-failed'; Detail = 'denied'; Record = $null; Win32Error = 5 }
+    $r8 = Resolve-P9HWtsSessionTable -EnumeratedSessions $bad8Enum -QueryResults $failQ8 -TargetSessionId 2
+    $cap8 = Get-P9HWtsProviderTableCapture -Result $r8 -TargetSessionId 2
+    $s8 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap8
+    $dir8 = Join-Path $SandboxRoot 'c8-fail'
+    New-Item -ItemType Directory -Path $dir8 -Force | Out-Null
+    $log8 = Join-Path $dir8 'observer.jsonl'
+    Add-P9HArtifactLine -Path $log8 -Line $pre7
+    $wait8 = Wait-P9HTargetDisconnected -TrialId 'c7-trial' -SequenceStart 2 -ObserverLogPath $log8 `
+        -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE' `
+        -Provider { $s8 } -TimeoutSeconds 2 -PollIntervalMs 100
+    $proof8 = Get-P9HReconnectAuthorizationProof -ObserverLogPath $log8 -TrialId 'c7-trial' `
+        -SessionId 2 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'C8' -Title 'A failed non-listener query cannot become authoritative through the adapter' `
+        -Input 'target line looks Disconnected but a real session query failed Win32 5' `
+        -Expected 'sample non-authoritative, Wait never proves, Proof A not proven' `
+        -Actual ("auth={0} outcome={1} waitProven={2} proofA={3}" -f $s8.Authoritative, $s8.CaptureOutcome, $wait8.Proven, $proof8.Proven) `
+        -Pass ($s8.Authoritative -eq $false -and (-not $wait8.Proven) -and (-not $proof8.Proven)) -Evidence $log8
+
+    # ---- C9: Win32 zero is never reported as a failure by the adapter ----
+    $s9 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap1
+    $zeroInWin32 = @($s9.Win32Errors | Where-Object { [int]$_ -eq 0 }).Count
+    Add-P9HTestResult -Id 'C9' -Title 'The adapter never reports a Win32 zero as a failure' `
+        -Input 'authoritative capture where every successful query returned Win32Error=0' `
+        -Expected 'zero codes absent from Win32Errors, outcome=ok' `
+        -Actual ("win32=[{0}] zeros={1} outcome={2}" -f (@($s9.Win32Errors) -join ','), $zeroInWin32, $s9.CaptureOutcome) `
+        -Pass ($zeroInWin32 -eq 0 -and $s9.CaptureOutcome -eq 'ok' -and $s9.Authoritative -eq $true) -Evidence $null
+
+    # ---- C10: every polled sample is persisted and read back ----
+    $dir10 = Join-Path $SandboxRoot 'c10-persist'
+    New-Item -ItemType Directory -Path $dir10 -Force | Out-Null
+    $log10 = Join-Path $dir10 'observer.jsonl'
+    Add-P9HArtifactLine -Path $log10 -Line $pre7
+    # Provider returns Active (rejected for disconnect) twice, then Disconnected.
+    $script:c10 = 0
+    $wait10 = Wait-P9HTargetDisconnected -TrialId 'c7-trial' -SequenceStart 2 -ObserverLogPath $log10 `
+        -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE' `
+        -Provider {
+            $script:c10++
+            if ($script:c10 -le 2) { $s6 } else { $s7 }
+        } -TimeoutSeconds 10 -PollIntervalMs 50
+    $back10 = Read-P9HObserverLog -Path $log10
+    $seqs10 = @($back10.Records | ForEach-Object { [int]$_.sequence })
+    Add-P9HTestResult -Id 'C10' -Title 'Every polled sample is persisted and read back' `
+        -Input 'two non-matching samples then a matching one' `
+        -Expected '3 disconnect-observed records persisted with increasing sequence, log readable' `
+        -Actual ("proven={0} records={1} seqs=[{2}] readOk={3}" -f $wait10.Proven, @($back10.Records).Count, ($seqs10 -join ','), $back10.Ok) `
+        -Pass ($wait10.Proven -and $back10.Ok -and @($back10.Records).Count -eq 4 -and
+            (($seqs10 -join ',') -eq '1,2,3,4')) -Evidence $log10
+
+    # ---- C11: a listener line can never authorize a disconnect proof ----
+    $listenerOnly = [pscustomobject][ordered]@{
+        Lines = @('65536|RDP-Tcp|state=6|user='); Authoritative = $true
+        RejectionReason = $null; ResolverDetail = $null
+        Win32Errors = @(); FailedCount = 0; ListenerCount = 1; EnumeratedCount = 1; IdentityCoveredCount = 0
+        TargetSessionId = 2
+    }
+    $s11 = ConvertTo-P9HWtsObserverProviderSample -Capture $listenerOnly
+    $dir11 = Join-Path $SandboxRoot 'c11-listener'
+    New-Item -ItemType Directory -Path $dir11 -Force | Out-Null
+    $log11 = Join-Path $dir11 'observer.jsonl'
+    Add-P9HArtifactLine -Path $log11 -Line $pre7
+    $wait11 = Wait-P9HTargetDisconnected -TrialId 'c7-trial' -SequenceStart 2 -ObserverLogPath $log11 `
+        -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE' `
+        -Provider { $s11 } -TimeoutSeconds 2 -PollIntervalMs 100
+    Add-P9HTestResult -Id 'C11' -Title 'A listener line can never stand in for a target disconnect' `
+        -Input 'provider returns only a WTSListen line while pinned target is session 2' `
+        -Expected 'Wait never proves a disconnect' `
+        -Actual ("waitProven={0} reason={1}" -f $wait11.Proven, [string]$wait11.Reason) `
+        -Pass ((-not $wait11.Proven)) -Evidence $log11
+
+    # ---- C12: a changed logon time on the same session id cannot prove a disconnect ----
+    $otherLogon = New-CQueryOk 2 4 'RDP-Tcp#0' 'p9hadmin' ($logonFt - 36000000000)
+    $q12 = @{ 0 = $services; 2 = $otherLogon; 65536 = (New-CListener 65536) }
+    $r12 = Resolve-P9HWtsSessionTable -EnumeratedSessions $discEnum -QueryResults $q12 -TargetSessionId 2
+    $cap12 = Get-P9HWtsProviderTableCapture -Result $r12 -TargetSessionId 2
+    $s12 = ConvertTo-P9HWtsObserverProviderSample -Capture $cap12
+    $dir12 = Join-Path $SandboxRoot 'c12-relogon'
+    New-Item -ItemType Directory -Path $dir12 -Force | Out-Null
+    $log12 = Join-Path $dir12 'observer.jsonl'
+    Add-P9HArtifactLine -Path $log12 -Line $pre7
+    $wait12 = Wait-P9HTargetDisconnected -TrialId 'c7-trial' -SequenceStart 2 -ObserverLogPath $log12 `
+        -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE' `
+        -Provider { $s12 } -TimeoutSeconds 2 -PollIntervalMs 100
+    Add-P9HTestResult -Id 'C12' -Title 'A different logon time on the same session id cannot prove the disconnect' `
+        -Input 'target session 2 Disconnected but WTSINFO logon time differs from the pin' `
+        -Expected 'Wait never proves; identity mismatch rejects' `
+        -Actual ("waitProven={0} reason={1} detail={2}" -f $wait12.Proven, [string]$wait12.Reason, [string]$wait12.Detail) `
+        -Pass ((-not $wait12.Proven)) -Evidence $log12
+}
+
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -3565,14 +3838,15 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HAuthorityOmissionTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
     Invoke-P9HWtsListenerAuthorityTests -SandboxRoot $SandboxRoot
+    Invoke-P9HObserverBridgeTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
 
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 209 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 221 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

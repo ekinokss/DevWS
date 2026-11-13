@@ -1600,6 +1600,75 @@ function New-P9HObserverRecordFromTableCapture {
         -ListenerDiagnostics $(if ($null -ne $Capture.PSObject.Properties['ListenerDiagnostics']) { @($Capture.ListenerDiagnostics) } else { $null })
 }
 
+function ConvertTo-P9HWtsObserverProviderSample {
+    # Project a REAL capture into the sample shape consumed by
+    # Wait-P9HTargetDisconnected.
+    #
+    # Stage 3B7C bridge correction. Wait-P9HTargetDisconnected takes a `-Provider`
+    # scriptblock and reads these fields from it:
+    #   RawWtsLines, CaptureOutcome, CaptureError, RejectionReason,
+    #   AuthorityReason, Win32Errors, Authoritative, QuserText
+    #
+    # Before this function there was NO production adapter between
+    # Get-P9HWtsProviderTableCapture and that shape. A caller therefore had to
+    # either hand-write a scriptblock that invented defaults (which is exactly how
+    # a rejected capture could masquerade as authoritative) or bypass the state
+    # machine entirely. Both are forbidden.
+    #
+    # This adapter DERIVES every field from the resolved result and its capture -
+    # it never invents a value:
+    #   * RawWtsLines      <- Capture.Lines            (the actual provider lines)
+    #   * CaptureOutcome   <- 'provider-error' iff the capture recorded a failed
+    #                         query; otherwise 'ok'. It is NOT hardcoded to 'ok'.
+    #   * Authoritative    <- Capture.Authoritative    (the resolver verdict)
+    #   * RejectionReason  <- Capture.RejectionReason
+    #   * AuthorityReason  <- Capture.RejectionReason when not authoritative
+    #   * Win32Errors      <- Capture.Win32Errors      (nonzero codes only)
+    #
+    # A rejected resolver result stays non-authoritative; a failed non-listener
+    # query cannot become authoritative; listener metadata stays auditable via
+    # ListenerCount/EnumeratedCount/IdentityCoveredCount; Win32 zero is already
+    # excluded upstream and is never treated as failure.
+    param(
+        [Parameter(Mandatory)]$Capture,
+        [AllowNull()][string]$QuserText = $null
+    )
+
+    $failedCount = if ($null -ne $Capture.PSObject.Properties['FailedCount']) { [int]$Capture.FailedCount } else { 0 }
+    $win32 = @(if ($null -ne $Capture.PSObject.Properties['Win32Errors']) { @($Capture.Win32Errors) })
+    $authoritative = [bool]$Capture.Authoritative
+    $rejection = if ($null -ne $Capture.PSObject.Properties['RejectionReason']) { [string]$Capture.RejectionReason } else { $null }
+
+    # The RAW diagnostic outcome. A capture whose read succeeded but whose TABLE
+    # was rejected is still 'ok' here - the rejection travels in
+    # RejectionReason/Authoritative, exactly as the observer expects.
+    $outcome = if ($failedCount -gt 0 -or $win32.Count -gt 0) { 'provider-error' } else { 'ok' }
+    $captureError = if ($outcome -eq 'provider-error') {
+        if (-not [string]::IsNullOrWhiteSpace([string]$Capture.ResolverDetail)) {
+            [string]$Capture.ResolverDetail
+        }
+        else { 'one or more per-session WTS queries failed' }
+    }
+    else { $null }
+
+    return [pscustomobject][ordered]@{
+        RawWtsLines      = @(if ($null -ne $Capture.PSObject.Properties['Lines']) { @($Capture.Lines) })
+        CaptureOutcome   = $outcome
+        CaptureError     = $captureError
+        Authoritative    = $authoritative
+        RejectionReason  = $rejection
+        AuthorityReason  = $(if ($authoritative) { $null } elseif ([string]::IsNullOrWhiteSpace($rejection)) { 'capture-not-authoritative' } else { $rejection })
+        Win32Errors      = @($win32)
+        QuserText        = $QuserText
+        # Listener inventory kept auditable through the adapter.
+        ListenerCount        = if ($null -ne $Capture.PSObject.Properties['ListenerCount']) { [int]$Capture.ListenerCount } else { $null }
+        EnumeratedCount      = if ($null -ne $Capture.PSObject.Properties['EnumeratedCount']) { [int]$Capture.EnumeratedCount } else { $null }
+        IdentityCoveredCount = if ($null -ne $Capture.PSObject.Properties['IdentityCoveredCount']) { [int]$Capture.IdentityCoveredCount } else { $null }
+        FailedCount          = $failedCount
+        TargetSessionId      = if ($null -ne $Capture.PSObject.Properties['TargetSessionId']) { [int]$Capture.TargetSessionId } else { $null }
+    }
+}
+
 function Get-P9HWtsProviderTableCapture {
     # Build the COMPLETE provider line table from a RESOLVED session-table
     # result, and carry that result's AUTHORITY forward.

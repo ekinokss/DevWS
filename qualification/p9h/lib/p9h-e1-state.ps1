@@ -272,6 +272,11 @@ function Wait-P9HTargetDisconnected {
                     SessionId = $_.targetSessionId
                     User      = $_.targetUser
                     State     = $_.targetState
+                    # Stage 3B7C bridge correction: StateName was omitted, so the
+                    # NON-disconnected path ('target-state-' + StateName) threw
+                    # instead of returning Disconnected=false. The defect only
+                    # surfaced once a real poll observed the target still Active.
+                    StateName = [string]$_.targetStateName
                     StationName = $_.targetStation
                     LogonTime = $_.targetObservedLogon
                 }
