@@ -1231,6 +1231,34 @@ function Invoke-P9HWtsSessionEnumerate {
     }
 }
 
+function Test-P9HWtsListenerSession {
+    # Is this enumerated session a WTS CONNECTION LISTENER rather than a real
+    # user session?
+    #
+    # Microsoft defines WTSListen (state 6) as a listener that accepts
+    # connections but has no logged-on user. Two consequences matter here:
+    #   * it has NO user identity and NO logon time to expose, and
+    #   * WTSQuerySessionInformationW(WTSInfo) cannot describe it, so a listener
+    #     legitimately answers with a non-matching or empty record.
+    #
+    # CLASSIFICATION IS BY THE ENUMERATED STATE, which is the only property the
+    # enumeration actually promises. Deliberately NOT by:
+    #   * session id range - 65536 is conventional, not contractual, and a rule
+    #     keyed on "high id" would excuse real failures of a real session;
+    #   * station name - 'RDP-Tcp' vs 'RDP-Tcp#0' differ by one character and a
+    #     name-based exemption is exactly the kind of broad excuse that would
+    #     hide a genuinely broken user session.
+    #
+    # Stage 3B7B-C1.
+    param([Parameter(Mandatory)][AllowNull()]$Session)
+
+    if ($null -eq $Session) { return $false }
+    $stateProp = $Session.PSObject.Properties['State']
+    if ($null -eq $stateProp -or $null -eq $stateProp.Value) { return $false }
+
+    return ([int]$stateProp.Value -eq $script:P9HWtsStateListen)
+}
+
 function Resolve-P9HWtsSessionTable {
     # Correlate an enumerated table with per-session WTSINFO facts.
     #
@@ -1240,12 +1268,38 @@ function Resolve-P9HWtsSessionTable {
     #   * WTSINFO supplies the per-record logon identity.
     #
     # Correlation rules, all fail-closed:
-    #   * every enumerated id must have a WTSINFO result whose id matches it;
+    #   * every enumerated id must be ACCOUNTED FOR - either correlated against
+    #     a WTSINFO record whose id matches, or explicitly classified a
+    #     WTSListen listener (see below);
     #   * a failed per-session query is recorded explicitly, never dropped;
-    #   * duplicate target records are ambiguous;
-    #   * the requested target must be present;
+    #   * duplicate records are ambiguous;
+    #   * the requested target must be present and must not be a listener;
     #   * a state that changes between the enumeration and the query is an
     #     evidence gap, not a successful transition.
+    #
+    # Stage 3B7B-C1 LISTENER CORRECTION
+    # ---------------------------------
+    # Stage 3B7B physically observed two WTSListen entries (session ids 65536 and
+    # 65537, station names '31C5CE94259D4006A9E4' and 'RDP-Tcp') alongside a real
+    # authenticated RDP session. WTSINFO cannot describe a listener, so both
+    # queries returned 'session-id-mismatch' and the resolver rejected the WHOLE
+    # table - even though the real session correlated perfectly. Capture
+    # authority was therefore False for an otherwise complete, consistent,
+    # genuinely authenticated observation.
+    #
+    # Listeners are now correlated as a DISTINCT class:
+    #   * no WTSINFO identity is REQUIRED for them, because none exists;
+    #   * a listener query failure is recorded as `ListenerDiagnostics` and does
+    #     NOT enter `Errors`, so it cannot reject the table;
+    #   * their id, station name and enumerated state are preserved verbatim, and
+    #     their metadata is explicitly attributed to the ENUMERATION (not
+    #     WTSINFO) via QuerySource='enumeration';
+    #   * a listener may never substitute for the target, and is never renderable
+    #     as a user session line.
+    #
+    # This is NOT a blanket excuse for high-numbered ids: the exemption applies
+    # only to sessions the enumeration itself reports in state WTSListen, and
+    # every non-listener session remains subject to the full identity contract.
     #
     # IMPORTANT LIMITATION, stated plainly: a sequence of sequential queries is
     # NOT an atomic Windows session snapshot. The table can change underneath the
@@ -1261,16 +1315,76 @@ function Resolve-P9HWtsSessionTable {
     $rows = [System.Collections.Generic.List[object]]::new()
     $errors = [System.Collections.Generic.List[string]]::new()
     $stateChanges = [System.Collections.Generic.List[string]]::new()
+    $listenerDiagnostics = [System.Collections.Generic.List[object]]::new()
 
     foreach ($session in @($EnumeratedSessions)) {
         $id = [int]$session.SessionId
         $query = if ($QueryResults.ContainsKey($id)) { $QueryResults[$id] } else { $null }
+        $isListener = Test-P9HWtsListenerSession -Session $session
 
+        # ---------------------------------------------------------------
+        # LISTENER ROWS
+        # ---------------------------------------------------------------
+        # A listener is recorded from the ENUMERATION alone. Any query outcome
+        # it produced is preserved as a diagnostic, separately from `Errors`,
+        # because a listener has no identity for WTSINFO to return - the
+        # inability to answer is expected, not a table defect.
+        if ($isListener) {
+            $diagReason = $null
+            $diagWin32 = $null
+            $diagDetail = $null
+            if ($null -eq $query) {
+                $diagReason = 'not-queried'
+            }
+            elseif (-not $query.Ok) {
+                $diagReason = [string]$query.Reason
+                if ($null -ne $query.PSObject.Properties['Win32Error'] -and $null -ne $query.Win32Error) {
+                    $diagWin32 = [int]$query.Win32Error
+                }
+                $diagDetail = [string]$query.Detail
+            }
+            else {
+                # A listener answered with a record. That is unexpected but not
+                # harmful: keep it visible without trusting it as identity.
+                $diagReason = 'listener-answered'
+                $diagDetail = ('WTSINFO unexpectedly returned for a WTSListen session (reported id {0})' -f [int]$query.Record.SessionId)
+            }
+
+            $listenerDiagnostics.Add([pscustomobject][ordered]@{
+                    SessionId    = $id
+                    StationName  = [string]$session.StationName
+                    State        = [int]$session.State
+                    StateName    = [string]$session.StateName
+                    QueryReason  = $diagReason
+                    Win32Error   = $diagWin32
+                    Detail       = $diagDetail
+                    QuerySource  = 'enumeration'
+                    IsListener   = $true
+                }) | Out-Null
+
+            $rows.Add([pscustomobject][ordered]@{
+                    SessionId = $id; StationName = [string]$session.StationName
+                    EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
+                    IsListener = $true
+                    QueryOk = $false; QueryReason = 'listener-no-identity'
+                    InfoSessionId = $null; InfoState = $null; InfoStateName = $null
+                    User = $null; LogonTime = $null; LogonSource = 'enumeration'
+                    SessionIdConsistent = $null; StateConsistent = $null
+                    Win32Error = $diagWin32
+                    Detail = $diagDetail
+                }) | Out-Null
+            continue
+        }
+
+        # ---------------------------------------------------------------
+        # NON-LISTENER ROWS: full fail-closed identity contract
+        # ---------------------------------------------------------------
         if ($null -eq $query) {
             $errors.Add(('{0}:not-queried' -f $id)) | Out-Null
             $rows.Add([pscustomobject][ordered]@{
                     SessionId = $id; StationName = [string]$session.StationName
                     EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
+                    IsListener = $false
                     QueryOk = $false; QueryReason = 'not-queried'
                     InfoSessionId = $null; InfoState = $null; InfoStateName = $null
                     User = $null; LogonTime = $null; LogonSource = $null
@@ -1288,6 +1402,7 @@ function Resolve-P9HWtsSessionTable {
             $rows.Add([pscustomobject][ordered]@{
                     SessionId = $id; StationName = [string]$session.StationName
                     EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
+                    IsListener = $false
                     QueryOk = $false; QueryReason = [string]$query.Reason
                     InfoSessionId = $null; InfoState = $null; InfoStateName = $null
                     User = $null; LogonTime = $null; LogonSource = $null
@@ -1312,6 +1427,7 @@ function Resolve-P9HWtsSessionTable {
         $rows.Add([pscustomobject][ordered]@{
                 SessionId = $id; StationName = [string]$session.StationName
                 EnumeratedState = [int]$session.State; EnumeratedStateName = [string]$session.StateName
+                IsListener = $false
                 QueryOk = $true; QueryReason = 'ok'
                 InfoSessionId = [int]$info.SessionId
                 InfoState = [int]$info.State; InfoStateName = [string]$info.StateName
@@ -1326,6 +1442,14 @@ function Resolve-P9HWtsSessionTable {
     $targets = @($rows | Where-Object { $_.SessionId -eq $TargetSessionId })
     $dupCheck = Find-P9HWtsDuplicateSessionId -Records @($EnumeratedSessions)
 
+    # Inventory accounting: the enumeration is COMPLETE (every entry is
+    # represented), while IDENTITY COVERAGE is complete only when every
+    # non-listener entry correlated. Keeping these separate is the whole point:
+    # "we saw every session" and "we have an identity for every user session"
+    # are different claims and must not be conflated.
+    $listenerRows = @($rows | Where-Object { $_.IsListener -eq $true })
+    $queryableRows = @($rows | Where-Object { $_.IsListener -ne $true })
+
     $targetOk = $false
     $targetReason = 'no-target'
     $targetRecord = $null
@@ -1338,6 +1462,12 @@ function Resolve-P9HWtsSessionTable {
     }
     elseif ($targets.Count -gt 1) {
         $targetReason = 'ambiguous-target'
+    }
+    elseif ($targets[0].IsListener -eq $true) {
+        # A listener is a connection endpoint, not a logged-on user. It can never
+        # stand in for the target, and asking for one is a caller error that must
+        # fail closed rather than resolve to a userless record.
+        $targetReason = 'target-is-listener'
     }
     elseif (-not $targets[0].QueryOk) {
         $targetReason = 'target-query-failed'
@@ -1388,6 +1518,18 @@ function Resolve-P9HWtsSessionTable {
         TargetReason      = $targetReason
         TargetRecord      = $targetRecord
         TargetStateChanged = $targetStateChanged
+        # ---- Stage 3B7B-C1 listener inventory ----
+        # `EnumeratedCount` is the COMPLETE inventory the enumeration reported.
+        # `IdentityCoveredCount` counts only sessions that actually correlated
+        # against WTSINFO, so listener metadata is never implied to be identity.
+        Listeners         = @($listenerRows)
+        ListenerCount     = $listenerRows.Count
+        ListenerDiagnostics = @($listenerDiagnostics)
+        QueryableCount    = $queryableRows.Count
+        EnumeratedCount   = $rows.Count
+        IdentityCoveredCount = @($queryableRows | Where-Object { $_.QueryOk -eq $true }).Count
+        ListenerExcludedFromIdentity = ($listenerRows.Count -gt 0)
+        ListenerMetadataSource = 'WTSEnumerateSessionsW (state=6 WTSListen); not WTSINFO'
         IsAtomicSnapshot  = $false
         AtomicityNote     = 'A sequence of sequential WTS queries is not an atomic session snapshot; a state change between the enumeration and a query is an evidence gap.'
     }
@@ -1422,9 +1564,17 @@ function New-P9HObserverRecordFromTableCapture {
     # capture stays 'ok' when the read itself succeeded - the rejection is
     # carried by captureAuthoritative/captureRejection instead - because
     # rewriting it to an error would misreport what the host actually did.
+    #
+    # Stage 3B7B-C1: `FailedCount` now counts only REQUIRED (non-listener)
+    # query failures, and `Win32Errors` carries only nonzero codes from failed
+    # queries, so an expected WTSListen limitation can no longer be reported as
+    # a provider error. A genuinely failed query still sets FailedCount>0 and
+    # therefore still produces 'provider-error'.
     $outcome = 'ok'
     $errorText = $null
-    if ([int]$Capture.FailedCount -gt 0 -or @($Capture.Win32Errors).Count -gt 0) {
+    $failedCount = if ($null -ne $Capture.PSObject.Properties['FailedCount']) { [int]$Capture.FailedCount } else { 0 }
+    $win32List = @(if ($null -ne $Capture.PSObject.Properties['Win32Errors']) { @($Capture.Win32Errors) })
+    if ($failedCount -gt 0 -or $win32List.Count -gt 0) {
         $outcome = 'provider-error'
         $errorText = if (-not [string]::IsNullOrWhiteSpace([string]$Capture.ResolverDetail)) {
             [string]$Capture.ResolverDetail
@@ -1440,7 +1590,11 @@ function New-P9HObserverRecordFromTableCapture {
         -CaptureAuthoritative ([bool]$Capture.Authoritative) `
         -CaptureAuthorityReason $(if ([string]::IsNullOrWhiteSpace([string]$Capture.RejectionReason)) { $null } else { [string]$Capture.RejectionReason }) `
         -CaptureRejection ([string]$Capture.RejectionReason) `
-        -CaptureWin32Errors @($Capture.Win32Errors)
+        -CaptureWin32Errors @($win32List) `
+        -ListenerCount $(if ($null -ne $Capture.PSObject.Properties['ListenerCount']) { $Capture.ListenerCount } else { $null }) `
+        -EnumeratedCount $(if ($null -ne $Capture.PSObject.Properties['EnumeratedCount']) { $Capture.EnumeratedCount } else { $null }) `
+        -IdentityCoveredCount $(if ($null -ne $Capture.PSObject.Properties['IdentityCoveredCount']) { $Capture.IdentityCoveredCount } else { $null }) `
+        -ListenerDiagnostics $(if ($null -ne $Capture.PSObject.Properties['ListenerDiagnostics']) { @($Capture.ListenerDiagnostics) } else { $null })
 }
 
 function Get-P9HWtsProviderTableCapture {
@@ -1478,6 +1632,10 @@ function Get-P9HWtsProviderTableCapture {
     $resolverDetail = $null
     $win32Errors = @()
     $targetStateChanged = $false
+    $listenerDiagnostics = @()
+    $listenerCount = 0
+    $enumeratedCount = 0
+    $identityCoveredCount = 0
 
     if ($null -ne $Result) {
         $rowsIn = @($Result.Rows)
@@ -1499,10 +1657,34 @@ function Get-P9HWtsProviderTableCapture {
             else { 'resolver-rejected:' + $resolverReason }
         }
 
-        # Preserve Win32 diagnostics for any failed per-session query.
+        # Preserve Win32 diagnostics for FAILED per-session queries only.
+        #
+        # Stage 3B7B-C1 correction: the previous predicate kept every non-null
+        # Win32Error, but `Invoke-P9HWtsSessionQuery` returns Win32Error=0 on
+        # SUCCESS. The array was therefore populated with zeros for a completely
+        # clean table, and New-P9HObserverRecordFromTableCapture interprets a
+        # nonempty array as a provider failure - so a perfect real capture could
+        # never become authoritative evidence.
+        #
+        # Zero means "no error" by definition, so it is excluded here. This is
+        # NOT a blanket filter of the array: a query is only consulted when it
+        # actually failed (QueryOk=false), and within that only a NONZERO code is
+        # recorded - a failed query with Win32 0 still fails closed through
+        # QueryOk/FailedCount, and a nonzero code is never dropped.
         $win32Errors = @(foreach ($r in @($Result.Rows)) {
-                if ($null -ne $r.PSObject.Properties['Win32Error'] -and $null -ne $r.Win32Error) { [int]$r.Win32Error }
+                if ($r.QueryOk -eq $true) { continue }
+                if ($null -eq $r.PSObject.Properties['Win32Error']) { continue }
+                if ($null -eq $r.Win32Error) { continue }
+                $code = [int]$r.Win32Error
+                if ($code -ne 0) { $code }
             })
+
+        # Stage 3B7B-C1 listener inventory, carried through so a consumer can
+        # tell COMPLETE ENUMERATION from COMPLETE IDENTITY COVERAGE.
+        $listenerDiagnostics = @($Result.ListenerDiagnostics)
+        $listenerCount = [int]$Result.ListenerCount
+        $enumeratedCount = [int]$Result.EnumeratedCount
+        $identityCoveredCount = [int]$Result.IdentityCoveredCount
     }
     elseif ($null -ne $Rows) {
         $rowsIn = @($Rows)
@@ -1529,13 +1711,30 @@ function Get-P9HWtsProviderTableCapture {
     foreach ($row in @($rowsIn)) {
         if ($null -eq $row) { continue }
 
+        # ---- LISTENER ROWS (Stage 3B7B-C1) ----
+        # A WTSListen entry is a connection endpoint with no user identity. It is
+        # NOT a failed query and it is NOT a renderable user session:
+        #   * it never enters `FailedQueries`, so an expected listener limitation
+        #     cannot masquerade as a provider error;
+        #   * it never becomes a `Lines` entry, because a line asserts a user
+        #     session state we do not have evidence for;
+        #   * it is preserved in `ListenerRows` with its full enumeration
+        #     provenance, so nothing observed is silently discarded.
+        if ($row.PSObject.Properties['IsListener'] -and $row.IsListener -eq $true) {
+            $targets.Add([pscustomobject]@{
+                    SessionId = [int]$row.SessionId; QueryOk = $false; Rendered = $false
+                    IsListener = $true; Row = $row
+                }) | Out-Null
+            continue
+        }
+
         if (-not $row.QueryOk) {
             # A failed per-session query is preserved explicitly. It is NOT
             # rendered as a line, because a line would assert a state we do not
             # have evidence for.
             $failed.Add($row) | Out-Null
             if ([int]$row.SessionId -eq $TargetSessionId) {
-                $targets.Add([pscustomobject]@{ SessionId = [int]$row.SessionId; QueryOk = $false; Rendered = $false; Row = $row }) | Out-Null
+                $targets.Add([pscustomobject]@{ SessionId = [int]$row.SessionId; QueryOk = $false; Rendered = $false; IsListener = $false; Row = $row }) | Out-Null
             }
             continue
         }
@@ -1554,7 +1753,7 @@ function Get-P9HWtsProviderTableCapture {
         $lines.Add((ConvertTo-P9HWtsProviderLine -Record $record)) | Out-Null
 
         if ([int]$row.SessionId -eq $TargetSessionId) {
-            $targets.Add([pscustomobject]@{ SessionId = [int]$row.SessionId; QueryOk = $true; Rendered = $true; Row = $row }) | Out-Null
+            $targets.Add([pscustomobject]@{ SessionId = [int]$row.SessionId; QueryOk = $true; Rendered = $true; IsListener = $false; Row = $row }) | Out-Null
         }
     }
 
@@ -1577,6 +1776,15 @@ function Get-P9HWtsProviderTableCapture {
         RowCount         = @($rowsIn).Count
         TargetSessionId  = $TargetSessionId
         IsAtomicSnapshot = $false
+        # ---- Stage 3B7B-C1 listener inventory ----
+        # `EnumeratedCount` = complete inventory; `IdentityCoveredCount` = sessions
+        # that actually produced a WTSINFO identity. They differ exactly by the
+        # listeners, and that difference is disclosed rather than hidden.
+        ListenerCount        = $listenerCount
+        EnumeratedCount      = $enumeratedCount
+        IdentityCoveredCount = $identityCoveredCount
+        ListenerDiagnostics  = @($listenerDiagnostics)
+        ListenerMetadataSource = 'WTSEnumerateSessionsW (state=6 WTSListen); not WTSINFO'
     }
 }
 

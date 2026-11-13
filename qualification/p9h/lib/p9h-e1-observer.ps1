@@ -35,6 +35,9 @@ $script:P9HWtsStateName = @{
 
 $script:P9HWtsStateDisconnected = 4
 $script:P9HWtsStateActive = 0
+# WTSListen: a connection listener that accepts sessions but has no logged-on
+# user, so it has no WTSINFO identity to return. Stage 3B7B-C1.
+$script:P9HWtsStateListen = 6
 
 # Identity strength. 'full' requires a verified logon time; 'degraded' is
 # usable ONLY for non-authoritative observations and can never satisfy a PASS.
@@ -393,7 +396,21 @@ function New-P9HObserverRecord {
         [AllowNull()][object]$CaptureAuthoritative = $null,
         [AllowNull()][string]$CaptureAuthorityReason = $null,
         [AllowNull()][string]$CaptureRejection = $null,
-        [AllowNull()][AllowEmptyCollection()][int[]]$CaptureWin32Errors = $null
+        [AllowNull()][AllowEmptyCollection()][int[]]$CaptureWin32Errors = $null,
+        # Stage 3B7B-C1 listener inventory (optional, bounded extension).
+        #
+        # A complete ENUMERATION may legitimately contain WTSListen entries that
+        # have no WTSINFO identity. Recording them separates two claims that must
+        # never be conflated:
+        #   * enumeratedCount      - how many sessions the enumeration reported;
+        #   * identityCoveredCount - how many of those produced a WTSINFO identity.
+        # The difference is exactly the listeners, and it is disclosed here rather
+        # than hidden. These fields are METADATA ONLY: they are not consulted by
+        # the authority predicate below, so no acceptance rule is weakened.
+        [AllowNull()][object]$ListenerCount = $null,
+        [AllowNull()][object]$EnumeratedCount = $null,
+        [AllowNull()][object]$IdentityCoveredCount = $null,
+        [AllowNull()][AllowEmptyCollection()][object[]]$ListenerDiagnostics = $null
     )
 
     $table = ConvertFrom-P9HWtsTable -Lines $RawWtsLines
@@ -470,6 +487,33 @@ function New-P9HObserverRecord {
         identityStrength = if ($target.Ok -and -not [string]::IsNullOrWhiteSpace([string]$target.Record.LogonTime)) { 'full' } else { 'degraded' }
         quser            = $QuserText
         corroboration    = $Corroboration
+    }
+
+    # Stage 3B7B-C1: record the listener inventory when the caller supplied it.
+    # Bounded extension - the fields are additive, carry enumeration provenance,
+    # and do not participate in the authority predicate above.
+    if ($null -ne $ListenerCount -or $null -ne $EnumeratedCount -or $null -ne $IdentityCoveredCount) {
+        $record['listenerCount'] = if ($null -ne $ListenerCount) { [int]$ListenerCount } else { $null }
+        $record['enumeratedCount'] = if ($null -ne $EnumeratedCount) { [int]$EnumeratedCount } else { $null }
+        $record['identityCoveredCount'] = if ($null -ne $IdentityCoveredCount) { [int]$IdentityCoveredCount } else { $null }
+        $record['enumeratedCountExceedsIdentity'] = if ($null -ne $EnumeratedCount -and $null -ne $IdentityCoveredCount) {
+            ([int]$EnumeratedCount -gt [int]$IdentityCoveredCount)
+        }
+        else { $null }
+    }
+    if ($null -ne $ListenerDiagnostics) {
+        $record['listenerDiagnostics'] = @($ListenerDiagnostics | ForEach-Object {
+                [ordered]@{
+                    sessionId   = [int]$_.SessionId
+                    stationName = [string]$_.StationName
+                    state       = [int]$_.State
+                    stateName   = [string]$_.StateName
+                    queryReason = [string]$_.QueryReason
+                    win32Error  = $_.Win32Error
+                    querySource = [string]$_.QuerySource
+                }
+            })
+        $record['listenerMetadataSource'] = 'WTSEnumerateSessionsW (state=6 WTSListen); not WTSINFO'
     }
 
     return ($record | ConvertTo-Json -Compress -Depth 6)

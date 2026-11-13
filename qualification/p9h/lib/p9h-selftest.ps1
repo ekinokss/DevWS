@@ -3111,6 +3111,439 @@ function Invoke-P9HAuthorityOmissionTests {
         -Pass ($u6Wait.Proven -and $u6Recs.Count -gt 0 -and $u6Recs[0].captureAuthoritative) -Evidence $u6Log
 }
 
+function Invoke-P9HWtsListenerAuthorityTests {
+    # L-series: listener-aware WTS authority + Win32-zero classification
+    # (Stage 3B7B-C1).
+    #
+    # Stage 3B7B physically established a genuine authenticated RDP session
+    # (id 2, RDP-Tcp#0, Active) alongside two WTSListen pseudo-sessions that
+    # WTSINFO cannot describe. The resolver rejected the WHOLE table, so a real
+    # observation could never be authoritative. Independently, a SUCCESSFUL
+    # native query reports Win32Error=0, and that zero was collected as a
+    # provider error, denying authority to a perfectly clean capture.
+    #
+    # These cases pin both corrections and, just as importantly, pin every
+    # fail-closed rule they must not weaken.
+    #
+    # Everything here is SYNTHETIC native-shaped data. No VM is contacted and no
+    # live WTS call is made.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $logonUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 13, 15, 46, 27), [System.DateTimeKind]::Utc)
+    $logonFt = $logonUtc.ToFileTimeUtc()
+    $logonIso = $logonUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    $user = 'P9HNODE\p9hadmin'
+    $shortUser = 'p9hadmin'
+
+    function New-LQueryOk([int]$Sid, [int]$State, [string]$Station, [string]$UserName, [long]$Ft) {
+        $rec = (ConvertFrom-P9HWtsInfoPayload -Payload (New-P9HWtsInfoPayload -SessionId $Sid -State $State `
+                    -StationName $Station -Domain 'P9HNODE' -UserName $UserName -LogonTime $Ft)).Record
+        return [pscustomobject]@{ Ok = $true; Reason = 'ok'; Detail = $null; Record = $rec; Win32Error = 0 }
+    }
+    function New-LQueryListenerMismatch([int]$Sid) {
+        return [pscustomobject]@{
+            Ok = $false; Reason = 'session-id-mismatch'
+            Detail = ('requested session {0} but WTSINFO reported 0' -f $Sid)
+            Record = $null; Win32Error = 0
+        }
+    }
+    function New-LEnum([object[]]$Spec) {
+        $p = New-P9HWtsSessionInfoPayload -Sessions $Spec
+        return (ConvertFrom-P9HWtsSessionInfoPayload -Payload $p.Payload -ReportedCount $p.ReportedCount -Layout $p.Layout).Records
+    }
+
+    # The exact physical shape Stage 3B7B observed.
+    $fullSpec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 0 }
+        @{ SessionId = 65536; StationName = '31C5CE94259D4006A9E4'; State = 6 }
+        @{ SessionId = 65537; StationName = 'RDP-Tcp'; State = 6 }
+    )
+    $fullEnum = New-LEnum $fullSpec
+    $servicesQ = New-LQueryOk 0 4 'Services' '' 0
+    $targetQ = New-LQueryOk 2 0 'RDP-Tcp#0' $shortUser $logonFt
+    $fullQueries = @{
+        0     = $servicesQ
+        2     = $targetQ
+        65536 = New-LQueryListenerMismatch 65536
+        65537 = New-LQueryListenerMismatch 65537
+    }
+
+    # ---- L1: complete table with listeners resolves and authorizes ----
+    $l1Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $fullQueries -TargetSessionId 2
+    $l1Capture = Get-P9HWtsProviderTableCapture -Result $l1Resolved -TargetSessionId 2
+    Add-P9HTestResult -Id 'L1' -Title 'Complete table with two WTSListen entries resolves authoritatively' `
+        -Input 'sessions 0 (Services,4), 2 (RDP-Tcp#0,0 Active), 65536 + 65537 (Listen,6)' `
+        -Expected 'resolver Ok=true, TargetOk=true, capture Authoritative=true, 0 errors' `
+        -Actual ("resOk={0} reason={1} targetOk={2} errors={3} auth={4} lines={5} listeners={6}" -f `
+            $l1Resolved.Ok, $l1Resolved.Reason, $l1Resolved.TargetOk, @($l1Resolved.Errors).Count, `
+            $l1Capture.Authoritative, $l1Capture.LineCount, $l1Resolved.ListenerCount) `
+        -Pass ($l1Resolved.Ok -and $l1Resolved.Reason -eq 'ok' -and $l1Resolved.TargetOk -and @($l1Resolved.Errors).Count -eq 0 -and $l1Capture.Authoritative -and $l1Capture.LineCount -eq 2 -and $l1Resolved.ListenerCount -eq 2) -Evidence $null
+
+    # ---- L2: both listeners unavailable for WTSINFO, recorded as diagnostics only ----
+    Add-P9HTestResult -Id 'L2' -Title 'Listener WTSINFO unavailability is a diagnostic, not a table error' `
+        -Input 'listener queries both return session-id-mismatch (Win32 0)' `
+        -Expected 'ListenerDiagnostics=2 preserved, Errors=0, each diagnostic attributed to the enumeration' `
+        -Actual ("diag={0} errs={1} reasons={2} sources={3}" -f `
+            @($l1Resolved.ListenerDiagnostics).Count, @($l1Resolved.Errors).Count, `
+            (@($l1Resolved.ListenerDiagnostics | ForEach-Object { $_.QueryReason }) -join ','), `
+            (@($l1Resolved.ListenerDiagnostics | ForEach-Object { $_.QuerySource }) -join ',')) `
+        -Pass (@($l1Resolved.ListenerDiagnostics).Count -eq 2 -and @($l1Resolved.Errors).Count -eq 0 -and
+            @($l1Resolved.ListenerDiagnostics | Where-Object { $_.QueryReason -eq 'session-id-mismatch' }).Count -eq 2 -and
+            @($l1Resolved.ListenerDiagnostics | Where-Object { $_.QuerySource -eq 'enumeration' }).Count -eq 2) -Evidence $null
+
+    # ---- L3: listener metadata survives with full enumeration provenance ----
+    $l3Ids = (@($l1Resolved.Listeners | ForEach-Object { [int]$_.SessionId }) | Sort-Object) -join ','
+    $l3Stations = (@($l1Resolved.Listeners | ForEach-Object { [string]$_.StationName }) -join ',')
+    Add-P9HTestResult -Id 'L3' -Title 'Listener id, station name and state are preserved verbatim' `
+        -Input 'two listeners with distinct station names' `
+        -Expected 'ids 65536,65537 preserved; station names preserved; all state=6' `
+        -Actual ("ids=[{0}] stations=[{1}] states=[{2}] source={3}" -f $l3Ids, $l3Stations,
+            (@($l1Resolved.Listeners | ForEach-Object { [int]$_.EnumeratedState }) -join ','), [string]$l1Resolved.ListenerMetadataSource) `
+        -Pass ($l3Ids -eq '65536,65537' -and $l3Stations -eq '31C5CE94259D4006A9E4,RDP-Tcp' -and
+            @($l1Resolved.Listeners | Where-Object { $_.EnumeratedState -ne 6 }).Count -eq 0 -and
+            [string]$l1Resolved.ListenerMetadataSource -like '*not WTSINFO*') -Evidence $null
+
+    # ---- L4: enumeration completeness is distinguished from identity coverage ----
+    Add-P9HTestResult -Id 'L4' -Title 'Complete enumeration is not conflated with complete identity coverage' `
+        -Input '4 enumerated entries, 2 with WTSINFO identity' `
+        -Expected 'EnumeratedCount=4, IdentityCoveredCount=2, QueryableCount=2, ListenerCount=2' `
+        -Actual ("enumerated={0} identity={1} queryable={2} listeners={3}" -f `
+            $l1Resolved.EnumeratedCount, $l1Resolved.IdentityCoveredCount, $l1Resolved.QueryableCount, $l1Resolved.ListenerCount) `
+        -Pass ($l1Resolved.EnumeratedCount -eq 4 -and $l1Resolved.IdentityCoveredCount -eq 2 -and
+            $l1Resolved.QueryableCount -eq 2 -and $l1Resolved.ListenerCount -eq 2 -and
+            $l1Resolved.ListenerExcludedFromIdentity -eq $true) -Evidence $null
+
+    # ---- L5: valid target Active with listeners present ----
+    Add-P9HTestResult -Id 'L5' -Title 'An Active target resolves correctly alongside listeners' `
+        -Input 'target session 2 Active, two listeners present' `
+        -Expected 'TargetOk=true, target record id=2, state 0, identity pinned' `
+        -Actual ("targetOk={0} reason={1} id={2} state={3} user={4} logon={5}" -f `
+            $l1Resolved.TargetOk, $l1Resolved.TargetReason, [int]$l1Resolved.TargetRecord.SessionId,
+            [int]$l1Resolved.TargetRecord.InfoState, [string]$l1Resolved.TargetRecord.User, [string]$l1Resolved.TargetRecord.LogonTime) `
+        -Pass ($l1Resolved.TargetOk -and [int]$l1Resolved.TargetRecord.SessionId -eq 2 -and
+            [int]$l1Resolved.TargetRecord.InfoState -eq 0 -and [string]$l1Resolved.TargetRecord.User -eq $user -and
+            [string]$l1Resolved.TargetRecord.LogonTime -eq $logonIso) -Evidence $null
+
+    # ---- L6: valid target Disconnected with listeners present ----
+    $l6Spec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 4 }
+        @{ SessionId = 65536; StationName = '31C5CE94259D4006A9E4'; State = 6 }
+        @{ SessionId = 65537; StationName = 'RDP-Tcp'; State = 6 }
+    )
+    $l6Enum = New-LEnum $l6Spec
+    $l6Queries = @{
+        0     = $servicesQ
+        2     = New-LQueryOk 2 4 'RDP-Tcp#0' $shortUser $logonFt
+        65536 = New-LQueryListenerMismatch 65536
+        65537 = New-LQueryListenerMismatch 65537
+    }
+    $l6Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $l6Enum -QueryResults $l6Queries -TargetSessionId 2
+    $l6Capture = Get-P9HWtsProviderTableCapture -Result $l6Resolved -TargetSessionId 2
+    $l6Parsed = ConvertFrom-P9HWtsTable -Lines $l6Capture.Lines
+    $l6Judged = Test-P9HTargetDisconnected -Records $l6Parsed.Records -SessionId 2 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'L6' -Title 'A genuinely Disconnected target with listeners present yields disconnect evidence' `
+        -Input 'target session 2 state 4, listeners still present' `
+        -Expected 'resolver Ok, capture authoritative, target Disconnected=true' `
+        -Actual ("resOk={0} auth={1} disc={2} reason={3}" -f $l6Resolved.Ok, $l6Capture.Authoritative, $l6Judged.Disconnected, $l6Judged.Reason) `
+        -Pass ($l6Resolved.Ok -and $l6Capture.Authoritative -and $l6Judged.Disconnected -and
+            $null -ne $l6Judged.Record -and [int]$l6Judged.Record.SessionId -eq 2) -Evidence $null
+
+    # ---- L7: a listener cannot substitute for the target ----
+    $l7Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $fullQueries -TargetSessionId 65536
+    $l7Capture = Get-P9HWtsProviderTableCapture -Result $l7Resolved -TargetSessionId 65536
+    Add-P9HTestResult -Id 'L7' -Title 'A listener can never be resolved as the target session' `
+        -Input 'target session id pinned to a WTSListen entry (65536)' `
+        -Expected 'TargetOk=false reason=target-is-listener, capture not authoritative' `
+        -Actual ("targetOk={0} reason={1} capAuth={2}" -f $l7Resolved.TargetOk, $l7Resolved.TargetReason, $l7Capture.Authoritative) `
+        -Pass ((-not $l7Resolved.TargetOk) -and $l7Resolved.TargetReason -eq 'target-is-listener' -and (-not $l7Capture.Authoritative)) -Evidence $null
+
+    # ---- L8: a listener cannot authorize reconnect ----
+    $l8Dir = Join-Path $SandboxRoot 'l8-listener-proof'
+    New-Item -ItemType Directory -Path $l8Dir -Force | Out-Null
+    $l8Log = Join-Path $l8Dir 'observer.jsonl'
+    # A listener-shaped "record" is written as the ONLY post observation: state 6
+    # with no user. It must never satisfy Proof A.
+    $l8Pre = New-P9HObserverRecordFromTableCapture -Capture $l1Capture -TrialId 'l8-trial' -Sequence 1 -Phase 'pre' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    Add-P9HArtifactLine -Path $l8Log -Line $l8Pre
+    $l8ListenerLine = '65536|RDP-Tcp|state=6|user='
+    $l8Disc = New-P9HObserverRecord -TrialId 'l8-trial' -Sequence 2 -Phase 'disconnect-observed' `
+        -RawWtsLines @($l8ListenerLine) -TargetSessionId 2 -TargetUser $user -TargetLogonTime $logonIso `
+        -CaptureAuthoritative $true
+    Add-P9HArtifactLine -Path $l8Log -Line $l8Disc
+    $l8Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $l8Log -TrialId 'l8-trial' `
+        -SessionId 2 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'L8' -Title 'A listener observation cannot authorize reconnect' `
+        -Input 'pre=authoritative Active, later observation contains only a Listen row' `
+        -Expected 'Proof A not proven (no state-4 record for the pinned target)' `
+        -Actual ("proven={0} reason={1}" -f $l8Proof.Proven, [string]$l8Proof.Reason) `
+        -Pass ((-not $l8Proof.Proven)) -Evidence $l8Log
+
+    # ---- L9: duplicate ids involving a listener fail closed ----
+    $l9Spec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 0 }
+        @{ SessionId = 65536; StationName = '31C5CE94259D4006A9E4'; State = 6 }
+        @{ SessionId = 65536; StationName = 'RDP-Tcp'; State = 6 }
+    )
+    $l9Enum = New-LEnum $l9Spec
+    $l9Queries = @{
+        0     = $servicesQ
+        2     = $targetQ
+        65536 = New-LQueryListenerMismatch 65536
+    }
+    $l9Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $l9Enum -QueryResults $l9Queries -TargetSessionId 2
+    $l9Capture = Get-P9HWtsProviderTableCapture -Result $l9Resolved -TargetSessionId 2
+    Add-P9HTestResult -Id 'L9' -Title 'Duplicate session ids involving listeners fail closed' `
+        -Input 'two listeners both enumerated as session 65536' `
+        -Expected 'Ok=false, ambiguous-enumeration, capture not authoritative' `
+        -Actual ("ok={0} reason={1} targetOk={2} dups=[{3}] capAuth={4}" -f `
+            $l9Resolved.Ok, $l9Resolved.Reason, $l9Resolved.TargetOk, (@($l9Resolved.DuplicateSessionIds) -join ','), $l9Capture.Authoritative) `
+        -Pass ((-not $l9Resolved.Ok) -and $l9Resolved.Reason -eq 'ambiguous-enumeration' -and
+            @($l9Resolved.DuplicateSessionIds) -contains 65536 -and (-not $l9Capture.Authoritative)) -Evidence $null
+
+    # ---- L10: target id absent fails closed ----
+    $l10Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $fullQueries -TargetSessionId 9
+    $l10Capture = Get-P9HWtsProviderTableCapture -Result $l10Resolved -TargetSessionId 9
+    Add-P9HTestResult -Id 'L10' -Title 'An absent target fails closed even with listeners accounted for' `
+        -Input 'pinned target session 9 not in a complete listener-aware table' `
+        -Expected 'TargetOk=false reason=no-target, capture not authoritative' `
+        -Actual ("targetOk={0} reason={1} capAuth={2}" -f $l10Resolved.TargetOk, $l10Resolved.TargetReason, $l10Capture.Authoritative) `
+        -Pass ((-not $l10Resolved.TargetOk) -and $l10Resolved.TargetReason -eq 'no-target' -and (-not $l10Capture.Authoritative)) -Evidence $null
+
+    # ---- L11: a failed SESSION 0 query still rejects ----
+    $l11Queries = @{
+        0     = [pscustomobject]@{ Ok = $false; Reason = 'native-query-failed'; Detail = 'WTSQuerySessionInformationW failed (Win32 5)'; Record = $null; Win32Error = 5 }
+        2     = $targetQ
+        65536 = New-LQueryListenerMismatch 65536
+        65537 = New-LQueryListenerMismatch 65537
+    }
+    $l11Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $l11Queries -TargetSessionId 2
+    $l11Capture = Get-P9HWtsProviderTableCapture -Result $l11Resolved -TargetSessionId 2
+    Add-P9HTestResult -Id 'L11' -Title 'A failed session-0 WTSINFO query still rejects the table' `
+        -Input 'session 0 query fails Win32 5, listeners present, target fine' `
+        -Expected 'Ok=false incomplete-session-table, capture not authoritative, Win32 5 preserved' `
+        -Actual ("ok={0} reason={1} capAuth={2} win32=[{3}]" -f $l11Resolved.Ok, $l11Resolved.Reason, $l11Capture.Authoritative, (@($l11Capture.Win32Errors) -join ',')) `
+        -Pass ((-not $l11Resolved.Ok) -and $l11Resolved.Reason -eq 'incomplete-session-table' -and
+            (-not $l11Capture.Authoritative) -and (@($l11Capture.Win32Errors) -contains 5)) -Evidence $null
+
+    # ---- L12: a failed non-target, NON-listener query still rejects ----
+    $l12Spec = @(
+        @{ SessionId = 0; StationName = 'Services'; State = 4 }
+        @{ SessionId = 2; StationName = 'RDP-Tcp#0'; State = 0 }
+        @{ SessionId = 3; StationName = 'RDP-Tcp#1'; State = 1 }
+        @{ SessionId = 65536; StationName = '31C5CE94259D4006A9E4'; State = 6 }
+    )
+    $l12Enum = New-LEnum $l12Spec
+    $l12Queries = @{
+        0     = $servicesQ
+        2     = $targetQ
+        3     = [pscustomobject]@{ Ok = $false; Reason = 'native-query-failed'; Detail = 'WTSQuerySessionInformationW failed (Win32 5)'; Record = $null; Win32Error = 5 }
+        65536 = New-LQueryListenerMismatch 65536
+    }
+    $l12Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $l12Enum -QueryResults $l12Queries -TargetSessionId 2
+    $l12Capture = Get-P9HWtsProviderTableCapture -Result $l12Resolved -TargetSessionId 2
+    Add-P9HTestResult -Id 'L12' -Title 'A failed non-target non-listener query still rejects the table' `
+        -Input 'real session 3 fails while listeners are excused' `
+        -Expected 'Ok=false incomplete-session-table, capture not authoritative' `
+        -Actual ("ok={0} reason={1} capAuth={2} failed={3}" -f $l12Resolved.Ok, $l12Resolved.Reason, $l12Capture.Authoritative, $l12Capture.FailedCount) `
+        -Pass ((-not $l12Resolved.Ok) -and $l12Resolved.Reason -eq 'incomplete-session-table' -and
+            (-not $l12Capture.Authoritative) -and $l12Capture.FailedCount -eq 1) -Evidence $null
+
+    # ---- L13: wrong user / logon identity still rejects ----
+    $l13Queries = @{
+        0     = $servicesQ
+        2     = New-LQueryOk 2 0 'RDP-Tcp#0' 'someoneelse' $logonFt
+        65536 = New-LQueryListenerMismatch 65536
+        65537 = New-LQueryListenerMismatch 65537
+    }
+    $l13Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $l13Queries -TargetSessionId 2
+    $l13Capture = Get-P9HWtsProviderTableCapture -Result $l13Resolved -TargetSessionId 2
+    $l13Parsed = ConvertFrom-P9HWtsTable -Lines $l13Capture.Lines
+    $l13Match = Get-P9HTargetSessionRecord -Records $l13Parsed.Records -SessionId 2 -User $user -LogonTime $logonIso -RequireLogonTime
+    # Wrong logon time (same user) must also fail.
+    $l13bQueries = @{ 0 = $servicesQ; 2 = (New-LQueryOk 2 0 'RDP-Tcp#0' $shortUser ($logonFt - 36000000000)); 65536 = (New-LQueryListenerMismatch 65536); 65537 = (New-LQueryListenerMismatch 65537) }
+    $l13bResolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $l13bQueries -TargetSessionId 2
+    $l13bCapture = Get-P9HWtsProviderTableCapture -Result $l13bResolved -TargetSessionId 2
+    $l13bParsed = ConvertFrom-P9HWtsTable -Lines $l13bCapture.Lines
+    $l13bMatch = Get-P9HTargetSessionRecord -Records $l13bParsed.Records -SessionId 2 -User $user -LogonTime $logonIso -RequireLogonTime
+    Add-P9HTestResult -Id 'L13' -Title 'Wrong user or wrong logon time still rejects the pinned identity' `
+        -Input 'user mismatch case and logon-time mismatch case, listeners present' `
+        -Expected 'both fail closed (user-mismatch / logon mismatch)' `
+        -Actual ("userMatchOk={0} reason={1} logonMatchOk={2} reason={3}" -f $l13Match.Ok, $l13Match.Reason, $l13bMatch.Ok, $l13bMatch.Reason) `
+        -Pass ((-not $l13Match.Ok) -and $l13Match.Reason -eq 'user-mismatch' -and (-not $l13bMatch.Ok)) -Evidence $null
+
+    # ---- L14: genuine target state inconsistency still rejects ----
+    $l14Queries = @{
+        0     = $servicesQ
+        2     = New-LQueryOk 2 4 'RDP-Tcp#0' $shortUser $logonFt   # enumerated Active, WTSINFO Disconnected
+        65536 = New-LQueryListenerMismatch 65536
+        65537 = New-LQueryListenerMismatch 65537
+    }
+    $l14Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $l14Queries -TargetSessionId 2
+    $l14Capture = Get-P9HWtsProviderTableCapture -Result $l14Resolved -TargetSessionId 2
+    Add-P9HTestResult -Id 'L14' -Title 'A genuine target state change during collection still rejects' `
+        -Input 'enumerated Active but WTSINFO reports Disconnected for the target' `
+        -Expected 'Ok=false state-changed-during-collection, capture not authoritative' `
+        -Actual ("ok={0} reason={1} targetStateChanged={2} capAuth={3}" -f `
+            $l14Resolved.Ok, $l14Resolved.Reason, $l14Resolved.TargetStateChanged, $l14Capture.Authoritative) `
+        -Pass ((-not $l14Resolved.Ok) -and $l14Resolved.Reason -eq 'state-changed-during-collection' -and
+            (-not $l14Capture.Authoritative)) -Evidence $null
+
+    # ---- L15: Win32Error=0 from a successful query is not a provider error ----
+    $l15Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $fullQueries -TargetSessionId 2
+    $l15Capture = Get-P9HWtsProviderTableCapture -Result $l15Resolved -TargetSessionId 2
+    $l15Json = New-P9HObserverRecordFromTableCapture -Capture $l15Capture -TrialId 'l15-trial' -Sequence 1 -Phase 'pre' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    $l15Rec = $l15Json | ConvertFrom-Json
+    Add-P9HTestResult -Id 'L15' -Title 'A successful query with Win32Error=0 does not create a provider error' `
+        -Input 'listener-aware complete table, every required query Ok=true Win32Error=0' `
+        -Expected 'capture.Win32Errors empty, observer captureOutcome=ok, captureAuthoritative=true' `
+        -Actual ("win32=[{0}] outcome={1} auth={2} listenerLifted={3}" -f `
+            (@($l15Capture.Win32Errors) -join ','), $l15Rec.captureOutcome, $l15Rec.captureAuthoritative, $l15Rec.listenerCount) `
+        -Pass (@($l15Capture.Win32Errors).Count -eq 0 -and $l15Rec.captureOutcome -eq 'ok' -and
+            $l15Rec.captureAuthoritative -eq $true -and $l15Rec.listenerCount -eq 2) -Evidence $null
+
+    # ---- L16: a FAILED query carrying Win32 0 still fails closed ----
+    $l16Queries = @{
+        0     = [pscustomobject]@{ Ok = $false; Reason = 'empty-native-response'; Detail = 'no bytes returned'; Record = $null; Win32Error = 0 }
+        2     = $targetQ
+        65536 = New-LQueryListenerMismatch 65536
+        65537 = New-LQueryListenerMismatch 65537
+    }
+    $l16Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $l16Queries -TargetSessionId 2
+    $l16Capture = Get-P9HWtsProviderTableCapture -Result $l16Resolved -TargetSessionId 2
+    $l16Rec = (New-P9HObserverRecordFromTableCapture -Capture $l16Capture -TrialId 'l16-trial' -Sequence 1 -Phase 'pre' `
+            -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE') | ConvertFrom-Json
+    Add-P9HTestResult -Id 'L16' -Title 'A failed query with Win32 zero still fails closed' `
+        -Input 'session 0 query Ok=false with Win32Error=0' `
+        -Expected 'resolver rejected, observer captureOutcome=provider-error, not authoritative' `
+        -Actual ("ok={0} reason={1} failed={2} outcome={3} auth={4}" -f `
+            $l16Resolved.Ok, $l16Resolved.Reason, $l16Capture.FailedCount, $l16Rec.captureOutcome, $l16Rec.captureAuthoritative) `
+        -Pass ((-not $l16Resolved.Ok) -and $l16Capture.FailedCount -eq 1 -and
+            $l16Rec.captureOutcome -eq 'provider-error' -and $l16Rec.captureAuthoritative -eq $false) -Evidence $null
+
+    # ---- L17: a real nonzero Win32 error is preserved AND blocks authority ----
+    $l17Queries = @{
+        0     = [pscustomobject]@{ Ok = $false; Reason = 'native-query-failed'; Detail = 'access denied'; Record = $null; Win32Error = 5 }
+        2     = $targetQ
+        65536 = New-LQueryListenerMismatch 65536
+        65537 = New-LQueryListenerMismatch 65537
+    }
+    $l17Resolved = Resolve-P9HWtsSessionTable -EnumeratedSessions $fullEnum -QueryResults $l17Queries -TargetSessionId 2
+    $l17Capture = Get-P9HWtsProviderTableCapture -Result $l17Resolved -TargetSessionId 2
+    $l17Rec = (New-P9HObserverRecordFromTableCapture -Capture $l17Capture -TrialId 'l17-trial' -Sequence 1 -Phase 'pre' `
+            -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE') | ConvertFrom-Json
+    Add-P9HTestResult -Id 'L17' -Title 'A real nonzero Win32 error is preserved and blocks authority' `
+        -Input 'session 0 query fails Win32 5' `
+        -Expected 'captureWin32Errors contains 5, observer provider-error, not authoritative' `
+        -Actual ("win32=[{0}] outcome={1} auth={2}" -f (@($l17Rec.captureWin32Errors) -join ','), $l17Rec.captureOutcome, $l17Rec.captureAuthoritative) `
+        -Pass ((@($l17Rec.captureWin32Errors) -contains 5) -and $l17Rec.captureOutcome -eq 'provider-error' -and $l17Rec.captureAuthoritative -eq $false) -Evidence $null
+
+    # ---- L18: listener metadata survives evidence serialization / read-back ----
+    $l18Dir = Join-Path $SandboxRoot 'l18-serialize'
+    New-Item -ItemType Directory -Path $l18Dir -Force | Out-Null
+    $l18Log = Join-Path $l18Dir 'observer.jsonl'
+    Add-P9HArtifactLine -Path $l18Log -Line $l15Json
+    $l18Back = Read-P9HObserverLog -Path $l18Log
+    $l18Persisted = @($l18Back.Records)[0]
+    $l18Diag = @($l18Persisted.listenerDiagnostics)
+    Add-P9HTestResult -Id 'L18' -Title 'Listener metadata and raw enumeration survive serialization and read-back' `
+        -Input 'observer record persisted to JSONL then read back' `
+        -Expected 'listenerCount=2, diagnosed ids preserved, rawWts lines preserved, source disclosed' `
+        -Actual ("readOk={0} listenerCount={1} diag={2} rawLines={3} source={4}" -f `
+            $l18Back.Ok, $l18Persisted.listenerCount, (@($l18Diag | ForEach-Object { $_.sessionId }) -join ','),
+            @($l18Persisted.rawWts).Count, [string]$l18Persisted.listenerMetadataSource) `
+        -Pass ($l18Back.Ok -and [int]$l18Persisted.listenerCount -eq 2 -and @($l18Diag).Count -eq 2 -and
+            @($l18Diag | Where-Object { [int]$_.sessionId -eq 65536 }).Count -eq 1 -and
+            @($l18Persisted.rawWts).Count -eq 2 -and
+            [string]$l18Persisted.listenerMetadataSource -like '*not WTSINFO*') -Evidence $l18Log
+
+    # ---- L19: POSITIVE synthetic Proof A + Proof B over listener-aware tables ----
+    $l19Dir = Join-Path $SandboxRoot 'l19-proof'
+    New-Item -ItemType Directory -Path $l19Dir -Force | Out-Null
+    $l19Log = Join-Path $l19Dir 'observer.jsonl'
+
+    $l19Pre = New-P9HObserverRecordFromTableCapture -Capture $l1Capture -TrialId 'l19-trial' -Sequence 1 -Phase 'pre' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    Add-P9HArtifactLine -Path $l19Log -Line $l19Pre
+    $l19Disc = New-P9HObserverRecordFromTableCapture -Capture $l6Capture -TrialId 'l19-trial' -Sequence 2 -Phase 'disconnect-observed' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    Add-P9HArtifactLine -Path $l19Log -Line $l19Disc
+    $l19ProofA = Get-P9HReconnectAuthorizationProof -ObserverLogPath $l19Log -TrialId 'l19-trial' `
+        -SessionId 2 -User $user -LogonTime $logonIso
+    # reconnect happened: target Active again, listeners present
+    $l19Post = New-P9HObserverRecordFromTableCapture -Capture $l1Capture -TrialId 'l19-trial' -Sequence 3 -Phase 'post' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    Add-P9HArtifactLine -Path $l19Log -Line $l19Post
+    $l19ProofB = Get-P9HDisconnectProof -ObserverLogPath $l19Log -TrialId 'l19-trial' `
+        -SessionId 2 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'L19' -Title 'Positive Proof A and Proof B over listener-aware authoritative tables' `
+        -Input 'pre Active -> disconnect-observed Disconnected -> post Active, listeners present throughout' `
+        -Expected 'Proof A proven and Proof B proven' `
+        -Actual ("proofA={0}({1}) proofB={2}({3})" -f $l19ProofA.Proven, [string]$l19ProofA.Reason, $l19ProofB.Proven, [string]$l19ProofB.Reason) `
+        -Pass ($l19ProofA.Proven -and $l19ProofB.Proven) -Evidence $l19Log
+
+    # ---- L20: NEGATIVE Proof A/B when a required non-listener query failed ----
+    $l20Dir = Join-Path $SandboxRoot 'l20-negproof'
+    New-Item -ItemType Directory -Path $l20Dir -Force | Out-Null
+    $l20Log = Join-Path $l20Dir 'observer.jsonl'
+    $l20Pre = New-P9HObserverRecordFromTableCapture -Capture $l11Capture -TrialId 'l20-trial' -Sequence 1 -Phase 'pre' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    Add-P9HArtifactLine -Path $l20Log -Line $l20Pre
+    $l20Disc = New-P9HObserverRecordFromTableCapture -Capture $l11Capture -TrialId 'l20-trial' -Sequence 2 -Phase 'disconnect-observed' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    Add-P9HArtifactLine -Path $l20Log -Line $l20Disc
+    $l20Post = New-P9HObserverRecordFromTableCapture -Capture $l11Capture -TrialId 'l20-trial' -Sequence 3 -Phase 'post' `
+        -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE'
+    Add-P9HArtifactLine -Path $l20Log -Line $l20Post
+    $l20A = Get-P9HReconnectAuthorizationProof -ObserverLogPath $l20Log -TrialId 'l20-trial' `
+        -SessionId 2 -User $user -LogonTime $logonIso
+    $l20B = Get-P9HDisconnectProof -ObserverLogPath $l20Log -TrialId 'l20-trial' `
+        -SessionId 2 -User $user -LogonTime $logonIso
+    Add-P9HTestResult -Id 'L20' -Title 'Negative Proof A and B when a required non-listener query failed' `
+        -Input 'incomplete (session 0 failed) tables across all phases' `
+        -Expected 'neither Proof A nor Proof B proven' `
+        -Actual ("proofA={0}({1}) proofB={2}({3})" -f $l20A.Proven, [string]$l20A.Reason, $l20B.Proven, [string]$l20B.Reason) `
+        -Pass ((-not $l20A.Proven) -and (-not $l20B.Proven)) -Evidence $l20Log
+
+    # ---- L21: a row set without a resolved result never becomes authoritative ----
+    $l21Capture = Get-P9HWtsProviderTableCapture -Rows $l1Resolved.Rows -TargetSessionId 2
+    $l21Rec = (New-P9HObserverRecordFromTableCapture -Capture $l21Capture -TrialId 'l21-trial' -Sequence 1 -Phase 'pre' `
+            -TargetUser $user -TargetLogonTime $logonIso -GuestIdentity 'P9HNODE') | ConvertFrom-Json
+    Add-P9HTestResult -Id 'L21' -Title 'Rows supplied without a resolved result never become authoritative' `
+        -Input 'the same complete listener-aware rows, but stripped of resolver status' `
+        -Expected 'capture.Authoritative=false reason=capture-rows-without-resolver-status, observer not authoritative' `
+        -Actual ("capAuth={0} reason={1} obsAuth={2}" -f $l21Capture.Authoritative, [string]$l21Capture.RejectionReason, $l21Rec.captureAuthoritative) `
+        -Pass ((-not $l21Capture.Authoritative) -and $l21Capture.RejectionReason -eq 'capture-rows-without-resolver-status' -and
+            $l21Rec.captureAuthoritative -eq $false) -Evidence $null
+
+    # ---- L22: session 0 keeps its own state and is never the disconnected target ----
+    $l1Parsed = ConvertFrom-P9HWtsTable -Lines $l1Capture.Lines
+    $l1ParsedRecords = @($l1Parsed.Records)
+    $l22Match = Get-P9HTargetSessionRecord -Records $l1ParsedRecords -SessionId 0 -User $user -LogonTime $logonIso
+    $l22Session0 = @($l1Resolved.Rows | Where-Object { [int]$_.SessionId -eq 0 })
+    Add-P9HTestResult -Id 'L22' -Title 'Session 0 keeps its own state and is never the pinned target' `
+        -Input 'session 0 Disconnected alongside an Active target session 2' `
+        -Expected 'session 0 present with state 4 and no user; cannot match the RDP identity' `
+        -Actual ("session0Rows={0} state={1} user=[{2}] matchOk={3} reason={4}" -f `
+            $l22Session0.Count, [int]$l22Session0[0].EnumeratedState, [string]$l22Session0[0].User, $l22Match.Ok, $l22Match.Reason) `
+        -Pass ($l22Session0.Count -eq 1 -and [int]$l22Session0[0].EnumeratedState -eq 4 -and
+            (-not $l22Match.Ok)) -Evidence $null
+
+    # ---- L23: no structural listener row leaks into the rendered user table ----
+    $l23Parse = ConvertFrom-P9HWtsTable -Lines $l1Capture.Lines
+    $l23ListenerLines = @($l23Parse.Records | Where-Object { [int]$_.State -eq 6 })
+    Add-P9HTestResult -Id 'L23' -Title 'No listener is rendered as a user session line' `
+        -Input 'listener-aware capture lines' `
+        -Expected 'parsed table has exactly 2 records (0 and 2), none in state 6' `
+        -Actual ("records={0} state6={1} ids=[{2}]" -f @($l23Parse.Records).Count, $l23ListenerLines.Count,
+            (@($l23Parse.Records | ForEach-Object { [int]$_.SessionId }) -join ',')) `
+        -Pass ($l23Parse.Ok -and @($l23Parse.Records).Count -eq 2 -and $l23ListenerLines.Count -eq 0) -Evidence $null
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -3131,14 +3564,15 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HAuthorityGateTests -SandboxRoot $SandboxRoot
     Invoke-P9HAuthorityOmissionTests -SandboxRoot $SandboxRoot
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
+    Invoke-P9HWtsListenerAuthorityTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
 
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 186 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 209 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

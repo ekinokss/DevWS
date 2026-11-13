@@ -700,5 +700,81 @@ The positive path is preserved: a clean capture with an omitted flag still deriv
 | U4 | explicit `true` cannot override a failed capture outcome |
 | U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
 
-The registry guard now covers **186** registered cases; the full run executes 187 including `R1`.
-All 180 Stage 3A.2 cases are retained unchanged.
+The registry guard now covers **209** registered cases; the full run executes 210 including `R1`.
+All 186 prior cases and `R1` are retained unchanged.
+
+---
+
+## Stage 3B7B-C1: listener-aware WTS authority and Win32-zero classification
+
+Stage 3B7B physically established a genuine authenticated RDP session (session 2,
+`RDP-Tcp#0`, Active, verified logon time) but could not make the capture
+authoritative. Two independent defects were responsible, and both are corrected
+here inside `qualification/p9h/` only.
+
+### Defect 1: WTSListen pseudo-sessions rejected the whole table
+
+Windows enumerates connection listeners (`WTSListen`, state 6) that accept
+sessions but have no logged-on user. `WTSQuerySessionInformationW(WTSInfo)`
+cannot describe them, so they answer with a non-matching record. The resolver
+required a matching identity for **every** enumerated id, so two unqueryable
+listener rows rejected an otherwise complete, consistent table containing a
+real user session. Capture authority was `False` for a correct observation.
+
+**Correction.** Listeners are now a distinct correlation class, classified by the
+**enumerated WTS state** - not by session-id range and not by station name, both
+of which would excuse genuine failures of real sessions:
+
+* no WTSINFO identity is required for a listener, because none exists;
+* listener query outcomes are preserved in `ListenerDiagnostics` and do **not**
+  enter `Errors`, so an expected limitation cannot fail the table;
+* each listener keeps its id, station name, enumerated state and
+  `QuerySource='enumeration'`, so its provenance is never implied to be WTSINFO;
+* a listener can never resolve as the target (`target-is-listener`), and is
+  never rendered as a user session line;
+* duplicate ids are still rejected across the **entire** enumeration, listeners
+  included.
+
+`EnumeratedCount` (complete inventory) is reported separately from
+`IdentityCoveredCount` (sessions that actually produced a WTSINFO identity), so
+"we saw every session" is never conflated with "we have an identity for every
+user session". The observer record carries `listenerCount`,
+`enumeratedCount`, `identityCoveredCount`, `enumeratedCountExceedsIdentity` and
+`listenerDiagnostics` as an additive metadata extension. None of these fields is
+consulted by the authority predicate, so no acceptance rule is weakened.
+
+### Defect 2: a successful query's Win32 zero was treated as a provider error
+
+`Invoke-P9HWtsSessionQuery` returns `Win32Error = 0` when the native query
+**succeeds**. The capture collected every non-null `Win32Error`, including
+zeros, and `New-P9HObserverRecordFromTableCapture` treats a nonempty
+`Win32Errors` array as a provider failure. A perfectly clean, authoritative
+capture therefore produced `captureOutcome='provider-error'` and denied
+authority - which in turn blocked Proof A on a genuine Active to Disconnected
+transition.
+
+**Correction.** Only **failed** queries (`QueryOk = false`) are consulted, and
+within those only a **nonzero** code is recorded. Zero means "no error". A failed
+query carrying Win32 0 still fails closed through `QueryOk`/`FailedCount`, and a
+nonzero code is never dropped. This is a source-aware rule, not a blanket filter
+of the error array.
+
+### Test coverage (L1-L23)
+
+| ID | Coverage |
+| --- | --- |
+| L1-L4 | complete listener-aware table resolves; listeners are diagnostics; provenance preserved; enumeration vs identity counting |
+| L5-L6 | Active and genuinely Disconnected targets both resolve with listeners present |
+| L7-L8 | a listener cannot be the target and cannot authorize reconnect |
+| L9-L10 | duplicate ids involving a listener, and an absent target, both fail closed |
+| L11-L12 | a failed session-0 query and a failed non-target non-listener query both still reject |
+| L13-L14 | wrong user/logon identity and a genuine target state change still reject |
+| L15-L17 | successful Win32 zero is not an error; failed Win32 zero still fails; nonzero preserved and blocking |
+| L18 | listener metadata and raw enumeration survive serialization and read-back |
+| L19-L20 | positive and negative Proof A / Proof B over listener-aware tables |
+| L21 | rows without a resolved result never become authoritative |
+| L22-L23 | session 0 keeps its own state; no listener is rendered as a user line |
+
+The offline probe `PROBE-PRE-FIX.log` / `PROBE-POST-FIX.log` replays identical
+synthetic native-shaped inputs against the pre-fix sources (both defects present)
+and the corrected sources (both absent).
