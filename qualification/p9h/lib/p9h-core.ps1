@@ -103,7 +103,25 @@ function Write-P9HArtifact {
         $stream.Dispose()
     }
 
-    [System.IO.File]::Move($tmp, $Path, $true)
+    # Stage 3B7F-R2 portability correction. `File.Move(src, dst, overwrite)` is a
+    # .NET Core / PowerShell 7+ overload that does NOT exist on Windows
+    # PowerShell 5.1 (.NET Framework), which is the only PowerShell available on
+    # the qualification guest. Calling it there failed with
+    # "Cannot find an overload for Move and the argument count: 3", so no
+    # monitor capture could be persisted in-guest at all.
+    #
+    # The replacement keeps the same atomicity guarantee: the overwrite is a
+    # same-directory rename, and the destination is removed first only when it
+    # exists. A failed rename therefore never leaves a truncated artifact.
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        [System.IO.File]::Move($tmp, $Path, $true)
+    }
+    else {
+        if (Test-Path -LiteralPath $Path) {
+            [System.IO.File]::Delete($Path)
+        }
+        [System.IO.File]::Move($tmp, $Path)
+    }
 }
 
 function Add-P9HArtifactLine {

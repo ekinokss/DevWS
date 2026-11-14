@@ -3996,8 +3996,58 @@ function Invoke-P9HChronologyBoundTests {
         -Expected 'not PASS, pre-capture-precedes-target-logon' `
         -Actual ("Verdict={0} reasons={1}" -f $z10.Verdict, ($z10.Reasons -join ',')) `
         -Pass ($z10.Verdict -ne 'PASS' -and $z10.Reasons -contains 'pre-capture-precedes-target-logon') -Evidence $otherLog
-}
 
+    # ---- Z11-Z13: artifact-write portability (Stage 3B7F-R2) ----
+    #
+    # Write-P9HArtifact used the .NET Core / PowerShell 7+ three-argument
+    # [System.IO.File]::Move(src, dst, overwrite) overload. That overload does
+    # NOT exist on Windows PowerShell 5.1 (.NET Framework), which is the only
+    # PowerShell available on the qualification guest, so NO monitor capture
+    # could be persisted in-guest at all - the physical trial failed with
+    # "Cannot find an overload for Move and the argument count: 3".
+    #
+    # These cases pin the observable contract that must hold on BOTH runtimes:
+    # a fresh write, an ATOMIC overwrite of an existing artifact, and a
+    # byte-stable BOM-free UTF-8 result.
+    $artDir = Join-Path $dir 'z-artifact'
+    New-Item -ItemType Directory -Path $artDir -Force | Out-Null
+    $artPath = Join-Path $artDir 'artifact.json'
+
+    # Z11: first write of a non-existent artifact
+    Write-P9HArtifact -Path $artPath -Lines @('{"first":true}')
+    $z11Exists = Test-Path -LiteralPath $artPath
+    $z11Text = if ($z11Exists) { [IO.File]::ReadAllText($artPath) } else { '' }
+    Add-P9HTestResult -Id 'Z11' -Title 'Artifact write creates a new file with exact content' `
+        -Input 'Write-P9HArtifact against a path that does not exist yet' `
+        -Expected 'file exists, exact JSON text, no stray .tmp' `
+        -Actual ("exists={0} text={1} tmpLeft={2}" -f $z11Exists, $z11Text.Trim(), (Test-Path -LiteralPath ($artPath + '.tmp'))) `
+        -Pass ($z11Exists -and $z11Text.Trim() -eq '{"first":true}' -and -not (Test-Path -LiteralPath ($artPath + '.tmp'))) `
+        -Evidence $artDir
+
+    # Z12: ATOMIC OVERWRITE of an existing artifact - the exact path that failed
+    # on PowerShell 5.1 before the portability correction.
+    Write-P9HArtifact -Path $artPath -Lines @('{"second":true}')
+    $z12Text = [IO.File]::ReadAllText($artPath)
+    Add-P9HTestResult -Id 'Z12' -Title 'Artifact write atomically overwrites an existing file' `
+        -Input 'Write-P9HArtifact against an existing artifact' `
+        -Expected 'content replaced, previous bytes gone, no stray .tmp' `
+        -Actual ("text={0} tmpLeft={1}" -f $z12Text.Trim(), (Test-Path -LiteralPath ($artPath + '.tmp'))) `
+        -Pass ($z12Text.Trim() -eq '{"second":true}' -and $z12Text -notmatch 'first' -and
+            -not (Test-Path -LiteralPath ($artPath + '.tmp'))) `
+        -Evidence $artDir
+
+    # Z13: BOM-free UTF-8 with CRLF terminators, so hashes are host-stable
+    Write-P9HArtifact -Path $artPath -Lines @('{"a":1}', '{"b":2}')
+    $z13Bytes = [IO.File]::ReadAllBytes($artPath)
+    $z13HasBom = ($z13Bytes.Length -ge 3 -and $z13Bytes[0] -eq 0xEF -and $z13Bytes[1] -eq 0xBB -and $z13Bytes[2] -eq 0xBF)
+    $z13Text = [IO.File]::ReadAllText($artPath)
+    Add-P9HTestResult -Id 'Z13' -Title 'Artifact bytes are BOM-free UTF-8 with CRLF line endings' `
+        -Input 'two lines written through Write-P9HArtifact' `
+        -Expected 'no UTF-8 BOM and CRLF terminators' `
+        -Actual ("bytes={0} hasBom={1} hasCrlf={2}" -f $z13Bytes.Length, $z13HasBom, $z13Text.Contains("`r`n")) `
+        -Pass ((-not $z13HasBom) -and $z13Text.Contains("`r`n")) `
+        -Evidence $artDir
+}
 
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
@@ -4028,7 +4078,7 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 231 `
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 234 `
         -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z')
 
     if (-not $registry.Ok) {

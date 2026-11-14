@@ -700,7 +700,7 @@ The positive path is preserved: a clean capture with an omitted flag still deriv
 | U4 | explicit `true` cannot override a failed capture outcome |
 | U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
 
-The registry guard now covers **231** registered cases; the full run executes 232 including `R1`.
+The registry guard now covers **234** registered cases; the full run executes 235 including `R1`.
 All 221 prior cases and `R1` are retained unchanged.
 
 ---
@@ -754,6 +754,53 @@ no prior positive case changes meaning.
 | Z8 | the existing POST lower bound is preserved |
 | Z9 | a failed transition still yields NOT FULLY EVIDENCED |
 | Z10 | the bound uses the caller's pinned logon, not the log line's own value |
+
+---
+
+## Stage 3B7F-R2: strict chronology physical acceptance and a PowerShell 5.1 portability defect
+
+The Stage 3B7F-R2 physical trial replayed E1 with the contract order corrected:
+the authoritative `pre` WTS observation is persisted and read back BEFORE the
+PRE monitor capture is taken. The strict verdict
+(`-RequirePreCaptureAfterPreObservation`) is PASS with zero rejection reasons,
+and the same verdict is independently reproducible on the host from the retained
+original bytes alone.
+
+That trial also exposed a genuine portability defect in this library.
+
+### Defect
+
+`Write-P9HArtifact` finalized its atomic rename with
+`[System.IO.File]::Move($tmp, $Path, $true)`. The three-argument overload is a
+.NET Core / PowerShell 7+ API. It does **not** exist on Windows PowerShell 5.1
+(.NET Framework), which is the only PowerShell available on the qualification
+guest. In-guest the call failed with
+
+```
+Cannot find an overload for "Move" and the argument count: "3".
+```
+
+so **no monitor capture could be persisted in the guest at all** - the physical
+trial could not produce evidence, even though every predicate was satisfied in
+principle.
+
+### Correction
+
+`Write-P9HArtifact` now branches on `$PSVersionTable.PSVersion.Major`. On 7+ it
+keeps the overwrite overload; on 5.1 it deletes the destination first and then
+performs the two-argument rename. Both paths keep the same-directory-rename
+atomicity: a reader never sees a half-written artifact, and a failed rename
+never leaves a truncated file.
+
+### Test coverage (Z11-Z13)
+
+| ID | Coverage |
+| --- | --- |
+| Z11 | writing a non-existent artifact creates it with exact content and no `.tmp` residue |
+| Z12 | writing an EXISTING artifact atomically replaces it - the exact path that failed on 5.1 |
+| Z13 | artifact bytes are BOM-free UTF-8 with CRLF terminators, so hashes are host-stable |
+
+The canonical suite is 235/235 PASS (234 registered cases plus `R1`).
 
 ### Re-evaluation of the R1 trial
 
