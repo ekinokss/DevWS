@@ -156,17 +156,16 @@ function Test-P9HNegativeOrigin {
 }
 
 function Get-P9HManagedTerminalWindowClassification {
-    # Stage 3B7G3-C1: classify ATTRIBUTED windows against the PRODUCT'S managed
-    # terminal identity contract, with a FAIL-CLOSED auxiliary window contract.
+    # Classify ATTRIBUTED windows against the PRODUCT'S managed terminal identity
+    # contract, with a POSITIVE auxiliary-role contract.
     #
-    # WHY THIS EXISTS
-    # ---------------
-    # The frozen N2-B identity rule was `skipped -and attributedWindowCount -eq 1`,
-    # where the count came from Select-P9HAttributableWindow: ANY newly created,
-    # visible, top-level HWND owned by an attributed PID. That is a PROCESS
-    # association rule, not a TERMINAL-WINDOW identity rule, and Stage 3B7G2
-    # returned INCONCLUSIVE (`attributed-window-count-not-one:2`) for a launch that
-    # created one managed terminal plus one owned helper window.
+    # WHAT THIS IS FOR
+    # ----------------
+    # The frozen N2-B identity rule counted EVERY newly created visible top-level
+    # HWND owned by an attributed PID (`Select-P9HAttributableWindow`). That is a
+    # PROCESS association rule, not a TERMINAL-WINDOW identity rule, and Stage
+    # 3B7G2 returned INCONCLUSIVE (`attributed-window-count-not-one:2`) for a launch
+    # that created one managed terminal plus one owned ConPTY helper window.
     #
     # The product does NOT identify managed terminal windows that way. From
     # src\native\devws-terminal-candidates.cs it enumerates them by EXACT class:
@@ -178,63 +177,84 @@ function Get-P9HManagedTerminalWindowClassification {
     # `WindowsTerminal` and the UI-Automation tab names to form a canonical title
     # family for the pinned windowId.
     #
-    # WHAT STAGE 3B7G3 GOT WRONG (corrected here)
-    # -------------------------------------------
-    # Stage 3B7G3 treated "GW_OWNER points at the managed terminal" + "the owning
-    # process has a name" as SUFFICIENT for `auxiliary`. Six false acceptances were
-    # reproduced against 3da88e6 before this correction: an arbitrary unknown
-    # full-size window, a second Cascadia terminal UI, and helpers whose command
-    # line carried a wrong or missing SetId/TerminalId/WindowId were all absorbed.
+    # CONTRACT HISTORY (each result keeps its own version)
+    # ---------------------------------------------------
+    #   p9h.auxiliary-window.v1  (G3): GW_OWNER + resolvable process == auxiliary.
+    #       REFUTED: six false acceptances, including a competing Cascadia UI.
+    #   p9h.auxiliary-window.v2  (C1): added ancestry, session, exact argv identity,
+    #       competing-UI exclusion, and required WS_EX_TOOLWINDOW (A8).
+    #       STILL WRONG in two ways:
+    #         (a) FALSE ACCEPTANCE - WS_EX_TOOLWINDOW was treated as a universal
+    #             role certificate. An arbitrary 1200x800 class carrying that bit
+    #             was accepted (reproduced as case X1).
+    #         (b) FALSE REJECTION - the ConPTY pseudo window is documented and
+    #             observed to be a `WS_POPUP` owned by the hosting terminal
+    #             (ConptyReparentPseudoConsole). WS_EX_TOOLWINDOW is an
+    #             implementation detail, NOT a documented guarantee, so requiring
+    #             it can reject genuine helpers on other builds.
+    #   p9h.auxiliary-window.v3  (C2, this function): the window CLASS participates
+    #       in a positive role argument. WS_EX_TOOLWINDOW is CORROBORATING evidence
+    #       only - never sufficient, never required.
     #
-    # GW_OWNER is NECESSARY relationship evidence. It is not, by itself, proof that
-    # a window is only ancillary.
+    # WHY WS_EX_TOOLWINDOW CANNOT BE DECISIVE
+    # ---------------------------------------
+    # Microsoft documents WS_EX_TOOLWINDOW as a PRESENTATION style: "a floating
+    # toolbar ... does not appear in the taskbar or in the dialog that appears when
+    # the user presses ALT+TAB". It says nothing about the window being
+    # noninteractive, harmless or internal. On a live host the bit is also set by
+    # Shell_TrayWnd, SystemTray_Main, tooltips_class32 and many others.
     #
-    # FOUR OUTCOMES
-    # -------------
-    #   managed-terminal       positively identified managed terminal UI
-    #   auxiliary              positively proven ancillary window
-    #   competing-managed-ui   another window claiming managed UI (class or title)
-    #   unclassified           anything else - fails closed
-    #
-    # THE AUXILIARY CONTRACT  (schema p9h.auxiliary-window.v2)
-    # -------------------------------------------------------
-    # A non-managed attributed window is `auxiliary` ONLY when EVERY factor is
-    # POSITIVELY established from the retained evidence:
+    # THE POSITIVE AUXILIARY CONTRACT (schema p9h.auxiliary-window.v3)
+    # ----------------------------------------------------------------
+    # A non-managed attributed window is `auxiliary` only when ALL of these hold:
     #
     #   A1  GW_OWNER names exactly one managed terminal in THIS set
     #   A2  its class is NOT the managed terminal class
-    #   A3  its owning process record resolves from the attributed inventory
+    #   A3  its owning process record RESOLVES from the attributed inventory
     #   A4  the owning process shares the managed terminal's session
     #   A5  the owning process is a STRICT descendant of the managed terminal
-    #   A6  the owner command line carries ALL THREE pinned identity values, each
+    #   A6  the owner command line carries all three pinned identity values, each
     #       EXACTLY equal (missing / unreadable / wrong => REFUSAL)
     #   A7  it does not claim a managed terminal title
-    #   A8  its WINDOW STYLE positively marks it as non-user-facing
-    #       (WS_EX_TOOLWINDOW, 0x00000080)
+    #   A8  its WINDOW CLASS is POSITIVELY identified as an auxiliary role class
     #
-    # A8 is the factor Stage 3B7G3 lacked, and it is not cosmetic. Factors A1-A7 are
-    # ALL satisfiable by a user-facing application window that the pinned shell
-    # launched: it inherits the same command line because argv identity is
-    # PROCESS-level rather than WINDOW-level, it is a genuine strict descendant, it
-    # is owned, and it need not carry a managed title. That case (residual R1) was
-    # reproduced and was still absorbed without A8. A tool window is the documented
-    # positive marker of a non-user-facing helper: it is absent from the taskbar and
-    # cannot be activated as a normal application window.
+    # A1-A7 are RELATIONSHIP and CAUSAL evidence. They are necessary, and each is
+    # independently refutable, but they are NOT sufficient: a user-facing
+    # application window launched by the pinned shell inherits the same command
+    # line (argv identity is PROCESS-level, not WINDOW-level), is a genuine strict
+    # descendant, is owned, and need not carry a managed title.
     #
-    # If the style was not recorded, the ancillary ROLE cannot be established from
-    # this evidence set. That is an EVIDENCE GAP: reported in `EvidenceGaps` and
-    # failing closed. It is never assumed, and no rectangle size substitutes for it.
+    # A8 is therefore about the CLASS, not about a style bit. The recognized
+    # auxiliary class is the ConPTY pseudo-console window, whose role is
+    # established independently of this qualification suite:
+    #
+    #   * Microsoft documents the pseudoconsole as a mechanism that "replace[s] the
+    #     user interactivity portion of the default console host window"; the
+    #     hosting application owns its presentation.
+    #   * microsoft/terminal documents ConptyReparentPseudoConsole: the pseudo
+    #     window's owner is set to "the actual hosting terminal's HWND", which is
+    #     exactly the GW_OWNER relation A1 requires.
+    #   * A Windows Terminal maintainer describes the object as "the fake
+    #     PseudoConsoleWindow ... basically just a 0*0 pixel sized WS_POPUP window,
+    #     which is owned by Windows Terminal", existing so GetConsoleWindow returns
+    #     a handle, and "simply just isn't visible".
+    #
+    # That establishes the class's ROLE. It does NOT establish that any individual
+    # window of that class belongs to THIS launch, which is why A1-A7 are still
+    # required and why the class alone is never sufficient.
+    #
+    # Everything else - including an arbitrary class that happens to carry
+    # WS_EX_TOOLWINDOW - is `unclassified` and fails closed.
     #
     # EVIDENCE GAPS (reported, never invented)
     # ----------------------------------------
     # The frozen window inventory records hwnd/pid/visible/class/rect/owner/title.
-    # It does NOT record GWL_STYLE / GWL_EXSTYLE / WS_EX_TOOLWINDOW / WS_CHILD. So a
-    # window whose ancillary role is otherwise plausible is INCONCLUSIVE - not
-    # accepted - until the style is observed.
+    # It does NOT record GWL_STYLE or GWL_EXSTYLE. Under v3 that absence is NOT
+    # fatal: style is corroborating, not decisive. It is still reported, because it
+    # is the one field that could turn a corroborated identity into a confirmed one.
     #
     # The qualification title check is a NARROW PROXY for the product's
-    # UI-Automation tab-title-family validator; it is not that validator. See
-    # `IdentityProxy` on the returned object.
+    # UI-Automation tab-title-family validator; it is not that validator.
     #
     # Parameters are pure data; this function touches no window and no VM.
     param(
@@ -246,8 +266,11 @@ function Get-P9HManagedTerminalWindowClassification {
         # is explicit rather than embedded as a magic string in two places.
         [string]$ManagedWindowClass = 'CASCADIA_HOSTING_WINDOW_CLASS',
         [string]$ManagedProcessName = 'WindowsTerminal',
-        # WS_EX_TOOLWINDOW - the positive non-user-facing marker required by A8.
-        [long]$RequiredExStyleMask = 0x00000080,
+        # The positively identified auxiliary-role class. This is a ROLE class, not
+        # an exclusion list: membership is necessary but never sufficient (A1-A7).
+        [string[]]$AuxiliaryRoleClasses = @('PseudoConsoleWindow'),
+        # Corroborating extended-style marker. NOT required, NOT sufficient.
+        [long]$CorroboratingExStyleMask = 0x00000080,
         [AllowNull()]$ProcessByPid = $null
     )
 
@@ -256,7 +279,6 @@ function Get-P9HManagedTerminalWindowClassification {
     $unclassified = [System.Collections.Generic.List[object]]::new()
     $competing = [System.Collections.Generic.List[object]]::new()
 
-    # Read a style value from either an int or a 0x-prefixed hex string.
     function ConvertFrom-StyleText {
         param($Value)
         if ($null -eq $Value) { return $null }
@@ -270,9 +292,8 @@ function Get-P9HManagedTerminalWindowClassification {
         return $null
     }
 
-    # True when the title belongs to the managed title family for this windowId:
+    # Mirrors the grammar of Resolve-DevWSTerminalTabTitle in src/lib/devws-config.ps1:
     # exactly <windowId>, or <windowId>#DevWS:<N> with canonical decimal N>=1.
-    # Mirrors the grammar of Resolve-DevWSTerminalTabTitle in src/lib/devws-config.ps1.
     function Test-ManagedTitleFamily {
         param([string]$Title, [string]$WindowId)
         if ([string]::IsNullOrWhiteSpace($Title) -or [string]::IsNullOrWhiteSpace($WindowId)) { return $false }
@@ -287,9 +308,8 @@ function Get-P9HManagedTerminalWindowClassification {
     #
     # This must be a separate pass. EnumWindows order is not guaranteed, and in the
     # genuine Stage 3B7G2 evidence the helper window (0x20330) is enumerated BEFORE
-    # its owner (0x50366). Evaluating ownership inline would test an auxiliary
-    # against a managed set that is still empty, and a correct auxiliary would be
-    # reported as unclassified purely because of enumeration order.
+    # its owner (0x50366). Evaluating relationships inline would test an auxiliary
+    # against a managed set that is still empty.
     $candidates = [System.Collections.Generic.List[object]]::new()
 
     foreach ($w in @($Windows)) {
@@ -336,9 +356,6 @@ function Get-P9HManagedTerminalWindowClassification {
 
     $managedPids = @($managed | ForEach-Object { [int]$_.pid })
 
-    # Resolve a pid's ancestry against the managed terminals, using ONLY the
-    # attributed process inventory. $true only when the chain reaches a managed
-    # terminal pid in at least one hop (a STRICT descendant).
     function Test-StrictDescendant {
         param([int]$StartPid)
         if ($null -eq $ProcessByPid) { return $false }
@@ -368,8 +385,8 @@ function Get-P9HManagedTerminalWindowClassification {
         return [string]$m.Groups['v'].Value
     }
 
-    # PASS 2: classify every non-managed attributed window against the complete
-    # managed set, under the fail-closed auxiliary contract.
+    # PASS 2: classify every non-managed attributed window under the positive
+    # auxiliary-role contract.
     foreach ($cand in $candidates) {
         if ($cand.IsManaged) { continue }
         $record = $cand.Record
@@ -383,7 +400,7 @@ function Get-P9HManagedTerminalWindowClassification {
         $gaps = [System.Collections.Generic.List[string]]::new()
 
         # --- COMPETING MANAGED UI -------------------------------------------------
-        # Positive evidence of another managed UI. Reported on its own so a
+        # Positive evidence of another managed UI, reported on its own so a
         # competing terminal can never be mistaken for a harmless helper.
         $claimsManagedClass = [string]::Equals($class, $ManagedWindowClass, [System.StringComparison]::Ordinal)
         $claimsManagedTitle = (Test-ManagedTitleFamily -Title $title -WindowId $ExpectedWindowId)
@@ -397,10 +414,18 @@ function Get-P9HManagedTerminalWindowClassification {
             continue
         }
 
+        # --- A8: the CLASS must be a positively identified auxiliary role --------
+        # This is the factor that stops a user-facing application window - or an
+        # arbitrary class that merely carries WS_EX_TOOLWINDOW - from being
+        # absorbed. Membership of the role set is NECESSARY, never sufficient.
+        $roleClassOk = (@($AuxiliaryRoleClasses) -contains $class)
+        if (-not $roleClassOk) {
+            $failed.Add(('class-is-not-a-positively-identified-auxiliary-role:' + $class)) | Out-Null
+        }
+
         # --- A1: GW_OWNER names exactly one managed terminal in THIS set ---------
         # The @() wrapper must surround the WHOLE expression: an `if` used as an
-        # expression unrolls a single-element result to a scalar, and a later
-        # `.Count` then throws under Set-StrictMode.
+        # expression unrolls a single-element result to a scalar under StrictMode.
         $ownerMatches = @(if (-not [string]::IsNullOrWhiteSpace($owner) -and $owner -ne '0x0') {
                 $managed | Where-Object { [string]::Equals([string]$_.hwnd, $owner, [System.StringComparison]::OrdinalIgnoreCase) }
             })
@@ -455,27 +480,28 @@ function Get-P9HManagedTerminalWindowClassification {
             }
         }
 
-        # --- A8: POSITIVE WINDOW-ROLE evidence ----------------------------------
-        # This is the factor that stops a user-facing application window launched
-        # by the pinned shell from being absorbed as "auxiliary". When the style is
-        # simply not recorded, the gap is reported rather than assumed either way.
+        # --- CORROBORATION: extended style -------------------------------------
+        # Recorded, never decisive. Absence is an evidence gap; a recorded value is
+        # supporting evidence. Neither can accept or reject on its own.
+        $corroborated = $null
         if (-not $cand.StyleRecorded) {
             $gaps.Add('window-style-not-recorded') | Out-Null
-            $failed.Add('window-style-evidence-absent') | Out-Null
         }
-        elseif (($cand.ExStyle -band $RequiredExStyleMask) -eq 0) {
-            $failed.Add(('not-a-tool-window:exStyle=0x{0:X8}' -f $cand.ExStyle)) | Out-Null
+        else {
+            $corroborated = (($cand.ExStyle -band $CorroboratingExStyleMask) -ne 0)
         }
 
-        $record['auxiliaryContract'] = 'p9h.auxiliary-window.v2'
+        $record['auxiliaryContract'] = 'p9h.auxiliary-window.v3'
+        $record['auxiliaryRoleClass'] = $roleClassOk
         $record['identitySetId'] = $argvSet
         $record['identityTerminalId'] = $argvTerm
         $record['identityWindowId'] = $argvWin
         $record['exStyle'] = if ($cand.StyleRecorded) { ('0x{0:X8}' -f $cand.ExStyle) } else { $null }
+        $record['styleCorroboratesRole'] = $corroborated
 
         if ($failed.Count -eq 0) {
             $record['classification'] = 'auxiliary'
-            $record['reason'] = 'auxiliary-contract-satisfied'
+            $record['reason'] = 'auxiliary-role-contract-satisfied'
             $auxiliary.Add([pscustomobject]$record) | Out-Null
         }
         else {
@@ -496,21 +522,20 @@ function Get-P9HManagedTerminalWindowClassification {
               else { 'one-managed-terminal-window' }
 
     $gapList = @($unclassified | ForEach-Object {
-            # Safe read: not every unclassified record carries evidenceGaps, and
-            # StrictMode makes a direct property access on such a record throw.
             $g = Get-P9HProp -Object $_ -Name 'evidenceGaps'
             if ($null -ne $g) { @($g) }
         } | Sort-Object -Unique)
 
     return [pscustomobject][ordered]@{
-        Schema                   = 'p9h.managed-terminals.v2'
-        AuxiliaryContract        = 'p9h.auxiliary-window.v2'
+        Schema                   = 'p9h.managed-terminals.v3'
+        AuxiliaryContract        = 'p9h.auxiliary-window.v3'
+        AuxiliaryRoleClasses     = @($AuxiliaryRoleClasses)
         ManagedWindowClass       = $ManagedWindowClass
         ManagedProcessName       = $ManagedProcessName
         ExpectedWindowId         = $ExpectedWindowId
         ExpectedTerminalId       = $ExpectedTerminalId
         ExpectedSetId            = $ExpectedSetId
-        RequiredExStyleMask      = ('0x{0:X8}' -f $RequiredExStyleMask)
+        CorroboratingExStyleMask = ('0x{0:X8}' -f $CorroboratingExStyleMask)
         RawAttributedHwndCount   = @($Windows).Count
         ManagedTerminalCount     = $count
         AuxiliaryCount           = $auxiliary.Count
@@ -523,14 +548,12 @@ function Get-P9HManagedTerminalWindowClassification {
         Unclassified             = @($unclassified.ToArray())
         CompetingManagedUi       = @($competing.ToArray())
         # The qualification title check is a PROXY for the product's UI-Automation
-        # tab-title-family validator, not that validator. Named here so no caller
-        # can mistake it for full product identity.
+        # tab-title-family validator, not that validator.
         IdentityProxy            = 'top-level-window-title-equals-windowId'
         # Properties this evidence set cannot establish. Reported, never assumed.
         UnprovenProperties       = @(
             'GWL_STYLE'
             'GWL_EXSTYLE'
-            'WS_EX_TOOLWINDOW'
             'WS_CHILD'
             'ui-automation-tab-title-family'
         )

@@ -893,7 +893,156 @@ token checked first; pinning preserved; and no `tsdiscon` process created.
 
 The canonical suite is 261/261 PASS (260 registered cases plus `R1`).
 
+## Stage 3B7G3-C2: positive auxiliary-role semantics and evidence adjudication
+
+Stage 3B7G3-C1 was **CHANGES REQUIRED**. This stage corrects C1's auxiliary
+contract and adjudicates whether the existing G2 evidence can support a defensible
+N2-B verdict. It is offline-only: no VM was booted, no product launched, no
+`tsdiscon`, and no historical artifact or artifact index was modified.
+
+### Finding 1: the C1 starting-probe contradiction
+
+The C1 report claimed six false acceptances reproduced against `3da88e6`, but the
+retained `gdrive:devws/p9h/3b7g3c1/starting-probe.log` recorded
+`false acceptances reproduced: NONE` with C1-era rejection reasons.
+
+**Cause:** the C1 probe wrote its log and JSON from a `finally` block to FIXED
+paths with no run identifier, and it was executed four times. Only the LAST run
+survived, and that run executed against the already-corrected classifier. The
+claim was true when measured; the artifact could not evidence it. That is a real
+harness provenance defect.
+
+**Correction:** the claim is now re-established without trusting any Git label.
+Commit `3da88e6` (tree `0fbc556e…`) is extracted to an immutable tree; the
+classifier file's SHA-256 as extracted is
+`c9c3e15dbe1c183898849556d8add64951dfcdfa6b191f99501c81f669adfb79`; the function
+is loaded FROM that file and its `ScriptBlock.File` must hash to the same value;
+the extracted text and the loaded function body are both asserted to lack every C1
+marker. Result: **six defects confirmed** (A, B1, B2, B4, B5, C; B3 correctly
+refused). The C1 claim is substantiated, and the original contradictory files are
+preserved unmodified.
+
+### Finding 2: C1's remaining false acceptance
+
+C1's factor A8 required `WS_EX_TOOLWINDOW` and exempted nothing else. Reproduced
+against `b069f0b`, an arbitrary class at 1200x800 with a valid owner, genuine
+descendant ancestry, exact identity argv and `exStyle=0x00000080` was
+**accepted as auxiliary**. Real-world classes carrying the same bit
+(`MozillaDropShadowWindowClass`, `ForegroundStaging`, `ThumbnailDeviceHelperWnd`)
+were accepted too. C1's own AW1 negative uses `WS_EX_APPWINDOW`, so it never
+exercised this path.
+
+**Cause:** a generic presentation bit was treated as a universal auxiliary-role
+certificate.
+
+### Finding 3: `WS_EX_TOOLWINDOW` does not establish an auxiliary role
+
+Microsoft documents `WS_EX_TOOLWINDOW` as a *presentation* style: "a floating
+toolbar ... does not appear in the taskbar or in the dialog that appears when the
+user presses ALT+TAB". It says nothing about the window being noninteractive,
+harmless or internal. It is also set by `Shell_TrayWnd`, `SystemTray_Main` and
+`tooltips_class32`.
+
+Conversely, the bit is **not** promised for the ConPTY helper. A Windows Terminal
+maintainer describes it as "the fake `PseudoConsoleWindow` ... basically just a
+`0*0` pixel sized `WS_POPUP` window, which is owned by Windows Terminal", and
+`winconpty` documents `ConptyReparentPseudoConsole` as making the pseudo window
+owned by "the actual hosting terminal's HWND". Neither statement mentions
+`WS_EX_TOOLWINDOW`.
+
+So C1's A8 was wrong in **both** directions: too permissive for arbitrary classes
+and potentially too strict for the genuine helper.
+
+| Property | Status |
+| --- | --- |
+| Owned by the hosting terminal (`GW_OWNER`) | **Documented and reproduced** |
+| `WS_POPUP`, hidden/zero-size presentation | **Documented and reproduced** |
+| `WS_EX_TOOLWINDOW` present | **Typical only** — observed on this host, never guaranteed |
+| `WS_CHILD` | Not applicable — `EnumWindows` yields top-level windows only |
+| Exact rectangle | Version-dependent (G2 recorded 16x16; host showed 0x0) |
+
+### The corrected contract: `p9h.auxiliary-window.v3`
+
+A non-managed attributed window is `auxiliary` only when ALL of these hold:
+
+| Factor | Requirement |
+| --- | --- |
+| A1 | `GW_OWNER` names exactly one managed terminal in this set |
+| A2/A8 | its CLASS is a positively identified auxiliary ROLE class |
+| A3 | owning process record resolves |
+| A4 | same session as the managed terminal |
+| A5 | owning process is a **strict** descendant |
+| A6 | all three pinned values present and exactly equal |
+| A7 | does not claim a managed terminal title |
+
+The role class is `PseudoConsoleWindow`, justified independently as the ConPTY
+pseudo-console window whose owner is the hosting terminal. This is **not** a
+class-name exclusion list: membership is NECESSARY and never sufficient, because
+A1 and A3-A7 must hold for the same window.
+
+`WS_EX_TOOLWINDOW` is demoted to **corroboration**: recorded as
+`styleCorroboratesRole` (a tri-state — `true`, `false`, or `null` when the field
+was absent or unreadable). It can never accept or reject on its own.
+
+Contract history, each result keeping its version:
+
+| Contract | Stage | Status |
+| --- | --- | --- |
+| `p9h.auxiliary-window.v1` | G3 | **refuted** — six false acceptances |
+| `p9h.auxiliary-window.v2` | C1 | **refuted** — arbitrary tool window accepted; genuine helper potentially rejected |
+| `p9h.auxiliary-window.v3` | C2 | class participates in a positive role argument |
+
+### Replay of the immutable G2 evidence
+
+All eight roles re-verified before and after; the artifact index used unmodified.
+
+| Evaluation | N2-A | N2-B | Reason |
+| --- | --- | --- | --- |
+| Historical `RawAttributedHwndsV1` | PASS | **INCONCLUSIVE** | `attributed-window-count-not-one:2` |
+| `ManagedTerminalV1` + `auxiliary-window.v3` | PASS | **PASS** | none |
+
+`raw=2 managed=1 auxiliary=1 unclassified=0 competing=0`; qualifying terminal
+`0x50366` (pid 7280); auxiliary `0x20330` (`PseudoConsoleWindow`, pid 10140) with
+`auxiliaryRoleClass=true` and `styleCorroboratesRole=null` because G2 never
+recorded the style. Every predicate is true: exit `exited` code 0, trace valid,
+process and window attribution succeed, trial identity matches, artifact binding
+verifies, broker ready, terminal finalized with zero failures.
+
+The verdict no longer depends on the absent style field, because v3 does not
+require it. The historical INCONCLUSIVE remains unchanged.
+
+### UI Automation limitation
+
+The product's `Test-DevWSHwndAssociation` validates a managed window using UI
+Automation **tab names** and the canonical `<windowId>[#DevWS:<N>]` family. The
+qualification classifier uses the **top-level title** plus exact class, process
+name and launch attribution. That is a narrower check, declared as
+`IdentityProxy`, with `ui-automation-tab-title-family` listed in
+`UnprovenProperties`. No UIA record was fabricated. Full product-equivalent UIA
+identity is **not** proven by this evidence set and is not claimed.
+
+### Test coverage
+
+The `R3` series (R301-R315) pins the v3 contract: arbitrary tool windows refused,
+the genuine helper accepted with **and** without a style field, foreign ownership,
+non-descendant owners, session mismatch, managed-title claims, contradictory
+identity, multiple helpers, helper-only sets, two managed terminals, both
+enumeration orders, contract self-identification, fallback-rectangle helpers, and
+helpers owned by a competing managed UI. Each negative asserts its own reason.
+
+Existing `AW` cases were updated where v3 changes the correct outcome (AW1, AW2,
+AW3, AW18); all other coverage is retained.
+
+The canonical suite is 342/342 PASS under **both** PowerShell 7.6.9 and Windows
+PowerShell 5.1 with a controlled module path (341 registered cases plus `R1`).
+
+---
 ## Stage 3B7G3-C1: fail-closed auxiliary contract and evidence sufficiency
+
+> **Superseded by Stage 3B7G3-C2.** C1's A8 (requiring `WS_EX_TOOLWINDOW`) was
+> refuted in both directions, and its starting-probe artifacts were overwritten by
+> later runs of the same probe. See the C2 section above.
+
 
 Stage 3B7G3 introduced `ManagedTerminalV1` and was accepted on a replay that
 returned N2-B **PASS**. Independent review found that verdict unsound. This stage

@@ -5588,6 +5588,176 @@ function Invoke-P9HManagedTerminalContractTests {
             $verdicts['ManagedTerminalV1'].Managed -eq 1) -Evidence $dir
 
     # =====================================================================
+    # R3 SERIES: the v3 positive auxiliary-role contract (Stage 3B7G3-C2).
+    #
+    # R3-1 is the decisive regression. C1 required WS_EX_TOOLWINDOW (A8) and so
+    # accepted ANY arbitrary class carrying that bit, because every relationship
+    # factor is satisfiable by an app window launched by the pinned shell. It also
+    # REJECTED a genuine ConPTY helper on any build that does not set the bit,
+    # which the Terminal documentation never promises. v3 makes the CLASS the role
+    # argument and demotes the style to corroboration.
+    # =====================================================================
+    $wsTool = $E_WS_EX_TOOLWINDOW
+    $wsApp = $E_WS_EX_APPWINDOW
+
+    # R3-1: arbitrary class, user-facing size, WS_EX_TOOLWINDOW set (C1 case X1).
+    $x1 = New-Win -Hwnd '0x74001' -WinPid 10140 -Class 'SomeArbitraryAppClass' -Title 'an-app-window' `
+        -Owner '0x50366' -X 100 -Y 100 -W 1200 -H 800 -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $x1) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R301' -Title 'An arbitrary class carrying WS_EX_TOOLWINDOW is NOT an auxiliary certificate' `
+        -Input 'unknown class, 1200x800, GW_OWNER=0x50366, genuine child, exact identity, WS_EX_TOOLWINDOW set' `
+        -Expected 'refused: the class is not a positively identified auxiliary role' `
+        -Actual ("ok={0} aux={1} unclassified={2} reason={3}" -f $r.Ok, $r.AuxiliaryCount, $r.UnclassifiedCount, $r.Unclassified[0].reason) `
+        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0 -and
+            $r.Unclassified[0].reason -match 'class-is-not-a-positively-identified-auxiliary-role') -Evidence $null
+
+    # R3-2: the genuine ConPTY helper with NO style recorded must still be
+    # accepted - a missing extended-style field must not disprove the role.
+    $genuine = New-Win -Hwnd '0x74002' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16
+    $r = Classify -Windows @($g2Terminal, $genuine) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R302' -Title 'The genuine helper class is accepted with no style field at all' `
+        -Input 'PseudoConsoleWindow, valid owner, genuine child, exact identity, exStyle absent' `
+        -Expected 'accepted; WS_EX_TOOLWINDOW is not required by the contract' `
+        -Actual ("ok={0} aux={1} uncl={2} styleCorroborates={3}" -f $r.Ok, $r.AuxiliaryCount, $r.UnclassifiedCount, [string]$r.Auxiliary[0].styleCorroboratesRole) `
+        -Pass ($r.Ok -eq $true -and $r.AuxiliaryCount -eq 1 -and $null -eq $r.Auxiliary[0].styleCorroboratesRole) -Evidence $null
+
+    # R3-3: the same helper WITH the bit records corroboration explicitly.
+    $genuine2 = New-Win -Hwnd '0x74003' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16 -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $genuine2) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R303' -Title 'A recorded tool-window bit is reported as corroboration, never as the reason' `
+        -Input 'the genuine helper with exStyle present and containing WS_EX_TOOLWINDOW' `
+        -Expected 'accepted with styleCorroboratesRole=True and the class role also true' `
+        -Actual ("ok={0} aux={1} corroborates={2} roleClass={3}" -f $r.Ok, $r.AuxiliaryCount, [string]$r.Auxiliary[0].styleCorroboratesRole, [string]$r.Auxiliary[0].auxiliaryRoleClass) `
+        -Pass ($r.Ok -eq $true -and $r.AuxiliaryCount -eq 1 -and $r.Auxiliary[0].styleCorroboratesRole -eq $true -and
+            $r.Auxiliary[0].auxiliaryRoleClass -eq $true) -Evidence $null
+
+    # R3-4: genuine class, but ownership points at a DIFFERENT hwnd.
+    $wrongOwner = New-Win -Hwnd '0x74004' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x99999' -X 0 -Y 0 -W 16 -H 16
+    $r = Classify -Windows @($g2Terminal, $wrongOwner) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R304' -Title 'A genuine helper class owned by a foreign HWND is refused' `
+        -Input 'PseudoConsoleWindow whose GW_OWNER is not the managed terminal' `
+        -Expected 'refused, reason owner-not-a-managed-terminal' `
+        -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'owner-not-a-managed-terminal') -Evidence $null
+
+    # R3-5: genuine class owned correctly, but the owner is NOT a descendant.
+    $stranger = New-Proc -ProcId 10400 -ParentPid 1 -Name 'pwsh.exe' `
+        -Cmd 'pwsh.exe -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
+    $w = New-Win -Hwnd '0x74005' -WinPid 10400 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366'
+    $r = Classify -Windows @($g2Terminal, $w) -Procs @($g2Procs[0], $stranger)
+    Add-P9HTestResult -Id 'R305' -Title 'A genuine helper class owned by a non-descendant is refused' `
+        -Input 'PseudoConsoleWindow with correct identity argv but an unrelated parent' `
+        -Expected 'refused, reason not-a-strict-descendant-of-managed-terminal' `
+        -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'not-a-strict-descendant') -Evidence $null
+
+    # R3-6: genuine class, correct owner, but a DIFFERENT session.
+    $otherSession = New-Proc -ProcId 10401 -ParentPid 7280 -Name 'pwsh.exe' -Session 5 `
+        -Cmd 'pwsh.exe -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
+    $w = New-Win -Hwnd '0x74006' -WinPid 10401 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366'
+    $r = Classify -Windows @($g2Terminal, $w) -Procs @($g2Procs[0], $otherSession)
+    Add-P9HTestResult -Id 'R306' -Title 'A genuine helper class from another session is refused' `
+        -Input 'PseudoConsoleWindow, valid owner, correct argv, but session 5' `
+        -Expected 'refused, reason session-mismatch' `
+        -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'session-mismatch') -Evidence $null
+
+    # R3-7: genuine class claiming the MANAGED TITLE -> competing bucket.
+    $claiming = New-Win -Hwnd '0x74007' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title $windowId `
+        -Owner '0x50366'
+    $r = Classify -Windows @($g2Terminal, $claiming) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R307' -Title 'A helper-class window claiming the managed title is competing UI' `
+        -Input 'PseudoConsoleWindow whose title is exactly the pinned windowId' `
+        -Expected 'Ok=False, competing=1' `
+        -Actual ("ok={0} competing={1} reason={2}" -f $r.Ok, $r.CompetingManagedUiCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.CompetingManagedUiCount -eq 1) -Evidence $null
+
+    # R3-8: contradictory evidence - genuine class and valid owner, but the
+    # identity argv names a different windowId. Identity must win.
+    $contradict = New-Proc -ProcId 10402 -ParentPid 7280 -Name 'pwsh.exe' `
+        -Cmd 'pwsh.exe -SetId n2qual -TerminalId n2qualterm -WindowId SOMEONE-ELSE'
+    $w = New-Win -Hwnd '0x74008' -WinPid 10402 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366'
+    $r = Classify -Windows @($g2Terminal, $w) -Procs @($g2Procs[0], $contradict)
+    Add-P9HTestResult -Id 'R308' -Title 'Contradictory launch identity defeats a plausible helper class' `
+        -Input 'PseudoConsoleWindow, valid owner, but owner argv names a different windowId' `
+        -Expected 'refused, reason windowId-mismatch' `
+        -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'windowId-mismatch') -Evidence $null
+
+    # R3-9: multiple genuinely identified helpers are all reported.
+    $h2 = New-Win -Hwnd '0x74009' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16
+    $r = Classify -Windows @($g2Terminal, $genuine, $h2) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R309' -Title 'Multiple genuinely identified helpers are all reported' `
+        -Input 'one managed terminal plus two positively identified helpers' `
+        -Expected 'Ok=True, managed=1, auxiliary=2, every reason present' `
+        -Actual ("ok={0} managed={1} aux={2} reason={3}" -f $r.Ok, $r.ManagedTerminalCount, $r.AuxiliaryCount, $r.Reason) `
+        -Pass ($r.Ok -eq $true -and $r.ManagedTerminalCount -eq 1 -and $r.AuxiliaryCount -eq 2) -Evidence $null
+
+    # R3-10: helpers only, no managed terminal.
+    $r = Classify -Windows @($genuine) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R310' -Title 'A helper with no managed terminal is still refused' `
+        -Input 'only the helper window; its owner is not in this set' `
+        -Expected 'Ok=False, managed=0' `
+        -Actual ("ok={0} managed={1} reason={2}" -f $r.Ok, $r.ManagedTerminalCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.ManagedTerminalCount -eq 0) -Evidence $null
+
+    # R3-11: two genuine managed terminals.
+    $secondTerm = New-Win -Hwnd '0x74010' -WinPid 7280 -Class $managedClass -Title $windowId
+    $r = Classify -Windows @($g2Terminal, $secondTerm) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R311' -Title 'Two genuine managed terminals are refused' `
+        -Input 'two windows satisfying the full managed-terminal contract' `
+        -Expected 'Ok=False, managed=2' `
+        -Actual ("ok={0} managed={1} reason={2}" -f $r.Ok, $r.ManagedTerminalCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.ManagedTerminalCount -eq 2) -Evidence $null
+
+    # R3-12: order independence under v3.
+    $fwd = Classify -Windows @($genuine, $g2Terminal) -Procs $g2Procs
+    $rev = Classify -Windows @($g2Terminal, $genuine) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R312' -Title 'The v3 contract is independent of enumeration order' `
+        -Input 'helper and owner presented in both orders' `
+        -Expected 'both: managed=1, auxiliary=1, unclassified=0' `
+        -Actual ("fwd=(m={0} a={1} u={2}) rev=(m={3} a={4} u={5})" -f
+            $fwd.ManagedTerminalCount, $fwd.AuxiliaryCount, $fwd.UnclassifiedCount,
+            $rev.ManagedTerminalCount, $rev.AuxiliaryCount, $rev.UnclassifiedCount) `
+        -Pass ($fwd.ManagedTerminalCount -eq 1 -and $fwd.AuxiliaryCount -eq 1 -and $fwd.UnclassifiedCount -eq 0 -and
+            $rev.ManagedTerminalCount -eq 1 -and $rev.AuxiliaryCount -eq 1 -and $rev.UnclassifiedCount -eq 0) -Evidence $null
+
+    # R3-13: the contract must advertise its own version so no result can be
+    # silently reinterpreted.
+    Add-P9HTestResult -Id 'R313' -Title 'The result names its own auxiliary contract version' `
+        -Input 'any classification result' `
+        -Expected 'AuxiliaryContract = p9h.auxiliary-window.v3 and the role class is declared' `
+        -Actual ("contract={0} roleClasses={1} schema={2}" -f $rev.AuxiliaryContract, (@($rev.AuxiliaryRoleClasses) -join ','), $rev.Schema) `
+        -Pass ($rev.AuxiliaryContract -eq 'p9h.auxiliary-window.v3' -and
+            @($rev.AuxiliaryRoleClasses) -contains 'PseudoConsoleWindow' -and
+            $rev.Schema -eq 'p9h.managed-terminals.v3') -Evidence $null
+
+    # R3-14: a helper at the forbidden fallback rectangle must satisfy the same
+    # contract; geometry is never proof of role.
+    $atFallback = New-Win -Hwnd '0x74011' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -X 9000 -Y 9000 -W 640 -H 400
+    $r = Classify -Windows @($g2Terminal, $atFallback) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R314' -Title 'A helper-class window at the fallback rectangle is judged by the same contract' `
+        -Input 'PseudoConsoleWindow at 9000,9000 with a large rectangle' `
+        -Expected 'accepted as auxiliary on role+relationship, geometry not decisive either way' `
+        -Actual ("ok={0} aux={1} reason={2}" -f $r.Ok, $r.AuxiliaryCount, $r.Auxiliary[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 1) -Evidence $null
+
+    # R3-15: helper class, but the managed window it claims is a COMPETING one.
+    $competingOwner = New-Win -Hwnd '0x74012' -WinPid 7280 -Class $managedClass -Title 'OTHER-TERM' -Owner '0x0'
+    $w = New-Win -Hwnd '0x74013' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x74012'
+    $r = Classify -Windows @($g2Terminal, $competingOwner, $w) -Procs $g2Procs
+    Add-P9HTestResult -Id 'R315' -Title 'A helper owned by a competing managed UI cannot legitimize it' `
+        -Input 'a foreign-title Cascadia window plus a helper whose GW_OWNER points at it' `
+        -Expected 'Ok=False; the competing window is bucketed and the helper is refused' `
+        -Actual ("ok={0} competing={1} aux={2} uncl={3}" -f $r.Ok, $r.CompetingManagedUiCount, $r.AuxiliaryCount, $r.UnclassifiedCount) `
+        -Pass ($r.Ok -eq $false -and $r.CompetingManagedUiCount -ge 1 -and $r.AuxiliaryCount -eq 0) -Evidence $null
+
+    # =====================================================================
     # C1 SERIES: fail-closed auxiliary contract (Stage 3B7G3-C1)
     #
     # Stage 3B7G3 accepted ANY window with a GW_OWNER link to the managed
@@ -5606,33 +5776,39 @@ function Invoke-P9HManagedTerminalContractTests {
         -Owner '0x50366' -X 100 -Y 100 -W 1200 -H 800 -ExStyle $wsApp
     $r = Classify -Windows @($g2Terminal, $c1a) -Procs $g2Procs
     Add-P9HTestResult -Id 'AW1' -Title 'An unknown full-size window owned by the managed terminal is refused' `
-        -Input 'arbitrary class, UI-sized rectangle, GW_OWNER=0x50366, genuine child, style recorded WITHOUT WS_EX_TOOLWINDOW' `
-        -Expected 'Ok=False and the reason names the non-tool-window role' `
+        -Input 'arbitrary class, UI-sized rectangle, GW_OWNER=0x50366, genuine child, WS_EX_APPWINDOW' `
+        -Expected 'Ok=False and the reason names the class role argument' `
         -Actual ("ok={0} aux={1} unclassified={2} reason={3}" -f $r.Ok, $r.AuxiliaryCount, $r.UnclassifiedCount, $r.Unclassified[0].reason) `
         -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0 -and $r.UnclassifiedCount -eq 1 -and
-            $r.Unclassified[0].reason -match 'not-a-tool-window') -Evidence $null
+            $r.Unclassified[0].reason -match 'class-is-not-a-positively-identified-auxiliary-role') -Evidence $null
 
-    # C1-2: same window when the style was NOT captured -> evidence gap, refused.
+    # C1-2 (v3 semantics): an unknown class with NO style is refused because the
+    # CLASS role argument fails - style is corroborating, not decisive, so its
+    # absence is reported but is no longer the reason for refusal.
     $c1b = New-Win -Hwnd '0x72002' -WinPid 10140 -Class 'SomeArbitraryAppClass' -Title 'an-app-window' `
         -Owner '0x50366' -X 100 -Y 100 -W 1200 -H 800
     $r = Classify -Windows @($g2Terminal, $c1b) -Procs $g2Procs
-    Add-P9HTestResult -Id 'AW2' -Title 'An unknown owned window with no recorded style is an evidence gap, not an accept' `
-        -Input 'the same window, but the record carries no exStyle at all' `
-        -Expected 'Ok=False, reason window-style-evidence-absent, gap reported' `
+    Add-P9HTestResult -Id 'AW2' -Title 'An unknown owned window is refused on its class even with no style recorded' `
+        -Input 'arbitrary class, no exStyle at all' `
+        -Expected 'Ok=False for the class role argument; the absent style is reported as a gap' `
         -Actual ("ok={0} aux={1} reason={2} gaps={3}" -f $r.Ok, $r.AuxiliaryCount, $r.Unclassified[0].reason, (@($r.EvidenceGaps) -join ',')) `
         -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0 -and
-            $r.Unclassified[0].reason -match 'window-style-evidence-absent' -and
+            $r.Unclassified[0].reason -match 'class-is-not-a-positively-identified-auxiliary-role' -and
             @($r.EvidenceGaps) -contains 'window-style-not-recorded') -Evidence $null
 
-    # C1-3: recognized helper class with valid GW_OWNER but NO style -> gap.
+    # C1-3 (v3 semantics): a genuine helper class DOES satisfy the role argument
+    # without any style, because the ConPTY role is documented independently of
+    # WS_EX_TOOLWINDOW. This is the reverse of the C1 expectation, and it is the
+    # correction: style must not be a prerequisite.
     $c1c = New-Win -Hwnd '0x72003' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
         -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16
     $r = Classify -Windows @($g2Terminal, $c1c) -Procs $g2Procs
-    Add-P9HTestResult -Id 'AW3' -Title 'A helper-shaped window with a valid owner but no style is INCONCLUSIVE' `
-        -Input 'PseudoConsoleWindow class, GW_OWNER=0x50366, 16x16, no exStyle recorded' `
-        -Expected 'not accepted on class or rectangle alone' `
-        -Actual ("ok={0} aux={1} reason={2}" -f $r.Ok, $r.AuxiliaryCount, $r.Unclassified[0].reason) `
-        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0) -Evidence $null
+    Add-P9HTestResult -Id 'AW3' -Title 'A positively identified helper class is accepted WITHOUT recorded style' `
+        -Input 'PseudoConsoleWindow, GW_OWNER=0x50366, genuine child, no exStyle recorded' `
+        -Expected 'accepted on class role + relationship evidence; the absent style is a reported gap, not a refusal' `
+        -Actual ("ok={0} aux={1} uncl={2} gaps={3}" -f $r.Ok, $r.AuxiliaryCount, $r.UnclassifiedCount, (@($r.EvidenceGaps) -join ',')) `
+        -Pass ($r.Ok -eq $true -and $r.AuxiliaryCount -eq 1 -and $r.UnclassifiedCount -eq 0 -and
+            $r.Auxiliary[0].auxiliaryRoleClass -eq $true) -Evidence $null
 
     # C1-4: competing Cascadia-class window WITH a valid owner -> competing bucket.
     $c1d = New-Win -Hwnd '0x72004' -WinPid 7280 -Class $managedClass -Title 'OTHER-TERMINAL' `
@@ -5673,29 +5849,29 @@ function Invoke-P9HManagedTerminalContractTests {
     }
 
     $aw6 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -SetId WRONGSET -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
-    Add-P9HTestResult -Id 'AW6' -Title 'A helper with VALID ownership and style but a wrong SetId is refused' `
-        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv has -SetId WRONGSET' `
+    Add-P9HTestResult -Id 'AW6' -Title 'A genuinely identified helper with a wrong SetId is refused' `
+        -Input 'PseudoConsoleWindow, GW_OWNER=0x50366, genuine child; owner argv has -SetId WRONGSET' `
         -Expected 'refused with a reason matching setId-mismatch' `
         -Actual ("aux={0} unclassified={1} reason={2}" -f $aw6.Aux, $aw6.Uncl, $aw6.Why) `
         -Pass ($aw6.Aux -eq 0 -and $aw6.Why -match 'setId-mismatch') -Evidence $null
 
     $aw7 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -SetId n2qual -TerminalId wrongterm -WindowId N2QUAL-n2qualterm'
-    Add-P9HTestResult -Id 'AW7' -Title 'A helper with VALID ownership and style but a wrong TerminalId is refused' `
-        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv has -TerminalId wrongterm' `
+    Add-P9HTestResult -Id 'AW7' -Title 'A genuinely identified helper with a wrong TerminalId is refused' `
+        -Input 'PseudoConsoleWindow, GW_OWNER=0x50366, genuine child; owner argv has -TerminalId wrongterm' `
         -Expected 'refused with a reason matching terminalId-mismatch' `
         -Actual ("aux={0} unclassified={1} reason={2}" -f $aw7.Aux, $aw7.Uncl, $aw7.Why) `
         -Pass ($aw7.Aux -eq 0 -and $aw7.Why -match 'terminalId-mismatch') -Evidence $null
 
     $aw8 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -SetId n2qual -TerminalId n2qualterm -WindowId OTHER-window'
-    Add-P9HTestResult -Id 'AW8' -Title 'A helper with VALID ownership and style but a wrong WindowId is refused' `
-        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv has -WindowId OTHER-window' `
+    Add-P9HTestResult -Id 'AW8' -Title 'A genuinely identified helper with a wrong WindowId is refused' `
+        -Input 'PseudoConsoleWindow, GW_OWNER=0x50366, genuine child; owner argv has -WindowId OTHER-window' `
         -Expected 'refused with a reason matching windowId-mismatch' `
         -Actual ("aux={0} unclassified={1} reason={2}" -f $aw8.Aux, $aw8.Uncl, $aw8.Why) `
         -Pass ($aw8.Aux -eq 0 -and $aw8.Why -match 'windowId-mismatch') -Evidence $null
 
     $aw9 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -NoExit -File bootstrap.ps1'
-    Add-P9HTestResult -Id 'AW9' -Title 'A helper with VALID ownership and style but no identity flags is refused' `
-        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv carries none of SetId/TerminalId/WindowId' `
+    Add-P9HTestResult -Id 'AW9' -Title 'A genuinely identified helper with no identity flags is refused' `
+        -Input 'PseudoConsoleWindow, GW_OWNER=0x50366, genuine child; owner argv carries none of SetId/TerminalId/WindowId' `
         -Expected 'refused with a reason matching setId-absent-from-owner-argv' `
         -Actual ("aux={0} unclassified={1} reason={2}" -f $aw9.Aux, $aw9.Uncl, $aw9.Why) `
         -Pass ($aw9.Aux -eq 0 -and $aw9.Why -match 'setId-absent-from-owner-argv') -Evidence $null
@@ -5705,7 +5881,7 @@ function Invoke-P9HManagedTerminalContractTests {
         -Owner '0x50366' -ExStyle $wsTool
     $r = Classify -Windows @($g2Terminal, $c1j) -Procs @($g2Procs[0], $noCmdProc)
     Add-P9HTestResult -Id 'AW10' -Title 'A helper with a missing owner command line is refused' `
-        -Input 'valid owner link and tool-window style, but the owning process has no command line' `
+        -Input 'genuine helper class and valid owner link, but the owning process has no command line' `
         -Expected 'refused, reason owner-command-line-missing' `
         -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
         -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'owner-command-line-missing') -Evidence $null
@@ -5717,7 +5893,7 @@ function Invoke-P9HManagedTerminalContractTests {
         -Owner '0x50366' -ExStyle $wsTool
     $r = Classify -Windows @($g2Terminal, $c1k) -Procs @($g2Procs[0], $otherSession)
     Add-P9HTestResult -Id 'AW11' -Title 'A helper owned across a session boundary is refused' `
-        -Input 'valid owner link, tool style and identity, but the owning process is in session 5' `
+        -Input 'valid owner link and identity, but the owning process is in session 5' `
         -Expected 'refused, reason session-mismatch' `
         -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
         -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'session-mismatch') -Evidence $null
@@ -5788,15 +5964,19 @@ function Invoke-P9HManagedTerminalContractTests {
         -Actual ("ok={0} aux={1} unclassified={2}" -f $r.Ok, $r.AuxiliaryCount, $r.UnclassifiedCount) `
         -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 1 -and $r.UnclassifiedCount -eq 1) -Evidence $null
 
-    # C1-18: style recorded but UNREADABLE must not be silently accepted.
+    # C1-18 (v3 semantics): an UNREADABLE style value must not be treated as if
+    # the style had been read and evaluated. Under v3 the style is corroborating,
+    # so the window is still accepted on the CLASS ROLE, but the corroboration must
+    # be reported as UNKNOWN - never silently as true or false.
     $badStyle = New-Win -Hwnd '0x72017' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
         -Owner '0x50366' -ExStyle 'not-a-number'
     $r = Classify -Windows @($g2Terminal, $badStyle) -Procs $g2Procs
-    Add-P9HTestResult -Id 'AW18' -Title 'An unreadable style value is never silently accepted' `
-        -Input 'exStyle present but not a number' `
-        -Expected 'Ok=False' `
-        -Actual ("ok={0} aux={1} reason={2}" -f $r.Ok, $r.AuxiliaryCount, $r.Unclassified[0].reason) `
-        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0) -Evidence $null
+    Add-P9HTestResult -Id 'AW18' -Title 'An unreadable style value is never silently interpreted' `
+        -Input 'exStyle present but not a number, on a genuinely identified helper class' `
+        -Expected 'corroboration reported as unknown (not True/False); role still decided by the class' `
+        -Actual ("aux={0} corroborates={1} roleClass={2}" -f $r.AuxiliaryCount, [string]$r.Auxiliary[0].styleCorroboratesRole, [string]$r.Auxiliary[0].auxiliaryRoleClass) `
+        -Pass ($r.AuxiliaryCount -eq 1 -and $null -eq $r.Auxiliary[0].styleCorroboratesRole -and
+            $r.Auxiliary[0].auxiliaryRoleClass -eq $true) -Evidence $null
 
     # C1-19: the ownership link must be REAL. A window whose owner is not in the
     # set is refused even with perfect style and identity.
@@ -5804,7 +5984,7 @@ function Invoke-P9HManagedTerminalContractTests {
         -Owner '0x0' -ExStyle $wsTool
     $r = Classify -Windows @($g2Terminal, $noOwner) -Procs $g2Procs
     Add-P9HTestResult -Id 'AW19' -Title 'A helper with no ownership link is refused despite perfect identity' `
-        -Input 'tool-window style and exact identity, but GW_OWNER is 0x0' `
+        -Input 'genuine helper class and exact identity, but GW_OWNER is 0x0' `
         -Expected 'refused, reason owner-not-a-managed-terminal' `
         -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
         -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'owner-not-a-managed-terminal') -Evidence $null
@@ -5814,7 +5994,7 @@ function Invoke-P9HManagedTerminalContractTests {
         -Input 'any classification result' `
         -Expected 'UnprovenProperties lists the absent style/UIA properties and IdentityProxy names the title proxy' `
         -Actual ("unproven={0} proxy={1}" -f (@($rev.UnprovenProperties) -join ','), $rev.IdentityProxy) `
-        -Pass (@($rev.UnprovenProperties) -contains 'WS_EX_TOOLWINDOW' -and
+        -Pass (@($rev.UnprovenProperties) -contains 'GWL_EXSTYLE' -and
             @($rev.UnprovenProperties) -contains 'ui-automation-tab-title-family' -and
             $rev.IdentityProxy -eq 'top-level-window-title-equals-windowId') -Evidence $null
 }
@@ -6149,8 +6329,8 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 326 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R', 'E', 'I', 'AW')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 341 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R', 'E', 'I', 'AW', 'R3')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `
