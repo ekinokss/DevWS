@@ -50,6 +50,10 @@ function Get-P9HExecutionContext {
     #
     # Deliberately read-only and obligation-free: it starts no process, opens no
     # session and changes nothing. It only reports identity.
+    #
+    # This function takes NO parameters on purpose (Stage 3B7G1). It is the only
+    # source of the ACTUAL local identity, and an executable path must obtain that
+    # identity from here rather than from a caller-supplied object.
     param()
 
     $identity = $null
@@ -71,28 +75,142 @@ function Get-P9HExecutionContext {
     }
 }
 
+function Test-P9HResolvedGuestTarget {
+    # Stage 3B7G1: is a WTS enumeration RESULT a genuine logged-on user session?
+    #
+    # Returns Ok=$true ONLY when the resolver produced an authoritative,
+    # consistent table in which the target is positively resolved as a real
+    # logged-on session matching the pinned identity, and whose enumerated state
+    # is NOT WTSListen.
+    #
+    # CLASSIFICATION IS BY THE ENUMERATED STATE, never by numeric range. A
+    # "session id >= 65536 means listener" rule is factually wrong: 65536 is
+    # conventional, not contractual, and a range rule would both excuse a real
+    # failure of a high-id user session and refuse a legitimate low-id listener.
+    #
+    # Deliberately read-only: it inspects a result that was already collected.
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Resolved,
+        [Parameter(Mandatory)][int]$TargetSessionId,
+        [AllowNull()][string]$TargetUser = $null,
+        [AllowNull()][string]$TargetLogonTime = $null
+    )
+
+    $fail = {
+        param($reason, $detail)
+        return [pscustomobject][ordered]@{
+            Ok = $false; Reason = $reason; Detail = $detail
+            State = $null; StateName = $null; User = $null; LogonTime = $null
+        }
+    }
+
+    if ($null -eq $Resolved) { return (& $fail 'no-resolution' 'no WTS resolution result was supplied') }
+
+    # ---- the enumeration/resolution itself must be authoritative ----
+    if ($null -ne $Resolved.PSObject.Properties['Ok'] -and $Resolved.Ok -ne $true) {
+        return (& $fail 'resolution-not-authoritative' ('resolver said: ' + [string]$Resolved.Reason))
+    }
+
+    if ($null -ne $Resolved.PSObject.Properties['TargetStateChanged'] -and $Resolved.TargetStateChanged -eq $true) {
+        return (& $fail 'target-state-changed-during-collection' 'the target moved between enumeration and query')
+    }
+
+    $rows = @($Resolved.Rows)
+    $targets = @($rows | Where-Object { [int]$_.SessionId -eq $TargetSessionId })
+    if ($targets.Count -eq 0) { return (& $fail 'target-not-present' ('session {0} was not in the table' -f $TargetSessionId)) }
+    if ($targets.Count -gt 1) { return (& $fail 'ambiguous-target' ('{0} rows claim session {1}' -f $targets.Count, $TargetSessionId)) }
+
+    $row = $targets[0]
+
+    if ($null -ne $row.PSObject.Properties['IsListener'] -and $row.IsListener -eq $true) {
+        return (& $fail 'target-is-listener' 'the target was classified as a WTS connection listener')
+    }
+
+    if ($row.QueryOk -ne $true) {
+        return (& $fail 'target-query-failed' ('WTSINFO: ' + [string]$row.QueryReason))
+    }
+
+    # ---- the ENUMERATED state is the authority for listener classification ----
+    $enumeratedState = $null
+    if ($null -ne $row.PSObject.Properties['EnumeratedState']) { $enumeratedState = [int]$row.EnumeratedState }
+
+    if ($null -eq $enumeratedState) {
+        return (& $fail 'enumerated-state-unavailable' 'the enumeration did not report the target state')
+    }
+
+    if ($enumeratedState -eq $script:P9HWtsStateListen) {
+        return (& $fail 'target-is-listener' ('enumerated state {0} is WTSListen, not a logged-on user session' -f $enumeratedState))
+    }
+
+    if ($enumeratedState -ne $script:P9HWtsStateActive) {
+        # Only WTSActive (0) means a session exists as a real logged-on user
+        # session. Anything else fails closed.
+        return (& $fail 'enumerated-state-not-active' ('enumerated state {0} is not an active user session' -f $enumeratedState))
+    }
+
+    if ($TargetSessionId -eq 0) {
+        return (& $fail 'target-is-session-zero' 'session 0 is the services session')
+    }
+
+    # ---- identity must match what the plan pinned ----
+    $user = [string]$row.User
+    $logon = [string]$row.LogonTime
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetUser)) {
+        # Account comparison is case-INsensitive on Windows and must NOT use
+        # Test-P9HLogonEqual: that helper compares LOGON TIME instants, and it
+        # correctly reports two non-timestamp strings as unequal.
+        $userMatches = [string]::Equals($user, $TargetUser, [System.StringComparison]::OrdinalIgnoreCase)
+        if (-not $userMatches) {
+            return (& $fail 'target-user-mismatch' ('observed {0}, pinned {1}' -f $user, $TargetUser))
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($TargetLogonTime)) {
+        if (-not (Test-P9HLogonEqual -Left $logon -Right $TargetLogonTime)) {
+            return (& $fail 'target-logon-mismatch' ('observed {0}, pinned {1}' -f $logon, $TargetLogonTime))
+        }
+    }
+
+    return [pscustomobject][ordered]@{
+        Ok = $true; Reason = 'target-resolved-positively'; Detail = $null
+        State = $enumeratedState
+        StateName = if ($null -ne $row.PSObject.Properties['EnumeratedStateName']) { [string]$row.EnumeratedStateName } else { $null }
+        User = $user
+        LogonTime = $logon
+    }
+}
+
 function Assert-P9HGuestExecutionContext {
-    # FAIL-CLOSED GUEST BOUNDARY.
+    # FAIL-CLOSED GUEST BOUNDARY - PURE / NON-EXECUTING.
     #
-    # Refuses to let a GUEST-targeted disconnect proceed anywhere except on the
-    # named guest. Every requirement below is MANDATORY and there is no way to
-    # switch a check off:
+    # Stage 3B7G1 split the boundary in two so an executable path can never be
+    # spoofed:
     #
-    #   * the plan must name the intended guest identity;
-    #   * the expected computer must be supplied by the caller (no default, so an
-    #     omitted value cannot silently disable the check);
+    #   * THIS function is the pure decision procedure. It may be handed a
+    #     synthetic context so the whole rule set is testable offline, and it
+    #     NEVER starts a process.
+    #   * Assert-P9HLiveGuestBoundary is the executable gate. It takes NO context
+    #     parameter at all and always reads the real local identity immediately
+    #     before process creation, so there is nothing to spoof.
+    #
+    # Every requirement below is MANDATORY and none can be switched off:
+    #
+    #   * the plan must name the intended guest identity and authorized VM id;
+    #   * the expected computer must be supplied by the caller (no default);
     #   * the ACTUAL local computer name must equal the expected one;
     #   * the plan's guest identity must equal the actual local computer name;
-    #   * the authorized VM id must be supplied and must equal the plan's VM id;
     #   * the target must not be session 0 and must not be a WTS listener.
     #
-    # It throws on every mismatch, BEFORE any process is created, and returns the
-    # verified execution context on success. Because it never runs tsdiscon, the
-    # whole boundary is testable without a live session.
+    # It throws on every mismatch and returns the (possibly synthetic) context on
+    # success. Callers that will create a process MUST use
+    # Assert-P9HLiveGuestBoundary instead.
     param(
         [Parameter(Mandatory)][AllowNull()]$Plan,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedComputerName,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedVmId,
+        # TEST INJECTION ONLY. Supplied exclusively by the synthetic suite. An
+        # executable path passes nothing here and uses the live gate instead.
         [AllowNull()]$LocalContext = $null
     )
 
@@ -161,17 +279,62 @@ function Assert-P9HGuestExecutionContext {
         throw 'P9-H: session 0 is the services session and can never be a disconnect target.'
     }
 
-    if ($targetId -ge 65536) {
-        # WTS listener ids (WTSListen) are connection endpoints, not logged-on
-        # users. Disconnecting one is meaningless and would prove nothing.
-        throw ("P9-H: session id {0} is in the WTS listener range and cannot be a disconnect target." -f $targetId)
-    }
-
+    # Stage 3B7G1 correction: listener classification is by the ENUMERATED WTS
+    # state (WTSListen = 6), NOT by numeric range. The previous
+    # "id >= 65536 means listener" rule was factually wrong twice over: 65536 is
+    # conventional rather than contractual, so it would refuse a legitimate
+    # logged-on user session that happens to have a high id, and it would accept a
+    # low-id listener. Positive resolution is now required (see
+    # Test-P9HResolvedGuestTarget), and a known resolver verdict is honoured.
     if ($null -ne $Plan.PSObject.Properties['TargetIsListener'] -and $Plan.TargetIsListener -eq $true) {
         throw 'P9-H: the disconnect target is a WTS listener, not a logged-on user session. Refusing.'
     }
 
+    if ($null -ne $Plan.PSObject.Properties['TargetEnumeratedState'] -and
+        $null -ne $Plan.TargetEnumeratedState -and [int]$Plan.TargetEnumeratedState -eq $script:P9HWtsStateListen) {
+        throw 'P9-H: the disconnect target is enumerated in state WTSListen (6), which is a connection listener, not a logged-on user session. Refusing.'
+    }
+
+    if ($null -ne $Plan.PSObject.Properties['TargetResolved'] -and $Plan.TargetResolved -eq $false) {
+        throw 'P9-H: the disconnect target was not positively resolved as an authoritative logged-on user session. Refusing to execute against an unresolved target.'
+    }
+
     return $context
+}
+
+function Assert-P9HLiveGuestBoundary {
+    # EXECUTABLE GUEST BOUNDARY - NOT SPOOFABLE.
+    #
+    # Stage 3B7G1. The Stage 3B7G0 boundary accepted an injected -LocalContext on
+    # every function, including the one that starts a process. A caller could
+    # therefore hand it a fabricated "ComputerName = the guest" object and satisfy
+    # the check on the HOST. That is a spoofing hole in the exact control the
+    # previous stage added.
+    #
+    # This function takes NO context parameter. It ALWAYS reads the real local
+    # identity via Get-P9HExecutionContext immediately before process creation, so
+    # there is no argument to forge. It delegates every rule to the pure helper
+    # above, so the pure and live paths cannot drift apart.
+    #
+    # Callers that will create a process MUST call this, never the pure helper.
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Plan,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedComputerName,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedVmId
+    )
+
+    # The ONLY source of identity: the real machine, read now.
+    $liveContext = Get-P9HExecutionContext
+
+    if ($null -eq $liveContext -or [string]::IsNullOrWhiteSpace([string]$liveContext.ComputerName)) {
+        throw 'P9-H: the live guest boundary could not determine this machine''s identity. A guest-targeted disconnect cannot be authorized without positive proof that this IS the guest.'
+    }
+
+    # Every rule, evaluated against the REAL identity. A spoofed string cannot
+    # reach this call because there is no parameter to supply one.
+    return (Assert-P9HGuestExecutionContext -Plan $Plan `
+            -ExpectedComputerName $ExpectedComputerName -ExpectedVmId $ExpectedVmId `
+            -LocalContext $liveContext)
 }
 
 function New-P9HDisconnectPlan {
@@ -195,7 +358,13 @@ function New-P9HDisconnectPlan {
         # which authorized VM it belongs to. Both are validated as non-empty
         # below, so an omitted value is a refusal, never a silent default.
         [AllowNull()][AllowEmptyString()][string]$GuestComputerName = $null,
-        [AllowNull()][AllowEmptyString()][string]$VmId = $null
+        [AllowNull()][AllowEmptyString()][string]$VmId = $null,
+        # Stage 3B7G1: the target must be POSITIVELY RESOLVED as a genuine
+        # logged-on user session. When a resolved WTS table is supplied the plan
+        # consumes its verdict; when it is not supplied the plan records that the
+        # resolution is outstanding and the live boundary refuses to execute
+        # without it.
+        [AllowNull()]$ResolvedSessions = $null
     )
 
     if ([string]::IsNullOrWhiteSpace($TargetSessionId)) {
@@ -209,10 +378,6 @@ function New-P9HDisconnectPlan {
 
     if ($id -eq 0) {
         throw 'P9-H: session 0 is the services session and can never be a disconnect target.'
-    }
-
-    if ($id -ge 65536) {
-        throw ("P9-H: session id {0} is in the WTS listener range and cannot be a disconnect target." -f $id)
     }
 
     if ([string]::IsNullOrWhiteSpace($TargetUser)) {
@@ -229,15 +394,35 @@ function New-P9HDisconnectPlan {
         throw 'P9-H: the disconnect plan must name the authorized VM id so execution is restricted to that authorized machine.'
     }
 
+    # Stage 3B7G1: POSITIVE target resolution.
+    #
+    # Listener classification is by the ENUMERATED WTS state (WTSListen = 6) and
+    # by positive identity resolution, NEVER by a numeric-range guess. The earlier
+    # "id >= 65536 is a listener" rule was wrong in both directions.
+    $resolution = $null
+    if ($null -ne $ResolvedSessions) {
+        $resolution = Test-P9HResolvedGuestTarget -Resolved $ResolvedSessions -TargetSessionId $id `
+            -TargetUser $TargetUser -TargetLogonTime $TargetLogonTime
+        if (-not $resolution.Ok) {
+            throw ("P9-H: the disconnect target was not positively resolved as a genuine logged-on user session ({0}): {1}." -f $resolution.Reason, $resolution.Detail)
+        }
+    }
+
     return [pscustomobject][ordered]@{
-        TrialId         = $TrialId
-        GuestComputerName = $GuestComputerName
-        VmId            = $VmId
-        TargetSessionId = $id
-        TargetUser      = $TargetUser
-        TargetLogonTime = $TargetLogonTime
-        Method          = $Method
-        CreatedUtc      = Get-P9HUtcStamp
+        TrialId            = $TrialId
+        GuestComputerName  = $GuestComputerName
+        VmId               = $VmId
+        TargetSessionId    = $id
+        TargetUser         = $TargetUser
+        TargetLogonTime    = $TargetLogonTime
+        Method             = $Method
+        # Evidence carried with the plan so the boundary can refuse later.
+        TargetResolved     = ($null -ne $resolution)
+        TargetIsListener   = if ($null -ne $resolution) { $false } else { $null }
+        TargetEnumeratedState = if ($null -ne $resolution) { $resolution.State } else { $null }
+        TargetResolvedUser = if ($null -ne $resolution) { $resolution.User } else { $null }
+        TargetResolvedLogon = if ($null -ne $resolution) { $resolution.LogonTime } else { $null }
+        CreatedUtc         = Get-P9HUtcStamp
     }
 }
 
@@ -253,10 +438,15 @@ function Invoke-P9HControlledDisconnect {
     # Returns the raw outcome. The caller MUST NOT treat Ok=$true as proof of
     # the transition; proof comes only from the observer log.
     #
-    # Stage 3B7G0: this function now enforces the GUEST EXECUTION BOUNDARY before
-    # it resolves a tool or starts a process. The boundary check runs AFTER the
+    # Stage 3B7G0: this function enforces the GUEST EXECUTION BOUNDARY before it
+    # resolves a tool or starts a process. The boundary check runs AFTER the
     # authorization token (so the token requirement is preserved) and BEFORE any
     # process creation, so a plan for a guest can never disconnect a host session.
+    #
+    # Stage 3B7G1: the boundary is now Assert-P9HLiveGuestBoundary, which takes NO
+    # context parameter. This function therefore has nothing a caller could forge:
+    # the ACTUAL machine identity is re-read from the operating system immediately
+    # before process creation and every rule is evaluated against it.
     param(
         [Parameter(Mandatory)]$Plan,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$AuthorizationToken,
@@ -264,9 +454,6 @@ function Invoke-P9HControlledDisconnect {
         # ALLOWED to touch. Omitting either is a refusal, not a skipped check.
         [AllowNull()][AllowEmptyString()][string]$ExpectedComputerName = $null,
         [AllowNull()][AllowEmptyString()][string]$ExpectedVmId = $null,
-        # Injectable purely so the boundary is testable without a live guest.
-        # The production path leaves this null and reads the real identity.
-        [AllowNull()]$LocalContext = $null,
         # NOT Mandatory: with a default value, Mandatory still makes PowerShell
         # PROMPT for the argument, which blocks a non-interactive harness. The
         # authorization token above is the real gate.
@@ -276,11 +463,11 @@ function Invoke-P9HControlledDisconnect {
     [void](Assert-P9HRealExecutionAuthorized -AuthorizationToken $AuthorizationToken -Action 'Invoke-P9HControlledDisconnect')
 
     # ---------------------------------------------------------------------
-    # GUEST EXECUTION BOUNDARY - fail closed BEFORE any process exists.
+    # LIVE GUEST EXECUTION BOUNDARY - fail closed BEFORE any process exists.
+    # No injectable context exists on this path.
     # ---------------------------------------------------------------------
-    $context = Assert-P9HGuestExecutionContext -Plan $Plan `
-        -ExpectedComputerName $ExpectedComputerName -ExpectedVmId $ExpectedVmId `
-        -LocalContext $LocalContext
+    $context = Assert-P9HLiveGuestBoundary -Plan $Plan `
+        -ExpectedComputerName $ExpectedComputerName -ExpectedVmId $ExpectedVmId
 
     if (-not (Test-Path -LiteralPath $TsdisconPath -PathType Leaf)) {
         return [pscustomobject][ordered]@{
@@ -587,6 +774,11 @@ function Test-P9HGuestDisconnectEligible {
     # typed the real-execution phrase is a permission question, while "may this
     # plan touch this machine at all" is a safety question. Keeping them separate
     # is what makes the boundary testable offline.
+    #
+    # Stage 3B7G1: -LocalContext is accepted HERE and ONLY here. This function
+    # never creates a process, so injecting a synthetic identity lets the whole
+    # rule set be tested on any machine. The executable path uses
+    # Assert-P9HLiveGuestBoundary and has no such parameter.
     param(
         [Parameter(Mandatory)][AllowNull()]$Plan,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedComputerName,
@@ -620,22 +812,94 @@ function Test-P9HGuestDisconnectEligible {
     }
 }
 
+function Resolve-P9HAuthorizedVm {
+    # Stage 3B7G1: REAL Hyper-V identity binding.
+    #
+    # Two matching caller-supplied strings are NOT independent evidence. Before any
+    # PowerShell Direct dispatch this resolves the VM from Hyper-V by NAME, reads
+    # the ACTUAL VM object id, and requires that id to equal the authorized
+    # candidate VM id.
+    #
+    # Read-only: Get-VM is a query. Nothing starts.
+    #
+    # Refuses when the VM is missing, ambiguous, stopped in a way that makes
+    # dispatch impossible, or when its real id differs from the authorized id.
+    #
+    # -VmsOverride exists ONLY so the resolution logic is testable without Hyper-V
+    # objects; production passes nothing and Hyper-V is consulted for real.
+    param(
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedVmName,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedVmId,
+        [AllowNull()]$VmsOverride = $null
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedVmName)) {
+        throw 'P9-H: Hyper-V binding requires the expected VM name.'
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ExpectedVmId)) {
+        throw 'P9-H: Hyper-V binding requires the authorized VM id.'
+    }
+
+    if ($null -ne $VmsOverride) {
+        $all = @($VmsOverride)
+    }
+    else {
+        if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue)) {
+            throw 'P9-H: the Hyper-V module is unavailable on this machine, so the authorized VM identity cannot be proven. Refusing to dispatch a guest action.'
+        }
+        $all = @(Get-VM -ErrorAction SilentlyContinue)
+    }
+
+    $byName = @($all | Where-Object { $null -ne $_ -and [string]::Equals([string]$_.Name, $ExpectedVmName, [System.StringComparison]::OrdinalIgnoreCase) })
+
+    if ($byName.Count -eq 0) {
+        throw ("P9-H: the authorized VM '{0}' does not exist on this machine. Refusing to dispatch." -f $ExpectedVmName)
+    }
+
+    if ($byName.Count -gt 1) {
+        throw ("P9-H: the VM name '{0}' is ambiguous ({1} matches). Refusing to dispatch." -f $ExpectedVmName, $byName.Count)
+    }
+
+    $vm = $byName[0]
+    $actualId = [string]$vm.Id
+
+    if ([string]::IsNullOrWhiteSpace($actualId)) {
+        throw 'P9-H: the resolved VM has no readable Hyper-V id. Refusing to dispatch.'
+    }
+
+    if (-not [string]::Equals($actualId, $ExpectedVmId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw ("P9-H: the VM named '{0}' resolves to Hyper-V id '{1}', but the authorized candidate VM id is '{2}'. Refusing to dispatch to a machine whose real identity does not match the authorization." -f $ExpectedVmName, $actualId, $ExpectedVmId)
+    }
+
+    return [pscustomobject][ordered]@{
+        Name         = [string]$vm.Name
+        Id           = $actualId
+        State        = [string]$vm.State
+        IDVerified   = $true
+        ResolvedUtc  = Get-P9HUtcStamp
+    }
+}
+
 function Invoke-P9HGuestControlledDisconnect {
     # Guest-targeted controlled disconnect ORCHESTRATION.
     #
     # This is the ONLY intended production entry point. It performs the whole
     # sequence in the correct order and cannot be redirected at the host:
     #
-    #   1. validate the plan and its guest binding LOCALLY, before any transport;
-    #   2. prove the authorized VM exists and is the expected one;
-    #   3. run the disconnect INSIDE that VM over PowerShell Direct;
-    #   4. re-verify the guest's own computer identity INSIDE the execution
+    #   1. authorization token;
+    #   2. REAL Hyper-V identity binding (name -> actual id == authorized id);
+    #   3. local boundary proof: this process must NOT need to be the guest,
+    #      because the execution is remote;
+    #   4. run the disconnect INSIDE that VM over PowerShell Direct;
+    #   5. re-verify the guest's own computer identity INSIDE the execution
     #      context before tsdiscon is started there;
-    #   5. return the guest's verbatim outcome.
+    #   6. return the guest's verbatim outcome.
     #
-    # The local boundary check in step 1 is what makes the Stage 3B7F-R2 incident
-    # impossible: a caller that forgets to orchestrate remotely is refused here,
-    # because the LOCAL computer is not the named guest.
+    # Stage 3B7G1 removed the caller-supplied -LocalContext from this function.
+    # Previously a caller could hand it an object claiming to BE the guest and the
+    # orchestration would take the "local-in-guest" branch on the HOST. That branch
+    # is now gated on the OS-supplied identity only.
     param(
         [Parameter(Mandatory)]$Plan,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$AuthorizationToken,
@@ -643,46 +907,52 @@ function Invoke-P9HGuestControlledDisconnect {
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ExpectedVmId,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$GuestCredentialUser,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$GuestCredentialPassword,
-        # Injectable so the whole orchestration is testable with no VM and no
-        # session. Production leaves these null.
-        [AllowNull()]$LocalContext = $null,
+        # TEST INJECTION for the Hyper-V lookup only. Production passes nothing.
+        [AllowNull()]$VmsOverride = $null,
+        # TEST INJECTION for the transport only. Production passes nothing.
         [AllowNull()][scriptblock]$RemoteInvoker = $null,
         [string]$TsdisconPath = (Join-Path $env:SystemRoot 'System32\tsdiscon.exe')
     )
 
-    # ---- 0. authorization first: the token requirement is never bypassed ----
+    # ---- 1. authorization first: the token requirement is never bypassed ----
     [void](Assert-P9HRealExecutionAuthorized -AuthorizationToken $AuthorizationToken -Action 'Invoke-P9HGuestControlledDisconnect')
 
     if ([string]::IsNullOrWhiteSpace($ExpectedVmName)) {
         throw 'P9-H: guest orchestration requires the authorized VM name; refusing to guess which machine to disconnect.'
     }
 
-    # ---- 1. local guest boundary: this process must BE the guest ----
-    # In the production topology the orchestration runs on the host and therefore
-    # FAILS this check, which is correct and deliberate: the guest-side execution
-    # must be performed by the remote invoker, never by the host itself.
-    $context = if ($null -ne $LocalContext) { $LocalContext } else { Get-P9HExecutionContext }
-    $weAreTheGuest = [string]::Equals([string]$context.ComputerName, [string]$Plan.GuestComputerName, [System.StringComparison]::OrdinalIgnoreCase)
+    # ---- 2. REAL Hyper-V identity binding, before any dispatch ----
+    $vm = Resolve-P9HAuthorizedVm -ExpectedVmName $ExpectedVmName -ExpectedVmId $ExpectedVmId -VmsOverride $VmsOverride
 
-    if ($weAreTheGuest) {
-        # Running already inside the guest: the local path is legitimate.
-        $out = Invoke-P9HControlledDisconnect -Plan $Plan -AuthorizationToken $AuthorizationToken `
-            -ExpectedComputerName $Plan.GuestComputerName -ExpectedVmId $ExpectedVmId `
-            -LocalContext $context -TsdisconPath $TsdisconPath
-        return [pscustomobject][ordered]@{
-            Ok                     = [bool]$out.Ok
-            Transport              = 'local-in-guest'
-            ExecutedOnComputerName = [string]$context.ComputerName
-            GuestOutcome           = $out
-        }
-    }
-
-    # ---- 2. host path: the plan must never execute here ----
-    # Prove the authorized VM identity before dispatching anything.
     if (-not [string]::Equals([string]$Plan.VmId, $ExpectedVmId, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw ("P9-H: the disconnect plan names VM id '{0}' but the authorized VM id is '{1}'. Refusing." -f $Plan.VmId, $ExpectedVmId)
     }
 
+    if (-not [string]::Equals([string]$Plan.GuestComputerName, [string]$ExpectedVmName, [System.StringComparison]::OrdinalIgnoreCase) -and
+        [string]::IsNullOrWhiteSpace([string]$Plan.GuestComputerName)) {
+        throw 'P9-H: the disconnect plan does not name its guest computer. Refusing an unbound plan.'
+    }
+
+    # ---- 3. the LOCAL identity is used ONLY to decide the legitimate branch ----
+    # This is read from the OS, never supplied by the caller.
+    $liveContext = Get-P9HExecutionContext
+    $weAreTheGuest = [string]::Equals([string]$liveContext.ComputerName, [string]$Plan.GuestComputerName, [System.StringComparison]::OrdinalIgnoreCase)
+
+    if ($weAreTheGuest) {
+        # Running already inside the guest: the local path is legitimate, and it
+        # still re-reads identity inside Invoke-P9HControlledDisconnect.
+        $out = Invoke-P9HControlledDisconnect -Plan $Plan -AuthorizationToken $AuthorizationToken `
+            -ExpectedComputerName $Plan.GuestComputerName -ExpectedVmId $vm.Id -TsdisconPath $TsdisconPath
+        return [pscustomobject][ordered]@{
+            Ok                     = [bool]$out.Ok
+            Transport              = 'local-in-guest'
+            AuthorizedVmId         = [string]$vm.Id
+            ExecutedOnComputerName = [string]$liveContext.ComputerName
+            GuestOutcome           = $out
+        }
+    }
+
+    # ---- 4. host path: the plan must never execute here ----
     if ([string]::IsNullOrWhiteSpace($GuestCredentialUser)) {
         throw 'P9-H: guest orchestration requires explicit guest credentials; refusing to dispatch an unauthenticated remote action.'
     }
@@ -694,25 +964,26 @@ function Invoke-P9HGuestControlledDisconnect {
     $payload = [ordered]@{
         TrialId         = [string]$Plan.TrialId
         ComputerName    = [string]$Plan.GuestComputerName
-        VmId            = [string]$Plan.VmId
+        VmId            = [string]$vm.Id
         TargetSessionId = [int]$Plan.TargetSessionId
         TargetUser      = [string]$Plan.TargetUser
         TargetLogonTime = [string]$Plan.TargetLogonTime
         TsdisconPath    = [string]$TsdisconPath
         AuthorizationToken = [string]$AuthorizationToken
-        ExpectedVmId    = [string]$ExpectedVmId
+        ExpectedVmId    = [string]$vm.Id
     }
 
     $invoker = if ($null -ne $RemoteInvoker) {
         $RemoteInvoker
     }
     else {
-        # Production invoker: PowerShell Direct. The remote block re-verifies the
-        # GUEST'S OWN computer identity before it starts tsdiscon, so a host that
-        # somehow reached this point still cannot disconnect its own session.
+        # Production invoker: PowerShell Direct against the VERIFIED VM object.
+        # The remote block re-verifies the GUEST'S OWN computer identity before it
+        # starts tsdiscon, so a host that somehow reached this point still cannot
+        # disconnect its own session.
         {
-            param($P, $VmName, $Credential)
-            Invoke-Command -VMName $VmName -Credential $Credential -ErrorAction Stop -ScriptBlock {
+            param($P, $Vm, $Credential)
+            Invoke-Command -VMId ([guid]$Vm.Id) -Credential $Credential -ErrorAction Stop -ScriptBlock {
                 param($Inner)
                 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
                 . 'C:\ProgramData\P9H\lib\p9h-e1-state.ps1'
@@ -755,12 +1026,14 @@ function Invoke-P9HGuestControlledDisconnect {
     $cred = New-Object System.Management.Automation.PSCredential(
         $GuestCredentialUser, (ConvertTo-SecureString $GuestCredentialPassword -AsPlainText -Force))
 
-    $remote = & $invoker $payload $ExpectedVmName $cred
+    $remote = & $invoker $payload $vm $cred
 
     return [pscustomobject][ordered]@{
         Ok                     = [bool]$remote.Ok
         Transport              = 'powershell-direct'
-        DispatchedFromComputer = [string]$context.ComputerName
+        AuthorizedVmName       = [string]$vm.Name
+        AuthorizedVmId         = [string]$vm.Id
+        DispatchedFromComputer = [string]$liveContext.ComputerName
         ExecutedOnComputerName = [string]$remote.GuestComputerName
         GuestOutcome           = $remote
     }

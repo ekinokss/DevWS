@@ -700,7 +700,7 @@ The positive path is preserved: a clean capture with an omitted flag still deriv
 | U4 | explicit `true` cannot override a failed capture outcome |
 | U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
 
-The registry guard now covers **253** registered cases; the full run executes 254 including `R1`.
+The registry guard now covers **260** registered cases; the full run executes 261 including `R1`.
 All 221 prior cases and `R1` are retained unchanged.
 
 ---
@@ -757,6 +757,67 @@ no prior positive case changes meaning.
 
 ---
 
+## Stage 3B7G1: non-spoofable guest boundary and real Hyper-V identity binding
+
+Stage 3B7G0 added a guest boundary, but every function - including the one that
+starts a process - accepted an injected `-LocalContext`. A caller could hand it a
+fabricated `ComputerName = <guest>` object and the control was defeated on the
+host. This stage removes that hole.
+
+### Split into a pure decision procedure and a live gate
+
+| Function | Injection | Starts a process |
+| --- | --- | --- |
+| `Assert-P9HGuestExecutionContext` | `-LocalContext` (pure) | **never** |
+| `Test-P9HGuestDisconnectEligible` | `-LocalContext` (pure) | **never** |
+| `Assert-P9HLiveGuestBoundary` | **none** | via its caller |
+| `Invoke-P9HControlledDisconnect` | **none** | yes |
+| `Invoke-P9HGuestControlledDisconnect` | **none** | yes (remote) |
+
+The live gate takes no context parameter at all, so there is nothing to forge: it
+re-reads the real machine identity immediately before process creation and
+delegates every rule to the pure helper so the two cannot drift apart. The
+orchestration's "am I already inside the guest?" branch is now gated on the
+OS-supplied identity only, never on a caller-supplied object.
+
+### Real Hyper-V identity binding
+
+Two matching caller-supplied strings are not independent evidence.
+`Resolve-P9HAuthorizedVm` resolves the VM by NAME from Hyper-V, reads the actual
+VM object id, and requires it to equal the authorized candidate VM id before any
+PowerShell Direct dispatch. It refuses a missing, ambiguous or mismatched VM.
+Dispatch now uses `Invoke-Command -VMId` with the verified id, and the guest
+re-verifies its own computer name inside the execution context.
+
+### Listener classification corrected
+
+`session id >= 65536 means listener` was wrong in both directions: it would refuse
+a legitimate logged-on user session that happens to have a high id, and accept a
+low-id listener. Classification is now by the **enumerated** WTS state
+(`WTSListen = 6`) plus **positive** identity resolution:
+
+- session 0 - always refused;
+- an enumerated `WTSListen` entry - refused regardless of its numeric id;
+- an unresolved, non-authoritative, failed, absent or moved target - refused;
+- a wrong user or logon identity - refused.
+
+`Test-P9HResolvedGuestTarget` performs the resolution against a real
+`Resolve-P9HWtsSessionTable` result, and `New-P9HDisconnectPlan` consumes it.
+
+### Coverage (H1-H19)
+
+spoofed context cannot reach process creation; live gate refuses on this machine;
+parameter surfaces verify only the pure helpers are injectable; omitted identity;
+unbound plan; session 0; `WTSListen` by state at low id **and** with the listener
+flag absent; a 70000 id correctly treated as a real session; unresolved target;
+non-authoritative/failed/absent/moved targets; wrong user and wrong logon;
+correct guest accepted by the non-executing path; incorrect Hyper-V id; missing
+and ambiguous VM; correct name/id verified; orchestration refusing to dispatch;
+token checked first; pinning preserved; and no `tsdiscon` process created.
+
+The canonical suite is 261/261 PASS (260 registered cases plus `R1`).
+
+---
 ## Stage 3B7G0: guest execution boundary, atomic replacement, and N2 readiness
 
 Stage 3B7F-R2's strict physical E1 result is preserved. This stage fixes the two
