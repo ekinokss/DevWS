@@ -1399,6 +1399,12 @@ function Get-P9HN2Verdicts {
             AuxiliaryWindowCount = if ($null -ne $terminalClass) { $terminalClass.AuxiliaryCount } else { $null }
             UnclassifiedWindowCount = if ($null -ne $terminalClass) { $terminalClass.UnclassifiedCount } else { $null }
             CompetingManagedUiCount = if ($null -ne $terminalClass) { $terminalClass.CompetingManagedUiCount } else { $null }
+            # Stage 3B7G4: the combined identity, so no reader has to infer it
+            # from the selector alone. `ManagedTerminalV1` has described three
+            # different predicates across G3, C1 and C2; this disambiguates them.
+            AuxiliaryContract = if ($null -ne $terminalClass) { $terminalClass.AuxiliaryContract } else { $null }
+            IdentityProxy = if ($null -ne $terminalClass) { $terminalClass.IdentityProxy } else { $null }
+            ManagedTerminalSchema = if ($null -ne $terminalClass) { $terminalClass.Schema } else { $null }
             EvidenceGaps = if ($null -ne $terminalClass) { @($terminalClass.EvidenceGaps) } else { @() }
             Reasons = @($reasonsA)
         }
@@ -1430,6 +1436,11 @@ function Get-P9HN2Verdicts {
             EvidenceGaps = if ($null -ne $terminalClass) { @($terminalClass.EvidenceGaps) } else { @() }
             AuxiliaryContract = if ($null -ne $terminalClass) { $terminalClass.AuxiliaryContract } else { $null }
             IdentityProxy = if ($null -ne $terminalClass) { $terminalClass.IdentityProxy } else { $null }
+            ManagedTerminalSchema = if ($null -ne $terminalClass) { $terminalClass.Schema } else { $null }
+            # The COMBINED identity of this verdict: selector + auxiliary role
+            # contract + schema. Two results are comparable only when all three
+            # agree, which is what makes historical evaluation unambiguous.
+            CombinedContract = ('{0}+{1}' -f $WindowIdentityContract, $(if ($null -ne $terminalClass) { $terminalClass.AuxiliaryContract } else { 'none' }))
             QualifyingTerminalHwnd = if ($null -ne $terminalClass) { $terminalClass.QualifyingHwnd } else { $null }
             QualifyingTerminalPid = if ($null -ne $terminalClass) { $terminalClass.QualifyingPid } else { $null }
             AuxiliaryWindows = if ($null -ne $terminalClass) { @($terminalClass.Auxiliary) } else { @() }

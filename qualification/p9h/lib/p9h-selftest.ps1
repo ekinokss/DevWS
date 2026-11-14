@@ -5736,6 +5736,38 @@ function Invoke-P9HManagedTerminalContractTests {
             @($rev.AuxiliaryRoleClasses) -contains 'PseudoConsoleWindow' -and
             $rev.Schema -eq 'p9h.managed-terminals.v3') -Evidence $null
 
+    # R3-16: the SELECTOR name alone is ambiguous. `ManagedTerminalV1` has meant
+    # three different predicates across G3, C1 and C2, so each verdict must also
+    # carry the auxiliary role contract, the schema and the combined identity.
+    # Two results are comparable only when all of those agree.
+    $vCombined = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+        -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+        -ArtifactIndexPath $singleIndex -WindowIdentityContract 'ManagedTerminalV1'
+    Add-P9HTestResult -Id 'R316' -Title 'Both verdicts expose a combined contract identity' `
+        -Input 'a verdict evaluated under ManagedTerminalV1' `
+        -Expected 'N2-A and N2-B each carry AuxiliaryContract, ManagedTerminalSchema and a matching CombinedContract' `
+        -Actual ("n2a=(aux={0} schema={1}) n2b=(aux={2} schema={3}) combined={4}" -f
+            $vCombined.N2A.AuxiliaryContract, $vCombined.N2A.ManagedTerminalSchema,
+            $vCombined.N2B.AuxiliaryContract, $vCombined.N2B.ManagedTerminalSchema, $vCombined.N2B.CombinedContract) `
+        -Pass ($vCombined.N2A.AuxiliaryContract -eq 'p9h.auxiliary-window.v3' -and
+            $vCombined.N2B.AuxiliaryContract -eq 'p9h.auxiliary-window.v3' -and
+            $vCombined.N2B.ManagedTerminalSchema -eq 'p9h.managed-terminals.v3' -and
+            $vCombined.N2B.CombinedContract -eq 'ManagedTerminalV1+p9h.auxiliary-window.v3') -Evidence $null
+
+    # R3-17: the historical selector must carry NO auxiliary contract, so it can
+    # never be mistaken for a managed-terminal evaluation.
+    $vHist = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+        -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+        -ArtifactIndexPath $singleIndex -WindowIdentityContract 'RawAttributedHwndsV1'
+    Add-P9HTestResult -Id 'R317' -Title 'The historical selector is distinguishable from the managed one' `
+        -Input 'the same trial under RawAttributedHwndsV1' `
+        -Expected 'CombinedContract = RawAttributedHwndsV1+none and no auxiliary contract' `
+        -Actual ("combined={0} aux={1}" -f $vHist.N2B.CombinedContract, [string]$vHist.N2B.AuxiliaryContract) `
+        -Pass ($vHist.N2B.CombinedContract -eq 'RawAttributedHwndsV1+none' -and
+            $null -eq $vHist.N2B.AuxiliaryContract) -Evidence $null
+
     # R3-14: a helper at the forbidden fallback rectangle must satisfy the same
     # contract; geometry is never proof of role.
     $atFallback = New-Win -Hwnd '0x74011' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
@@ -6329,7 +6361,7 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 341 `
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 343 `
         -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R', 'E', 'I', 'AW', 'R3')
 
     if (-not $registry.Ok) {
