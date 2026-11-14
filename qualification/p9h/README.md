@@ -893,6 +893,142 @@ token checked first; pinning preserved; and no `tsdiscon` process created.
 
 The canonical suite is 261/261 PASS (260 registered cases plus `R1`).
 
+## Stage 3B7G3-C1: fail-closed auxiliary contract and evidence sufficiency
+
+Stage 3B7G3 introduced `ManagedTerminalV1` and was accepted on a replay that
+returned N2-B **PASS**. Independent review found that verdict unsound. This stage
+corrects the contract, and the corrected contract returns **INCONCLUSIVE** on the
+same immutable G2 evidence.
+
+No VM was booted, no RDP session opened, no product launched, no `tsdiscon`
+issued, and no historical artifact or artifact index was modified.
+
+### The six false acceptances in Stage 3B7G3
+
+Stage 3B7G3 treated `GW_OWNER == managed terminal` plus a nonempty process name as
+**sufficient** for `auxiliary`. Reproduced against `3da88e6`, before any change:
+
+| Case | Fixture | 3B7G3 result |
+| --- | --- | --- |
+| A | arbitrary-class UI-sized window, `GW_OWNER=0x50366` | accepted as auxiliary |
+| B1 | helper, valid owner, `-SetId WRONGSET` | accepted as auxiliary |
+| B2 | helper, valid owner, `-TerminalId wrongterm` | accepted as auxiliary |
+| B4 | helper, valid owner, no identity flags | accepted as auxiliary |
+| B5 | helper, valid owner, command line unreadable | accepted as auxiliary |
+| C | second `CASCADIA` window, `GW_OWNER=0x50366` | absorbed as auxiliary |
+
+Case B3 (`-WindowId OTHER-window`) was already refused, but only because a
+`-WindowId` contradiction was the single check the old code performed. Stage
+3B7G3's E10 was additionally **misleading**: it used a fake owner (`0x99998`), so
+its rejection came from ownership, never from the identity requirement.
+
+### Root cause
+
+`GW_OWNER` is a **relationship** fact, not a **role** fact. The old classifier
+therefore had no way to distinguish an owned helper from an owned application
+window, and it never examined identity at all beyond one `-WindowId` comparison.
+
+### The corrected auxiliary contract (`p9h.auxiliary-window.v2`)
+
+A non-managed attributed window is `auxiliary` only when **every** factor is
+positively established:
+
+| Factor | Requirement |
+| --- | --- |
+| A1 | `GW_OWNER` names exactly one managed terminal in this set |
+| A2 | its class is not the managed terminal class |
+| A3 | its owning process record resolves from the attributed inventory |
+| A4 | the owning process shares the managed terminal's session |
+| A5 | the owning process is a **strict** descendant of the managed terminal |
+| A6 | the owner command line carries all three pinned values, each exactly equal |
+| A7 | it does not claim a managed terminal title |
+| A8 | its window style positively marks it as non-user-facing (`WS_EX_TOOLWINDOW`) |
+
+A window claiming the managed class **or** the managed title family is routed to a
+separate `competing-managed-ui` bucket and can never be absorbed as harmless.
+
+### Why A8 is the decisive factor
+
+Factors A1-A7 are **all satisfiable by a user-facing application window** that the
+pinned shell happened to launch: argv identity is *process*-level, not
+*window*-level, so every window of a shell process shares one command line. That
+case (residual R1) was reproduced and was still absorbed without A8. A tool window
+is the documented positive marker of a non-user-facing helper: absent from the
+taskbar, not activatable as a normal application window.
+
+### Ordinal replay of the immutable G2 evidence
+
+All eight artifact roles re-verified before and after; the artifact index was used
+unmodified.
+
+| Evaluation | N2-A | N2-B | Reason |
+| --- | --- | --- | --- |
+| Historical `RawAttributedHwndsV1` | PASS | **INCONCLUSIVE** | `attributed-window-count-not-one:2` |
+| Corrected `ManagedTerminalV1` | PASS | **INCONCLUSIVE** | `unclassified-attributed-window:1` |
+
+The historical result reproduces G2 exactly. The corrected result is INCONCLUSIVE
+because the frozen window record has no `GWL_EXSTYLE`, so factor A8 is undecidable
+for `0x20330`. The classifier reports `EvidenceGaps =
+window-style-not-recorded` rather than assuming a value.
+
+Every other predicate is true: exit `exited` code 0, trace valid, process and
+window attribution succeed, trial identity matches, artifact binding verifies,
+broker ready, terminal finalized with zero failures.
+
+### Counterfactual: exactly one missing observation
+
+Adding **only** `exStyle = 0x00000080` to the recorded helper flips the corrected
+verdict to PASS, with nothing else changed. No other lifecycle, identity or
+provenance predicate is missing. The gap is precisely one observable fact.
+
+### Product contract versus the qualification proxy
+
+The product's `Test-DevWSHwndAssociation` validates a managed window using UI
+Automation **tab names** and the canonical `<windowId>[#DevWS:<N>]` title family.
+The qualification classifier uses the **top-level window title** instead. That is a
+narrower check and does not implement the product validator. It is named explicitly
+as `IdentityProxy = top-level-window-title-equals-windowId`, and
+`UnprovenProperties` lists `ui-automation-tab-title-family`. No UIA record was
+fabricated.
+
+### What a future acquisition must add
+
+`Get-P9HWindowInventory` **already** records `GetWindow(hwnd, GW_OWNER)` on every
+enumerated window, so re-requesting it would add nothing. The genuinely absent
+fields are `GWL_STYLE`, `GWL_EXSTYLE` (where `WS_EX_TOOLWINDOW` lives), and the UIA
+tab-name set.
+
+The smallest complete addition is **one field** on the existing per-window record:
+
+```
+exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE)
+```
+
+A read-only preflight validated that read live on this host (362 top-level windows,
+73 genuine tool windows observed, `MozillaDropShadowWindowClass` among them). No
+physical acquisition was performed in this stage.
+
+### Test coverage
+
+The `AW` series (AW1-AW20) contains the C1 adversarial cases required by review:
+unknown UI-sized owned window, unknown class with valid owner, competing Cascadia
+window with valid owner, wrong `SetId`/`TerminalId`/`WindowId`/missing flags with a
+**valid** owner, unreadable style, absent ownership link, session mismatch, managed
+title at the forbidden fallback coordinates, both enumeration orders, auxiliary-only,
+two managed terminals, multiple proven auxiliaries, and an ambiguous window beside
+valid lifecycle evidence. Each negative asserts its **own** rejection reason, so no
+pass can be credited to an unrelated prerequisite.
+
+The `E` series was updated where the stronger contract changed the correct outcome
+(E7 now expects the competing bucket). The `I` series now distinguishes four
+outcomes: body executed, blocked on a prompt (`I4b`, a timeout), timely
+noninteractive refusal (`I4`, `I4c`), and a correct optional script under
+`-NonInteractive` (`I4d`). `I4` previously could pass on a hang; it now requires a
+timely exit that names the missing mandatory parameter.
+
+The canonical suite is 327/327 PASS under **both** PowerShell 7.6.9 and Windows
+PowerShell 5.1 (326 registered cases plus `R1`).
+
 ---
 ## Stage 3B7G3: N2-B window identity contract adjudication (offline)
 
@@ -967,6 +1103,12 @@ managed set. `E2b` pins this by evaluating both orders and requiring identical
 results.
 
 ### Offline replay of the retained G2 evidence
+
+> **Superseded by Stage 3B7G3-C1.** The replay below was evaluated with the
+> original 3B7G3 auxiliary rule, which review found unsound (see the C1 section
+> above). Its PASS is preserved as a record of what that rule returned; the
+> corrected contract returns INCONCLUSIVE on the same bytes.
+> 
 
 The eight artifacts were restored byte-identically to the exact paths the
 unmodified `artifact-index.jsonl` binds (that directory had been cleaned up after

@@ -5069,19 +5069,36 @@ function Invoke-P9HManagedTerminalContractTests {
 
     # ---------------------------------------------------------------- builders
     function New-Proc {
-        param([int]$ProcId = 7280, [string]$Name = 'WindowsTerminal.exe', [string]$Cmd = $null, [int]$Session = 2)
-        if ([string]::IsNullOrWhiteSpace($Cmd)) {
+        # ParentPid defaults to an unrelated launcher, but it is EXPLICIT so a
+        # fixture can model the real G2 parentage: pid 10140's ppid IS 7280.
+        #
+        # -EmptyCommandLine models a process whose command line could NOT be read.
+        # It is distinct from omitting -Cmd, which means "use the default identity
+        # command line" and would otherwise silently satisfy the identity factors.
+        param([int]$ProcId = 7280, [int]$ParentPid = 5732, [string]$Name = 'WindowsTerminal.exe', [string]$Cmd = $null, [int]$Session = 2, [switch]$EmptyCommandLine)
+        if ($EmptyCommandLine) {
+            $Cmd = ''
+        }
+        elseif ([string]::IsNullOrWhiteSpace($Cmd)) {
             $Cmd = 'pwsh.exe -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
         }
-        return [pscustomobject]@{ pid = $ProcId; ppid = 5732; name = $Name; sessionId = $Session; commandLine = $Cmd; commandLength = $Cmd.Length; startUtc = '2026-11-14T18:06:08.5000000Z' }
+        return [pscustomobject]@{ pid = $ProcId; ppid = $ParentPid; name = $Name; sessionId = $Session; commandLine = $Cmd; commandLength = $Cmd.Length; startUtc = '2026-11-14T18:06:08.5000000Z' }
     }
+    # WS_EX_TOOLWINDOW is the positive non-user-facing marker the auxiliary
+    # contract requires. A fixture supplies it explicitly; omitting it models a
+    # record that simply did not capture window style.
+    $script:E_WS_EX_TOOLWINDOW = 0x00000080
+    $script:E_WS_EX_APPWINDOW = 0x00040000
     function New-Win {
         param(
             [string]$Hwnd = '0x50366', [int]$WinPid = 7280, [string]$Class = $managedClass,
             [string]$Title = $windowId, [string]$Owner = '0x0', [bool]$Visible = $true,
-            [int]$X = 18, [int]$Y = 26, [int]$W = 1129, [int]$H = 635
+            [int]$X = 18, [int]$Y = 26, [int]$W = 1129, [int]$H = 635,
+            $ExStyle = $null
         )
-        return [pscustomobject]@{ hwnd = $Hwnd; pid = $WinPid; visible = $Visible; class = $Class; x = $X; y = $Y; width = $W; height = $H; owner = $Owner; title = $Title }
+        $o = [ordered]@{ hwnd = $Hwnd; pid = $WinPid; visible = $Visible; class = $Class; x = $X; y = $Y; width = $W; height = $H; owner = $Owner; title = $Title }
+        if ($null -ne $ExStyle) { $o['exStyle'] = $ExStyle }
+        return [pscustomobject]$o
     }
     function Classify {
         param([object[]]$Windows, $Procs)
@@ -5093,10 +5110,10 @@ function Invoke-P9HManagedTerminalContractTests {
 
     # The genuine G2 pair: one managed terminal plus its Win32-owned pseudoconsole.
     $g2Terminal = New-Win
-    $g2Pseudo = New-Win -Hwnd '0x20330' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16
+    $g2Pseudo = New-Win -Hwnd '0x20330' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16 -ExStyle $E_WS_EX_TOOLWINDOW
     $g2Procs = @(
         (New-Proc)
-        (New-Proc -ProcId 10140 -Name 'pwsh.exe' -Cmd 'pwsh.exe -NoExit -File cwd-shell-bootstrap.ps1 -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm')
+        (New-Proc -ProcId 10140 -ParentPid 7280 -Name 'pwsh.exe' -Cmd 'pwsh.exe -NoExit -File cwd-shell-bootstrap.ps1 -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm')
     )
 
     # =====================================================================
@@ -5189,13 +5206,18 @@ function Invoke-P9HManagedTerminalContractTests {
     # =====================================================================
     # E7: an unrelated Cascadia window (foreign title, foreign pid) is refused
     # =====================================================================
+    # UPDATED for the corrected contract: a second CASCADIA-class window is now
+    # routed to the COMPETING MANAGED UI bucket rather than being counted as an
+    # unclassified window. Either way the trial is refused, but naming the correct
+    # bucket is the point - a competing terminal UI must never be merely "unknown".
     $foreign = New-Win -Hwnd '0x88888' -WinPid 4242 -Title 'someone-elses-terminal'
     $e7 = Classify -Windows @($g2Terminal, $foreign) -Procs @($g2Procs[0], (New-Proc -ProcId 4242 -Cmd 'wt.exe -w other'))
-    Add-P9HTestResult -Id 'E7' -Title 'An unrelated Cascadia window is refused' `
+    Add-P9HTestResult -Id 'E7' -Title 'An unrelated Cascadia window is refused as competing managed UI' `
         -Input 'second CASCADIA window with a foreign windowId, owned by a process without the pinned argv' `
-        -Expected 'Ok=False, unclassified=1' `
-        -Actual ("ok={0} managed={1} unclassified={2}" -f $e7.Ok, $e7.ManagedTerminalCount, $e7.UnclassifiedCount) `
-        -Pass ($e7.Ok -eq $false -and $e7.ManagedTerminalCount -eq 1 -and $e7.UnclassifiedCount -eq 1) -Evidence $null
+        -Expected 'Ok=False, managed=1, competing=1, reason names the competing UI' `
+        -Actual ("ok={0} managed={1} competing={2} reason={3}" -f $e7.Ok, $e7.ManagedTerminalCount, $e7.CompetingManagedUiCount, $e7.Reason) `
+        -Pass ($e7.Ok -eq $false -and $e7.ManagedTerminalCount -eq 1 -and $e7.CompetingManagedUiCount -eq 1 -and
+            $e7.Reason -eq 'competing-managed-ui-evidence') -Evidence $null
 
     # =====================================================================
     # E8: PID mismatch on the auxiliary link is refused
@@ -5277,7 +5299,7 @@ function Invoke-P9HManagedTerminalContractTests {
     # =====================================================================
     # E14: MULTIPLE auxiliary candidates are all reported, count stays one
     # =====================================================================
-    $aux2 = New-Win -Hwnd '0x20350' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366'
+    $aux2 = New-Win -Hwnd '0x20350' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366' -ExStyle $E_WS_EX_TOOLWINDOW
     $e14 = Classify -Windows @($g2Terminal, $g2Pseudo, $aux2) -Procs $g2Procs
     Add-P9HTestResult -Id 'E14' -Title 'Multiple proven auxiliary windows are all reported explicitly' `
         -Input 'the managed terminal plus two Win32-owned pseudoconsole windows' `
@@ -5378,7 +5400,9 @@ function Invoke-P9HManagedTerminalContractTests {
     New-WindowInventory $postPath @(
         [ordered]@{ hwnd = '0x100'; pid = 5732; visible = $true; class = 'Shell_TrayWnd'; x = 0; y = 0; width = 10; height = 10; owner = '0x0'; title = 'tray' }
         [ordered]@{ hwnd = '0x50366'; pid = 7280; visible = $true; class = $managedClass; x = 18; y = 26; width = 1129; height = 635; owner = '0x0'; title = $windowId }
-        [ordered]@{ hwnd = '0x20330'; pid = 10140; visible = $true; class = 'PseudoConsoleWindow'; x = 0; y = 0; width = 16; height = 16; owner = '0x50366'; title = '' }
+        # The helper carries WS_EX_TOOLWINDOW: the auxiliary contract requires
+        # POSITIVE non-user-facing evidence, which the frozen G2 record lacked.
+        [ordered]@{ hwnd = '0x20330'; pid = 10140; visible = $true; class = 'PseudoConsoleWindow'; x = 0; y = 0; width = 16; height = 16; owner = '0x50366'; title = ''; exStyle = $E_WS_EX_TOOLWINDOW }
     )
     $tracePath = Join-Path $dir 'trace.jsonl'
     New-Trace -Path $tracePath
@@ -5562,6 +5586,237 @@ function Invoke-P9HManagedTerminalContractTests {
         -Pass ($verdicts['RawAttributedHwndsV1'].N2A -eq 'PASS' -and $verdicts['RawAttributedHwndsV1'].N2B -eq 'PASS' -and
             $verdicts['ManagedTerminalV1'].N2A -eq 'PASS' -and $verdicts['ManagedTerminalV1'].N2B -eq 'PASS' -and
             $verdicts['ManagedTerminalV1'].Managed -eq 1) -Evidence $dir
+
+    # =====================================================================
+    # C1 SERIES: fail-closed auxiliary contract (Stage 3B7G3-C1)
+    #
+    # Stage 3B7G3 accepted ANY window with a GW_OWNER link to the managed
+    # terminal plus a resolvable process name as "auxiliary". Six false
+    # acceptances were reproduced against 3da88e6. These cases pin the
+    # corrected contract, whose decisive addition is factor A8: positive
+    # WS_EX_TOOLWINDOW evidence.
+    # =====================================================================
+    $wsTool = $E_WS_EX_TOOLWINDOW
+    $wsApp = $E_WS_EX_APPWINDOW
+
+    # C1-1: unknown full-size window owned by the genuine managed HWND.
+    # Every relationship factor passes; only window ROLE is unknown. With style
+    # recorded as a normal app window it must be REFUSED for that reason.
+    $c1a = New-Win -Hwnd '0x72001' -WinPid 10140 -Class 'SomeArbitraryAppClass' -Title 'an-app-window' `
+        -Owner '0x50366' -X 100 -Y 100 -W 1200 -H 800 -ExStyle $wsApp
+    $r = Classify -Windows @($g2Terminal, $c1a) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW1' -Title 'An unknown full-size window owned by the managed terminal is refused' `
+        -Input 'arbitrary class, UI-sized rectangle, GW_OWNER=0x50366, genuine child, style recorded WITHOUT WS_EX_TOOLWINDOW' `
+        -Expected 'Ok=False and the reason names the non-tool-window role' `
+        -Actual ("ok={0} aux={1} unclassified={2} reason={3}" -f $r.Ok, $r.AuxiliaryCount, $r.UnclassifiedCount, $r.Unclassified[0].reason) `
+        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0 -and $r.UnclassifiedCount -eq 1 -and
+            $r.Unclassified[0].reason -match 'not-a-tool-window') -Evidence $null
+
+    # C1-2: same window when the style was NOT captured -> evidence gap, refused.
+    $c1b = New-Win -Hwnd '0x72002' -WinPid 10140 -Class 'SomeArbitraryAppClass' -Title 'an-app-window' `
+        -Owner '0x50366' -X 100 -Y 100 -W 1200 -H 800
+    $r = Classify -Windows @($g2Terminal, $c1b) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW2' -Title 'An unknown owned window with no recorded style is an evidence gap, not an accept' `
+        -Input 'the same window, but the record carries no exStyle at all' `
+        -Expected 'Ok=False, reason window-style-evidence-absent, gap reported' `
+        -Actual ("ok={0} aux={1} reason={2} gaps={3}" -f $r.Ok, $r.AuxiliaryCount, $r.Unclassified[0].reason, (@($r.EvidenceGaps) -join ',')) `
+        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0 -and
+            $r.Unclassified[0].reason -match 'window-style-evidence-absent' -and
+            @($r.EvidenceGaps) -contains 'window-style-not-recorded') -Evidence $null
+
+    # C1-3: recognized helper class with valid GW_OWNER but NO style -> gap.
+    $c1c = New-Win -Hwnd '0x72003' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16
+    $r = Classify -Windows @($g2Terminal, $c1c) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW3' -Title 'A helper-shaped window with a valid owner but no style is INCONCLUSIVE' `
+        -Input 'PseudoConsoleWindow class, GW_OWNER=0x50366, 16x16, no exStyle recorded' `
+        -Expected 'not accepted on class or rectangle alone' `
+        -Actual ("ok={0} aux={1} reason={2}" -f $r.Ok, $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0) -Evidence $null
+
+    # C1-4: competing Cascadia-class window WITH a valid owner -> competing bucket.
+    $c1d = New-Win -Hwnd '0x72004' -WinPid 7280 -Class $managedClass -Title 'OTHER-TERMINAL' `
+        -Owner '0x50366' -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $c1d) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW4' -Title 'A competing Cascadia window is never absorbed as auxiliary' `
+        -Input 'second managed-class window with a valid GW_OWNER and tool-window style' `
+        -Expected 'Ok=False, competing=1, auxiliary=0' `
+        -Actual ("ok={0} competing={1} aux={2} reason={3}" -f $r.Ok, $r.CompetingManagedUiCount, $r.AuxiliaryCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.CompetingManagedUiCount -eq 1 -and $r.AuxiliaryCount -eq 0) -Evidence $null
+
+    # C1-5: a foreign-class window claiming a MANAGED TITLE -> competing bucket.
+    $c1e = New-Win -Hwnd '0x72005' -WinPid 10140 -Class 'SomeHelperClass' -Title $windowId `
+        -Owner '0x50366' -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $c1e) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW5' -Title 'A foreign-class window claiming a managed title is competing UI' `
+        -Input 'non-managed class whose title is exactly the pinned windowId' `
+        -Expected 'Ok=False, competing=1' `
+        -Actual ("ok={0} competing={1} reason={2}" -f $r.Ok, $r.CompetingManagedUiCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.CompetingManagedUiCount -eq 1) -Evidence $null
+
+    # AW6..AW9: VALID ownership and VALID tool-window style, but an identity
+    # defect. These are the cases Stage 3B7G3 could not prove, because its E10
+    # used a NONEXISTENT owner (0x99998) and so was rejected by ownership rather
+    # than by the identity requirement. Each is refused FOR ITS OWN REASON, and
+    # each adds its result with a LITERAL id so the registry guard counts it.
+    #
+    # The probe keeps the four cases identical apart from the field under test, so
+    # a pass cannot come from an unrelated prerequisite.
+    function Invoke-IdentityDefect {
+        param([string]$OwnerCmd)
+        $badProc = New-Proc -ProcId 10300 -ParentPid 7280 -Name 'pwsh.exe' -Cmd $OwnerCmd
+        $win = New-Win -Hwnd '0x72010' -WinPid 10300 -Class 'PseudoConsoleWindow' -Title '' `
+            -Owner '0x50366' -ExStyle $wsTool
+        $res = Classify -Windows @($g2Terminal, $win) -Procs @($g2Procs[0], $badProc)
+        $why = if ($res.UnclassifiedCount -ge 1) { $res.Unclassified[0].reason } else { '' }
+        return [pscustomobject]@{ Aux = $res.AuxiliaryCount; Uncl = $res.UnclassifiedCount; Why = $why }
+    }
+
+    $aw6 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -SetId WRONGSET -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
+    Add-P9HTestResult -Id 'AW6' -Title 'A helper with VALID ownership and style but a wrong SetId is refused' `
+        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv has -SetId WRONGSET' `
+        -Expected 'refused with a reason matching setId-mismatch' `
+        -Actual ("aux={0} unclassified={1} reason={2}" -f $aw6.Aux, $aw6.Uncl, $aw6.Why) `
+        -Pass ($aw6.Aux -eq 0 -and $aw6.Why -match 'setId-mismatch') -Evidence $null
+
+    $aw7 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -SetId n2qual -TerminalId wrongterm -WindowId N2QUAL-n2qualterm'
+    Add-P9HTestResult -Id 'AW7' -Title 'A helper with VALID ownership and style but a wrong TerminalId is refused' `
+        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv has -TerminalId wrongterm' `
+        -Expected 'refused with a reason matching terminalId-mismatch' `
+        -Actual ("aux={0} unclassified={1} reason={2}" -f $aw7.Aux, $aw7.Uncl, $aw7.Why) `
+        -Pass ($aw7.Aux -eq 0 -and $aw7.Why -match 'terminalId-mismatch') -Evidence $null
+
+    $aw8 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -SetId n2qual -TerminalId n2qualterm -WindowId OTHER-window'
+    Add-P9HTestResult -Id 'AW8' -Title 'A helper with VALID ownership and style but a wrong WindowId is refused' `
+        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv has -WindowId OTHER-window' `
+        -Expected 'refused with a reason matching windowId-mismatch' `
+        -Actual ("aux={0} unclassified={1} reason={2}" -f $aw8.Aux, $aw8.Uncl, $aw8.Why) `
+        -Pass ($aw8.Aux -eq 0 -and $aw8.Why -match 'windowId-mismatch') -Evidence $null
+
+    $aw9 = Invoke-IdentityDefect -OwnerCmd 'pwsh.exe -NoLogo -NoExit -File bootstrap.ps1'
+    Add-P9HTestResult -Id 'AW9' -Title 'A helper with VALID ownership and style but no identity flags is refused' `
+        -Input 'GW_OWNER=0x50366, WS_EX_TOOLWINDOW, genuine child; owner argv carries none of SetId/TerminalId/WindowId' `
+        -Expected 'refused with a reason matching setId-absent-from-owner-argv' `
+        -Actual ("aux={0} unclassified={1} reason={2}" -f $aw9.Aux, $aw9.Uncl, $aw9.Why) `
+        -Pass ($aw9.Aux -eq 0 -and $aw9.Why -match 'setId-absent-from-owner-argv') -Evidence $null
+    # C1-10: missing command line entirely, with valid ownership and style.
+    $noCmdProc = New-Proc -ProcId 10301 -ParentPid 7280 -Name 'pwsh.exe' -EmptyCommandLine
+    $c1j = New-Win -Hwnd '0x72011' -WinPid 10301 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $c1j) -Procs @($g2Procs[0], $noCmdProc)
+    Add-P9HTestResult -Id 'AW10' -Title 'A helper with a missing owner command line is refused' `
+        -Input 'valid owner link and tool-window style, but the owning process has no command line' `
+        -Expected 'refused, reason owner-command-line-missing' `
+        -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'owner-command-line-missing') -Evidence $null
+
+    # C1-11: stale / wrong-session ownership evidence.
+    $otherSession = New-Proc -ProcId 10302 -ParentPid 7280 -Name 'pwsh.exe' -Session 5 `
+        -Cmd 'pwsh.exe -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
+    $c1k = New-Win -Hwnd '0x72012' -WinPid 10302 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $c1k) -Procs @($g2Procs[0], $otherSession)
+    Add-P9HTestResult -Id 'AW11' -Title 'A helper owned across a session boundary is refused' `
+        -Input 'valid owner link, tool style and identity, but the owning process is in session 5' `
+        -Expected 'refused, reason session-mismatch' `
+        -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'session-mismatch') -Evidence $null
+
+    # C1-12: the pinned windowID at the forbidden absolute fallback rectangle.
+    # A window at 9000,9000 is placement-fallback evidence; it must never be
+    # silently absorbed as a harmless helper.
+    $c1l = New-Win -Hwnd '0x72013' -WinPid 10140 -Class $managedClass -Title $windowId `
+        -Owner '0x0' -X 9000 -Y 9000 -W 640 -H 400
+    $r = Classify -Windows @($g2Terminal, $c1l) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW12' -Title 'A second managed-title window at the fallback rectangle is not ignored' `
+        -Input 'a managed-class, managed-title window at 9000,9000 (the forbidden fallback origin)' `
+        -Expected 'Ok=False, competing=1 (a competing managed UI is refused)' `
+        -Actual ("ok={0} managed={1} competing={2} reason={3}" -f $r.Ok, $r.ManagedTerminalCount, $r.CompetingManagedUiCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.CompetingManagedUiCount -eq 1) -Evidence $null
+
+    # C1-13: the genuine helper in BOTH enumeration orders (order independence
+    # under the corrected contract, not just the old one).
+    $realHelper = New-Win -Hwnd '0x20330' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16 -ExStyle $wsTool
+    $fwd = Classify -Windows @($realHelper, $g2Terminal) -Procs $g2Procs
+    $rev = Classify -Windows @($g2Terminal, $realHelper) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW13' -Title 'The corrected contract remains independent of enumeration order' `
+        -Input 'the genuine helper and its owner presented in both orders' `
+        -Expected 'both orders: managed=1, auxiliary=1, unclassified=0' `
+        -Actual ("pseudoFirst=(m={0} a={1} u={2}) terminalFirst=(m={3} a={4} u={5})" -f
+            $fwd.ManagedTerminalCount, $fwd.AuxiliaryCount, $fwd.UnclassifiedCount,
+            $rev.ManagedTerminalCount, $rev.AuxiliaryCount, $rev.UnclassifiedCount) `
+        -Pass ($fwd.ManagedTerminalCount -eq 1 -and $fwd.AuxiliaryCount -eq 1 -and $fwd.UnclassifiedCount -eq 0 -and
+            $rev.ManagedTerminalCount -eq 1 -and $rev.AuxiliaryCount -eq 1 -and $rev.UnclassifiedCount -eq 0) -Evidence $null
+
+    # C1-14: auxiliaries only, with no managed terminal at all.
+    $r = Classify -Windows @($realHelper) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW14' -Title 'A proven auxiliary with no managed terminal is still refused' `
+        -Input 'only the helper window; its GW_OWNER names a window not in this set' `
+        -Expected 'Ok=False, managed=0' `
+        -Actual ("ok={0} managed={1} reason={2}" -f $r.Ok, $r.ManagedTerminalCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.ManagedTerminalCount -eq 0) -Evidence $null
+
+    # C1-15: two genuine managed terminals are refused.
+    $secondTerm = New-Win -Hwnd '0x72014' -WinPid 7280 -Class $managedClass -Title $windowId
+    $r = Classify -Windows @($g2Terminal, $secondTerm) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW15' -Title 'Two genuine managed terminals are refused' `
+        -Input 'two windows satisfying the full managed-terminal contract' `
+        -Expected 'Ok=False, managed=2' `
+        -Actual ("ok={0} managed={1} reason={2}" -f $r.Ok, $r.ManagedTerminalCount, $r.Reason) `
+        -Pass ($r.Ok -eq $false -and $r.ManagedTerminalCount -eq 2 -and $r.Reason -eq 'multiple-managed-terminal-windows') -Evidence $null
+
+    # C1-16: multiple genuinely proven auxiliaries are all reported.
+    $h2 = New-Win -Hwnd '0x72015' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $realHelper, $h2) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW16' -Title 'Multiple genuinely proven auxiliaries are all reported' `
+        -Input 'one managed terminal plus two helper windows that both satisfy the contract' `
+        -Expected 'Ok=True, managed=1, auxiliary=2, every reason present' `
+        -Actual ("ok={0} managed={1} aux={2} reasons={3}" -f $r.Ok, $r.ManagedTerminalCount, $r.AuxiliaryCount,
+            (@($r.Auxiliary | ForEach-Object { $_.hwnd + ':' + $_.reason }) -join ',')) `
+        -Pass ($r.Ok -eq $true -and $r.ManagedTerminalCount -eq 1 -and $r.AuxiliaryCount -eq 2 -and
+            @($r.Auxiliary | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.reason) }).Count -eq 0) -Evidence $null
+
+    # C1-17: a genuine auxiliary alongside an ambiguous window -> still refused.
+    $ambiguous = New-Win -Hwnd '0x72016' -WinPid 10140 -Class 'MysteryClass' -Title '' `
+        -Owner '0x50366' -X 50 -Y 50 -W 400 -H 300
+    $r = Classify -Windows @($g2Terminal, $realHelper, $ambiguous) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW17' -Title 'An ambiguous window beside an otherwise valid lifecycle still fails' `
+        -Input 'one proven auxiliary plus one window with no recorded style' `
+        -Expected 'Ok=False; the proven auxiliary stays accepted but the ambiguity blocks' `
+        -Actual ("ok={0} aux={1} unclassified={2}" -f $r.Ok, $r.AuxiliaryCount, $r.UnclassifiedCount) `
+        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 1 -and $r.UnclassifiedCount -eq 1) -Evidence $null
+
+    # C1-18: style recorded but UNREADABLE must not be silently accepted.
+    $badStyle = New-Win -Hwnd '0x72017' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x50366' -ExStyle 'not-a-number'
+    $r = Classify -Windows @($g2Terminal, $badStyle) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW18' -Title 'An unreadable style value is never silently accepted' `
+        -Input 'exStyle present but not a number' `
+        -Expected 'Ok=False' `
+        -Actual ("ok={0} aux={1} reason={2}" -f $r.Ok, $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.Ok -eq $false -and $r.AuxiliaryCount -eq 0) -Evidence $null
+
+    # C1-19: the ownership link must be REAL. A window whose owner is not in the
+    # set is refused even with perfect style and identity.
+    $noOwner = New-Win -Hwnd '0x72018' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' `
+        -Owner '0x0' -ExStyle $wsTool
+    $r = Classify -Windows @($g2Terminal, $noOwner) -Procs $g2Procs
+    Add-P9HTestResult -Id 'AW19' -Title 'A helper with no ownership link is refused despite perfect identity' `
+        -Input 'tool-window style and exact identity, but GW_OWNER is 0x0' `
+        -Expected 'refused, reason owner-not-a-managed-terminal' `
+        -Actual ("aux={0} reason={1}" -f $r.AuxiliaryCount, $r.Unclassified[0].reason) `
+        -Pass ($r.AuxiliaryCount -eq 0 -and $r.Unclassified[0].reason -match 'owner-not-a-managed-terminal') -Evidence $null
+
+    # C1-20: the classifier must advertise what it could NOT prove.
+    Add-P9HTestResult -Id 'AW20' -Title 'The classifier names the properties this evidence set cannot prove' `
+        -Input 'any classification result' `
+        -Expected 'UnprovenProperties lists the absent style/UIA properties and IdentityProxy names the title proxy' `
+        -Actual ("unproven={0} proxy={1}" -f (@($rev.UnprovenProperties) -join ','), $rev.IdentityProxy) `
+        -Pass (@($rev.UnprovenProperties) -contains 'WS_EX_TOOLWINDOW' -and
+            @($rev.UnprovenProperties) -contains 'ui-automation-tab-title-family' -and
+            $rev.IdentityProxy -eq 'top-level-window-title-equals-windowId') -Evidence $null
 }
 
 
@@ -5647,30 +5902,55 @@ function Invoke-P9HParameterBindingTests {
     # hung Stage 3B7G2 - and report whether the body was reached or the binder
     # blocked on a prompt.
     function Invoke-Probe {
-        param([string]$Path, [int]$TimeoutSeconds = 20)
-        $psi = New-ProbeStartInfo -Argv @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Path)
+        # Run a probe and report WHICH of four outcomes happened. Distinguishing
+        # them matters: "body not reached" is true both for a clean noninteractive
+        # refusal and for a child that blocked until it was killed, and treating
+        # those as the same result is how a hang can masquerade as a passing test.
+        #
+        #   body executed            BodyReached = true
+        #   blocked on a prompt      TimedOut    = true   (killed after the timeout)
+        #   timely noninteractive    TimedOut    = false, error names the parameter
+        #   silent failure           TimedOut    = false, no body, no named error
+        param(
+            [string]$Path,
+            [int]$TimeoutSeconds = 20,
+            # Leave stdin OPEN AND EMPTY so an interactive prompt can block.
+            [switch]$OfferEmptyStdin,
+            # Add -NonInteractive so the host can never wait for input.
+            [switch]$NonInteractive
+        )
+
+        $argv = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass')
+        if ($NonInteractive) { $argv += '-NonInteractive' }
+        $argv += @('-File', $Path)
+
+        $psi = New-ProbeStartInfo -Argv $argv
+        if (-not $OfferEmptyStdin) { $psi.RedirectStandardInput = $false }
+
         $proc = [System.Diagnostics.Process]::Start($psi)
-        # Deliberately DO NOT close stdin: an open empty pipe is what prompts.
+        # Deliberately DO NOT close stdin when offering it: an open empty pipe is
+        # exactly what makes the binder prompt.
         $finished = $proc.WaitForExit($TimeoutSeconds * 1000)
         if (-not $finished) { try { $proc.Kill() } catch { } }
         $out = ''
         $err = ''
         try { $out = $proc.StandardOutput.ReadToEnd() } catch { }
         try { $err = $proc.StandardError.ReadToEnd() } catch { }
+
         return [pscustomobject]@{
             BodyReached = ($out -match 'BODY-Settle=')
             Prompted    = (-not $finished) -or ($err -match 'missing mandatory parameter')
             TimedOut    = (-not $finished)
+            NamesMissingMandatory = ($err -match 'missing mandatory parameter')
             ExitCode    = if ($finished) { $proc.ExitCode } else { $null }
             Stdout      = $out.Trim()
             Stderr      = $err.Trim()
         }
     }
-
     # =====================================================================
     # I1: Mandatory + default does NOT apply the default and can block
     # =====================================================================
-    $r1 = Invoke-Probe -Path $mandatoryWithDefault
+    $r1 = Invoke-Probe -Path $mandatoryWithDefault -OfferEmptyStdin
     Add-P9HTestResult -Id 'I1' -Title 'A Mandatory parameter with a default value never uses that default' `
         -Input 'param([Parameter(Mandatory)][string]$SettleSeconds = "10") invoked with no argument, stdin open and empty' `
         -Expected 'the default is unreachable: the body is not reached (prompt or fast mandatory failure)' `
@@ -5695,7 +5975,7 @@ function Invoke-P9HParameterBindingTests {
     # =====================================================================
     # I3: OPTIONAL with a default is the correct shape - no prompt, default used
     # =====================================================================
-    $r3 = Invoke-Probe -Path $optionalWithDefault
+    $r3 = Invoke-Probe -Path $optionalWithDefault -OfferEmptyStdin
     Add-P9HTestResult -Id 'I3' -Title 'An optional parameter with a default stays non-mandatory and applies its default' `
         -Input 'param([string]$SettleSeconds = "10") invoked with no argument, stdin open and empty' `
         -Expected 'body runs immediately with SettleSeconds=10, no prompt' `
@@ -5703,16 +5983,60 @@ function Invoke-P9HParameterBindingTests {
         -Pass ($r3.BodyReached -eq $true -and $r3.Prompted -eq $false -and $r3.Stdout -match 'BODY-Settle=10') -Evidence $dir
 
     # =====================================================================
-    # I4: a TRULY mandatory parameter has no misleading default
+    # I4: a TRULY mandatory parameter has no misleading default.
+    #
+    # IMPORTANT: `body not reached` ALONE is not sufficient evidence. A child that
+    # HANGS on an interactive prompt also never reaches the body, so the earlier
+    # form of this case could pass on a timeout. I4 therefore asserts a TIMELY,
+    # NON-INTERACTIVE refusal: the process must exit on its own, before the
+    # timeout, with a mandatory-parameter error.
     # =====================================================================
-    $r4 = Invoke-Probe -Path $mandatoryWithoutDefault
-    Add-P9HTestResult -Id 'I4' -Title 'A truly Mandatory parameter without a default fails closed rather than inventing a value' `
+    $r4 = Invoke-Probe -Path $mandatoryWithoutDefault -NonInteractive
+    Add-P9HTestResult -Id 'I4' -Title 'A truly Mandatory parameter without a default refuses promptly instead of blocking' `
         -Input 'param([Parameter(Mandatory)][string]$SettleSeconds) invoked with no argument' `
-        -Expected 'the body never runs and no fabricated value is used' `
-        -Actual ("bodyReached={0} exited={1}" -f $r4.BodyReached, $r4.ExitCode) `
-        -Pass ($r4.BodyReached -eq $false) -Evidence $dir
+        -Expected 'the body never runs, the process exits in time, and the error names the missing mandatory parameter' `
+        -Actual ("bodyReached={0} timedOut={1} exited={2} namesMandatory={3}" -f
+            $r4.BodyReached, $r4.TimedOut, $r4.ExitCode, ($r4.Stderr -match 'missing mandatory parameter')) `
+        -Pass ($r4.BodyReached -eq $false -and $r4.TimedOut -eq $false -and
+            $null -ne $r4.ExitCode -and $r4.Stderr -match 'missing mandatory parameter') -Evidence $dir
 
     # =====================================================================
+    # I4b: the SAME construct with an OPEN EMPTY stdin DOES block, and that
+    # blocking is a TIMEOUT - distinguished from a clean refusal. This is the
+    # behaviour difference the harness must never mistake for a verdict.
+    # =====================================================================
+    $r4b = Invoke-Probe -Path $mandatoryWithDefault -OfferEmptyStdin -TimeoutSeconds 8
+    Add-P9HTestResult -Id 'I4b' -Title 'Mandatory-with-default blocking is reported as a timeout, not a refusal' `
+        -Input 'the G2 construct with stdin open and empty, bounded at 8s' `
+        -Expected 'timed out on a prompt (body never reached) - never mistaken for a clean outcome' `
+        -Actual ("timedOut={0} bodyReached={1}" -f $r4b.TimedOut, $r4b.BodyReached) `
+        -Pass ($r4b.TimedOut -eq $true -and $r4b.BodyReached -eq $false) -Evidence $dir
+
+    # =====================================================================
+    # I4c: a GENUINELY NONINTERACTIVE invocation terminates. This is the shape
+    # qualification orchestration must use: it can never wait for parameter input.
+    # =====================================================================
+    $r4c = Invoke-Probe -Path $mandatoryWithoutDefault -NonInteractive
+    Add-P9HTestResult -Id 'I4c' -Title 'A noninteractive invocation terminates instead of waiting for input' `
+        -Input 'the truly-mandatory script invoked with -NonInteractive and no argument' `
+        -Expected 'terminates on its own with a mandatory-parameter error' `
+        -Actual ("timedOut={0} exited={1} namesMandatory={2}" -f
+            $r4c.TimedOut, $r4c.ExitCode, ($r4c.Stderr -match 'missing mandatory parameter')) `
+        -Pass ($r4c.TimedOut -eq $false -and $r4c.BodyReached -eq $false -and
+            $r4c.Stderr -match 'missing mandatory parameter') -Evidence $dir
+
+    # =====================================================================
+    # I4d: the SAME noninteractive invocation of the OPTIONAL-with-default script
+    # must still SUCCEED, proving the noninteractive shape is not itself fatal.
+    # =====================================================================
+    $r4d = Invoke-Probe -Path $optionalWithDefault -NonInteractive
+    Add-P9HTestResult -Id 'I4d' -Title 'A noninteractive invocation of a correct optional script succeeds' `
+        -Input 'the optional-with-default script under -NonInteractive' `
+        -Expected 'body runs and applies the default' `
+        -Actual ("bodyReached={0} timedOut={1} stdout=[{2}]" -f $r4d.BodyReached, $r4d.TimedOut, $r4d.Stdout) `
+        -Pass ($r4d.BodyReached -eq $true -and $r4d.TimedOut -eq $false -and $r4d.Stdout -match 'BODY-Settle=10') -Evidence $dir
+
+    # =====================================================================    # =====================================================================
     # I5: AST scan of the STAGE'S OWN scripts
     # =====================================================================
     # Only qualification/p9h/ is scanned: this correction is qualification-only
@@ -5825,8 +6149,8 @@ function Invoke-P9HAllSelfTests {
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 303 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R', 'E', 'I')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 326 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R', 'E', 'I', 'AW')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

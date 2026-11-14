@@ -156,8 +156,8 @@ function Test-P9HNegativeOrigin {
 }
 
 function Get-P9HManagedTerminalWindowClassification {
-    # Stage 3B7G3: classify ATTRIBUTED windows against the PRODUCT'S OWN managed
-    # terminal identity contract.
+    # Stage 3B7G3-C1: classify ATTRIBUTED windows against the PRODUCT'S managed
+    # terminal identity contract, with a FAIL-CLOSED auxiliary window contract.
     #
     # WHY THIS EXISTS
     # ---------------
@@ -166,31 +166,75 @@ function Get-P9HManagedTerminalWindowClassification {
     # visible, top-level HWND owned by an attributed PID. That is a PROCESS
     # association rule, not a TERMINAL-WINDOW identity rule, and Stage 3B7G2
     # returned INCONCLUSIVE (`attributed-window-count-not-one:2`) for a launch that
-    # created exactly one managed terminal plus its own Win32-owned pseudoconsole.
+    # created one managed terminal plus one owned helper window.
     #
     # The product does NOT identify managed terminal windows that way. From
-    # src\native\devws-terminal-candidates.cs the product enumerates managed
-    # terminal windows by EXACT window class:
+    # src\native\devws-terminal-candidates.cs it enumerates them by EXACT class:
     #
     #     private const string WindowsTerminalTopLevelClass = "CASCADIA_HOSTING_WINDOW_CLASS";
     #     ... string.Equals(className.ToString(), WindowsTerminalTopLevelClass, Ordinal)
     #
     # and src\lib\devws-identity.ps1 additionally requires the owning process to be
-    # `WindowsTerminal` and the UI-Automation tab names to form a canonical
-    # title family for the pinned windowId. A `PseudoConsoleWindow` is therefore
-    # NOT a managed terminal window under the product's contract, no matter which
-    # process owns it or how small its rectangle is.
+    # `WindowsTerminal` and the UI-Automation tab names to form a canonical title
+    # family for the pinned windowId.
     #
-    # WHAT THIS IS NOT
-    # ----------------
-    # This is NOT `Count -ge 1`, and NOT a generic class-name exclusion list:
-    #   * the MANAGED count must still be exactly 1;
-    #   * a window is auxiliary ONLY when it is positively linked to that ONE
-    #     managed terminal by Win32 ownership (GW_OWNER) or by being owned by a
-    #     process whose argv carries the SAME pinned SetId/TerminalId/WindowId;
-    #   * anything else - an unproven second Cascadia window, a window with an
-    #     unresolvable owner, a foreign-session window - is UNCLASSIFIED and fails
-    #     closed.
+    # WHAT STAGE 3B7G3 GOT WRONG (corrected here)
+    # -------------------------------------------
+    # Stage 3B7G3 treated "GW_OWNER points at the managed terminal" + "the owning
+    # process has a name" as SUFFICIENT for `auxiliary`. Six false acceptances were
+    # reproduced against 3da88e6 before this correction: an arbitrary unknown
+    # full-size window, a second Cascadia terminal UI, and helpers whose command
+    # line carried a wrong or missing SetId/TerminalId/WindowId were all absorbed.
+    #
+    # GW_OWNER is NECESSARY relationship evidence. It is not, by itself, proof that
+    # a window is only ancillary.
+    #
+    # FOUR OUTCOMES
+    # -------------
+    #   managed-terminal       positively identified managed terminal UI
+    #   auxiliary              positively proven ancillary window
+    #   competing-managed-ui   another window claiming managed UI (class or title)
+    #   unclassified           anything else - fails closed
+    #
+    # THE AUXILIARY CONTRACT  (schema p9h.auxiliary-window.v2)
+    # -------------------------------------------------------
+    # A non-managed attributed window is `auxiliary` ONLY when EVERY factor is
+    # POSITIVELY established from the retained evidence:
+    #
+    #   A1  GW_OWNER names exactly one managed terminal in THIS set
+    #   A2  its class is NOT the managed terminal class
+    #   A3  its owning process record resolves from the attributed inventory
+    #   A4  the owning process shares the managed terminal's session
+    #   A5  the owning process is a STRICT descendant of the managed terminal
+    #   A6  the owner command line carries ALL THREE pinned identity values, each
+    #       EXACTLY equal (missing / unreadable / wrong => REFUSAL)
+    #   A7  it does not claim a managed terminal title
+    #   A8  its WINDOW STYLE positively marks it as non-user-facing
+    #       (WS_EX_TOOLWINDOW, 0x00000080)
+    #
+    # A8 is the factor Stage 3B7G3 lacked, and it is not cosmetic. Factors A1-A7 are
+    # ALL satisfiable by a user-facing application window that the pinned shell
+    # launched: it inherits the same command line because argv identity is
+    # PROCESS-level rather than WINDOW-level, it is a genuine strict descendant, it
+    # is owned, and it need not carry a managed title. That case (residual R1) was
+    # reproduced and was still absorbed without A8. A tool window is the documented
+    # positive marker of a non-user-facing helper: it is absent from the taskbar and
+    # cannot be activated as a normal application window.
+    #
+    # If the style was not recorded, the ancillary ROLE cannot be established from
+    # this evidence set. That is an EVIDENCE GAP: reported in `EvidenceGaps` and
+    # failing closed. It is never assumed, and no rectangle size substitutes for it.
+    #
+    # EVIDENCE GAPS (reported, never invented)
+    # ----------------------------------------
+    # The frozen window inventory records hwnd/pid/visible/class/rect/owner/title.
+    # It does NOT record GWL_STYLE / GWL_EXSTYLE / WS_EX_TOOLWINDOW / WS_CHILD. So a
+    # window whose ancillary role is otherwise plausible is INCONCLUSIVE - not
+    # accepted - until the style is observed.
+    #
+    # The qualification title check is a NARROW PROXY for the product's
+    # UI-Automation tab-title-family validator; it is not that validator. See
+    # `IdentityProxy` on the returned object.
     #
     # Parameters are pure data; this function touches no window and no VM.
     param(
@@ -202,22 +246,50 @@ function Get-P9HManagedTerminalWindowClassification {
         # is explicit rather than embedded as a magic string in two places.
         [string]$ManagedWindowClass = 'CASCADIA_HOSTING_WINDOW_CLASS',
         [string]$ManagedProcessName = 'WindowsTerminal',
+        # WS_EX_TOOLWINDOW - the positive non-user-facing marker required by A8.
+        [long]$RequiredExStyleMask = 0x00000080,
         [AllowNull()]$ProcessByPid = $null
     )
 
     $managed = [System.Collections.Generic.List[object]]::new()
     $auxiliary = [System.Collections.Generic.List[object]]::new()
     $unclassified = [System.Collections.Generic.List[object]]::new()
+    $competing = [System.Collections.Generic.List[object]]::new()
+
+    # Read a style value from either an int or a 0x-prefixed hex string.
+    function ConvertFrom-StyleText {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        $text = ([string]$Value).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+        if ($text -match '^0[xX](?<h>[0-9a-fA-F]+)$') {
+            try { return [Convert]::ToInt64($Matches['h'], 16) } catch { return $null }
+        }
+        $parsed = 0L
+        if ([int64]::TryParse($text, [ref]$parsed)) { return $parsed }
+        return $null
+    }
+
+    # True when the title belongs to the managed title family for this windowId:
+    # exactly <windowId>, or <windowId>#DevWS:<N> with canonical decimal N>=1.
+    # Mirrors the grammar of Resolve-DevWSTerminalTabTitle in src/lib/devws-config.ps1.
+    function Test-ManagedTitleFamily {
+        param([string]$Title, [string]$WindowId)
+        if ([string]::IsNullOrWhiteSpace($Title) -or [string]::IsNullOrWhiteSpace($WindowId)) { return $false }
+        if ($Title -ieq $WindowId) { return $true }
+        $prefix = $WindowId + '#DevWS:'
+        if ($Title.Length -le $prefix.Length) { return $false }
+        if (-not $Title.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        return ($Title.Substring($prefix.Length) -match '^[1-9][0-9]*$')
+    }
 
     # PASS 1: identify every MANAGED terminal window.
     #
-    # This must be a separate pass. EnumWindows order is not guaranteed, and in
-    # the genuine Stage 3B7G2 evidence the pseudoconsole (0x20330) is enumerated
-    # BEFORE its owner (0x50366). Evaluating ownership inline would therefore
-    # test an auxiliary against a managed set that is still empty, and a correct
-    # auxiliary would be reported as unclassified purely because of enumeration
-    # order. That is exactly the kind of order-dependent judgment this contract
-    # must never make.
+    # This must be a separate pass. EnumWindows order is not guaranteed, and in the
+    # genuine Stage 3B7G2 evidence the helper window (0x20330) is enumerated BEFORE
+    # its owner (0x50366). Evaluating ownership inline would test an auxiliary
+    # against a managed set that is still empty, and a correct auxiliary would be
+    # reported as unclassified purely because of enumeration order.
     $candidates = [System.Collections.Generic.List[object]]::new()
 
     foreach ($w in @($Windows)) {
@@ -245,9 +317,13 @@ function Get-P9HManagedTerminalWindowClassification {
             rect = ('{0},{1} {2}x{3}' -f (Get-P9HProp $w 'x'), (Get-P9HProp $w 'y'), (Get-P9HProp $w 'width'), (Get-P9HProp $w 'height'))
         }
         $candidates.Add([pscustomobject]@{
-                Record  = $record
-                IsManaged = ($classOk -and $procOk -and $titleOk)
-                Argv    = $argv
+                Record        = $record
+                IsManaged     = ($classOk -and $procOk -and $titleOk)
+                Argv          = $argv
+                Proc          = $proc
+                SessionId     = if ($null -ne $proc) { [int](Get-P9HProp -Object $proc -Name 'sessionId') } else { $null }
+                ExStyle       = (ConvertFrom-StyleText (Get-P9HProp -Object $w -Name 'exStyle'))
+                StyleRecorded = ($null -ne (ConvertFrom-StyleText (Get-P9HProp -Object $w -Name 'exStyle')))
             }) | Out-Null
     }
 
@@ -258,77 +334,207 @@ function Get-P9HManagedTerminalWindowClassification {
         $managed.Add([pscustomobject]$cand.Record) | Out-Null
     }
 
+    $managedPids = @($managed | ForEach-Object { [int]$_.pid })
+
+    # Resolve a pid's ancestry against the managed terminals, using ONLY the
+    # attributed process inventory. $true only when the chain reaches a managed
+    # terminal pid in at least one hop (a STRICT descendant).
+    function Test-StrictDescendant {
+        param([int]$StartPid)
+        if ($null -eq $ProcessByPid) { return $false }
+        $seen = @{}
+        $cursor = $StartPid
+        $hops = 0
+        while ($true) {
+            if ($hops -gt 32) { return $false }
+            if ($seen.ContainsKey($cursor)) { return $false }
+            $seen[$cursor] = $true
+
+            if (-not $ProcessByPid.ContainsKey($cursor)) { return $false }
+            $node = $ProcessByPid[$cursor]
+            $parent = [int](Get-P9HProp -Object $node -Name 'ppid')
+            $hops++
+            if ($parent -le 0) { return $false }
+            if ($managedPids -contains $parent) { return $true }
+            $cursor = $parent
+        }
+    }
+
+    function Get-ArgvFlag {
+        param([string]$Argv, [string]$Flag)
+        if ([string]::IsNullOrWhiteSpace($Argv)) { return $null }
+        $m = [regex]::Match($Argv, '(?:^|\s)-' + [regex]::Escape($Flag) + '\s+(?:"(?<v>[^"]*)"|(?<v>\S+))')
+        if (-not $m.Success) { return $null }
+        return [string]$m.Groups['v'].Value
+    }
+
     # PASS 2: classify every non-managed attributed window against the complete
-    # managed set.
+    # managed set, under the fail-closed auxiliary contract.
     foreach ($cand in $candidates) {
         if ($cand.IsManaged) { continue }
         $record = $cand.Record
         $argv = [string]$cand.Argv
         $owner = [string]$record['owner']
+        $class = [string]$record['class']
+        $title = [string]$record['title']
         $procName = [string]$record['processName']
 
-        # ---- auxiliary: positively linked to the managed terminal in THIS set ----
-        #
-        # Stage 3B7G3: the acceptance rule is the WIN32 OWNERSHIP LINK, which is
-        # independent of process argv and of window class. argv identity is used
-        # only as a CORROBORATING REJECT: if the owning process carries the pinned
-        # identity for a DIFFERENT windowId, the window is not auxiliary. It is
-        # never used on its own to admit a window, because any window owned by the
-        # terminal process would then be callable ancillary evidence and an
-        # unknown extra window could be silently absorbed.
-        $auxReason = $null
+        $failed = [System.Collections.Generic.List[string]]::new()
+        $gaps = [System.Collections.Generic.List[string]]::new()
 
-        if (-not [string]::IsNullOrWhiteSpace($owner) -and $owner -ne '0x0') {
-            $ownerIsManaged = @($managed | Where-Object { [string]::Equals([string]$_.hwnd, $owner, [System.StringComparison]::OrdinalIgnoreCase) }).Count -eq 1
-            if ($ownerIsManaged -and -not [string]::IsNullOrWhiteSpace($procName)) {
-                $auxReason = 'win32-owned-by-managed-terminal'
+        # --- COMPETING MANAGED UI -------------------------------------------------
+        # Positive evidence of another managed UI. Reported on its own so a
+        # competing terminal can never be mistaken for a harmless helper.
+        $claimsManagedClass = [string]::Equals($class, $ManagedWindowClass, [System.StringComparison]::Ordinal)
+        $claimsManagedTitle = (Test-ManagedTitleFamily -Title $title -WindowId $ExpectedWindowId)
+        if ($claimsManagedClass -or $claimsManagedTitle) {
+            $record['classification'] = 'competing-managed-ui'
+            $why = @()
+            if ($claimsManagedClass) { $why += 'managed-terminal-class' }
+            if ($claimsManagedTitle) { $why += 'managed-title-family' }
+            $record['reason'] = 'competing-managed-ui:' + ($why -join '+')
+            $competing.Add([pscustomobject]$record) | Out-Null
+            continue
+        }
+
+        # --- A1: GW_OWNER names exactly one managed terminal in THIS set ---------
+        # The @() wrapper must surround the WHOLE expression: an `if` used as an
+        # expression unrolls a single-element result to a scalar, and a later
+        # `.Count` then throws under Set-StrictMode.
+        $ownerMatches = @(if (-not [string]::IsNullOrWhiteSpace($owner) -and $owner -ne '0x0') {
+                $managed | Where-Object { [string]::Equals([string]$_.hwnd, $owner, [System.StringComparison]::OrdinalIgnoreCase) }
+            })
+        if ($ownerMatches.Count -ne 1) { $failed.Add('owner-not-a-managed-terminal') | Out-Null }
+
+        # --- A3: the owning process record must RESOLVE --------------------------
+        if ($null -eq $cand.Proc -or [string]::IsNullOrWhiteSpace($procName)) {
+            $failed.Add('owning-process-unresolved') | Out-Null
+        }
+
+        # --- A4: same session as the managed terminal ----------------------------
+        if ($null -ne $cand.Proc -and $ownerMatches.Count -eq 1) {
+            $terminalPid = [int]$ownerMatches[0].pid
+            $terminalProc = if ($ProcessByPid -and $ProcessByPid.ContainsKey($terminalPid)) { $ProcessByPid[$terminalPid] } else { $null }
+            if ($null -eq $terminalProc) {
+                $failed.Add('managed-terminal-process-unresolved') | Out-Null
+            }
+            elseif ([int](Get-P9HProp -Object $terminalProc -Name 'sessionId') -ne [int]$cand.SessionId) {
+                $failed.Add('session-mismatch') | Out-Null
             }
         }
 
-        if ($null -ne $auxReason -and -not [string]::IsNullOrWhiteSpace($argv)) {
-            # Contradiction check: an owner argv that names a DIFFERENT windowId
-            # means this window is not part of the pinned terminal's tree.
-            if ($argv -match '-WindowId\s+"?([^\s"]+)') {
-                $namedWindow = $Matches[1]
-                if (-not [string]::Equals($namedWindow, $ExpectedWindowId, [System.StringComparison]::Ordinal)) {
-                    $auxReason = $null
-                }
+        # --- A5: STRICT descendant of the managed terminal -----------------------
+        if ($null -ne $cand.Proc) {
+            if (-not (Test-StrictDescendant -StartPid ([int]$record['pid']))) {
+                $failed.Add('not-a-strict-descendant-of-managed-terminal') | Out-Null
             }
         }
 
-        if ($null -ne $auxReason) {
+        # --- A6: ALL THREE pinned identity values, exactly equal -----------------
+        $argvSet = Get-ArgvFlag -Argv $argv -Flag 'SetId'
+        $argvTerm = Get-ArgvFlag -Argv $argv -Flag 'TerminalId'
+        $argvWin = Get-ArgvFlag -Argv $argv -Flag 'WindowId'
+
+        if ([string]::IsNullOrWhiteSpace($argv)) {
+            $failed.Add('owner-command-line-missing') | Out-Null
+        }
+        else {
+            if ($null -eq $argvSet) { $failed.Add('setId-absent-from-owner-argv') | Out-Null }
+            elseif (-not [string]::Equals($argvSet, $ExpectedSetId, [System.StringComparison]::Ordinal)) {
+                $failed.Add(('setId-mismatch:' + $argvSet)) | Out-Null
+            }
+
+            if ($null -eq $argvTerm) { $failed.Add('terminalId-absent-from-owner-argv') | Out-Null }
+            elseif (-not [string]::Equals($argvTerm, $ExpectedTerminalId, [System.StringComparison]::Ordinal)) {
+                $failed.Add(('terminalId-mismatch:' + $argvTerm)) | Out-Null
+            }
+
+            if ($null -eq $argvWin) { $failed.Add('windowId-absent-from-owner-argv') | Out-Null }
+            elseif (-not [string]::Equals($argvWin, $ExpectedWindowId, [System.StringComparison]::Ordinal)) {
+                $failed.Add(('windowId-mismatch:' + $argvWin)) | Out-Null
+            }
+        }
+
+        # --- A8: POSITIVE WINDOW-ROLE evidence ----------------------------------
+        # This is the factor that stops a user-facing application window launched
+        # by the pinned shell from being absorbed as "auxiliary". When the style is
+        # simply not recorded, the gap is reported rather than assumed either way.
+        if (-not $cand.StyleRecorded) {
+            $gaps.Add('window-style-not-recorded') | Out-Null
+            $failed.Add('window-style-evidence-absent') | Out-Null
+        }
+        elseif (($cand.ExStyle -band $RequiredExStyleMask) -eq 0) {
+            $failed.Add(('not-a-tool-window:exStyle=0x{0:X8}' -f $cand.ExStyle)) | Out-Null
+        }
+
+        $record['auxiliaryContract'] = 'p9h.auxiliary-window.v2'
+        $record['identitySetId'] = $argvSet
+        $record['identityTerminalId'] = $argvTerm
+        $record['identityWindowId'] = $argvWin
+        $record['exStyle'] = if ($cand.StyleRecorded) { ('0x{0:X8}' -f $cand.ExStyle) } else { $null }
+
+        if ($failed.Count -eq 0) {
             $record['classification'] = 'auxiliary'
-            $record['reason'] = $auxReason
+            $record['reason'] = 'auxiliary-contract-satisfied'
             $auxiliary.Add([pscustomobject]$record) | Out-Null
         }
         else {
             $record['classification'] = 'unclassified'
-            $record['reason'] = 'no-proven-managed-terminal-relationship'
+            $record['reason'] = ($failed -join ';')
+            if ($gaps.Count -gt 0) { $record['evidenceGaps'] = @($gaps.ToArray()) }
             $unclassified.Add([pscustomobject]$record) | Out-Null
         }
     }
-    $count = $managed.Count
-    $ok = ($count -eq 1 -and $unclassified.Count -eq 0)
 
-    $reason = if ($unclassified.Count -gt 0) { 'unclassified-attributed-window' }
+    $count = $managed.Count
+    $ok = ($count -eq 1 -and $unclassified.Count -eq 0 -and $competing.Count -eq 0)
+
+    $reason = if ($competing.Count -gt 0) { 'competing-managed-ui-evidence' }
+              elseif ($unclassified.Count -gt 0) { 'unclassified-attributed-window' }
               elseif ($count -eq 0) { 'no-managed-terminal-window' }
               elseif ($count -gt 1) { 'multiple-managed-terminal-windows' }
               else { 'one-managed-terminal-window' }
 
+    $gapList = @($unclassified | ForEach-Object {
+            # Safe read: not every unclassified record carries evidenceGaps, and
+            # StrictMode makes a direct property access on such a record throw.
+            $g = Get-P9HProp -Object $_ -Name 'evidenceGaps'
+            if ($null -ne $g) { @($g) }
+        } | Sort-Object -Unique)
+
     return [pscustomobject][ordered]@{
-        Schema                   = 'p9h.managed-terminals.v1'
+        Schema                   = 'p9h.managed-terminals.v2'
+        AuxiliaryContract        = 'p9h.auxiliary-window.v2'
         ManagedWindowClass       = $ManagedWindowClass
         ManagedProcessName       = $ManagedProcessName
         ExpectedWindowId         = $ExpectedWindowId
+        ExpectedTerminalId       = $ExpectedTerminalId
+        ExpectedSetId            = $ExpectedSetId
+        RequiredExStyleMask      = ('0x{0:X8}' -f $RequiredExStyleMask)
         RawAttributedHwndCount   = @($Windows).Count
         ManagedTerminalCount     = $count
         AuxiliaryCount           = $auxiliary.Count
         UnclassifiedCount        = $unclassified.Count
+        CompetingManagedUiCount  = $competing.Count
         QualifyingHwnd           = if ($count -eq 1) { [string]$managed[0].hwnd } else { $null }
         QualifyingPid            = if ($count -eq 1) { [int]$managed[0].pid } else { $null }
         Managed                  = @($managed.ToArray())
         Auxiliary                = @($auxiliary.ToArray())
         Unclassified             = @($unclassified.ToArray())
+        CompetingManagedUi       = @($competing.ToArray())
+        # The qualification title check is a PROXY for the product's UI-Automation
+        # tab-title-family validator, not that validator. Named here so no caller
+        # can mistake it for full product identity.
+        IdentityProxy            = 'top-level-window-title-equals-windowId'
+        # Properties this evidence set cannot establish. Reported, never assumed.
+        UnprovenProperties       = @(
+            'GWL_STYLE'
+            'GWL_EXSTYLE'
+            'WS_EX_TOOLWINDOW'
+            'WS_CHILD'
+            'ui-automation-tab-title-family'
+        )
+        EvidenceGaps             = @($gapList)
         Ok                       = $ok
         Reason                   = $reason
     }
@@ -1086,6 +1292,7 @@ function Get-P9HN2Verdicts {
             $identityConsistent = ($skipped -and $terminalClass.Ok)
             if (-not $identityConsistent) {
                 if (-not $skipped) { $identityReason = 'item-not-reported-skipped-by-lifecycle-trace' }
+                elseif ($terminalClass.CompetingManagedUiCount -gt 0) { $identityReason = ('competing-managed-ui:' + $terminalClass.CompetingManagedUiCount) }
                 elseif ($terminalClass.UnclassifiedCount -gt 0) { $identityReason = ('unclassified-attributed-window:' + $terminalClass.UnclassifiedCount) }
                 elseif ($terminalClass.ManagedTerminalCount -ne 1) { $identityReason = ('managed-terminal-count:' + $terminalClass.ManagedTerminalCount) }
                 else { $identityReason = 'identity-inconsistent' }
@@ -1168,6 +1375,8 @@ function Get-P9HN2Verdicts {
             ManagedTerminalCount = if ($null -ne $terminalClass) { $terminalClass.ManagedTerminalCount } else { $null }
             AuxiliaryWindowCount = if ($null -ne $terminalClass) { $terminalClass.AuxiliaryCount } else { $null }
             UnclassifiedWindowCount = if ($null -ne $terminalClass) { $terminalClass.UnclassifiedCount } else { $null }
+            CompetingManagedUiCount = if ($null -ne $terminalClass) { $terminalClass.CompetingManagedUiCount } else { $null }
+            EvidenceGaps = if ($null -ne $terminalClass) { @($terminalClass.EvidenceGaps) } else { @() }
             Reasons = @($reasonsA)
         }
         N2B = [pscustomobject][ordered]@{
@@ -1193,6 +1402,11 @@ function Get-P9HN2Verdicts {
             ManagedTerminalCount = if ($null -ne $terminalClass) { $terminalClass.ManagedTerminalCount } else { $null }
             AuxiliaryWindowCount = if ($null -ne $terminalClass) { $terminalClass.AuxiliaryCount } else { $null }
             UnclassifiedWindowCount = if ($null -ne $terminalClass) { $terminalClass.UnclassifiedCount } else { $null }
+            CompetingManagedUiCount = if ($null -ne $terminalClass) { $terminalClass.CompetingManagedUiCount } else { $null }
+            CompetingManagedUiWindows = if ($null -ne $terminalClass) { @($terminalClass.CompetingManagedUi) } else { @() }
+            EvidenceGaps = if ($null -ne $terminalClass) { @($terminalClass.EvidenceGaps) } else { @() }
+            AuxiliaryContract = if ($null -ne $terminalClass) { $terminalClass.AuxiliaryContract } else { $null }
+            IdentityProxy = if ($null -ne $terminalClass) { $terminalClass.IdentityProxy } else { $null }
             QualifyingTerminalHwnd = if ($null -ne $terminalClass) { $terminalClass.QualifyingHwnd } else { $null }
             QualifyingTerminalPid = if ($null -ne $terminalClass) { $terminalClass.QualifyingPid } else { $null }
             AuxiliaryWindows = if ($null -ne $terminalClass) { @($terminalClass.Auxiliary) } else { @() }
