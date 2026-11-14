@@ -3817,6 +3817,188 @@ function Invoke-P9HObserverBridgeTests {
 }
 
 
+function Invoke-P9HChronologyBoundTests {
+    # Z-series: fail-closed lower-bound chronology for the E1 verdict
+    # (Stage 3B7F-R1-A).
+    #
+    # The E1 evaluator originally bounded the captures only ABOVE (pre before the
+    # disconnect) and the post capture only BELOW (after the post observation).
+    # Nothing stopped a PRE monitor capture from predating the very RDP session it
+    # claimed to describe. A synthetic PRE capture timestamped five hours before
+    # the target logon returned PASS with zero reasons.
+    #
+    # The correction adds a mandatory target-logon lower bound and an opt-in
+    # pre-observation lower bound. These cases pin both, and pin that the previous
+    # guarantees (and every unrelated N2 predicate) are untouched.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $dir = Join-Path $SandboxRoot 'z-chronology'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+    $trialId = 'z-chrono-trial'
+    $user = 'qauser'
+    $tokens = @('path:DEFAULT_MONITOR/1&AAAA&0&UID1001', 'path:DEFAULT_MONITOR/1&AAAA&0&UID1002')
+    $rects = @('x=0 y=0 w=1920 h=1080', 'x=-2560 y=0 w=2560 h=1440')
+
+    # pinned target logon for the syntactic trials
+    $logonUtc = [datetime]::SpecifyKind([datetime]::new(2026, 11, 14, 9, 5, 16), [System.DateTimeKind]::Utc)
+    $logonIso = $logonUtc.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+
+    function New-ZCapture([string]$name, [string]$capturedUtc) {
+        $recs = @()
+        for ($i = 0; $i -lt 2; $i++) { $recs += [pscustomobject][ordered]@{ identity = $tokens[$i]; rect = $rects[$i] } }
+        $obj = [ordered]@{
+            tokenCount = 2; identityComplete = $true; sessionId = 3; trialId = $trialId
+            capturedUtc = $capturedUtc; tokens = $tokens; parsedMonitors = $recs
+        }
+        $p = Join-Path $dir $name
+        Write-P9HArtifact -Path $p -Lines @(($obj | ConvertTo-Json -Depth 6))
+        return $p
+    }
+    function New-ZLog([string]$name, [string]$preUtc, [string]$discUtc, [string]$postUtc) {
+        $p = Join-Path $dir $name
+        $seq = 1
+        foreach ($e in @(
+                @{ Phase = 'pre'; State = 0; Utc = $preUtc }
+                @{ Phase = 'disconnect-observed'; State = 4; Utc = $discUtc }
+                @{ Phase = 'post'; State = 0; Utc = $postUtc })) {
+            $line = New-P9HObserverRecord -TrialId $trialId -Sequence $seq -Phase $e.Phase `
+                -RawWtsLines @(('3|RDP-Tcp#0|state=' + $e.State + '|user=' + $user + '|logon=' + $logonIso)) `
+                -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso
+            $j = $line | ConvertFrom-Json
+            $j.utc = $e.Utc
+            Add-P9HArtifactLine -Path $p -Line ($j | ConvertTo-Json -Compress -Depth 6)
+            $seq++
+        }
+        return $p
+    }
+
+    # Canonical fixture: capture AFTER the pre observation (contract-compliant).
+    $preObsUtc = '2026-11-14T09:05:20.0000000Z'
+    $discUtc = '2026-11-14T09:10:56.0000000Z'
+    $postObsUtc = '2026-11-14T09:12:44.0000000Z'
+    $goodPre = New-ZCapture 'z-good-pre.json' '2026-11-14T09:06:48.0000000Z'
+    $goodPost = New-ZCapture 'z-good-post.json' '2026-11-14T09:12:51.0000000Z'
+    $goodLog = New-ZLog 'z-good.jsonl' $preObsUtc $discUtc $postObsUtc
+
+    # ---- Z1: the genuine ordering PASSES (positive control) ----
+    $z1 = Get-P9HE1Verdict -PreCapturePath $goodPre -PostCapturePath $goodPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    Add-P9HTestResult -Id 'Z1' -Title 'Genuine ordering still satisfies the complete E1 predicate' `
+        -Input 'preObs < preCapture < disconnect < postObs < postCapture, all after the target logon' `
+        -Expected 'PASS, lower bound satisfied' `
+        -Actual ("Verdict={0} lowerBound={1} reasons={2}" -f $z1.Verdict, $z1.PreCaptureLowerBoundOk, ($z1.Reasons -join ',')) `
+        -Pass ($z1.Verdict -eq 'PASS' -and $z1.PreCaptureLowerBoundOk -eq $true) -Evidence $goodLog
+
+    # ---- Z2: PRE capture BEFORE the target logon is rejected ----
+    $badPre = New-ZCapture 'z-bad-logon-pre.json' '2026-11-14T04:06:48.0000000Z'
+    $z2 = Get-P9HE1Verdict -PreCapturePath $badPre -PostCapturePath $goodPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    Add-P9HTestResult -Id 'Z2' -Title 'A PRE capture that predates the target logon is rejected' `
+        -Input 'PRE captured 5 h BEFORE the pinned RDP logon (the impossible timeline)' `
+        -Expected 'not PASS, pre-capture-precedes-target-logon reported' `
+        -Actual ("Verdict={0} lowerBound={1} reasons={2}" -f $z2.Verdict, $z2.PreCaptureLowerBoundOk, ($z2.Reasons -join ',')) `
+        -Pass ($z2.Verdict -ne 'PASS' -and $z2.Reasons -contains 'pre-capture-precedes-target-logon' -and
+            $z2.PreCaptureLowerBoundOk -eq $false) -Evidence $goodLog
+
+    # ---- Z3: PRE capture predating the pre observation is rejected WHEN REQUIRED ----
+    $earlyPre = New-ZCapture 'z-early-pre.json' '2026-11-14T09:05:18.0000000Z'   # after logon, before preObs
+    $z3 = Get-P9HE1Verdict -PreCapturePath $earlyPre -PostCapturePath $goodPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId `
+        -RequirePreCaptureAfterPreObservation
+    Add-P9HTestResult -Id 'Z3' -Title 'When the contract demands it, a PRE capture before the pre observation is rejected' `
+        -Input 'preCapture between logon and preObs, -RequirePreCaptureAfterPreObservation' `
+        -Expected 'not PASS, pre-capture-precedes-pre-observation reported' `
+        -Actual ("Verdict={0} lowerBound={1} reasons={2}" -f $z3.Verdict, $z3.PreCaptureLowerBoundOk, ($z3.Reasons -join ',')) `
+        -Pass ($z3.Verdict -ne 'PASS' -and $z3.Reasons -contains 'pre-capture-precedes-pre-observation') -Evidence $goodLog
+
+    # ---- Z4: the same ordering is tolerated when the contract does NOT demand it ----
+    $z4 = Get-P9HE1Verdict -PreCapturePath $earlyPre -PostCapturePath $goodPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    $z4Sub = $z4.SubObservations
+    Add-P9HTestResult -Id 'Z4' -Title 'Capture-then-observe remains acceptable when the contract does not demand ordering' `
+        -Input 'same fixture, no -RequirePreCaptureAfterPreObservation' `
+        -Expected 'PASS, ordering still reported as False in SubObservations' `
+        -Actual ("Verdict={0} notBeforePreObs={1} required={2}" -f $z4.Verdict, $z4Sub['preCaptureNotBeforePreObservation'], $z4Sub['preCaptureAfterPreObservationRequired']) `
+        -Pass ($z4.Verdict -eq 'PASS' -and $z4Sub['preCaptureNotBeforePreObservation'] -eq $false -and
+            $z4Sub['preCaptureAfterPreObservationRequired'] -eq $false) -Evidence $goodLog
+
+    # ---- Z5: a missing pinned logon cannot satisfy the chronology ----
+    $z5 = Get-P9HE1Verdict -PreCapturePath $goodPre -PostCapturePath $goodPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $null -TrialId $trialId
+    Add-P9HTestResult -Id 'Z5' -Title 'An absent pinned logon fails closed rather than skipping the bound' `
+        -Input 'TargetLogonTime omitted' -Expected 'not PASS, pinned-logon-unavailable-for-chronology' `
+        -Actual ("Verdict={0} lowerBound={1} reasons={2}" -f $z5.Verdict, $z5.PreCaptureLowerBoundOk, ($z5.Reasons -join ',')) `
+        -Pass ($z5.Verdict -ne 'PASS' -and $z5.Reasons -contains 'pinned-logon-unavailable-for-chronology') -Evidence $goodLog
+
+    # ---- Z6: an unparseable capture timestamp is still rejected ----
+    $badTsPre = New-ZCapture 'z-badts-pre.json' 'not-a-timestamp'
+    $z6 = Get-P9HE1Verdict -PreCapturePath $badTsPre -PostCapturePath $goodPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    Add-P9HTestResult -Id 'Z6' -Title 'An unparseable PRE capture timestamp is rejected' `
+        -Input 'capturedUtc = "not-a-timestamp"' -Expected 'not PASS, capture-timestamp-invalid' `
+        -Actual ("Verdict={0} reasons={1}" -f $z6.Verdict, ($z6.Reasons -join ',')) `
+        -Pass ($z6.Verdict -ne 'PASS' -and $z6.Reasons -contains 'capture-timestamp-invalid') -Evidence $goodLog
+
+    # ---- Z7: the upper chronology checks are preserved ----
+    $latePre = New-ZCapture 'z-late-pre.json' '2026-11-14T09:11:30.0000000Z'   # after the disconnect
+    $z7 = Get-P9HE1Verdict -PreCapturePath $latePre -PostCapturePath $goodPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    Add-P9HTestResult -Id 'Z7' -Title 'The existing upper bound (PRE before the disconnect) is preserved' `
+        -Input 'PRE captured after the disconnect observation' -Expected 'not PASS, does-not-bracket-transition' `
+        -Actual ("Verdict={0} chronologyOk={1} reasons={2}" -f $z7.Verdict, $z7.ChronologyOk, ($z7.Reasons -join ',')) `
+        -Pass ($z7.Verdict -ne 'PASS' -and $z7.ChronologyOk -eq $false -and
+            $z7.Reasons -contains 'capture-does-not-bracket-transition') -Evidence $goodLog
+
+    # ---- Z8: POST capture that precedes the post observation is still rejected ----
+    $earlyPost = New-ZCapture 'z-early-post.json' '2026-11-14T09:12:40.0000000Z'   # before postObs 09:12:44
+    $z8 = Get-P9HE1Verdict -PreCapturePath $goodPre -PostCapturePath $earlyPost -ObserverLogPath $goodLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    Add-P9HTestResult -Id 'Z8' -Title 'The existing lower bound on the POST capture is preserved' `
+        -Input 'POST capture before the post-reconnect observation' -Expected 'not PASS, does-not-bracket-transition' `
+        -Actual ("Verdict={0} chronologyOk={1} reasons={2}" -f $z8.Verdict, $z8.ChronologyOk, ($z8.Reasons -join ',')) `
+        -Pass ($z8.Verdict -ne 'PASS' -and $z8.ChronologyOk -eq $false) -Evidence $goodLog
+
+    # ---- Z9: a failed transition is unaffected by the new bound ----
+    # A log with pre + disconnect-observed but NO post-reconnect record: the
+    # transition cannot be proven, so the verdict must not be PASS regardless of
+    # the (valid) monitor chronology.
+    $noProofLog = Join-Path $dir 'z-noproof.jsonl'
+    $seq = 1
+    foreach ($e in @(
+            @{ Phase = 'pre'; State = 0; Utc = $preObsUtc }
+            @{ Phase = 'disconnect-observed'; State = 4; Utc = $discUtc })) {
+        $line = New-P9HObserverRecord -TrialId $trialId -Sequence $seq -Phase $e.Phase `
+            -RawWtsLines @(('3|RDP-Tcp#0|state=' + $e.State + '|user=' + $user + '|logon=' + $logonIso)) `
+            -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso
+        $j = $line | ConvertFrom-Json
+        $j.utc = $e.Utc
+        Add-P9HArtifactLine -Path $noProofLog -Line ($j | ConvertTo-Json -Compress -Depth 6)
+        $seq++
+    }
+    $z9 = Get-P9HE1Verdict -PreCapturePath $goodPre -PostCapturePath $goodPost -ObserverLogPath $noProofLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    Add-P9HTestResult -Id 'Z9' -Title 'The new bound does not change a failed-transition outcome' `
+        -Input 'valid chronology but no post-reconnect record' -Expected 'NOT FULLY EVIDENCED, not PASS' `
+        -Actual ("Verdict={0} disconnectProven={1} reason={2}" -f $z9.Verdict, $z9.DisconnectProven, $z9.DisconnectReason) `
+        -Pass ($z9.Verdict -eq 'NOT FULLY EVIDENCED' -and $z9.DisconnectProven -eq $false) -Evidence $noProofLog
+
+    # ---- Z10: the bound uses the PINNED logon, not the log line's own value ----
+    # Capture sits between a DIFFERENT (earlier) logon and the pinned one; it must
+    # be rejected because the caller's pin is authoritative.
+    $otherLogon = $logonUtc.AddHours(-2).ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+    $otherLog = New-ZLog 'z-otherlogon.jsonl' '2026-11-14T07:05:20.0000000Z' $discUtc $postObsUtc
+    $midPre = New-ZCapture 'z-mid-pre.json' '2026-11-14T07:30:00.0000000Z'
+    $z10 = Get-P9HE1Verdict -PreCapturePath $midPre -PostCapturePath $goodPost -ObserverLogPath $otherLog `
+        -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso -TrialId $trialId
+    Add-P9HTestResult -Id 'Z10' -Title 'The lower bound is the pinned logon supplied by the caller' `
+        -Input 'capture after the log line logon but before the pinned logon' `
+        -Expected 'not PASS, pre-capture-precedes-target-logon' `
+        -Actual ("Verdict={0} reasons={1}" -f $z10.Verdict, ($z10.Reasons -join ',')) `
+        -Pass ($z10.Verdict -ne 'PASS' -and $z10.Reasons -contains 'pre-capture-precedes-target-logon') -Evidence $otherLog
+}
+
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -3839,14 +4021,15 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HDateHandlingTests -SandboxRoot $SandboxRoot
     Invoke-P9HWtsListenerAuthorityTests -SandboxRoot $SandboxRoot
     Invoke-P9HObserverBridgeTests -SandboxRoot $SandboxRoot
+    Invoke-P9HChronologyBoundTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
 
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 221 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 231 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

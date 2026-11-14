@@ -700,8 +700,73 @@ The positive path is preserved: a clean capture with an omitted flag still deriv
 | U4 | explicit `true` cannot override a failed capture outcome |
 | U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
 
-The registry guard now covers **221** registered cases; the full run executes 222 including `R1`.
-All 209 prior cases and `R1` are retained unchanged.
+The registry guard now covers **231** registered cases; the full run executes 232 including `R1`.
+All 221 prior cases and `R1` are retained unchanged.
+
+---
+
+## Stage 3B7F-R1-A: fail-closed lower-bound chronology for the E1 verdict
+
+An audit of the retained Stage 3B7F-R1 evidence found that the E1 evaluator bounded
+the monitor captures only from ABOVE (PRE before the disconnect) and the POST
+capture only from BELOW (after the post observation). **Nothing bounded the PRE
+capture from below**, so a PRE capture timestamped before the very RDP session it
+claimed to describe still satisfied the complete predicate.
+
+Reproduced synthetically against the unmodified evaluator: a PRE capture stamped
+five hours BEFORE the pinned target logon returned `Verdict=PASS` with an empty
+`Reasons` array. An internally impossible evidence timeline was accepted.
+
+### Correction
+
+Two lower bounds are now evaluated, with deliberately different strengths:
+
+| Bound | Default | Rationale |
+| --- | --- | --- |
+| PRE capture must not predate the **pinned target logon** | **always enforced** | a monitor snapshot of a session cannot have been taken before that session existed - an evidential impossibility |
+| PRE capture must not predate the **authoritative `pre` observation** | opt-in via `-RequirePreCaptureAfterPreObservation` | the ordering is a *procedural* requirement of some trial contracts; capture-then-observe is still truthful because both precede the disconnect |
+
+Both are conditioned on the bound being present and parseable. An absent pinned
+logon, or an unparseable bound, is reported as its own reason rather than silently
+skipped, so the predicate cannot be satisfied by omitting evidence.
+
+New sub-observations: `preCaptureNotBeforeTargetLogon`,
+`preCaptureAfterPreObservationRequired`, `preCaptureNotBeforePreObservation`,
+`preCaptureLowerBoundOk`. The result object also exposes
+`PreCaptureLowerBoundOk`. The lower bound is part of the acceptance predicate:
+`PASS` now requires `preLowerBoundOk` in addition to the previous conditions.
+
+Existing behaviour is preserved: the PRE-before-disconnect and
+POST-after-observation checks are untouched, and the opt-in bound defaults off so
+no prior positive case changes meaning.
+
+### Test coverage (Z1-Z10)
+
+| ID | Coverage |
+| --- | --- |
+| Z1 | genuine ordering (preObs < preCapture < disconnect < postObs < postCapture) still PASSES |
+| Z2 | PRE capture before the target logon is rejected |
+| Z3 | with the flag, PRE capture before the pre observation is rejected |
+| Z4 | without the flag the same ordering is tolerated and the relationship is still reported |
+| Z5 | an absent pinned logon fails closed instead of skipping the bound |
+| Z6 | an unparseable PRE capture timestamp is rejected |
+| Z7 | the existing upper bound (PRE before disconnect) is preserved |
+| Z8 | the existing POST lower bound is preserved |
+| Z9 | a failed transition still yields NOT FULLY EVIDENCED |
+| Z10 | the bound uses the caller's pinned logon, not the log line's own value |
+
+### Re-evaluation of the R1 trial
+
+The Stage 3B7F-R1 final report stated a PRE capture of `2026-11-14T04:06:48.964Z`,
+nearly five hours BEFORE the target logon. The retained original artifact
+(`pre-monitor.json`, sha256 `dfee403b...`) actually contains
+`2026-11-14T09:06:48.9644082Z`. **The five-hour figure was a report transcription
+error; the artifact is correct and the capture post-dates the logon by 1.54 min.**
+The R1 trial satisfies the mandatory lower bound.
+
+Its measured ordering is `preCapture 09:06:48.964` then `preObs 09:09:07.575`
+(capture-then-observe, 2.31 min apart), so under the OPT-IN flag the trial would
+be reported NOT FULLY EVIDENCED. Under the default contract it remains PASS.
 
 ---
 
