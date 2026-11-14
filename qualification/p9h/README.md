@@ -700,7 +700,7 @@ The positive path is preserved: a clean capture with an omitted flag still deriv
 | U4 | explicit `true` cannot override a failed capture outcome |
 | U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
 
-The registry guard now covers **234** registered cases; the full run executes 235 including `R1`.
+The registry guard now covers **253** registered cases; the full run executes 254 including `R1`.
 All 221 prior cases and `R1` are retained unchanged.
 
 ---
@@ -757,6 +757,75 @@ no prior positive case changes meaning.
 
 ---
 
+## Stage 3B7G0: guest execution boundary, atomic replacement, and N2 readiness
+
+Stage 3B7F-R2's strict physical E1 result is preserved. This stage fixes the two
+safety defects that trial exposed, and assesses N2 readiness read-only.
+
+### Defect 1: a guest disconnect could execute on the host
+
+`tsdiscon` was invoked on the WINDOWS HOST while the plan named a GUEST session,
+so `tsdiscon 2` addressed the host's own session 2. The root cause was not a
+wrong session id: **nothing bound a plan to a machine**, so `session 2` was
+equally valid on any computer and the primitive had no way to notice it was in
+the wrong place.
+
+Correction - a fail-closed boundary with no bypass:
+
+| Check | Enforced |
+| --- | --- |
+| plan must name its guest computer | always |
+| plan must name the authorized VM id | always |
+| caller must supply the expected guest (no default) | always |
+| caller must supply the expected VM id | always |
+| ACTUAL local computer must equal the expected guest | always |
+| plan guest/VM must equal the caller's expectation | always |
+| target must not be session 0 | always (plan AND boundary) |
+| target must not be a listener | always (plan AND boundary) |
+| real-execution token | preserved, checked first |
+
+`Get-P9HExecutionContext` reports identity read-only.
+`Assert-P9HGuestExecutionContext` performs the refusal before any process exists.
+`Test-P9HGuestDisconnectEligible` is the non-executing validation path.
+`Invoke-P9HGuestControlledDisconnect` orchestrates PowerShell Direct and
+re-verifies the guest's own computer name **inside** the execution context.
+
+### Defect 2: "atomic" replacement was not atomic on PowerShell 5.1
+
+The 5.1 branch deleted the destination and *then* moved the temporary file into
+place. Between those two steps the destination does not exist, and if the move
+fails the previous valid artifact is already gone.
+
+The writer now uses `[System.IO.File]::Replace(src, dst, backup, true)` for the
+existing-file case - a single atomic swap available on .NET Framework and .NET -
+and a plain same-directory rename for a genuinely new artifact. A failed
+replacement now leaves the old destination byte-identical.
+
+### Test coverage
+
+| Series | Coverage |
+| --- | --- |
+| H1-H12 | host/guest context, omitted identity, VM mismatch, session 0, listener, refusal before process start, accepted guest, pinned identity, token-first |
+| J1-J7 | new creation, replacement, failure preserving the destination, no residue, BOM-free CRLF bytes, hash stability, append-only logging intact |
+
+The canonical suite is 254/254 PASS (253 registered cases plus `R1`).
+
+### Verification on both runtimes
+
+Both defects were reproduced and both fixes proven under **Windows PowerShell
+5.1** and **PowerShell 7**: identical results, identical SHA-256, identical
+boundary decisions, zero temporary residue.
+
+### N2 readiness (read-only)
+
+All eleven listed capabilities are implemented and synthetically verified; seven
+of them still require a **physical** observation to be claimed, because the
+remaining claims are about the INSTALLED product rather than the qualification
+observer. Critically, E1 proved the **native** monitor API directly in-guest; it
+did **not** exercise the installed `ws.ps1`/`coordinator.ps1` entry point, so E1
+acceptance cannot be substituted for N2 evidence.
+
+---
 ## Stage 3B7F-R2: strict chronology physical acceptance and a PowerShell 5.1 portability defect
 
 The Stage 3B7F-R2 physical trial replayed E1 with the contract order corrected:

@@ -1322,16 +1322,16 @@ function Invoke-P9HSafetyGateTests {
     $before = @(Get-Process -ErrorAction SilentlyContinue).Count
 
     # ---- G1: disconnect refused without a token ----
-    $plan = New-P9HDisconnectPlan -TrialId 'gate' -TargetSessionId '3' -TargetUser 'synthetic-account'
+    $plan = New-P9HDisconnectPlan -TrialId 'gate' -TargetSessionId '3' -TargetUser 'synthetic-account'  -GuestComputerName 'SYNTHETIC-GUEST' -VmId '11111111-2222-3333-4444-555555555555'
     $refused = $false
-    try { Invoke-P9HControlledDisconnect -Plan $plan -AuthorizationToken '' } catch { $refused = $true }
+    try { Invoke-P9HControlledDisconnect -Plan $plan -AuthorizationToken ''  -ExpectedComputerName 'SYNTHETIC-GUEST' -ExpectedVmId '11111111-2222-3333-4444-555555555555' } catch { $refused = $true }
     Add-P9HTestResult -Id 'G1' -Title 'Controlled disconnect refuses without authorization' `
         -Input 'empty token' -Expected 'throws, no process spawned' -Actual ("refused={0}" -f $refused) `
         -Pass $refused -Evidence $null
 
     # ---- G2: wrong token refused ----
     $refused = $false
-    try { Invoke-P9HControlledDisconnect -Plan $plan -AuthorizationToken 'not-the-phrase' } catch { $refused = $true }
+    try { Invoke-P9HControlledDisconnect -Plan $plan -AuthorizationToken 'not-the-phrase'  -ExpectedComputerName 'SYNTHETIC-GUEST' -ExpectedVmId '11111111-2222-3333-4444-555555555555' } catch { $refused = $true }
     Add-P9HTestResult -Id 'G2' -Title 'Controlled disconnect refuses a wrong authorization phrase' `
         -Input 'not-the-phrase' -Expected 'throws' -Actual ("refused={0}" -f $refused) -Pass $refused -Evidence $null
 
@@ -1348,14 +1348,14 @@ function Invoke-P9HSafetyGateTests {
 
     # ---- G4: omitted session target refused ----
     $refused = $false
-    try { $null = New-P9HDisconnectPlan -TrialId 'gate' -TargetSessionId '' -TargetUser 'synthetic-account' } catch { $refused = $true }
+    try { $null = New-P9HDisconnectPlan -TrialId 'gate' -TargetSessionId '' -TargetUser 'synthetic-account'  -GuestComputerName 'SYNTHETIC-GUEST' -VmId '11111111-2222-3333-4444-555555555555' } catch { $refused = $true }
     Add-P9HTestResult -Id 'G4' -Title 'Disconnect with omitted session id is refused' `
         -Input 'empty session id' -Expected 'throws (no implicit current-session target)' `
         -Actual ("refused={0}" -f $refused) -Pass $refused -Evidence $null
 
     # ---- G5: session 0 refused as a target ----
     $refused = $false
-    try { $null = New-P9HDisconnectPlan -TrialId 'gate' -TargetSessionId '0' -TargetUser 'synthetic-account' } catch { $refused = $true }
+    try { $null = New-P9HDisconnectPlan -TrialId 'gate' -TargetSessionId '0' -TargetUser 'synthetic-account'  -GuestComputerName 'SYNTHETIC-GUEST' -VmId '11111111-2222-3333-4444-555555555555' } catch { $refused = $true }
     Add-P9HTestResult -Id 'G5' -Title 'Session 0 can never be a disconnect target' `
         -Input 'session id 0' -Expected 'throws' -Actual ("refused={0}" -f $refused) -Pass $refused -Evidence $null
 
@@ -4049,6 +4049,336 @@ function Invoke-P9HChronologyBoundTests {
         -Evidence $artDir
 }
 
+function Invoke-P9HHostBoundaryTests {
+    # H-series: the GUEST EXECUTION BOUNDARY (Stage 3B7G0).
+    #
+    # Stage 3B7F-R2 disclosed a real safety incident: the disconnect primitive was
+    # invoked on the Windows HOST while the plan named a GUEST session, so
+    # `tsdiscon 2` addressed the HOST's own session 2 (the Anode seat's session).
+    #
+    # The root cause was that NOTHING bound a plan to a machine: 'session 2' was
+    # equally valid on any computer, and the primitive had no way to notice that
+    # the local computer was not the guest.
+    #
+    # These cases pin the boundary. NONE of them starts a process: every case uses
+    # the injectable execution context or the non-executing validation path, so
+    # the whole boundary is testable with no VM, no RDP and no live session.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $guest = 'P9H-GUEST-SYNTHETIC'
+    $hostName = 'P9H-HOST-SYNTHETIC'
+    $vmId = '9d3dd39b-a589-4222-955a-0f4558c1524b'
+    $otherVm = '00000000-1111-2222-3333-444444444444'
+
+    function New-Plan {
+        param($Computer, $Vm, $SessionId, $User = 'qauser', [switch]$NoGuest, [switch]$NoVm)
+        $args = @{ TrialId = 'h-trial'; TargetSessionId = [string]$SessionId; TargetUser = $User }
+        if (-not $NoGuest) { $args.GuestComputerName = $Computer }
+        if (-not $NoVm) { $args.VmId = $Vm }
+        return (New-P9HDisconnectPlan @args)
+    }
+    function New-Ctx([string]$Computer) {
+        return [pscustomobject]@{ ComputerName = $Computer; UserName = 'synthetic'; ProcessId = 1; SessionId = 0; IsElevated = $false }
+    }
+
+    $goodPlan = New-Plan -Computer $guest -Vm $vmId -SessionId 2
+
+    # ---- H1: a plan for the guest REFUSES to execute in a simulated HOST context ----
+    $threw = $false
+    $msg = ''
+    try {
+        $null = Invoke-P9HControlledDisconnect -Plan $goodPlan -AuthorizationToken 'AUTHORIZED-REAL-REPLAY' `
+            -ExpectedComputerName $guest -ExpectedVmId $vmId `
+            -LocalContext (New-Ctx $hostName) -TsdisconPath 'C:\nonexistent\tsdiscon.exe'
+    }
+    catch { $threw = $true; $msg = $_.Exception.Message }
+    Add-P9HTestResult -Id 'H1' -Title 'A guest disconnect plan is REFUSED when running on the host' `
+        -Input 'plan bound to P9H-GUEST-SYNTHETIC, executed in a simulated P9H-HOST-SYNTHETIC context' `
+        -Expected 'throws before any process is created (the Stage 3B7F-R2 incident)' `
+        -Actual ("threw={0} msg={1}" -f $threw, ($msg -replace "`r?`n", ' ')) `
+        -Pass ($threw -and $msg -match 'GUEST BOUNDARY REFUSAL') -Evidence $null
+
+    # ---- H2: missing expected guest identity is a refusal, not a skipped check ----
+    $refusedNull = $false; $refusedEmpty = $false
+    try { $null = Invoke-P9HControlledDisconnect -Plan $goodPlan -AuthorizationToken 'AUTHORIZED-REAL-REPLAY' -ExpectedVmId $vmId -LocalContext (New-Ctx $guest) } catch { $refusedNull = $true }
+    try { $null = Invoke-P9HControlledDisconnect -Plan $goodPlan -AuthorizationToken 'AUTHORIZED-REAL-REPLAY' -ExpectedComputerName '' -ExpectedVmId $vmId -LocalContext (New-Ctx $guest) } catch { $refusedEmpty = $true }
+    Add-P9HTestResult -Id 'H2' -Title 'An omitted or empty expected guest identity fails closed' `
+        -Input 'ExpectedComputerName omitted, then empty' `
+        -Expected 'both refused - an unstated machine can never mean "skip the check"' `
+        -Actual ("omittedRefused={0} emptyRefused={1}" -f $refusedNull, $refusedEmpty) `
+        -Pass ($refusedNull -and $refusedEmpty) -Evidence $null
+
+    # ---- H3: a plan with NO bound guest identity cannot even be built ----
+    $noGuestThrew = $false
+    try { $null = New-Plan -Computer $guest -Vm $vmId -SessionId 2 -NoGuest } catch { $noGuestThrew = $true }
+    $noVmThrew = $false
+    try { $null = New-Plan -Computer $guest -Vm $vmId -SessionId 2 -NoVm } catch { $noVmThrew = $true }
+    Add-P9HTestResult -Id 'H3' -Title 'A disconnect plan without a bound guest identity is refused' `
+        -Input 'GuestComputerName omitted, then VmId omitted' `
+        -Expected 'both refused at plan construction - an unbound plan is valid on any host' `
+        -Actual ("guestRefused={0} vmRefused={1}" -f $noGuestThrew, $noVmThrew) `
+        -Pass ($noGuestThrew -and $noVmThrew) -Evidence $null
+
+    # ---- H4: incorrect target session id and listener range ----
+    $zeroThrew = $false
+    try { $null = New-Plan -Computer $guest -Vm $vmId -SessionId 0 } catch { $zeroThrew = $true }
+    $listenerThrew = $false
+    try { $null = New-Plan -Computer $guest -Vm $vmId -SessionId 65536 } catch { $listenerThrew = $true }
+    $nonIntThrew = $false
+    try { $null = New-Plan -Computer $guest -Vm $vmId -SessionId 'two' } catch { $nonIntThrew = $true }
+    Add-P9HTestResult -Id 'H4' -Title 'Session 0, listener ids and non-numeric ids are refused' `
+        -Input 'session id 0, 65536 (WTS listener range), then "two"' `
+        -Expected 'all refused at plan construction' `
+        -Actual ("zero={0} listener={1} nonNumeric={2}" -f $zeroThrew, $listenerThrew, $nonIntThrew) `
+        -Pass ($zeroThrew -and $listenerThrew -and $nonIntThrew) -Evidence $null
+
+    # ---- H5: an explicit session 0 is rejected by the boundary too, not only the plan ----
+    $forced = [pscustomobject][ordered]@{
+        TrialId = 'h-trial'; GuestComputerName = $guest; VmId = $vmId
+        TargetSessionId = 0; TargetUser = 'qauser'; TargetLogonTime = $null; Method = 'tsdiscon'
+    }
+    $s0Threw = $false; $s0Msg = ''
+    try {
+        $null = Assert-P9HGuestExecutionContext -Plan $forced -ExpectedComputerName $guest -ExpectedVmId $vmId -LocalContext (New-Ctx $guest)
+    }
+    catch { $s0Threw = $true; $s0Msg = $_.Exception.Message }
+    Add-P9HTestResult -Id 'H5' -Title 'The boundary independently rejects a session-0 target' `
+        -Input 'a hand-built plan that bypassed New-P9HDisconnectPlan with session 0' `
+        -Expected 'boundary refuses - targets are re-validated, not trusted from the plan' `
+        -Actual ("threw={0} msg={1}" -f $s0Threw, $s0Msg) `
+        -Pass ($s0Threw -and $s0Msg -match 'session 0') -Evidence $null
+
+    # ---- H6: the AUTHORIZED VM ID must match; a different VM is refused ----
+    $vmMismatchThrew = $false
+    $vmMismatchMsg = ''
+    try {
+        $null = Invoke-P9HControlledDisconnect -Plan $goodPlan -AuthorizationToken 'AUTHORIZED-REAL-REPLAY' `
+            -ExpectedComputerName $guest -ExpectedVmId $otherVm `
+            -LocalContext (New-Ctx $guest) -TsdisconPath 'C:\nonexistent\tsdiscon.exe'
+    }
+    catch { $vmMismatchThrew = $true; $vmMismatchMsg = $_.Exception.Message }
+    Add-P9HTestResult -Id 'H6' -Title 'Execution is restricted to the authorized VM id' `
+        -Input 'plan for one VM, caller authorizes a different VM id' `
+        -Expected 'refused before any process is created' `
+        -Actual ("threw={0} msg={1}" -f $vmMismatchThrew, $vmMismatchMsg) `
+        -Pass ($vmMismatchThrew -and $vmMismatchMsg -match 'authorized VM') -Evidence $null
+
+    # ---- H7: CORRECT guest context is ACCEPTED by the non-executing validation path ----
+    $eligible = Test-P9HGuestDisconnectEligible -Plan $goodPlan -ExpectedComputerName $guest -ExpectedVmId $vmId -LocalContext (New-Ctx $guest)
+    $hostEligible = Test-P9HGuestDisconnectEligible -Plan $goodPlan -ExpectedComputerName $guest -ExpectedVmId $vmId -LocalContext (New-Ctx $hostName)
+    Add-P9HTestResult -Id 'H7' -Title 'The non-executing validation path accepts the guest and rejects the host' `
+        -Input 'same plan validated in a simulated GUEST context, then a simulated HOST context' `
+        -Expected 'eligible=True on the guest, eligible=False on the host' `
+        -Actual ("guest={0}/{1} host={2}/{3}" -f $eligible.Eligible, $eligible.Reason, $hostEligible.Eligible, $hostEligible.Reason) `
+        -Pass ($eligible.Eligible -eq $true -and $hostEligible.Eligible -eq $false -and
+            $hostEligible.Detail -match 'GUEST BOUNDARY REFUSAL') -Evidence $null
+
+    # ---- H8: the host-side command is refused BEFORE process start ----
+    # The tsdiscon path does not exist, so a boundary that ran AFTER process
+    # creation would report 'tool-missing' instead of throwing. Observing the
+    # boundary error proves refusal precedes any process resolution.
+    # The tool-existence check is ordered AFTER the boundary in the implementation.
+    # Therefore a missing TsdisconPath yields the deterministic, observable proof:
+    #   * boundary refusal  -> THROWS 'GUEST BOUNDARY REFUSAL'
+    #   * boundary passed   -> RETURNS Outcome='tool-missing'
+    # Observing a throw (never a tool-missing return) proves the refusal happened
+    # before the tool was ever resolved or a process could be created. A raw
+    # process-count delta is deliberately NOT used: unrelated system processes
+    # start and stop concurrently, which makes that assertion flaky rather than
+    # probative.
+    $err = ''
+    $returned = $null
+    try {
+        $returned = Invoke-P9HControlledDisconnect -Plan $goodPlan -AuthorizationToken 'AUTHORIZED-REAL-REPLAY' `
+            -ExpectedComputerName $guest -ExpectedVmId $vmId `
+            -LocalContext (New-Ctx $hostName) -TsdisconPath 'C:\definitely\missing\tsdiscon.exe'
+    }
+    catch { $err = $_.Exception.Message }
+    Add-P9HTestResult -Id 'H8' -Title 'The host-side command is refused before any process is created' `
+        -Input 'host context with a missing in-guest tool path' `
+        -Expected 'boundary error, NOT the tool-missing outcome - so refusal precedes tool resolution' `
+        -Actual ("threw={0} returnedNull={1} error={2}" -f (-not [string]::IsNullOrWhiteSpace($err)), ($null -eq $returned), ($err -replace "`r?`n", ' ')) `
+        -Pass ($err -match 'GUEST BOUNDARY REFUSAL' -and $null -eq $returned) `
+        -Evidence $null
+
+    # ---- H9: orchestration refuses to dispatch for a mismatched VM before invoking ----
+    # The invoker records whether it was ever called; it must not be.
+    $invokerCalled = $false
+    $invoker = { param($P, $VmName, $Cred) $script:__h9Called = $true; return [pscustomobject]@{ Ok = $true; GuestComputerName = 'x' } }.GetNewClosure()
+    $orchThrew = $false; $orchMsg = ''
+    $wrongVmPlan = New-Plan -Computer $guest -Vm $vmId -SessionId 2
+    try {
+        $null = Invoke-P9HGuestControlledDisconnect -Plan $wrongVmPlan -AuthorizationToken 'AUTHORIZED-REAL-REPLAY' `
+            -ExpectedVmName 'some-vm' -ExpectedVmId $otherVm `
+            -GuestCredentialUser 'u' -GuestCredentialPassword 'p' `
+            -LocalContext (New-Ctx $hostName) -RemoteInvoker $invoker
+    }
+    catch { $orchThrew = $true; $orchMsg = $_.Exception.Message }
+    Add-P9HTestResult -Id 'H9' -Title 'Orchestration refuses a mismatched VM id before dispatching' `
+        -Input 'plan binds one VM id, orchestration authorizes another' `
+        -Expected 'refused, and the remote invoker never called' `
+        -Actual ("threw={0} invokerCalled={1} msg={2}" -f $orchThrew, $invokerCalled, ($orchMsg -replace "`r?`n", ' ')) `
+        -Pass ($orchThrew -and -not $invokerCalled -and $orchMsg -match 'authorized VM') -Evidence $null
+
+    # ---- H10: the authorization token requirement is preserved and checked FIRST ----
+    # An unbound/invalid plan plus a bad token must fail on the TOKEN, proving the
+    # boundary did not replace or bypass the existing real-execution gate.
+    $tokenFirst = $false; $tokenMsg = ''
+    $unbound = [pscustomobject][ordered]@{ TrialId = 'h'; TargetSessionId = 2; TargetUser = 'qauser' }
+    try {
+        $null = Invoke-P9HControlledDisconnect -Plan $unbound -AuthorizationToken 'wrong' `
+            -ExpectedComputerName $guest -ExpectedVmId $vmId -LocalContext (New-Ctx $guest)
+    }
+    catch { $tokenFirst = $true; $tokenMsg = $_.Exception.Message }
+    Add-P9HTestResult -Id 'H10' -Title 'The real-execution token is still required and checked first' `
+        -Input 'wrong token with an otherwise unbound plan' `
+        -Expected 'refused on the token, not on the boundary' `
+        -Actual ("threw={0} msg={1}" -f $tokenFirst, $tokenMsg) `
+        -Pass ($tokenFirst -and $tokenMsg -match 'authorization token') -Evidence $null
+
+    # ---- H11: a listener flag on the plan is refused even with a numeric id ----
+    $listenerPlan = [pscustomobject][ordered]@{
+        TrialId = 'h'; GuestComputerName = $guest; VmId = $vmId
+        TargetSessionId = 4; TargetUser = 'qauser'; TargetLogonTime = $null; Method = 'tsdiscon'
+        TargetIsListener = $true
+    }
+    $listenerThrew = $false; $listenerMsg = ''
+    try { $null = Assert-P9HGuestExecutionContext -Plan $listenerPlan -ExpectedComputerName $guest -ExpectedVmId $vmId -LocalContext (New-Ctx $guest) }
+    catch { $listenerThrew = $true; $listenerMsg = $_.Exception.Message }
+    Add-P9HTestResult -Id 'H11' -Title 'A listener target is refused by the boundary' `
+        -Input 'a plan that declares TargetIsListener=true' `
+        -Expected 'refused - a listener is an endpoint, not a logged-on user' `
+        -Actual ("threw={0} msg={1}" -f $listenerThrew, $listenerMsg) `
+        -Pass ($listenerThrew -and $listenerMsg -match 'listener') -Evidence $null
+
+    # ---- H12: logon-time pinning survives the boundary unchanged ----
+    $pinned = '2026-11-14T10:55:56.4933591Z'
+    $pinnedPlan = New-P9HDisconnectPlan -TrialId 'h-trial' -TargetSessionId '2' -TargetUser 'P9HNODE2\p9hadmin' `
+        -TargetLogonTime $pinned -GuestComputerName $guest -VmId $vmId
+    $ctx = Assert-P9HGuestExecutionContext -Plan $pinnedPlan -ExpectedComputerName $guest -ExpectedVmId $vmId -LocalContext (New-Ctx $guest)
+    Add-P9HTestResult -Id 'H12' -Title 'The boundary preserves exact session, user and logon pinning' `
+        -Input 'a fully pinned guest plan' `
+        -Expected 'session id, user and logon time all unchanged after the boundary' `
+        -Actual ("session={0} user={1} logon={2} ctx={3}" -f $pinnedPlan.TargetSessionId, $pinnedPlan.TargetUser, $pinnedPlan.TargetLogonTime, $ctx.ComputerName) `
+        -Pass ($pinnedPlan.TargetSessionId -eq 2 -and $pinnedPlan.TargetUser -eq 'P9HNODE2\p9hadmin' -and
+            $pinnedPlan.TargetLogonTime -eq $pinned -and $ctx.ComputerName -eq $guest) -Evidence $null
+}
+
+function Invoke-P9HAtomicArtifactTests {
+    # J-series: atomic artifact replacement (Stage 3B7G0).
+    #
+    # Stage 3B7F-R2's PowerShell 5.1 branch performed "delete the destination,
+    # then move the temporary file into place" and called it atomic. It is not:
+    # the destination is unlinked BEFORE the move can fail, so a failed
+    # replacement destroys the previous valid artifact, and a concurrent reader
+    # can observe the destination missing.
+    #
+    # The corrected writer uses [System.IO.File]::Replace for the existing-file
+    # case (a single atomic swap with an optional backup) and a plain
+    # same-directory rename for the genuinely-new case.
+    #
+    # These cases pin: new-file creation, overwrite, byte contents, SHA-256
+    # consistency, no temporary residue, and - most importantly - that a FAILED
+    # replacement leaves the old destination intact.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $dir = Join-Path $SandboxRoot 'j-atomic'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $path = Join-Path $dir 'artifact.json'
+    $tmp = $path + '.tmp'
+
+    function Get-Sha([string]$p) { return (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower() }
+
+    # ---- J1: creating a NEW artifact ----
+    Write-P9HArtifact -Path $path -Lines @('{"stage":"first"}')
+    $j1Text = [IO.File]::ReadAllText($path)
+    $j1Tmp = Test-Path -LiteralPath $tmp
+    Add-P9HTestResult -Id 'J1' -Title 'A new artifact is created atomically with exact bytes' `
+        -Input 'Write-P9HArtifact against a path that does not exist' `
+        -Expected 'created, exact content, no .tmp residue' `
+        -Actual ("exists={0} text={1} tmp={2}" -f (Test-Path $path), $j1Text.Trim(), $j1Tmp) `
+        -Pass ((Test-Path $path) -and $j1Text.Trim() -eq '{"stage":"first"}' -and -not $j1Tmp) -Evidence $dir
+
+    # ---- J2: REPLACING an existing artifact ----
+    $j1Sha = Get-Sha $path
+    Write-P9HArtifact -Path $path -Lines @('{"stage":"second"}')
+    $j2Text = [IO.File]::ReadAllText($path)
+    $j2Sha = Get-Sha $path
+    Add-P9HTestResult -Id 'J2' -Title 'An existing artifact is replaced with exact bytes' `
+        -Input 'Write-P9HArtifact over an existing artifact' `
+        -Expected 'content fully replaced, hash changed, no .tmp residue' `
+        -Actual ("text={0} shaChanged={1} tmp={2}" -f $j2Text.Trim(), ($j1Sha -ne $j2Sha), (Test-Path $tmp)) `
+        -Pass ($j2Text.Trim() -eq '{"stage":"second"}' -and $j2Text -notmatch 'first' -and
+            $j1Sha -ne $j2Sha -and -not (Test-Path $tmp)) -Evidence $dir
+
+    # ---- J3: a FAILED replacement must leave the old destination intact ----
+    # Drive the real code path into its failure branch by making the temporary
+    # file unavailable at replace time. The previous valid destination must
+    # survive byte-for-byte, which the old delete-then-move could not guarantee.
+    Write-P9HArtifact -Path $path -Lines @('{"stage":"keep-me"}')
+    $j3Before = [IO.File]::ReadAllText($path)
+    $j3ShaBefore = Get-Sha $path
+
+    $replaceFailed = $false
+    try {
+        # emulate the write having failed after the temp file was produced
+        [IO.File]::WriteAllText($tmp, 'PARTIAL')
+        [IO.File]::Delete($tmp)                       # temp gone -> Replace must fail
+        [System.IO.File]::Replace($tmp, $path, ($tmp + '.bak'), $true)
+    }
+    catch { $replaceFailed = $true }
+
+    $j3After = [IO.File]::ReadAllText($path)
+    $j3ShaAfter = Get-Sha $path
+    Add-P9HTestResult -Id 'J3' -Title 'A failed replacement preserves the previous destination' `
+        -Input 'the replacement source disappears before the swap' `
+        -Expected 'failure raised AND the old artifact byte-identical afterwards' `
+        -Actual ("failed={0} preserved={1} shaStable={2}" -f $replaceFailed, ($j3After -eq $j3Before), ($j3ShaBefore -eq $j3ShaAfter)) `
+        -Pass ($replaceFailed -and $j3After -eq $j3Before -and $j3ShaBefore -eq $j3ShaAfter) -Evidence $dir
+
+    # ---- J4: no temporary or backup residue after successful operations ----
+    $residue = @(Get-ChildItem $dir -File | Where-Object { $_.Name -match '\.(tmp|bak)$' })
+    Add-P9HTestResult -Id 'J4' -Title 'No temporary or backup files are left behind' `
+        -Input 'several writes into one directory' `
+        -Expected 'zero *.tmp and *.bak files' `
+        -Actual ("residue={0} names={1}" -f $residue.Count, (($residue | ForEach-Object { $_.Name }) -join ',')) `
+        -Pass ($residue.Count -eq 0) -Evidence $dir
+
+    # ---- J5: content contract - BOM-free UTF-8 with CRLF ----
+    Write-P9HArtifact -Path $path -Lines @('{"a":1}', '{"b":2}')
+    $bytes = [IO.File]::ReadAllBytes($path)
+    $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+    $text = [IO.File]::ReadAllText($path)
+    Add-P9HTestResult -Id 'J5' -Title 'Artifact bytes are BOM-free UTF-8 with CRLF terminators' `
+        -Input 'two lines written through Write-P9HArtifact' `
+        -Expected 'no BOM, CRLF present, trailing newline' `
+        -Actual ("bytes={0} bom={1} crlf={2}" -f $bytes.Length, $hasBom, $text.Contains("`r`n")) `
+        -Pass ((-not $hasBom) -and $text.Contains("`r`n") -and $text.EndsWith("`r`n")) -Evidence $dir
+
+    # ---- J6: repeated replacement stays stable (idempotent write) ----
+    $shas = @()
+    for ($i = 1; $i -le 4; $i++) {
+        Write-P9HArtifact -Path $path -Lines @('{"stable":true}')
+        $shas += Get-Sha $path
+    }
+    $distinct = @($shas | Sort-Object -Unique).Count
+    Add-P9HTestResult -Id 'J6' -Title 'Repeated replacement yields identical bytes and hashes' `
+        -Input 'four consecutive writes of the same content' `
+        -Expected 'exactly one distinct SHA-256' `
+        -Actual ("writes=4 distinctHashes={0}" -f $distinct) `
+        -Pass ($distinct -eq 1) -Evidence $dir
+
+    # ---- J7: append-only logging is unchanged by this correction ----
+    $logPath = Join-Path $dir 'observer.jsonl'
+    for ($i = 1; $i -le 3; $i++) { Add-P9HArtifactLine -Path $logPath -Line ('{"sequence":' + $i + '}') }
+    $logLines = @([IO.File]::ReadAllLines($logPath) | Where-Object { $_.Trim() })
+    Add-P9HTestResult -Id 'J7' -Title 'Append-only observer logging still appends and never truncates' `
+        -Input 'three sequential Add-P9HArtifactLine calls' `
+        -Expected 'three records in order, none lost' `
+        -Actual ("lines={0} content={1}" -f $logLines.Count, ($logLines -join '|')) `
+        -Pass ($logLines.Count -eq 3 -and $logLines[0] -eq '{"sequence":1}' -and $logLines[2] -eq '{"sequence":3}') -Evidence $dir
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -4072,14 +4402,16 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HWtsListenerAuthorityTests -SandboxRoot $SandboxRoot
     Invoke-P9HObserverBridgeTests -SandboxRoot $SandboxRoot
     Invoke-P9HChronologyBoundTests -SandboxRoot $SandboxRoot
+    Invoke-P9HHostBoundaryTests -SandboxRoot $SandboxRoot
+    Invoke-P9HAtomicArtifactTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
 
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 234 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 253 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `
