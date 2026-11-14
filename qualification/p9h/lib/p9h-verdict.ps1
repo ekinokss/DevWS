@@ -856,9 +856,29 @@ function Get-P9HN2Verdicts {
 
     # The attributed window's identity must be consistent with the plan: the
     # terminal we attributed must be the one the trace planned to skip.
+    #
+    # Stage 3B7G2: this predicate is UNCHANGED (skipped AND exactly one window).
+    # Only the DIAGNOSTIC is improved: when the attribution succeeded but the
+    # identity gate fails, the verdict now states WHICH half failed - no skip, or
+    # the wrong number of windows - instead of a single opaque reason. The
+    # acceptance requirement is deliberately not relaxed.
     $identityConsistent = $false
+    $identityReason = $null
     if ($processAttributed -and $windowAttributed) {
         $identityConsistent = ($skipped -and $newWindowCount -eq 1)
+        if (-not $identityConsistent) {
+            if (-not $skipped) { $identityReason = 'item-not-reported-skipped-by-lifecycle-trace' }
+            elseif ($newWindowCount -ne 1) { $identityReason = ('attributed-window-count-not-one:' + [int]$newWindowCount) }
+            else { $identityReason = 'identity-inconsistent' }
+        }
+    }
+    elseif ($processAttributed -and -not $windowAttributed -and -not $skipped) {
+        # Neither the skip nor the window is present: say so explicitly rather
+        # than letting the attribution failure obscure a missing placement skip.
+        $identityReason = 'item-not-reported-skipped-by-lifecycle-trace'
+    }
+    elseif ($processAttributed -and -not $windowAttributed -and -not $windowAttribution) {
+        $identityReason = 'window-attribution-not-evaluated'
     }
 
     if (-not $trialIdPresent) { $reasonsB.Add('trial-id-missing') }
@@ -873,7 +893,10 @@ function Get-P9HN2Verdicts {
     if ($exitCaptured -and -not $processAttributed) { $reasonsB.Add('no-causally-attributed-process:' + $attribution.Reason) }
     if ($exitCaptured -and -not $windowAttributed) { $reasonsB.Add('no-causally-attributed-window') }
     if ($exitCaptured -and $processAttributed -and $windowAttributed -and -not $identityConsistent) {
-        $reasonsB.Add('window-identity-inconsistent-with-plan')
+        $reasonsB.Add('window-identity-inconsistent-with-plan:' + [string]$identityReason)
+    }
+    elseif ($exitCaptured -and $identityReason -eq 'item-not-reported-skipped-by-lifecycle-trace') {
+        $reasonsB.Add('identity-consistency-blocked:' + [string]$identityReason)
     }
 
     $n2b = 'INCONCLUSIVE'
@@ -920,6 +943,7 @@ function Get-P9HN2Verdicts {
             WindowAttributed = $windowAttributed
             AttributedWindowCount = $newWindowCount
             IdentityConsistent = $identityConsistent
+            IdentityConsistencyReason = $identityReason
             TrialIdRequested = $TrialId
             TrialIdFromExitRecord = $exitTrial
             TrialIdentityMatches = $exitTrialMatches

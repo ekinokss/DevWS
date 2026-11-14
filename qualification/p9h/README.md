@@ -700,7 +700,7 @@ The positive path is preserved: a clean capture with an omitted flag still deriv
 | U4 | explicit `true` cannot override a failed capture outcome |
 | U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
 
-The registry guard now covers **260** registered cases; the full run executes 261 including `R1`.
+The registry guard now covers **274** registered cases; the full run executes 275 including `R1`.
 All 221 prior cases and `R1` are retained unchanged.
 
 ---
@@ -757,6 +757,82 @@ no prior positive case changes meaning.
 
 ---
 
+## Stage 3B7G2: N2 fixture correction and elevated attribution
+
+Stage 3B7G1 left two independently measured blockers. Both are resolved here, and
+the second one was a **fixture defect, not a product defect**.
+
+### Root cause: the G1 fixture never asked for relative placement
+
+The retained G1 trace reads `source:"fallback"`, `profileId:""`, `skipped:[]` and
+an empty warning list. The product's planner explains it exactly:
+
+```
+if (-not $profileAware -and -not $relativeTarget) {   # legacy absolute fast path
+    ... ApplyGeometry = $true ... Warnings = @()
+}
+```
+
+`$relativeTarget` is true only when a targeted window declares
+`layoutMode: "relative"`. The G1 fixture declared **neither** `layoutMode` nor
+`layoutRelative` - it only *claimed* `anchorAbsent: true` in its own descriptor.
+The descriptor was never evidence of anything; the runtime planner had no
+relative request at all, so the skip branch was unreachable by construction.
+
+A corrected fixture therefore needs: `layoutMode: "relative"`, a
+`layoutRelative` object with `monitor.identity` (durable `path:`/`edid:`
+syntax), `basis` (`monitor`|`workArea`) and a normalized `rect`, plus an
+absolute fallback at `x=9000,y=9000`. An **absent configuration anchor** is
+legitimate test input; a fabricated monitor *observation* would not be.
+
+### Elevated process attribution
+
+Stage 3B7G1 measured that a Medium-integrity inventory recovered command lines
+for 41/56 session processes but not for the product's own elevated ones. The
+division of responsibility is now explicit and enforced:
+
+| Context | Responsibility |
+| --- | --- |
+| Medium | launches the installed product, collects its authentic lifecycle trace |
+| **High** | reads process metadata for attribution (`p9h-elevated-inventory.ps1`) |
+| Interactive | collects real top-level HWNDs and rectangles |
+| Host | orchestration and byte-preserving retention |
+
+`Get-P9HElevatedProcessInventory` is strictly read-only and records **provenance
+per row**: collecting user, integrity label, collector pid/session/computer,
+query success and query source. Command lines of unrelated processes are
+redacted rather than retained. `ConvertTo-P9HAttributionInventory` derives the
+`new-processes` artifact transparently from real post-minus-pre measurements and
+reports `SkippedNoCommandLine` / `SkippedOtherSession` so exclusions stay
+auditable instead of silently dropped.
+
+`Get-P9HLaunchAttribution` was **not** relaxed: it still requires independent
+argv identity (`-SetId`/`-TerminalId`/`-WindowId`), a recovered creation time
+inside the launch window, and a non-launcher pid.
+
+### N2-B diagnostics (§7)
+
+The N2-B identity predicate is unchanged - `skipped AND exactly one attributed
+window`. Only the reason is now specific: `IdentityConsistencyReason` reports
+`item-not-reported-skipped-by-lifecycle-trace`,
+`attributed-window-count-not-one:<n>`, or `identity-inconsistent`, and the
+N2-A/N2-B reasons surfaces carry those names instead of an opaque failure.
+
+### Coverage (R0-R13)
+
+legacy fast path reproduces the G1 trace; absent anchor + unreachable fallback is
+skipped deterministically; reachable fallback is *applied* not skipped; a
+matching profile makes no false skip claim; unavailable topology advertises no
+fallback; Medium argv refuses attribution; High argv attributes; launcher pid,
+stale time, wrong session and wrong identity all refuse; one window eligible and
+two not; a missing skip blocks N2-A and N2-B; **the same artifacts become
+PASS-eligible once the skip and warning are genuinely present**; two attributed
+windows break N2-B; and the seven-role binding plus post-binding digest rules
+remain enforced.
+
+The canonical suite is 275/275 PASS (274 registered cases plus `R1`).
+
+---
 ## Stage 3B7G1: non-spoofable guest boundary and real Hyper-V identity binding
 
 Stage 3B7G0 added a guest boundary, but every function - including the one that

@@ -4555,6 +4555,494 @@ function Invoke-P9HAtomicArtifactTests {
         -Pass ($logLines.Count -eq 3 -and $logLines[0] -eq '{"sequence":1}' -and $logLines[2] -eq '{"sequence":3}') -Evidence $dir
 }
 
+function Invoke-P9HRelaunchTests {
+    # R-series: corrected N2 fixture, placement branch and elevated attribution
+    # (Stage 3B7G2).
+    #
+    # Every case here is PURE: the product's real planner functions are invoked
+    # with a SYNTHETIC topology, and the collector's projection is exercised with
+    # synthetic inventories. Nothing launches, and no VM is contacted.
+    #
+    # The G1 root cause is pinned first, because it is the whole point of this
+    # stage: a profile-free set whose items declare NO relative mode takes the
+    # legacy absolute fast path and therefore cannot emit a skip.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $dir = Join-Path $SandboxRoot 'r-relaunch'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    # Write-P9HArtifact creates the target's directory only, not an ancestor's;
+    # create the verdict subtree up front.
+    $earlyVerdictDir = Join-Path $dir 'verdict'
+    New-Item -ItemType Directory -Path $earlyVerdictDir -Force | Out-Null
+
+    # The layout planner under test is PRODUCT code. These cases exercise the REAL
+    # frozen implementation from the repository tree rather than a reimplementation,
+    # and every one of them is pure: a synthetic topology is injected, so loading
+    # the module contacts no VM, launches nothing and moves no window.
+    # <repo>\qualification\p9h\lib -> <repo>
+    $repoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $script:P9HModuleRoot))
+    $productLib = Join-Path $repoRoot 'src\lib'
+    foreach ($libFile in @('devws-paths.ps1', 'devws-config.ps1', 'devws-native.ps1', 'devws-monitor.ps1',
+            'devws-lifecycle-layout.ps1', 'devws-relative-layout.ps1', 'devws-layout-profile.ps1')) {
+        $libPath = Join-Path $productLib $libFile
+        if (Test-Path -LiteralPath $libPath) { . $libPath }
+    }
+    $plannerAvailable = [bool](Get-Command New-DevWSLifecycleLayoutPlan -ErrorAction SilentlyContinue)
+    # Always recorded: a case that only exists on the failure branch would appear
+    # as "registered but not run" whenever the planner loads.
+    Add-P9HTestResult -Id 'R0' -Title 'The product placement planner is loadable for pure offline tests' `
+        -Input 'src\lib planner module' -Expected 'New-DevWSLifecycleLayoutPlan available' `
+        -Actual ("plannerAvailable={0} libRoot={1}" -f $plannerAvailable, $productLib) `
+        -Pass $plannerAvailable -Evidence $null
+    if (-not $plannerAvailable) { return }
+
+    # ---------------------------------------------------------------- topology
+    # A synthetic two-monitor topology. The relative anchor below is DELIBERATELY
+    # absent from it: an absent configuration anchor is legitimate test input,
+    # whereas a fabricated monitor OBSERVATION would not be.
+    function New-Topology {
+        param([switch]$Unavailable)
+        if ($Unavailable) {
+            return [pscustomobject]@{ Available = $false; Monitors = @(); IdentityComplete = $false; Signature = $null; Fingerprint = $null }
+        }
+        $monitors = @(
+            [pscustomobject]@{
+                IdentityToken = 'path:SYNTH/1&AAAA&0&UID256'; GdiDeviceName = '\\.\DISPLAY1'; Primary = $true
+                MonitorRect = [pscustomobject]@{ x = 0; y = 0; w = 1280; h = 720 }
+                WorkRect = [pscustomobject]@{ x = 0; y = 0; w = 1280; h = 672 }
+            }
+            [pscustomobject]@{
+                IdentityToken = 'path:SYNTH/1&AAAA&0&UID257'; GdiDeviceName = '\\.\DISPLAY2'; Primary = $false
+                MonitorRect = [pscustomobject]@{ x = -1280; y = 0; w = 1280; h = 720 }
+                WorkRect = [pscustomobject]@{ x = -1280; y = 0; w = 1280; h = 672 }
+            }
+        )
+        return [pscustomobject]@{
+            Available = $true; Monitors = $monitors; IdentityComplete = $true
+            CorrelationComplete = $true; IdentityAmbiguous = $false
+            Signature = 'path:SYNTH/1&AAAA&0&UID256;path:SYNTH/1&AAAA&0&UID257'
+            Fingerprint = 'SYNTHETICFINGERPRINT'
+        }
+    }
+    $topology = New-Topology
+
+    # ------------------------------------------------------------- item makers
+    function New-RItem {
+        param(
+            [string]$ItemId = 'relterm',
+            [string]$LayoutMode = $null,
+            $LayoutRelative = $null,
+            $Layout = $null,
+            [switch]$Disabled
+        )
+        $o = [ordered]@{ id = $ItemId; type = 'terminal'; enabled = (-not $Disabled); windowId = "N2QUAL-$ItemId" }
+        if ($null -ne $LayoutMode) { $o.layoutMode = $LayoutMode }
+        if ($null -ne $LayoutRelative) { $o.layoutRelative = $LayoutRelative }
+        $o.layout = if ($null -ne $Layout) { $Layout } else { [pscustomobject]@{ x = 9000; y = 9000; w = 640; h = 400 } }
+        return [pscustomobject]$o
+    }
+    function New-Set {
+        param([object[]]$Windows = @(), $LayoutProfiles = $null, [string]$Id = 'n2qual')
+        $o = [ordered]@{ id = $Id; windows = @($Windows) }
+        if ($null -ne $LayoutProfiles) { $o.layoutProfiles = $LayoutProfiles }
+        return [pscustomobject]$o
+    }
+    # A DURABLE identity that is genuinely absent from the synthetic topology above.
+    $absentRelative = [pscustomobject]@{
+        monitor = [pscustomobject]@{ identity = 'path:OTHERHW/9&BBBB&0&UID999' }
+        basis   = 'monitor'
+        rect    = [pscustomobject]@{ x = 0.5; y = 0.5; w = 0.25; h = 0.25 }
+    }
+
+    # =====================================================================
+    # R1: relative configuration ABSENT -> legacy absolute fast path (the G1 bug)
+    # =====================================================================
+    $legacySet = New-Set -Windows @( New-RItem -ItemId 'n2qualterm' )
+    $legacy = New-DevWSLifecycleLayoutPlan -Set $legacySet -SetId 'n2qual' -TopologyProvider { $topology }
+    $legacyItem = @($legacy.Items)[0]
+    Add-P9HTestResult -Id 'R1' -Title 'No relative mode takes the legacy absolute fast path (the Stage 3B7G1 root cause)' `
+        -Input 'a profile-free set whose only item declares neither layoutMode nor layoutRelative' `
+        -Expected 'Source=fallback, RelativeAware=False, ApplyGeometry=True, no warnings, no skipped items' `
+        -Actual ("source={0} relativeAware={1} apply={2} warnings={3} skipped={4}" -f
+            $legacy.Source, $legacy.RelativeAware, $legacyItem.ApplyGeometry, @($legacy.Warnings).Count,
+            @($legacy.Items | Where-Object { -not $_.ApplyGeometry }).Count) `
+        -Pass ($legacy.Source -eq 'fallback' -and $legacy.RelativeAware -eq $false -and
+            $legacyItem.ApplyGeometry -eq $true -and @($legacy.Warnings).Count -eq 0 -and
+            @($legacy.Items | Where-Object { -not $_.ApplyGeometry }).Count -eq 0) -Evidence $null
+
+    # =====================================================================
+    # R2: valid missing anchor + unreachable fallback -> SKIPPED placement
+    # =====================================================================
+    $skipSet = New-Set -Windows @( New-RItem -ItemId 'n2qualterm' -LayoutMode 'relative' -LayoutRelative $absentRelative )
+    $skipPlan = New-DevWSLifecycleLayoutPlan -Set $skipSet -SetId 'n2qual' -TopologyProvider { $topology }
+    $skipItem = @($skipPlan.Items)[0]
+    $skipWarn = (@($skipPlan.Warnings) -join ' | ')
+    Add-P9HTestResult -Id 'R2' -Title 'An absent anchor with an unreachable fallback is SKIPPED deterministically' `
+        -Input 'layoutMode=relative, layoutRelative.monitor.identity absent from the topology, fallback 9000,9000' `
+        -Expected 'Source=relative, ApplyGeometry=False, FallbackUsed=False, one deterministic warning' `
+        -Actual ("source={0} apply={1} fallbackUsed={2} status={3} warnings={4}" -f
+            $skipPlan.Source, $skipItem.ApplyGeometry, $skipItem.FallbackUsed, $skipItem.PlacementStatus, $skipWarn) `
+        -Pass ($skipPlan.Source -eq 'relative' -and $skipPlan.RelativeAware -eq $true -and
+            $skipItem.ApplyGeometry -eq $false -and $skipItem.FallbackUsed -eq $false -and
+            @($skipPlan.Warnings).Count -eq 1 -and
+            $skipWarn -match 'no reachable placement' -and $skipWarn -match 'will not be changed') `
+        -Evidence $null
+
+    # =====================================================================
+    # R3: missing anchor + REACHABLE fallback -> fallback APPLIED, not a skip
+    # =====================================================================
+    $reachable = [pscustomobject]@{ x = 100; y = 100; w = 640; h = 400 }
+    $fbSet = New-Set -Windows @( New-RItem -ItemId 'n2qualterm' -LayoutMode 'relative' -LayoutRelative $absentRelative -Layout $reachable )
+    $fbPlan = New-DevWSLifecycleLayoutPlan -Set $fbSet -SetId 'n2qual' -TopologyProvider { $topology }
+    $fbItem = @($fbPlan.Items)[0]
+    Add-P9HTestResult -Id 'R3' -Title 'A reachable fallback is APPLIED rather than skipped' `
+        -Input 'same absent anchor, but the fallback rectangle IS reachable' `
+        -Expected 'ApplyGeometry=True, FallbackUsed=True, warning names the fallback' `
+        -Actual ("apply={0} fallbackUsed={1} status={2} warnings={3}" -f
+            $fbItem.ApplyGeometry, $fbItem.FallbackUsed, $fbItem.PlacementStatus, @($fbPlan.Warnings).Count) `
+        -Pass ($fbItem.ApplyGeometry -eq $true -and $fbItem.FallbackUsed -eq $true -and
+            @($fbPlan.Warnings).Count -eq 1) -Evidence $null
+
+    # =====================================================================
+    # R4: an exact matching profile override must NOT produce a false relative skip
+    # =====================================================================
+    $profileGeometry = [pscustomobject]@{ x = 0; y = 0; w = 640; h = 400 }
+    # The matcher signature is derived from the profile's monitor TOKEN list, and
+    # the topology signature is the same canonical multiset, so an exact match is
+    # expressed by listing the real monitors.
+    # A profile's per-item overrides live under a 'layouts' MAP keyed by item id,
+    # and are looked up as sparse properties there.
+    $profLayoutMap = [ordered]@{ 'n2qualterm' = [pscustomobject]@{ x = 0; y = 0; w = 640; h = 400 } }
+    $profProjection = [ordered]@{
+        id      = 'exact'
+        match   = [pscustomobject]@{ monitors = @('path:SYNTH/1&AAAA&0&UID256', 'path:SYNTH/1&AAAA&0&UID257') }
+        layouts = [pscustomobject]$profLayoutMap
+    }
+    $profSet = New-Set -LayoutProfiles @([pscustomobject]$profProjection) `
+        -Windows @( New-RItem -ItemId 'n2qualterm' -LayoutMode 'relative' -LayoutRelative $absentRelative -Layout $reachable )
+    $profPlan = New-DevWSLifecycleLayoutPlan -Set $profSet -SetId 'n2qual' -TopologyProvider { $topology }
+    $profItem = @($profPlan.Items)[0]
+    Add-P9HTestResult -Id 'R4' -Title 'A matching profile wins and makes no false relative-skip claim' `
+        -Input 'relative item with a reachable fallback AND an exact matching layout profile' `
+        -Expected 'Source=profile, ApplyGeometry=True, no skip warning' `
+        -Actual ("source={0} profileId={1} apply={2} warnings={3}" -f $profPlan.Source, $profItem.ProfileId, $profItem.ApplyGeometry, @($profPlan.Warnings).Count) `
+        -Pass ($profPlan.Source -eq 'profile' -and $profItem.ApplyGeometry -eq $true -and
+            @($profPlan.Warnings).Count -eq 0) -Evidence $null
+
+    # =====================================================================
+    # R5: unavailable topology never advertises a fallback
+    # =====================================================================
+    $unavailSet = New-Set -Windows @( New-RItem -ItemId 'n2qualterm' -LayoutMode 'relative' -LayoutRelative $absentRelative -Layout $reachable )
+    $unavail = New-DevWSLifecycleLayoutPlan -Set $unavailSet -SetId 'n2qual' -TopologyProvider { New-Topology -Unavailable }
+    $unavailItem = @($unavail.Items)[0]
+    Add-P9HTestResult -Id 'R5' -Title 'An unavailable topology applies nothing and advertises no fallback' `
+        -Input 'relative item with a reachable fallback but no topology' `
+        -Expected 'ApplyGeometry=False, FallbackUsed=False, warning explains the topology' `
+        -Actual ("apply={0} fallbackUsed={1} status={2}" -f $unavailItem.ApplyGeometry, $unavailItem.FallbackUsed, $unavailItem.PlacementStatus) `
+        -Pass ($unavailItem.ApplyGeometry -eq $false -and $unavailItem.FallbackUsed -eq $false -and
+            (@($unavail.Warnings) -join ' ') -match 'topology is unavailable') -Evidence $null
+
+    # =====================================================================
+    # R6: MEDIUM argv unavailable -> attribution REFUSES
+    # =====================================================================
+    $mediumAfter = [pscustomobject]@{
+        CollectorIntegrity = 'Medium'
+        Processes = @(
+            [pscustomobject]@{ pid = 7001; ppid = 1; name = 'WindowsTerminal.exe'; sessionId = 2; startUtc = '2026-11-14T14:48:06.5000000Z'; startSource = 'datetime'; commandLine = ''; commandLength = 0 }
+        )
+    }
+    $mediumBefore = [pscustomobject]@{ CollectorIntegrity = 'Medium'; Processes = @() }
+    $medDelta = ConvertTo-P9HAttributionInventory -Before $mediumBefore -After $mediumAfter -SessionId 2
+    $medAttr = Get-P9HLaunchAttribution -AddedProcesses @($medDelta.Added) `
+        -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+        -LauncherPid 7000 -LaunchedAtUtc '2026-11-14T14:48:02.0000000Z' -ExitedAtUtc '2026-11-14T14:48:08.0000000Z'
+    Add-P9HTestResult -Id 'R6' -Title 'A Medium-sourced empty argv refuses attribution (never inferred)' `
+        -Input 'new process whose command line the Medium collector could not read' `
+        -Expected 'Ok=False; the process is excluded, not guessed from its name' `
+        -Actual ("ok={0} reason={1} added={2} skippedNoCmd={3}" -f $medAttr.Ok, $medAttr.Reason,
+            @($medDelta.Added).Count, @($medDelta.SkippedNoCommandLine).Count) `
+        -Pass ($medAttr.Ok -eq $false -and @($medDelta.Added).Count -eq 0 -and
+            @($medDelta.SkippedNoCommandLine).Count -eq 1) -Evidence $null
+
+    # =====================================================================
+    # R7: HIGH authentic argv with matching pid/session/start -> attribution SUCCEEDS
+    # =====================================================================
+    $goodCmd = 'pwsh.exe -File coordinator.ps1 -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
+    $highAfter = [pscustomobject]@{
+        CollectorIntegrity = 'High'
+        Processes = @(
+            [pscustomobject]@{ pid = 7001; ppid = 1; name = 'WindowsTerminal.exe'; sessionId = 2; startUtc = '2026-11-14T14:48:06.5000000Z'; startSource = 'datetime'; commandLine = $goodCmd; commandLength = $goodCmd.Length; collectedByIntegrity = 'High' }
+            [pscustomobject]@{ pid = 7002; ppid = 1; name = 'unrelated.exe'; sessionId = 2; startUtc = '2026-11-14T14:48:06.6000000Z'; startSource = 'datetime'; commandLine = 'unrelated.exe --foo'; commandLength = 19; collectedByIntegrity = 'High' }
+        )
+    }
+    $highBefore = [pscustomobject]@{ CollectorIntegrity = 'High'; Processes = @() }
+    $highDelta = ConvertTo-P9HAttributionInventory -Before $highBefore -After $highAfter -SessionId 2
+    $highAttr = Get-P9HLaunchAttribution -AddedProcesses @($highDelta.Added) `
+        -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+        -LauncherPid 7000 -LaunchedAtUtc '2026-11-14T14:48:02.0000000Z' -ExitedAtUtc '2026-11-14T14:48:08.0000000Z'
+    Add-P9HTestResult -Id 'R7' -Title 'High-integrity argv with matching identity/time attributes the process' `
+        -Input 'both processes carry argv; only one names the frozen SetId/TerminalId/WindowId inside the window' `
+        -Expected 'Ok=True, exactly one attributed pid, provenance retained' `
+        -Actual ("ok={0} count={1} pids={2} integrity={3}" -f $highAttr.Ok, $highAttr.Count,
+            (@($highAttr.Processes | ForEach-Object { $_.pid }) -join ','), $highDelta.afterIntegrity) `
+        -Pass ($highAttr.Ok -eq $true -and $highAttr.Count -eq 1 -and
+            [int](@($highAttr.Processes)[0].pid) -eq 7001 -and $highDelta.afterIntegrity -eq 'High') -Evidence $null
+
+    # =====================================================================
+    # R8: wrong PID / wrong session / stale start time / wrong identity all refuse
+    # =====================================================================
+    $refusals = [ordered]@{}
+    # (a) launcher pid excluded
+    $refusals['launcherPidExcluded'] = -not (Get-P9HLaunchAttribution -AddedProcesses @($highDelta.Added) `
+            -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+            -LauncherPid 7001 -LaunchedAtUtc '2026-11-14T14:48:02.0000000Z' -ExitedAtUtc '2026-11-14T14:48:08.0000000Z').Ok
+    # (b) stale creation time outside the launch window
+    $refusals['staleCreationTime'] = -not (Get-P9HLaunchAttribution -AddedProcesses @($highDelta.Added) `
+            -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+            -LauncherPid 7000 -LaunchedAtUtc '2026-11-15T00:00:00.0000000Z' -ExitedAtUtc '2026-11-15T00:00:10.0000000Z').Ok
+    # (c) wrong SetId
+    $refusals['wrongSetId'] = -not (Get-P9HLaunchAttribution -AddedProcesses @($highDelta.Added) `
+            -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'otherset' `
+            -LauncherPid 7000 -LaunchedAtUtc '2026-11-14T14:48:02.0000000Z' -ExitedAtUtc '2026-11-14T14:48:08.0000000Z').Ok
+    # (d) wrong TerminalId
+    $refusals['wrongTerminalId'] = -not (Get-P9HLaunchAttribution -AddedProcesses @($highDelta.Added) `
+            -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'otherterm' -ExpectedSetId 'n2qual' `
+            -LauncherPid 7000 -LaunchedAtUtc '2026-11-14T14:48:02.0000000Z' -ExitedAtUtc '2026-11-14T14:48:08.0000000Z').Ok
+    # (e) wrong WindowId
+    $refusals['wrongWindowId'] = -not (Get-P9HLaunchAttribution -AddedProcesses @($highDelta.Added) `
+            -ExpectedWindowId 'OTHER-win' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+            -LauncherPid 7000 -LaunchedAtUtc '2026-11-14T14:48:02.0000000Z' -ExitedAtUtc '2026-11-14T14:48:08.0000000Z').Ok
+    # (f) wrong session filtered out by the projection
+    $wrongSession = ConvertTo-P9HAttributionInventory -Before $highBefore -After $highAfter -SessionId 9
+    $refusals['wrongSession'] = (@($wrongSession.Added).Count -eq 0 -and @($wrongSession.SkippedOtherSession).Count -eq 2)
+    # (g) missing process identity entirely
+    $refusals['noProcesses'] = -not (Get-P9HLaunchAttribution -AddedProcesses @() `
+            -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+            -LauncherPid 7000 -LaunchedAtUtc '2026-11-14T14:48:02.0000000Z' -ExitedAtUtc '2026-11-14T14:48:08.0000000Z').Ok
+
+    Add-P9HTestResult -Id 'R8' -Title 'Launcher pid, stale time, wrong session and wrong identity all refuse' `
+        -Input 'seven independent negative attribution conditions' `
+        -Expected 'every one refused' `
+        -Actual (($refusals.Keys | ForEach-Object { $_ + '=' + $refusals[$_] }) -join ' ') `
+        -Pass (@($refusals.Values | Where-Object { $_ -ne $true }).Count -eq 0) -Evidence $null
+
+    # =====================================================================
+    # R9: exactly one attributed window is eligible; two are NOT
+    # =====================================================================
+    function New-Win([string]$Hwnd, [int]$OwnerPid, [int]$X = 0, [int]$Y = 0) {
+        return [pscustomobject]@{ hwnd = $Hwnd; pid = $OwnerPid; visible = $true; x = $X; y = $Y; width = 640; height = 400; title = 'managed' }
+    }
+    $afterOne = @()
+    $afterOne += (New-Win '100' 7002)
+    $afterOne += (New-Win '101' 7002)
+    $afterOne += (New-Win '102' 7001)
+    $oneSel = Select-P9HAttributableWindow -PreWindowHwnds @('100', '101') -AfterWindows $afterOne -CandidatePids @(7001)
+    $afterTwo = @()
+    $afterTwo += (New-Win '100' 7002)
+    $afterTwo += (New-Win '101' 7002)
+    $afterTwo += (New-Win '102' 7001)
+    $afterTwo += (New-Win '103' 7001)
+    $twoSel = Select-P9HAttributableWindow -PreWindowHwnds @('100', '101') -AfterWindows $afterTwo -CandidatePids @(7001)
+    Add-P9HTestResult -Id 'R9' -Title 'One newly observed attributed window is eligible; two are not' `
+        -Input 'the same pre-inventory with one, then two, new windows owned by the attributed pid' `
+        -Expected 'count 1 attributed; count 2 attributed but not identity-consistent' `
+        -Actual ("one={0}/{1} two={2}/{3}" -f $oneSel.Attributed, $oneSel.Count, $twoSel.Attributed, $twoSel.Count) `
+        -Pass ($oneSel.Attributed -eq $true -and $oneSel.Count -eq 1 -and $twoSel.Attributed -eq $true -and $twoSel.Count -eq 2) `
+        -Evidence $null
+
+    # =====================================================================
+    # R10: a missing placement skip blocks N2-A and N2-B identity consistency
+    # =====================================================================
+    # A real end-to-end verdict over synthetic-but-honest artifacts: the trace
+    # has NO skipped item, the process and window attribute correctly, and the
+    # trial is fully bound. N2-A must still refuse for the missing skip, and N2-B
+    # must report the improved identity reason rather than an opaque failure.
+    $vDir = Join-Path $dir 'verdict'
+    New-Item -ItemType Directory -Path $vDir -Force | Out-Null
+    $tid = 'r-relaunch-trial'
+
+    $captureObj = [ordered]@{
+        tokenCount = 1; identityComplete = $true; sessionId = 2; trialId = $tid
+        capturedUtc = '2026-11-14T14:48:00.0000000Z'
+        tokens = @('path:SYNTH/1&AAAA&0&UID256')
+        parsedMonitors = @([pscustomobject][ordered]@{ identity = 'path:SYNTH/1&AAAA&0&UID256'; rect = 'x=0 y=0 w=1280 h=720' })
+    }
+    $fxPath = Join-Path $vDir 'fixture.json'
+    Write-P9HArtifact -Path $fxPath -Lines @(([ordered]@{
+                itemId = 'n2qualterm'; enabledItems = 1; enabledTerminals = 1; totalItems = 1
+                anchorAbsent = $true; layoutFallback = [ordered]@{ x = 9000; y = 9000; w = 640; h = 400 }
+            } | ConvertTo-Json -Depth 4))
+    $tracePath = Join-Path $vDir 'trace.jsonl'
+    $null = Add-P9HArtifactLine -Path $tracePath -Line ((@{ event = 'lifecycle-layout-plan'; utcMs = 1000; set = 'n2qual'; skipped = @() } | ConvertTo-Json -Compress))
+    foreach ($e in @(
+            @{ ev = 'transaction-start'; ms = 1010 }
+            @{ ev = 'stage2-broker-ready'; ms = 1020; planId = 'deadbeef' }
+            @{ ev = 'stage2-terminal-final'; ms = 1030 }
+            @{ ev = 'transaction-end'; ms = 1040 })) {
+        $o = [ordered]@{ event = $e.ev; utcMs = $e.ms; set = 'n2qual' }
+        if ($e.ContainsKey('planId')) { $o.planId = $e.planId }
+        if ($e.ev -eq 'stage2-terminal-final') { $o.finalized = 1; $o.failures = 0 }
+        if ($e.ev -eq 'transaction-end') { $o.broker = $true; $o.uncertain = $false; $o.failures = @() }
+        $null = Add-P9HArtifactLine -Path $tracePath -Line ($o | ConvertTo-Json -Compress -Depth 4)
+    }
+    $soPath = Join-Path $vDir 'stdout.txt'
+    Write-P9HArtifact -Path $soPath -Lines @("Workspace 'n2qual' restored.")
+    $prePath = Join-Path $vDir 'pre-windows.json'
+    Write-P9HArtifact -Path $prePath -Lines @(([ordered]@{ Windows = @([ordered]@{ hwnd = '100'; pid = 7002; visible = $true; x = 0; y = 0; width = 10; height = 10 }) } | ConvertTo-Json -Depth 5))
+    $postPath = Join-Path $vDir 'post-windows.json'
+    Write-P9HArtifact -Path $postPath -Lines @(([ordered]@{ Windows = @(
+                    [ordered]@{ hwnd = '100'; pid = 7002; visible = $true; x = 0; y = 0; width = 10; height = 10 }
+                    [ordered]@{ hwnd = '102'; pid = 7001; visible = $true; x = 0; y = 0; width = 640; height = 400 }
+                ) } | ConvertTo-Json -Depth 5))
+    $exPath = Join-Path $vDir 'exit.json'
+    Write-P9HArtifact -Path $exPath -Lines @(([ordered]@{
+                trialId = $tid; schema = 'p9h.exit-record.v1'; sequence = 1; outcome = 'exited'; exitCode = 0
+                launcherPid = 7000; launcherPath = 'C:\Windows\System32\cmd.exe'
+                launchedAtUtc = '2026-11-14T14:48:02.0000000Z'; exitedAtUtc = '2026-11-14T14:48:08.0000000Z'
+            } | ConvertTo-Json -Depth 4))
+    $npPath = Join-Path $vDir 'new-processes.json'
+    Write-P9HArtifact -Path $npPath -Lines @($highDelta | ConvertTo-Json -Depth 6)
+
+    # Bind the seven roles first: these cases are about the SKIP requirement, so
+    # artifact binding must be satisfied and must not be the recorded reason.
+    $rCtx = New-P9HTrialContext -RootDirectory $SandboxRoot -TrialId $tid -Kind n2
+    foreach ($rb in @(
+            @{ role = 'fixture'; path = $fxPath }
+            @{ role = 'stdout'; path = $soPath }
+            @{ role = 'pre-windows'; path = $prePath }
+            @{ role = 'post-windows'; path = $postPath }
+            @{ role = 'exit-record'; path = $exPath }
+            @{ role = 'new-processes'; path = $npPath }
+            @{ role = 'trace'; path = $tracePath })) {
+        $null = Add-P9HArtifactRole -Context $rCtx -Path $rb.path -Role $rb.role
+    }
+    $null = Write-P9HArtifactIndex -Context $rCtx
+    $rIndex = Join-Path $rCtx.Directory 'artifact-index.jsonl'
+
+    $v = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+        -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+        -ArtifactIndexPath $rIndex
+    $vBlocked = @(
+        ($v.N2A.Verdict -ne 'PASS'),
+        ($v.N2A.Reasons -contains 'item-not-in-skipped-set'),
+        ($v.N2A.ProcessAttributed -eq $true),
+        ($v.N2A.WindowAttributed -eq $true),
+        ($v.N2B.Verdict -ne 'PASS'),
+        ($v.N2B.IdentityConsistent -eq $false),
+        ([string]$v.N2B.IdentityConsistencyReason -eq 'item-not-reported-skipped-by-lifecycle-trace')
+    )
+    Add-P9HTestResult -Id 'R10' -Title 'A missing placement skip still blocks N2-A and N2-B identity consistency' `
+        -Input 'honest artifacts with full attribution but NO skipped item in the lifecycle trace' `
+        -Expected 'N2-A reason item-not-in-skipped-set; N2-B names the missing skip explicitly' `
+        -Actual ("n2a={0} reasons=[{1}] n2b={2} identityReason={3}" -f $v.N2A.Verdict,
+            (@($v.N2A.Reasons) -join ';'), $v.N2B.Verdict, $v.N2B.IdentityConsistencyReason) `
+        -Pass (@($vBlocked | Where-Object { $_ -ne $true }).Count -eq 0) -Evidence $vDir
+
+    # =====================================================================
+    # R11: with the skip PRESENT, the same artifacts become PASS-eligible
+    # =====================================================================
+    # This proves the block in R10 was genuinely the missing skip and not some
+    # other defect: the ONLY change is that the trace now reports the item.
+    $traceSkip = Join-Path $vDir 'trace-skipped.jsonl'
+    $null = Add-P9HArtifactLine -Path $traceSkip -Line ((@{ event = 'lifecycle-layout-plan'; utcMs = 1000; set = 'n2qual'; skipped = @('n2qualterm') } | ConvertTo-Json -Compress))
+    foreach ($e in @(
+            @{ ev = 'transaction-start'; ms = 1010 }
+            @{ ev = 'stage2-broker-ready'; ms = 1020; planId = 'deadbeef' }
+            @{ ev = 'stage2-terminal-final'; ms = 1030 }
+            @{ ev = 'transaction-end'; ms = 1040 })) {
+        $o = [ordered]@{ event = $e.ev; utcMs = $e.ms; set = 'n2qual' }
+        if ($e.ContainsKey('planId')) { $o.planId = $e.planId }
+        if ($e.ev -eq 'stage2-terminal-final') { $o.finalized = 1; $o.failures = 0 }
+        if ($e.ev -eq 'transaction-end') { $o.broker = $true; $o.uncertain = $false; $o.failures = @() }
+        $null = Add-P9HArtifactLine -Path $traceSkip -Line ($o | ConvertTo-Json -Compress -Depth 4)
+    }
+    $soWarn = Join-Path $vDir 'stdout-warn.txt'
+    Write-P9HArtifact -Path $soWarn -Lines @("n2qual/n2qualterm: relative layout has no reachable placement (relative-target-and-fallback-unreachable); the item will be handled normally but its window position will not be changed.")
+    # Re-bind because the trace and stdout changed.
+    $skipCtx = New-P9HTrialContext -RootDirectory (Join-Path $SandboxRoot 'skip-arm') -TrialId $tid -Kind n2
+    foreach ($rb in @(
+            @{ role = 'fixture'; path = $fxPath }
+            @{ role = 'stdout'; path = $soWarn }
+            @{ role = 'pre-windows'; path = $prePath }
+            @{ role = 'post-windows'; path = $postPath }
+            @{ role = 'exit-record'; path = $exPath }
+            @{ role = 'new-processes'; path = $npPath }
+            @{ role = 'trace'; path = $traceSkip })) {
+        $null = Add-P9HArtifactRole -Context $skipCtx -Path $rb.path -Role $rb.role
+    }
+    $null = Write-P9HArtifactIndex -Context $skipCtx
+    $skipIndex = Join-Path $skipCtx.Directory 'artifact-index.jsonl'
+
+    $vSkip = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $traceSkip -StdoutPath $soWarn `
+        -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+        -ArtifactIndexPath $skipIndex
+    Add-P9HTestResult -Id 'R11' -Title 'With the skip and warning present the same evidence becomes PASS-eligible' `
+        -Input 'identical artifacts except the trace reports the item skipped and stdout carries the warning' `
+        -Expected 'N2-A PASS, N2-B PASS, identity consistent' `
+        -Actual ("n2a={0}[{5}] n2b={1}[{6}] identity={2} skipped={3} warning={4}" -f
+            $vSkip.N2A.Verdict, $vSkip.N2B.Verdict, $vSkip.N2B.IdentityConsistent,
+            $vSkip.N2A.SkippedInTrace, $vSkip.N2A.WarningPresent,
+            (@($vSkip.N2A.Reasons) -join ';'), (@($vSkip.N2B.Reasons) -join ';')) `
+        -Pass ($vSkip.N2A.Verdict -eq 'PASS' -and $vSkip.N2B.Verdict -eq 'PASS' -and
+            $vSkip.N2B.IdentityConsistent -eq $true) -Evidence $vDir
+
+    # =====================================================================
+    # R12: two attributed windows break N2-B identity consistency
+    # =====================================================================
+    $postTwo = Join-Path $vDir 'post-windows-two.json'
+    Write-P9HArtifact -Path $postTwo -Lines @(([ordered]@{ Windows = @(
+                    [ordered]@{ hwnd = '100'; pid = 7002; visible = $true; x = 0; y = 0; width = 10; height = 10 }
+                    [ordered]@{ hwnd = '102'; pid = 7001; visible = $true; x = 0; y = 0; width = 640; height = 400 }
+                    [ordered]@{ hwnd = '103'; pid = 7001; visible = $true; x = 10; y = 10; width = 640; height = 400 }
+                ) } | ConvertTo-Json -Depth 5))
+    $vTwo = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $traceSkip -StdoutPath $soWarn `
+        -PreWindowPath $prePath -PostWindowPath $postTwo -ExitRecordPath $exPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId 'N2QUAL-n2qualterm' -ExpectedTerminalId 'n2qualterm' -ExpectedSetId 'n2qual' `
+        -ArtifactIndexPath $skipIndex
+    Add-P9HTestResult -Id 'R12' -Title 'Two attributed windows break N2-B identity consistency' `
+        -Input 'the same trial but the product created a second attributable window' `
+        -Expected 'N2-B not PASS, identity reason names the window count' `
+        -Actual ("n2b={0} count={1} identity={2} reason={3}" -f $vTwo.N2B.Verdict,
+            $vTwo.N2B.AttributedWindowCount, $vTwo.N2B.IdentityConsistent, $vTwo.N2B.IdentityConsistencyReason) `
+        -Pass ($vTwo.N2B.Verdict -ne 'PASS' -and $vTwo.N2B.IdentityConsistent -eq $false -and
+            [string]$vTwo.N2B.IdentityConsistencyReason -eq 'attributed-window-count-not-one:2') -Evidence $vDir
+
+    # =====================================================================
+    # R13: the seven-role binding and digest rules are still enforced
+    # =====================================================================
+    $ctx = New-P9HTrialContext -RootDirectory $SandboxRoot -TrialId $tid -Kind n2
+    $roles = @(
+        @{ role = 'fixture'; path = $fxPath }
+        @{ role = 'stdout'; path = $soPath }
+        @{ role = 'pre-windows'; path = $prePath }
+        @{ role = 'post-windows'; path = $postPath }
+        @{ role = 'exit-record'; path = $exPath }
+        @{ role = 'new-processes'; path = $npPath }
+        @{ role = 'trace'; path = $tracePath }
+    )
+    foreach ($r in $roles) { $null = Add-P9HArtifactRole -Context $ctx -Path $r.path -Role $r.role }
+    $null = Write-P9HArtifactIndex -Context $ctx
+    $indexPath = Join-Path $ctx.Directory 'artifact-index.jsonl'
+    $bindOk = Get-P9HArtifactBinding -TrialId $tid -ArtifactIndexPath $indexPath `
+        -RequiredRoles @('fixture', 'stdout', 'pre-windows', 'post-windows', 'exit-record', 'new-processes', 'trace')
+    # now tamper with one bound artifact and re-verify
+    $origStdout = [IO.File]::ReadAllText($soPath)
+    [IO.File]::WriteAllText($soPath, $origStdout + "tampered`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    $bindBad = Get-P9HArtifactBinding -TrialId $tid -ArtifactIndexPath $indexPath `
+        -RequiredRoles @('fixture', 'stdout', 'pre-windows', 'post-windows', 'exit-record', 'new-processes', 'trace')
+    [IO.File]::WriteAllText($soPath, $origStdout, (New-Object System.Text.UTF8Encoding($false)))
+    # a missing role must also refuse
+    $bindMissing = Get-P9HArtifactBinding -TrialId 'other-trial' -ArtifactIndexPath $indexPath `
+        -RequiredRoles @('fixture')
+    Add-P9HTestResult -Id 'R13' -Title 'Seven-role binding and post-binding digest rules remain enforced' `
+        -Input 'all seven roles bound; then one artifact tampered; then a foreign trial id' `
+        -Expected 'binding verified; tampering detected; foreign trial refused' `
+        -Actual ("ok={0} tamperedOk={1} foreignOk={2}" -f $bindOk.Ok, $bindBad.Ok, $bindMissing.Ok) `
+        -Pass ($bindOk.Ok -eq $true -and $bindBad.Ok -eq $false -and $bindMissing.Ok -eq $false) -Evidence $ctx.Directory
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -4580,14 +5068,15 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HChronologyBoundTests -SandboxRoot $SandboxRoot
     Invoke-P9HHostBoundaryTests -SandboxRoot $SandboxRoot
     Invoke-P9HAtomicArtifactTests -SandboxRoot $SandboxRoot
+    Invoke-P9HRelaunchTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
 
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 260 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 274 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `
