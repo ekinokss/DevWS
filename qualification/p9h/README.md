@@ -93,6 +93,8 @@ qualification/p9h/
     p9h-n2-inventory.ps1      process/window inventory, delta, attribution
     p9h-verdict.ps1           E1 and N2-A/N2-B verdict rules
     p9h-evidence.ps1          trial context, stage journal, artifact index
+    p9h-wts-provider.ps1      WTSINFO/WTS_SESSION_INFO layout, enumeration, decode, provider lines
+    p9h-collector.ps1         trial collector: seven N2 roles, origin model, E1 provenance
     p9h-fault.ps1             fault-injection harness
     p9h-selftest.ps1          the test cases
 ```
@@ -340,6 +342,682 @@ historical index is evidence rather than an input to be sanitized.
 | A required role absent | `binding-incomplete:trace` |
 | All seven roles valid and same-trial | accepted, 7/7 verified |
 
-These are covered by the P-series (P1–P11), which also proves the N2-A/N2-B independence above and
-retains the N2-B cross-trial protection. The registry guard now covers **119** registered cases
-(108 from Stage 2.4 plus 11 P-series cases); the full run executes 120 including the R1 guard.
+These are covered by the P-series (P1-P11), which also proves the N2-A/N2-B independence above and
+retains the N2-B cross-trial protection.
+
+## Stage 3A — offline WTS provider and collector integration
+
+Stage 3A connects a native `WTSINFO` provider to the frozen evidence contract. **No live session
+query, RDP action, `tsdiscon`, PowerShell Direct call or installed-product launch occurs in this
+stage**; every assertion runs from synthetic bytes or synthetic facts.
+
+### Provider contract (documented APIs only)
+
+| API | Use |
+| --- | --- |
+| `WTSEnumerateSessionsW` | session ids and station names |
+| `WTSQuerySessionInformationW` (`WTSInfo`, class 24) | one `WTSINFO` structure |
+| `WTSFreeMemory` | release every buffer the API allocated |
+
+`WTSINFO` is modelled with the documented field order and the `winsrv.h` array lengths *including*
+their terminators (`WINSTATIONNAME_LENGTH` 32, `DOMAIN_LENGTH` 17, `USERNAME_LENGTH + 1` 21). On x64
+that is **216 bytes**, with `State` at 0, `SessionId` at 4, `WinStationName` at 32, `Domain` at 96,
+`UserName` at 130, `ConnectTime` at 176 and `LogonTime` at 200.
+
+The layout is cross-checked rather than assumed: `Test-P9HWtsInfoLayout` compares the published
+offsets against `Marshal.SizeOf` / `Marshal.OffsetOf` results for the *current* process architecture
+and distinguishes three failures — `layout-unsupported`, `layout-size-mismatch` and
+`layout-offset-mismatch`. A host that cannot describe `WTSINFO` reports an explicit capability gap
+(`Get-P9HWtsProviderCapability` → `Capability = 'unsupported'`) instead of inventing a logon time.
+
+### FILETIME conversion
+
+`LogonTime` is a `FILETIME`: 100-nanosecond intervals since 1601-01-01Z. **Zero is the Win32
+"not available" sentinel, not the epoch.** Converting it blindly would turn a missing logon time into
+a plausible 1601 timestamp and defeat the identity check, so zero, negative and out-of-range values
+are rejected explicitly and the record carries `LogonSource = 'wtsinfo-zero'` (or the specific
+reason) rather than a fabricated value.
+
+### Provider → observer integration
+
+`ConvertTo-P9HWtsProviderLine` is the only integration point. It emits the line format the frozen
+observer has always parsed:
+
+```
+<id>|<station>|state=<n>|user=<account>[|logon=<ISO-8601 UTC>]
+```
+
+When a logon time is unavailable the trailing `|logon=` segment is **omitted**, which
+`ConvertFrom-P9HLogonTimeField` already reports as `absent`. That keeps the capability gap visible.
+No observer function was modified: `ConvertFrom-P9HWtsLine`, `Get-P9HTargetSessionRecord`,
+`New-P9HObserverRecord`, `Get-P9HReconnectAuthorizationProof` and `Get-P9HDisconnectProof` are
+unchanged, and every E1 predicate still fails closed on missing provider evidence.
+
+### Collector integration
+
+`Add-P9HCollectorArtifactRoles` binds the seven required N2 roles through the **existing**
+`Add-P9HArtifactRole` mechanism — no second manifest, no new binding rule, same schema and digests:
+
+```
+fixture, stdout, pre-windows, post-windows, exit-record, new-processes, trace
+```
+
+Two provenance classes are kept distinct and reported by `New-P9HCollectorManifest`:
+
+- **product** — bytes the product emitted. The collector records only role/path/digest; it never
+  rewrites them, never invents a product event, and never invents a product trial id.
+- **collector** — metadata the collector authors about the trial.
+
+The E1 observation log is bound as **supporting provenance only**, into a separate
+`e1-observation-index.jsonl`. It is deliberately *not* written into `artifact-index.jsonl`, whose
+seven-role contract is closed: a separate file makes it structurally impossible for an E1 record to
+be counted as N2 evidence.
+
+A trial with any missing artifact is refused **before** anything is written
+(`collector-artifacts-incomplete`), so a partial index can never be mistaken for a complete binding.
+
+### Tests: Q1–Q15 (provider) and K1–K15 (collector)
+
+| Series | Coverage |
+| --- | --- |
+| Q1–Q2 | valid payload with nonzero logon; exact UTC round-trip |
+| Q3–Q6 | zero, negative, empty payload, struct-size mismatch |
+| Q7 | published layout vs measured native mirror |
+| Q8 | provider line round-trips through the frozen parser |
+| Q9–Q11 | duplicate ids (ambiguous), wrong user, reused id with different logon |
+| Q12 | missing provider logon fails closed for authoritative matching |
+| Q13–Q14 | live query refused without authorization; Win32 error preserved |
+| Q15 | capability reported explicitly |
+| K1–K3 | seven roles bound; verified by the frozen gate; tamper detected |
+| K4–K5 | incomplete trial refused; E1 log never enters the N2 index |
+| K6–K7 | manifest separates provenance; product bytes never rewritten |
+| K8–K9 | Active → Disconnected → Active proven; session 0 cannot substitute |
+| K10–K13 | no authorization without persisted evidence; provider error and interrupted writes preserved; cross-trial refused |
+| K14–K15 | collector-bound trial preserves N2-A independence and can satisfy both verdicts |
+
+The registry guard now covers **149** registered cases; the full run executes 150 including `R1`.
+All Stage 2.x cases are retained unchanged.
+
+## Stage 3A.1 — complete enumeration and provenance corrections
+
+Independent review of Stage 3A found three defects. All three are closed.
+
+### 1. `WTSEnumerateSessionsW` was documented but not implemented
+
+Stage 3A declared the enumeration API in prose and implemented only the single-session query. The
+E1 contract needs the **complete** session table, because a table containing only the target cannot
+demonstrate that session 0's disconnected state is not the target's state.
+
+`Invoke-P9HWtsSessionEnumerate` now implements it against the documented `WTS_SESSION_INFO` record:
+
+```
+DWORD SessionId;
+LPWSTR pWinStationName;          // pointer: 8 bytes on x64, 4 on x86
+WTS_CONNECTSTATE_CLASS State;
+```
+
+The pointer forces 8-byte alignment, so the record is **24 bytes on x64** (`SessionId` 0,
+`pWinStationName` 8, `State` 16) and **12 bytes on x86**. The stride is derived from the pointer size
+and then **measured** with `Marshal.SizeOf`/`OffsetOf`; `Test-P9HWtsSessionInfoLayout` distinguishes
+`layout-unsupported`, `layout-size-mismatch` and `layout-offset-mismatch`.
+
+Decoding rejects, explicitly: a zero or negative count, a buffer too small for the reported count, a
+station-name pointer outside the buffer, and an unreadable name. A malformed record makes the **whole
+capture** unusable rather than silently dropping the entry a verdict might depend on.
+
+`Resolve-P9HWtsSessionTable` correlates the enumeration with per-session `WTSINFO` results:
+
+| Rule | Failure |
+| --- | --- |
+| Enumerated id must equal its `WTSINFO` id | `target-session-id-mismatch` |
+| Duplicate ids make the table ambiguous | `ambiguous-enumeration` |
+| A failed per-session query is recorded, never dropped | `incomplete-session-table` |
+| The target must be present | `no-target` |
+| A state that moved between enumeration and query | `state-changed-during-collection` |
+
+**Stated limitation:** a sequence of sequential WTS queries is **not** an atomic Windows session
+snapshot. `IsAtomicSnapshot` is always `false`, and a state change is classified as an **evidence
+gap**, never as a successful transition. The observer is therefore required to treat instability as
+instability.
+
+`Get-P9HWtsProviderTableCapture` emits one provider line for **every** enumerated session, so the
+frozen parser sees the same table a live observation would — including session 0.
+
+### 2. Layout verification now gates the live query
+
+Stage 3A had `Test-P9HWtsInfoLayout` but the live path never called it. `Invoke-P9HWtsSessionQuery`
+now:
+
+1. validates the layout **before** any interop and refuses with an explicit capability status;
+2. rejects a returned byte count that does not equal the measured `WTSINFO` size **before** decode;
+3. rejects a decoded `SessionId` that does not equal the requested id;
+4. distinguishes a native failure (Win32 code preserved) from a successful-but-empty response
+   (`empty-native-response`).
+
+Passing the local layout check is **not** evidence that the live API works; it only proves this build
+can describe the structure. Zero, negative and out-of-range FILETIME rejection is unchanged.
+
+### 3. Artifact origin was misclassified
+
+Stage 3A labelled all seven N2 roles `product`, which is factually wrong: the exit record is written
+by the qualification recorder, the inventories are OS facts the qualification tooling observes, and
+the fixture is a qualification-defined input.
+
+The model now separates **who produced** the content from **who captured** it:
+
+| Role | `origin` | `capturedBy` |
+| --- | --- | --- |
+| `fixture` | `fixture` | `qualification-launcher` |
+| `stdout` | `product` | `qualification-launcher` |
+| `pre-windows` | `operating-system` | `qualification-observer` |
+| `post-windows` | `operating-system` | `qualification-observer` |
+| `exit-record` | `qualification` | `qualification-recorder` |
+| `new-processes` | `operating-system` | `qualification-observer` |
+| `trace` | `product` | `qualification-capture` |
+
+This is a **reporting** correction only. The seven required roles, their SHA-256 binding and their
+acceptance meaning are unchanged, and no verdict reads these fields. `New-P9HCollectorManifest`
+reports the classification per role and grouped by origin, and K6 now asserts each role's origin
+instead of a bare count — including the specific proof that a collector-authored exit record is never
+described as product-generated.
+
+### Tests: Y1–Y16 (plus a rewritten K6)
+
+| ID | Coverage |
+| --- | --- |
+| Y1 | full two-session enumeration with session 0 present |
+| Y2 | target Active + session 0 Disconnected yields no target disconnect proof |
+| Y3 | genuinely disconnected target yields correct target evidence |
+| Y4 | enumeration failure preserves the Win32 error |
+| Y5 | duplicate target session ids rejected as ambiguous |
+| Y6 | enumerated/`WTSINFO` session-id mismatch fails closed |
+| Y7 | missing target logon time still blocks authoritative matching |
+| Y8 | per-session query failure preserved without losing other observations |
+| Y9 | a state change during collection is an evidence gap |
+| Y10 | layout mismatch prevents the native path |
+| Y11 | empty/invalid successful buffers are explicit, distinct failures |
+| Y12 | exact per-role origin classification |
+| Y13 | the collector exit record is never described as product |
+| Y14 | E1/N2 index separation with the seven-role digest binding intact |
+| Y15 | live enumeration refuses without authorization |
+| Y16 | full-table output drives the frozen E1 proofs end to end |
+| K6 | per-role origin assertions (replacing the count-only check) |
+
+The registry guard now covers **165** registered cases; the full run executes 166 including `R1`.
+All 149 Stage 3A cases are retained unchanged.
+
+## Stage 3A.2 — session-table evidence authority gate
+
+Independent review found that a **rejected** session table could still become authoritative
+transition evidence. This is the most serious finding since Stage 2.4.1, because it is a false
+reconnect authorization rather than a reporting inaccuracy.
+
+### The defect, reproduced
+
+`Get-P9HWtsProviderTableCapture` accepted only `-Rows`, and `New-P9HObserverRecord` took
+`captureOutcome` as an unconditional `'ok'`. So a resolver result with `Ok = $false` still produced a
+clean-looking provider line table, and Proof A/B accepted it.
+
+Reproduced against `969e362`:
+
+| Counterexample | Before | Now |
+| --- | --- | --- |
+| Enumerated Active, queried Disconnected (table moved) | **Proof A proven** | `disconnect-capture-state-changed` |
+| Non-target session query failed (Win32 5) | **Proof A proven** | rejected, Win32 preserved |
+| `captureOutcome='provider-error'` with a valid target line | **Proof A proven** | `disconnect-capture-not-authoritative` |
+| `provider-error` on the post observation | **Proof B proven** | `post-capture-not-authoritative` |
+| Target absent from a successful enumeration | **resolver `Ok=true`** | `target-not-resolved:no-target` |
+
+### Authority propagation
+
+The capture now consumes the **complete resolved result**, not just its rows, and carries the verdict
+forward:
+
+```
+Resolve-P9HWtsSessionTable  ->  Get-P9HWtsProviderTableCapture -Result
+                            ->  New-P9HObserverRecordFromTableCapture
+                            ->  Get-P9HReconnectAuthorizationProof / Get-P9HDisconnectProof
+```
+
+Three properties are now distinct and all are preserved:
+
+- **raw observations** (`Lines`, `rawWts`) — every fact actually seen, kept even when rejected;
+- **accepted facts** (`Authoritative`) — whether those observations may be used as evidence;
+- **diagnostics** (`RejectionReason`, `Win32Errors`, `ResolverReason`) — why not.
+
+A rejected capture is never discarded and never upgraded. `-Rows` alone is explicitly **not**
+authoritative (`capture-rows-without-resolver-status`), because without the resolver verdict there is
+no evidence the table was complete or consistent.
+
+### The gate at Proof A and Proof B
+
+Both proofs now require the observation's capture to be authoritative:
+
+| Proof | New rejection |
+| --- | --- |
+| A | `pre-capture-not-authoritative`, and non-authoritative disconnect records are excluded from candidacy |
+| B | `post-capture-not-authoritative` |
+
+`Wait-P9HTargetDisconnected` previously hardcoded `-CaptureOutcome 'ok'`; it now consumes the
+provider's `Authoritative`/`RejectionReason`/`CaptureOutcome`/`Win32Errors`, persists rejected samples
+with their diagnostics, and keeps polling rather than authorizing on a rejected reading.
+
+**Deliberately excluded from `captureAuthoritative`:** target matching. "Was this capture accepted?"
+and "does it describe the pinned target?" are separate questions; folding them together would mask
+the precise downstream diagnostics (`pre-not-active`, `logon-unavailable`, `user-mismatch`). This is
+why A10 still reports `pre-not-active`/`logon-unavailable` rather than a generic authority failure.
+
+No E1 acceptance threshold was relaxed. Every change **rejects** evidence that previously qualified.
+
+### Tests: B1–B9 (authority) and S1–S6 (capture contract)
+
+| ID | Coverage |
+| --- | --- |
+| B1–B3 | inconsistent state, failed per-session query, ambiguous table cannot authorize |
+| B4–B5 | provider-error records cannot satisfy Proof A or Proof B |
+| B6 | missing target yields explicit non-success |
+| B7–B8 | **positive controls**: valid Active→Disc authorizes; Active→Disc→Active satisfies Proof B |
+| B9 | raw diagnostics survive a rejected evaluation byte-for-byte |
+| S1–S3 | accepted capture authoritative; rows-alone never; rejected capture keeps raw table |
+| S4 | five distinct, non-authoritative rejection reasons |
+| S5–S6 | the wait gate persists rejected samples without upgrading them and is never satisfied by them |
+
+The registry guard now covers **180** registered cases; the full run executes 181 including `R1`.
+All 165 Stage 3A.1 cases are retained unchanged.
+
+## Stage 3B0 — read-only host WTS preflight
+
+The first authorized **read-only** native WTS preflight on the Windows host. No session or VM was
+modified: no `tsdiscon`, no session connect/disconnect, no token manipulation, no service restart, no
+PowerShell Direct, no guest query.
+
+### Host WTS capability — HOST VERIFIED
+
+| Check | Result |
+| --- | --- |
+| `WTSINFO` layout | **216 bytes on x64**, offsets 0/4/32/96/130/176/184/192/200/208 |
+| `WTS_SESSION_INFO` layout | **24 bytes on x64**, `SessionId` 0, `pWinStationName` 8, `State` 16 |
+| `WTSEnumerateSessionsW` | succeeded, `Win32 0`, 2 sessions reported |
+| Returned session count | valid (2), matched the enumerated set |
+| Per-session `WTSINFO` | 2/2 succeeded, returned 216/216 bytes |
+| Session-ID consistency | 2/2 returned ids matched the enumerated ids |
+| State agreement | 2/2 enumeration states matched `WTSINFO` states |
+| `LogonTime` populated | yes for the interactive session (`0x01DB…`) |
+| `LogonTime` unavailable | session 0 reported `logonRaw=0`, reason `zero` — explicitly absent, never 1601 |
+| Native exceptions / crashes | none |
+| Buffers released | `WTSFreeMemory` in `finally` on every path; no leak or crash observed |
+
+Two sessions were observed consistently across **5 bounded read-only observations**: session 0
+(`Services`, Disconnected, no logon) and session 1 (`Console`, Active, logon present).
+
+### Exact conversion validation
+
+```
+rawTicks          134388962797932344
+arithmetic UTC    2026-11-11T18:44:39.7932344Z   (1601 epoch + ticks, independent of adapter)
+FromFileTimeUtc   2026-11-11T18:44:39.7932344Z
+adapter           2026-11-11T18:44:39.7932344Z
+local equivalent  2026-11-11 21:44:39  (Turkey Standard Time, +03:00)
+quser reported    2026-11-11 21:44        -> minute-precision agreement
+```
+
+Sentinel handling re-verified live: `0` → `zero`, `-1` → `negative`, `1` → `epoch-invalid`;
+`116444736000000000` → `1970-01-01T00:00:00Z` (a legitimate FILETIME, correctly accepted).
+
+### Non-atomic snapshot limitation
+
+`IsAtomicSnapshot` is always `false`: a sequence of sequential WTS queries is **not** an atomic
+session snapshot, and a state change between the enumeration and a query is an evidence gap — not a
+transition. Recorded in the preflight report.
+
+### The omitted-authority defect (synthetic-only reproduction)
+
+Stage 3A.2 covered only an **explicit** `CaptureAuthoritative=$false`. Review identified that
+**omitting** the flag left a record authoritative:
+
+| Reproduced case | Before | After |
+| --- | --- | --- |
+| `captureOutcome='provider-error'`, authority flag omitted | **Proof A proven** | authority derived `false` |
+| Same omission on the post observation | **Proof B proven** | `post-capture-not-authoritative` |
+| `Wait-P9HTargetDisconnected`, provider omits `Authoritative` + reports error | **wait proven** | 0 authoritative records, times out |
+
+Two minimal corrections:
+
+1. `New-P9HObserverRecord`: `CaptureAuthoritative` is now nullable. Omitted ⇒ **derived** from
+   `CaptureOutcome`; asserted ⇒ ANDed with the observed outcome, so an explicit `$true` can never
+   override a failed capture. Reason surfaces as `capture-outcome-<outcome>`.
+2. `Wait-P9HTargetDisconnected`: passes the provider's outcome through instead of assuming
+   authoritative when `Authoritative` is absent.
+
+The positive path is preserved: a clean capture with an omitted flag still derives `true` (`U3`, `U6`).
+
+### Tests: U1–U6
+
+| ID | Coverage |
+| --- | --- |
+| U1–U2 | omitted authority + provider error cannot satisfy Proof A / Proof B |
+| U3 | omitted authority + clean capture still derives authoritative |
+| U4 | explicit `true` cannot override a failed capture outcome |
+| U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
+
+The registry guard now covers **253** registered cases; the full run executes 254 including `R1`.
+All 221 prior cases and `R1` are retained unchanged.
+
+---
+
+## Stage 3B7F-R1-A: fail-closed lower-bound chronology for the E1 verdict
+
+An audit of the retained Stage 3B7F-R1 evidence found that the E1 evaluator bounded
+the monitor captures only from ABOVE (PRE before the disconnect) and the POST
+capture only from BELOW (after the post observation). **Nothing bounded the PRE
+capture from below**, so a PRE capture timestamped before the very RDP session it
+claimed to describe still satisfied the complete predicate.
+
+Reproduced synthetically against the unmodified evaluator: a PRE capture stamped
+five hours BEFORE the pinned target logon returned `Verdict=PASS` with an empty
+`Reasons` array. An internally impossible evidence timeline was accepted.
+
+### Correction
+
+Two lower bounds are now evaluated, with deliberately different strengths:
+
+| Bound | Default | Rationale |
+| --- | --- | --- |
+| PRE capture must not predate the **pinned target logon** | **always enforced** | a monitor snapshot of a session cannot have been taken before that session existed - an evidential impossibility |
+| PRE capture must not predate the **authoritative `pre` observation** | opt-in via `-RequirePreCaptureAfterPreObservation` | the ordering is a *procedural* requirement of some trial contracts; capture-then-observe is still truthful because both precede the disconnect |
+
+Both are conditioned on the bound being present and parseable. An absent pinned
+logon, or an unparseable bound, is reported as its own reason rather than silently
+skipped, so the predicate cannot be satisfied by omitting evidence.
+
+New sub-observations: `preCaptureNotBeforeTargetLogon`,
+`preCaptureAfterPreObservationRequired`, `preCaptureNotBeforePreObservation`,
+`preCaptureLowerBoundOk`. The result object also exposes
+`PreCaptureLowerBoundOk`. The lower bound is part of the acceptance predicate:
+`PASS` now requires `preLowerBoundOk` in addition to the previous conditions.
+
+Existing behaviour is preserved: the PRE-before-disconnect and
+POST-after-observation checks are untouched, and the opt-in bound defaults off so
+no prior positive case changes meaning.
+
+### Test coverage (Z1-Z10)
+
+| ID | Coverage |
+| --- | --- |
+| Z1 | genuine ordering (preObs < preCapture < disconnect < postObs < postCapture) still PASSES |
+| Z2 | PRE capture before the target logon is rejected |
+| Z3 | with the flag, PRE capture before the pre observation is rejected |
+| Z4 | without the flag the same ordering is tolerated and the relationship is still reported |
+| Z5 | an absent pinned logon fails closed instead of skipping the bound |
+| Z6 | an unparseable PRE capture timestamp is rejected |
+| Z7 | the existing upper bound (PRE before disconnect) is preserved |
+| Z8 | the existing POST lower bound is preserved |
+| Z9 | a failed transition still yields NOT FULLY EVIDENCED |
+| Z10 | the bound uses the caller's pinned logon, not the log line's own value |
+
+---
+
+## Stage 3B7G0: guest execution boundary, atomic replacement, and N2 readiness
+
+Stage 3B7F-R2's strict physical E1 result is preserved. This stage fixes the two
+safety defects that trial exposed, and assesses N2 readiness read-only.
+
+### Defect 1: a guest disconnect could execute on the host
+
+`tsdiscon` was invoked on the WINDOWS HOST while the plan named a GUEST session,
+so `tsdiscon 2` addressed the host's own session 2. The root cause was not a
+wrong session id: **nothing bound a plan to a machine**, so `session 2` was
+equally valid on any computer and the primitive had no way to notice it was in
+the wrong place.
+
+Correction - a fail-closed boundary with no bypass:
+
+| Check | Enforced |
+| --- | --- |
+| plan must name its guest computer | always |
+| plan must name the authorized VM id | always |
+| caller must supply the expected guest (no default) | always |
+| caller must supply the expected VM id | always |
+| ACTUAL local computer must equal the expected guest | always |
+| plan guest/VM must equal the caller's expectation | always |
+| target must not be session 0 | always (plan AND boundary) |
+| target must not be a listener | always (plan AND boundary) |
+| real-execution token | preserved, checked first |
+
+`Get-P9HExecutionContext` reports identity read-only.
+`Assert-P9HGuestExecutionContext` performs the refusal before any process exists.
+`Test-P9HGuestDisconnectEligible` is the non-executing validation path.
+`Invoke-P9HGuestControlledDisconnect` orchestrates PowerShell Direct and
+re-verifies the guest's own computer name **inside** the execution context.
+
+### Defect 2: "atomic" replacement was not atomic on PowerShell 5.1
+
+The 5.1 branch deleted the destination and *then* moved the temporary file into
+place. Between those two steps the destination does not exist, and if the move
+fails the previous valid artifact is already gone.
+
+The writer now uses `[System.IO.File]::Replace(src, dst, backup, true)` for the
+existing-file case - a single atomic swap available on .NET Framework and .NET -
+and a plain same-directory rename for a genuinely new artifact. A failed
+replacement now leaves the old destination byte-identical.
+
+### Test coverage
+
+| Series | Coverage |
+| --- | --- |
+| H1-H12 | host/guest context, omitted identity, VM mismatch, session 0, listener, refusal before process start, accepted guest, pinned identity, token-first |
+| J1-J7 | new creation, replacement, failure preserving the destination, no residue, BOM-free CRLF bytes, hash stability, append-only logging intact |
+
+The canonical suite is 254/254 PASS (253 registered cases plus `R1`).
+
+### Verification on both runtimes
+
+Both defects were reproduced and both fixes proven under **Windows PowerShell
+5.1** and **PowerShell 7**: identical results, identical SHA-256, identical
+boundary decisions, zero temporary residue.
+
+### N2 readiness (read-only)
+
+All eleven listed capabilities are implemented and synthetically verified; seven
+of them still require a **physical** observation to be claimed, because the
+remaining claims are about the INSTALLED product rather than the qualification
+observer. Critically, E1 proved the **native** monitor API directly in-guest; it
+did **not** exercise the installed `ws.ps1`/`coordinator.ps1` entry point, so E1
+acceptance cannot be substituted for N2 evidence.
+
+---
+## Stage 3B7F-R2: strict chronology physical acceptance and a PowerShell 5.1 portability defect
+
+The Stage 3B7F-R2 physical trial replayed E1 with the contract order corrected:
+the authoritative `pre` WTS observation is persisted and read back BEFORE the
+PRE monitor capture is taken. The strict verdict
+(`-RequirePreCaptureAfterPreObservation`) is PASS with zero rejection reasons,
+and the same verdict is independently reproducible on the host from the retained
+original bytes alone.
+
+That trial also exposed a genuine portability defect in this library.
+
+### Defect
+
+`Write-P9HArtifact` finalized its atomic rename with
+`[System.IO.File]::Move($tmp, $Path, $true)`. The three-argument overload is a
+.NET Core / PowerShell 7+ API. It does **not** exist on Windows PowerShell 5.1
+(.NET Framework), which is the only PowerShell available on the qualification
+guest. In-guest the call failed with
+
+```
+Cannot find an overload for "Move" and the argument count: "3".
+```
+
+so **no monitor capture could be persisted in the guest at all** - the physical
+trial could not produce evidence, even though every predicate was satisfied in
+principle.
+
+### Correction
+
+`Write-P9HArtifact` now branches on `$PSVersionTable.PSVersion.Major`. On 7+ it
+keeps the overwrite overload; on 5.1 it deletes the destination first and then
+performs the two-argument rename. Both paths keep the same-directory-rename
+atomicity: a reader never sees a half-written artifact, and a failed rename
+never leaves a truncated file.
+
+### Test coverage (Z11-Z13)
+
+| ID | Coverage |
+| --- | --- |
+| Z11 | writing a non-existent artifact creates it with exact content and no `.tmp` residue |
+| Z12 | writing an EXISTING artifact atomically replaces it - the exact path that failed on 5.1 |
+| Z13 | artifact bytes are BOM-free UTF-8 with CRLF terminators, so hashes are host-stable |
+
+The canonical suite is 235/235 PASS (234 registered cases plus `R1`).
+
+### Re-evaluation of the R1 trial
+
+The Stage 3B7F-R1 final report stated a PRE capture of `2026-11-14T04:06:48.964Z`,
+nearly five hours BEFORE the target logon. The retained original artifact
+(`pre-monitor.json`, sha256 `dfee403b...`) actually contains
+`2026-11-14T09:06:48.9644082Z`. **The five-hour figure was a report transcription
+error; the artifact is correct and the capture post-dates the logon by 1.54 min.**
+The R1 trial satisfies the mandatory lower bound.
+
+Its measured ordering is `preCapture 09:06:48.964` then `preObs 09:09:07.575`
+(capture-then-observe, 2.31 min apart), so under the OPT-IN flag the trial would
+be reported NOT FULLY EVIDENCED. Under the default contract it remains PASS.
+
+---
+
+## Stage 3B7C: real-observation bridge for controlled disconnect/reconnect
+
+Stage 3B7C executes one physical Active → Disconnected → Active RDP transition.
+Before that could be attempted, the **real data path** had to be auditable end to
+end. Two defects were found in it and corrected within `qualification/p9h/`.
+
+### Defect 1: no production adapter into `Wait-P9HTargetDisconnected`
+
+`Wait-P9HTargetDisconnected` consumes a `-Provider` scriptblock and reads
+`RawWtsLines`, `CaptureOutcome`, `CaptureError`, `RejectionReason`,
+`AuthorityReason`, `Win32Errors` and `Authoritative` from it. Nothing in the
+product projected `Get-P9HWtsProviderTableCapture` into that shape, so a caller
+had to hand-write a scriptblock - and a hand-written scriptblock is exactly how an
+invented `CaptureOutcome = 'ok'` default could make a rejected capture look
+authoritative.
+
+**Correction.** `ConvertTo-P9HWtsObserverProviderSample` derives every field from
+the resolved result and its capture and invents none:
+
+| Field | Source |
+| --- | --- |
+| `RawWtsLines` | `Capture.Lines` |
+| `CaptureOutcome` | `'provider-error'` **iff** the capture recorded a failed query, else `'ok'` |
+| `Authoritative` | `Capture.Authoritative` (the resolver verdict) |
+| `RejectionReason` | `Capture.RejectionReason` |
+| `AuthorityReason` | rejection when not authoritative, else `null` |
+| `Win32Errors` | `Capture.Win32Errors` (nonzero only) |
+
+Listener inventory (`ListenerCount`, `EnumeratedCount`, `IdentityCoveredCount`)
+stays auditable through the adapter.
+
+### Defect 2: `StateName` omitted from the polled record
+
+`Wait-P9HTargetDisconnected` built a synthetic record for
+`Test-P9HTargetDisconnected` without `StateName`. The disconnected path never
+touches it, so synthetic tests passed - but the **non-disconnected** path
+formats its reason as `'target-state-' + $match.Record.StateName` and threw
+`PropertyNotFoundException`. The first real poll while the target was still
+Active would have crashed the wait loop instead of polling again.
+
+**Correction.** The projected record now carries `StateName` from the persisted
+`targetStateName`.
+
+### Test coverage (C1-C12)
+
+| ID | Coverage |
+| --- | --- |
+| C1 | clean authoritative capture projects to an authoritative sample |
+| C2 | rejected resolver result stays non-authoritative; nonzero Win32 preserved |
+| C3 | rows-only capture keeps outcome `ok` but is never authoritative |
+| C4 | the adapter derives `provider-error` from the capture, never a default |
+| C5 | listener inventory stays auditable through the adapter |
+| C6 | a disconnected session 0 cannot satisfy Proof A |
+| C7 | the adapter drives `Wait` and `Assert-P9HReconnectPermitted` end to end |
+| C8 | a failed non-listener query cannot become authoritative |
+| C9 | a Win32 zero is never reported as a failure |
+| C10 | every polled sample is persisted and read back with increasing sequence |
+| C11 | a listener line can never stand in for a target disconnect |
+| C12 | a different logon time on the same session id cannot prove a disconnect |
+
+---
+
+## Stage 3B7B-C1: listener-aware WTS authority and Win32-zero classification
+
+Stage 3B7B physically established a genuine authenticated RDP session (session 2,
+`RDP-Tcp#0`, Active, verified logon time) but could not make the capture
+authoritative. Two independent defects were responsible, and both are corrected
+here inside `qualification/p9h/` only.
+
+### Defect 1: WTSListen pseudo-sessions rejected the whole table
+
+Windows enumerates connection listeners (`WTSListen`, state 6) that accept
+sessions but have no logged-on user. `WTSQuerySessionInformationW(WTSInfo)`
+cannot describe them, so they answer with a non-matching record. The resolver
+required a matching identity for **every** enumerated id, so two unqueryable
+listener rows rejected an otherwise complete, consistent table containing a
+real user session. Capture authority was `False` for a correct observation.
+
+**Correction.** Listeners are now a distinct correlation class, classified by the
+**enumerated WTS state** - not by session-id range and not by station name, both
+of which would excuse genuine failures of real sessions:
+
+* no WTSINFO identity is required for a listener, because none exists;
+* listener query outcomes are preserved in `ListenerDiagnostics` and do **not**
+  enter `Errors`, so an expected limitation cannot fail the table;
+* each listener keeps its id, station name, enumerated state and
+  `QuerySource='enumeration'`, so its provenance is never implied to be WTSINFO;
+* a listener can never resolve as the target (`target-is-listener`), and is
+  never rendered as a user session line;
+* duplicate ids are still rejected across the **entire** enumeration, listeners
+  included.
+
+`EnumeratedCount` (complete inventory) is reported separately from
+`IdentityCoveredCount` (sessions that actually produced a WTSINFO identity), so
+"we saw every session" is never conflated with "we have an identity for every
+user session". The observer record carries `listenerCount`,
+`enumeratedCount`, `identityCoveredCount`, `enumeratedCountExceedsIdentity` and
+`listenerDiagnostics` as an additive metadata extension. None of these fields is
+consulted by the authority predicate, so no acceptance rule is weakened.
+
+### Defect 2: a successful query's Win32 zero was treated as a provider error
+
+`Invoke-P9HWtsSessionQuery` returns `Win32Error = 0` when the native query
+**succeeds**. The capture collected every non-null `Win32Error`, including
+zeros, and `New-P9HObserverRecordFromTableCapture` treats a nonempty
+`Win32Errors` array as a provider failure. A perfectly clean, authoritative
+capture therefore produced `captureOutcome='provider-error'` and denied
+authority - which in turn blocked Proof A on a genuine Active to Disconnected
+transition.
+
+**Correction.** Only **failed** queries (`QueryOk = false`) are consulted, and
+within those only a **nonzero** code is recorded. Zero means "no error". A failed
+query carrying Win32 0 still fails closed through `QueryOk`/`FailedCount`, and a
+nonzero code is never dropped. This is a source-aware rule, not a blanket filter
+of the error array.
+
+### Test coverage (L1-L23)
+
+| ID | Coverage |
+| --- | --- |
+| L1-L4 | complete listener-aware table resolves; listeners are diagnostics; provenance preserved; enumeration vs identity counting |
+| L5-L6 | Active and genuinely Disconnected targets both resolve with listeners present |
+| L7-L8 | a listener cannot be the target and cannot authorize reconnect |
+| L9-L10 | duplicate ids involving a listener, and an absent target, both fail closed |
+| L11-L12 | a failed session-0 query and a failed non-target non-listener query both still reject |
+| L13-L14 | wrong user/logon identity and a genuine target state change still reject |
+| L15-L17 | successful Win32 zero is not an error; failed Win32 zero still fails; nonzero preserved and blocking |
+| L18 | listener metadata and raw enumeration survive serialization and read-back |
+| L19-L20 | positive and negative Proof A / Proof B over listener-aware tables |
+| L21 | rows without a resolved result never become authoritative |
+| L22-L23 | session 0 keeps its own state; no listener is rendered as a user line |
+
+The offline probe `PROBE-PRE-FIX.log` / `PROBE-POST-FIX.log` replays identical
+synthetic native-shaped inputs against the pre-fix sources (both defects present)
+and the corrected sources (both absent).

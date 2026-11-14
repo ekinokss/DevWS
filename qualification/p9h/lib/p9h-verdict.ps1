@@ -164,7 +164,11 @@ function Get-P9HE1Verdict {
         [Parameter(Mandatory)][int]$TargetSessionId,
         [Parameter(Mandatory)][string]$TargetUser,
         [AllowNull()][string]$TargetLogonTime = $null,
-        [string]$TrialId = ''
+        [string]$TrialId = '',
+        # Stage 3B7F-R1-A: demand that the PRE monitor capture follow the
+        # authoritative pre WTS observation. Off by default (a capture-then-observe
+        # sequence is coherent); the R1 trial contract requires it.
+        [switch]$RequirePreCaptureAfterPreObservation
     )
 
     $sub = [ordered]@{}
@@ -278,14 +282,99 @@ function Get-P9HE1Verdict {
         $reasons.Add('capture-does-not-bracket-transition')
     }
 
+    # ---------------------------------------------------------------------
+    # Stage 3B7F-R1-A: FAIL-CLOSED LOWER-BOUND CHRONOLOGY
+    #
+    # The checks above only bound the captures from ABOVE (pre must precede the
+    # disconnect) and the post capture from BELOW (post must follow the post
+    # observation). Nothing bounded the PRE capture from BELOW, so a PRE capture
+    # that predates the very session it claims to describe - an impossible
+    # timeline - still satisfied the complete predicate. That was reproduced with
+    # a synthetic PRE capture timestamped five hours before the target logon and
+    # the evaluator returned PASS with no reasons.
+    #
+    # TWO bounds are now available, with deliberately different strengths:
+    #
+    # (1) TARGET LOGON - ALWAYS ENFORCED.
+    #     A monitor snapshot of a session cannot legitimately have been taken
+    #     before that session existed. This is an EVIDENTIAL impossibility, so it
+    #     is unconditional and is part of the acceptance predicate.
+    #
+    # (2) AUTHORITATIVE PRE OBSERVATION - ENFORCED ONLY ON REQUEST.
+    #     Some trial contracts prescribe "collect the pre observation, THEN capture
+    #     the monitors". Where a contract says that, the ordering is a procedural
+    #     requirement and the caller can demand it with
+    #     -RequirePreCaptureAfterPreObservation. It is NOT implied by default,
+    #     because capturing the monitors first and persisting the pre WTS
+    #     observation immediately afterwards is still a coherent, truthful
+    #     sequence - both precede the disconnect, and the capture does not claim
+    #     knowledge of a session that did not yet exist.
+    #
+    # Both bounds are conditioned on the bound being AVAILABLE and parseable: an
+    # absent or unreadable bound is reported as its own reason rather than being
+    # silently skipped, so the predicate cannot be satisfied by omitting evidence.
+    # ---------------------------------------------------------------------
+    $preLowerBoundOk = $true
+
+    # (1) target logon lower bound (mandatory)
+    $pinnedLogonUtc = ConvertTo-P9HUtcOrNull -Value $TargetLogonTime
+    $logonBoundOk = $null
+    if ($null -eq $pinnedLogonUtc) {
+        # Without a pinned logon there is no session identity to bound against.
+        $logonBoundOk = $false
+        $preLowerBoundOk = $false
+        $reasons.Add('pinned-logon-unavailable-for-chronology')
+    }
+    else {
+        $logonBoundOk = ($preCaptureUtc -ge $pinnedLogonUtc)
+        if (-not $logonBoundOk) {
+            $preLowerBoundOk = $false
+            $reasons.Add('pre-capture-precedes-target-logon')
+        }
+    }
+
+    # (2) authoritative pre-observation lower bound (opt-in per trial contract)
+    $preObsUtcForBound = $null
+    if ($proof.Proven -and $null -ne $proof.Pre) {
+        $preObsUtcForBound = ConvertTo-P9HUtcOrNull -Value $proof.Pre.utc
+    }
+    $preObsBoundOk = $null
+    if ($RequirePreCaptureAfterPreObservation) {
+        if ($null -eq $preObsUtcForBound) {
+            $preObsBoundOk = $false
+            $preLowerBoundOk = $false
+            $reasons.Add('pre-observation-timestamp-unavailable-for-chronology')
+        }
+        else {
+            $preObsBoundOk = ($preCaptureUtc -ge $preObsUtcForBound)
+            if (-not $preObsBoundOk) {
+                $preLowerBoundOk = $false
+                $reasons.Add('pre-capture-precedes-pre-observation')
+            }
+        }
+    }
+    else {
+        # Not required by this contract; still REPORT the relationship so the
+        # ordering is visible in the verdict object either way.
+        $preObsBoundOk = if ($null -ne $preObsUtcForBound) { ($preCaptureUtc -ge $preObsUtcForBound) } else { $null }
+    }
+
+    $sub['preCaptureNotBeforeTargetLogon'] = $logonBoundOk
+    $sub['preCaptureAfterPreObservationRequired'] = [bool]$RequirePreCaptureAfterPreObservation
+    $sub['preCaptureNotBeforePreObservation'] = $preObsBoundOk
+    $sub['preCaptureLowerBoundOk'] = $preLowerBoundOk
+
     $tokensSatisfied = $tokenCountOk -and $distinctOk -and $tokenSetEqual -and $pairsEqual -and
                        $negativeOrigin -and $identityComplete -and $nonSession0 -and
                        $sessionMatchesTarget -and $sessionConsistent -and
                        $trialPresent -and $trialAgrees -and $timestampsValid -and $captureOrderOk -and
                        $preMon.Consistent -and $postMon.Consistent
 
+    # Stage 3B7F-R1-A: the lower-bound chronology is part of the acceptance
+    # predicate, not a separate advisory observation. A capture that cannot have
+    # existed when it claims to have been taken is not evidence of a transition.
     $verdict = 'NOT FULLY EVIDENCED'
-    if ($tokensSatisfied -and $proof.Proven -and $chronologyOk) { $verdict = 'PASS' }
+    if ($tokensSatisfied -and $proof.Proven -and $chronologyOk -and $preLowerBoundOk) { $verdict = 'PASS' }
 
     return [pscustomobject][ordered]@{
         Verdict = $verdict
@@ -293,6 +382,7 @@ function Get-P9HE1Verdict {
         DisconnectProven = [bool]$proof.Proven
         DisconnectReason = [string]$proof.Reason
         ChronologyOk = $chronologyOk
+        PreCaptureLowerBoundOk = $preLowerBoundOk
         SubObservations = $sub
         Reasons = @($reasons)
         Tokens = @($preIdentities)

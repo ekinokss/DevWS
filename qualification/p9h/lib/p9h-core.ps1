@@ -103,7 +103,38 @@ function Write-P9HArtifact {
         $stream.Dispose()
     }
 
-    [System.IO.File]::Move($tmp, $Path, $true)
+    # ---------------------------------------------------------------------
+    # ATOMIC REPLACEMENT.
+    #
+    # Stage 3B7G0 correction. Stage 3B7F-R2's PowerShell 5.1 branch performed
+    # "delete the destination, then move the temporary file into place". That is
+    # NOT atomic: between the delete and the move the destination does not exist,
+    # a reader can observe its absence, and if the move fails (target locked, disk
+    # full, ACL change) the previous VALID artifact is already gone. The stage
+    # that introduced it claimed atomicity it did not provide.
+    #
+    # The correct primitive on Windows is ReplaceFileW, which swaps two files
+    # atomically and supports a backup copy. .NET exposes it through
+    # [System.IO.File]::Replace(source, destination, backupFileName[, ignoreMetadataErrors]):
+    #   * the destination is replaced in ONE operation, never unlinked first;
+    #   * if the replacement fails the ORIGINAL destination is left intact;
+    #   * the backup parameter gives an additional recoverable copy.
+    # That overload exists on .NET Framework (PowerShell 5.1) AND on .NET
+    # (PowerShell 7), so a single code path serves both runtimes.
+    #
+    # File.Replace requires the destination to exist. A genuinely new artifact
+    # therefore uses a plain same-directory rename, which is atomic on NTFS for
+    # the create case because it never transitions through a missing state.
+    # ---------------------------------------------------------------------
+    if (Test-Path -LiteralPath $Path) {
+        $backup = $tmp + '.bak'
+        if (Test-Path -LiteralPath $backup) { [System.IO.File]::Delete($backup) }
+        [System.IO.File]::Replace($tmp, $Path, $backup, $true)
+        if (Test-Path -LiteralPath $backup) { [System.IO.File]::Delete($backup) }
+    }
+    else {
+        [System.IO.File]::Move($tmp, $Path)
+    }
 }
 
 function Add-P9HArtifactLine {
