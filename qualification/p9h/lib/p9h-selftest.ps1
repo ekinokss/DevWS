@@ -2742,7 +2742,7 @@ function Invoke-P9HAuthorityGateTests {
     $null = Add-P9HArtifactLine -Path $b2Log -Line (New-P9HObserverRecordFromTableCapture -Capture $cleanActiveCap -TrialId $b2Trial.TrialId -Sequence 1 -Phase 'pre' -TargetUser $user -TargetLogonTime $logonIso)
     $null = Add-P9HArtifactLine -Path $b2Log -Line (New-P9HObserverRecordFromTableCapture -Capture $failedNonTargetCap -TrialId $b2Trial.TrialId -Sequence 2 -Phase 'disconnect-observed' -TargetUser $user -TargetLogonTime $logonIso)
     $b2Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b2Log -TrialId $b2Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
-    $b2Record = @(Read-P9HObserverLog -Path $b2Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $b2Record = @((Read-P9HObserverLog -Path $b2Log).Records) | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
     Add-P9HTestResult -Id 'B2' -Title 'A failed per-session query cannot authorize reconnect' `
         -Input 'session 0 query failed Win32 5, target 3 reads Disconnected' `
         -Expected 'capture not authoritative, Proof A not proven, Win32 preserved' `
@@ -2779,7 +2779,7 @@ function Invoke-P9HAuthorityGateTests {
             -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)' `
             -CaptureAuthoritative $false -CaptureAuthorityReason 'provider-error')
     $b4Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b4Log -TrialId $b4Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
-    $b4Record = @(Read-P9HObserverLog -Path $b4Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $b4Record = @((Read-P9HObserverLog -Path $b4Log).Records) | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
     Add-P9HTestResult -Id 'B4' -Title 'A provider-error observer record cannot satisfy Proof A' `
         -Input 'valid Disconnected target line whose capture was a provider error' `
         -Expected 'record keeps its raw line and error, Proof A not proven' `
@@ -2859,7 +2859,7 @@ function Invoke-P9HAuthorityGateTests {
     $b9Before = Get-P9HFileSha256 -Path $b9Log
     $null = Get-P9HReconnectAuthorizationProof -ObserverLogPath $b9Log -TrialId $b9Trial.TrialId -SessionId 3 -User $user -LogonTime $logonIso
     $b9After = Get-P9HFileSha256 -Path $b9Log
-    $b9Record = @(Read-P9HObserverLog -Path $b9Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $b9Record = @((Read-P9HObserverLog -Path $b9Log).Records) | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
     Add-P9HTestResult -Id 'B9' -Title 'Raw diagnostic observations survive a rejected evaluation unchanged' `
         -Input 'rejected capture with a preserved Win32 failure' `
         -Expected 'log bytes identical, raw lines and diagnostics still present' `
@@ -2947,7 +2947,7 @@ function Invoke-P9HAuthorityGateTests {
         -ObserverLogPath $s5Log -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
         -Provider $s5Provider -TimeoutSeconds 8 -PollIntervalMs 10
 
-    $s5Records = @(Read-P9HObserverLog -Path $s5Log).Records
+    $s5Records = @((Read-P9HObserverLog -Path $s5Log).Records)
     $s5First = @($s5Records | Where-Object { [int]$_.sequence -eq 1 }) | Select-Object -First 1
     Add-P9HTestResult -Id 'S5' -Title 'A rejected sample is persisted with its reason and never upgraded to ok' `
         -Input 'provider reports a rejected capture, then an authoritative one' `
@@ -2979,7 +2979,7 @@ function Invoke-P9HAuthorityGateTests {
         -ObserverLogPath $s6Log -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
         -Provider $s6Provider -TimeoutSeconds 2 -PollIntervalMs 50
 
-    $s6Records = @(Read-P9HObserverLog -Path $s6Log).Records
+    $s6Records = @((Read-P9HObserverLog -Path $s6Log).Records)
     $s6AllNonAuth = @($s6Records | Where-Object { -not $_.captureAuthoritative }).Count
     Add-P9HTestResult -Id 'S6' -Title 'A wait gate is never satisfied by rejected samples alone' `
         -Input 'provider always reports a provider-error capture' `
@@ -3023,7 +3023,7 @@ function Invoke-P9HAuthorityOmissionTests {
     $null = Add-P9HArtifactLine -Path $u1Log -Line (New-P9HObserverRecord -TrialId $u1.TrialId -Sequence 2 -Phase 'disconnect-observed' `
             -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
             -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)')
-    $u1Rec = @(Read-P9HObserverLog -Path $u1Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $u1Rec = @((Read-P9HObserverLog -Path $u1Log).Records) | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
     $u1Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $u1Log -TrialId $u1.TrialId -SessionId 3 -User $user -LogonTime $logonIso
     Add-P9HTestResult -Id 'U1' -Title 'An omitted authority flag with a provider error cannot satisfy Proof A' `
         -Input 'provider-error record, CaptureAuthoritative not supplied' `
@@ -3041,7 +3041,7 @@ function Invoke-P9HAuthorityOmissionTests {
     $null = Add-P9HArtifactLine -Path $u2Log -Line (New-P9HObserverRecord -TrialId $u2.TrialId -Sequence 3 -Phase 'post' `
             -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
             -CaptureOutcome 'provider-error' -CaptureError 'WTSQuerySessionInformationW failed (Win32 5)')
-    $u2Rec = @(Read-P9HObserverLog -Path $u2Log).Records | Where-Object { $_.phase -eq 'post' } | Select-Object -Last 1
+    $u2Rec = @((Read-P9HObserverLog -Path $u2Log).Records) | Where-Object { $_.phase -eq 'post' } | Select-Object -Last 1
     $u2Proof = Get-P9HDisconnectProof -ObserverLogPath $u2Log -TrialId $u2.TrialId -SessionId 3 -User $user -LogonTime $logonIso
     Add-P9HTestResult -Id 'U2' -Title 'An omitted authority flag with a provider error cannot satisfy Proof B' `
         -Input 'provider-error post observation, CaptureAuthoritative not supplied' `
@@ -3057,7 +3057,7 @@ function Invoke-P9HAuthorityOmissionTests {
             -RawWtsLines @($activeLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
     $null = Add-P9HArtifactLine -Path $u3Log -Line (New-P9HObserverRecord -TrialId $u3.TrialId -Sequence 2 -Phase 'disconnect-observed' `
             -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso)
-    $u3Rec = @(Read-P9HObserverLog -Path $u3Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $u3Rec = @((Read-P9HObserverLog -Path $u3Log).Records) | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
     $u3Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $u3Log -TrialId $u3.TrialId -SessionId 3 -User $user -LogonTime $logonIso
     Add-P9HTestResult -Id 'U3' -Title 'An omitted authority flag with a clean capture still derives authoritative' `
         -Input 'clean capture, CaptureAuthoritative not supplied' `
@@ -3073,7 +3073,7 @@ function Invoke-P9HAuthorityOmissionTests {
     $null = Add-P9HArtifactLine -Path $u4Log -Line (New-P9HObserverRecord -TrialId $u4.TrialId -Sequence 2 -Phase 'disconnect-observed' `
             -RawWtsLines @($discLine) -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
             -CaptureOutcome 'provider-error' -CaptureAuthoritative $true)
-    $u4Rec = @(Read-P9HObserverLog -Path $u4Log).Records | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
+    $u4Rec = @((Read-P9HObserverLog -Path $u4Log).Records) | Where-Object { $_.phase -eq 'disconnect-observed' } | Select-Object -Last 1
     $u4Proof = Get-P9HReconnectAuthorizationProof -ObserverLogPath $u4Log -TrialId $u4.TrialId -SessionId 3 -User $user -LogonTime $logonIso
     Add-P9HTestResult -Id 'U4' -Title 'An explicit authoritative flag cannot override a failed capture outcome' `
         -Input 'CaptureOutcome=provider-error with CaptureAuthoritative=true' `
@@ -3097,7 +3097,7 @@ function Invoke-P9HAuthorityOmissionTests {
     $u5Wait = Wait-P9HTargetDisconnected -TrialId $u5.TrialId -SequenceStart 1 -ObserverLogPath $u5Log `
         -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
         -Provider $u5Provider -TimeoutSeconds 1 -PollIntervalMs 40
-    $u5Recs = @(Read-P9HObserverLog -Path $u5Log).Records
+    $u5Recs = @((Read-P9HObserverLog -Path $u5Log).Records)
     $u5Auth = @($u5Recs | Where-Object { $_.captureAuthoritative }).Count
     Add-P9HTestResult -Id 'U5' -Title 'A silent failing provider cannot authorize through the wait gate' `
         -Input 'provider omits Authoritative and reports provider-error' `
@@ -3114,7 +3114,7 @@ function Invoke-P9HAuthorityOmissionTests {
     $u6Wait = Wait-P9HTargetDisconnected -TrialId $u6.TrialId -SequenceStart 1 -ObserverLogPath $u6Log `
         -TargetSessionId 3 -TargetUser $user -TargetLogonTime $logonIso `
         -Provider $u6Provider -TimeoutSeconds 5 -PollIntervalMs 40
-    $u6Recs = @(Read-P9HObserverLog -Path $u6Log).Records
+    $u6Recs = @((Read-P9HObserverLog -Path $u6Log).Records)
     Add-P9HTestResult -Id 'U6' -Title 'A silent clean provider still authorizes through the wait gate' `
         -Input 'provider omits Authoritative and reports no error' `
         -Expected 'wait proven, sample authoritative' `
@@ -5043,6 +5043,754 @@ function Invoke-P9HRelaunchTests {
         -Pass ($bindOk.Ok -eq $true -and $bindBad.Ok -eq $false -and $bindMissing.Ok -eq $false) -Evidence $ctx.Directory
 }
 
+function Invoke-P9HManagedTerminalContractTests {
+    # E-series: the versioned managed-terminal window identity contract
+    # (Stage 3B7G3).
+    #
+    # Stage 3B7G2 returned N2-B INCONCLUSIVE with
+    # `attributed-window-count-not-one:2` for a launch that created exactly ONE
+    # managed Windows Terminal window plus its own Win32-owned pseudoconsole. The
+    # historical rule counted PROCESS-associated HWNDs, not MANAGED TERMINAL
+    # windows.
+    #
+    # These cases pin the corrected interpretation against every way it could be
+    # abused, plus the original false-INCONCLUSIVE reproduction. All fixtures are
+    # synthetic and none of them contacts a VM: the classifier and the verdict are
+    # pure functions of the supplied records.
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $dir = Join-Path $SandboxRoot 'e-managed-terminal'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+    $setId = 'n2qual'
+    $windowId = 'N2QUAL-n2qualterm'
+    $terminalId = 'n2qualterm'
+    $managedClass = 'CASCADIA_HOSTING_WINDOW_CLASS'
+
+    # ---------------------------------------------------------------- builders
+    function New-Proc {
+        param([int]$ProcId = 7280, [string]$Name = 'WindowsTerminal.exe', [string]$Cmd = $null, [int]$Session = 2)
+        if ([string]::IsNullOrWhiteSpace($Cmd)) {
+            $Cmd = 'pwsh.exe -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm'
+        }
+        return [pscustomobject]@{ pid = $ProcId; ppid = 5732; name = $Name; sessionId = $Session; commandLine = $Cmd; commandLength = $Cmd.Length; startUtc = '2026-11-14T18:06:08.5000000Z' }
+    }
+    function New-Win {
+        param(
+            [string]$Hwnd = '0x50366', [int]$WinPid = 7280, [string]$Class = $managedClass,
+            [string]$Title = $windowId, [string]$Owner = '0x0', [bool]$Visible = $true,
+            [int]$X = 18, [int]$Y = 26, [int]$W = 1129, [int]$H = 635
+        )
+        return [pscustomobject]@{ hwnd = $Hwnd; pid = $WinPid; visible = $Visible; class = $Class; x = $X; y = $Y; width = $W; height = $H; owner = $Owner; title = $Title }
+    }
+    function Classify {
+        param([object[]]$Windows, $Procs)
+        $map = @{}
+        foreach ($p in @($Procs)) { $map[[int]$p.pid] = $p }
+        return Get-P9HManagedTerminalWindowClassification -Windows $Windows `
+            -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId -ProcessByPid $map
+    }
+
+    # The genuine G2 pair: one managed terminal plus its Win32-owned pseudoconsole.
+    $g2Terminal = New-Win
+    $g2Pseudo = New-Win -Hwnd '0x20330' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366' -X 0 -Y 0 -W 16 -H 16
+    $g2Procs = @(
+        (New-Proc)
+        (New-Proc -ProcId 10140 -Name 'pwsh.exe' -Cmd 'pwsh.exe -NoExit -File cwd-shell-bootstrap.ps1 -SetId n2qual -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm')
+    )
+
+    # =====================================================================
+    # E1: the original false-INCONCLUSIVE reproduction, historical contract
+    # =====================================================================
+    $histRaw = Classify -Windows @($g2Terminal, $g2Pseudo) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E1' -Title 'Historical rule counts the auxiliary pseudoconsole as a second attributed HWND' `
+        -Input 'the exact Stage 3B7G2 pair: one managed terminal + one Win32-owned PseudoConsoleWindow' `
+        -Expected 'raw attributed count 2, which is what produced G2 INCONCLUSIVE' `
+        -Actual ("rawCount={0} hwnds={1}" -f $histRaw.RawAttributedHwndCount, ((@($histRaw.Managed + $histRaw.Auxiliary + $histRaw.Unclassified) | ForEach-Object { $_.hwnd }) -join ',')) `
+        -Pass ($histRaw.RawAttributedHwndCount -eq 2) -Evidence $null
+
+    # =====================================================================
+    # E2: corrected contract accepts the same pair as ONE managed terminal
+    # =====================================================================
+    $e2 = Classify -Windows @($g2Terminal, $g2Pseudo) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E2' -Title 'Corrected contract: one managed terminal plus one proven auxiliary' `
+        -Input 'same G2 pair; auxiliary is linked by GW_OWNER to the managed terminal' `
+        -Expected 'Ok=True, managed=1, auxiliary=1, unclassified=0' `
+        -Actual ("ok={0} managed={1} aux={2} unclassified={3} qualifying={4}" -f $e2.Ok, $e2.ManagedTerminalCount, $e2.AuxiliaryCount, $e2.UnclassifiedCount, $e2.QualifyingHwnd) `
+        -Pass ($e2.Ok -eq $true -and $e2.ManagedTerminalCount -eq 1 -and $e2.AuxiliaryCount -eq 1 -and $e2.UnclassifiedCount -eq 0 -and $e2.QualifyingHwnd -eq '0x50366') -Evidence $null
+
+    # =====================================================================
+    # E2b: ENUMERATION-ORDER INDEPENDENCE
+    #
+    # The genuine Stage 3B7G2 post inventory lists the pseudoconsole (0x20330)
+    # BEFORE its owner (0x50366). A classifier that resolves ownership inline
+    # therefore tests an auxiliary against a managed set that is still empty, and
+    # reports a correct auxiliary as unclassified purely because of enumeration
+    # order. Both orders must produce the identical classification.
+    # =====================================================================
+    $e2bForward = Classify -Windows @($g2Pseudo, $g2Terminal) -Procs $g2Procs
+    $e2bReverse = Classify -Windows @($g2Terminal, $g2Pseudo) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E2b' -Title 'Classification is independent of window enumeration order' `
+        -Input 'the G2 pair in BOTH orders (pseudoconsole first, then terminal first)' `
+        -Expected 'both orders: managed=1, auxiliary=1, unclassified=0, same qualifying HWND' `
+        -Actual ("pseudoFirst=(ok={0} managed={1} aux={2} unclassified={3} q={4}) terminalFirst=(ok={5} managed={6} aux={7} unclassified={8} q={9})" -f
+            $e2bForward.Ok, $e2bForward.ManagedTerminalCount, $e2bForward.AuxiliaryCount, $e2bForward.UnclassifiedCount, $e2bForward.QualifyingHwnd,
+            $e2bReverse.Ok, $e2bReverse.ManagedTerminalCount, $e2bReverse.AuxiliaryCount, $e2bReverse.UnclassifiedCount, $e2bReverse.QualifyingHwnd) `
+        -Pass ($e2bForward.Ok -eq $true -and $e2bForward.ManagedTerminalCount -eq 1 -and $e2bForward.AuxiliaryCount -eq 1 -and
+            $e2bForward.UnclassifiedCount -eq 0 -and $e2bForward.QualifyingHwnd -eq '0x50366' -and
+            $e2bReverse.Ok -eq $true -and $e2bReverse.ManagedTerminalCount -eq 1 -and $e2bReverse.AuxiliaryCount -eq 1 -and
+            $e2bReverse.UnclassifiedCount -eq 0 -and $e2bReverse.QualifyingHwnd -eq '0x50366') -Evidence $null
+
+    # =====================================================================
+    # E3: one qualifying managed terminal ALONE is accepted
+    # =====================================================================
+    $e3 = Classify -Windows @($g2Terminal) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E3' -Title 'A single qualifying managed terminal is accepted' `
+        -Input 'one CASCADIA_HOSTING_WINDOW_CLASS window owned by WindowsTerminal.exe with the pinned title' `
+        -Expected 'Ok=True, managed=1, auxiliary=0, unclassified=0' `
+        -Actual ("ok={0} managed={1} aux={2} unclassified={3}" -f $e3.Ok, $e3.ManagedTerminalCount, $e3.AuxiliaryCount, $e3.UnclassifiedCount) `
+        -Pass ($e3.Ok -eq $true -and $e3.ManagedTerminalCount -eq 1 -and $e3.AuxiliaryCount -eq 0) -Evidence $null
+
+    # =====================================================================
+    # E4: TWO managed terminal windows are REFUSED
+    # =====================================================================
+    $twoMg = New-Win -Hwnd '0x60001' -WinPid 9001 -Title 'OTHER-win'
+    $e4 = Classify -Windows @($g2Terminal, $twoMg) -Procs @($g2Procs[0], (New-Proc -ProcId 9001)) -ExpectedWindowId $windowId
+    # Note: the second window carries a DIFFERENT title so it cannot qualify as the
+    # pinned terminal; assert on the classification shape instead.
+    $e4b = Classify -Windows @($g2Terminal, (New-Win -Hwnd '0x60002' -WinPid 7280)) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E4' -Title 'Two distinct managed terminal windows are refused' `
+        -Input 'two CASCADIA_HOSTING_WINDOW_CLASS windows, same owning process, both visible and new' `
+        -Expected 'Ok=False, managed=2' `
+        -Actual ("ok={0} managed={1} reason={2} | different-title variant managed={3}" -f $e4b.Ok, $e4b.ManagedTerminalCount, $e4b.Reason, $e4.ManagedTerminalCount) `
+        -Pass ($e4b.Ok -eq $false -and $e4b.ManagedTerminalCount -eq 2 -and $e4b.Reason -eq 'multiple-managed-terminal-windows') -Evidence $null
+
+    # =====================================================================
+    # E5: auxiliary HWND WITHOUT a managed terminal is refused
+    # =====================================================================
+    $e5 = Classify -Windows @($g2Pseudo) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E5' -Title 'An auxiliary window with no managed terminal is refused' `
+        -Input 'only the PseudoConsoleWindow, whose GW_OWNER points at a window not in the set' `
+        -Expected 'Ok=False, managed=0' `
+        -Actual ("ok={0} managed={1} unclassified={2} reason={3}" -f $e5.Ok, $e5.ManagedTerminalCount, $e5.UnclassifiedCount, $e5.Reason) `
+        -Pass ($e5.Ok -eq $false -and $e5.ManagedTerminalCount -eq 0) -Evidence $null
+
+    # =====================================================================
+    # E6: an UNKNOWN second window is refused (unclassified), not ignored
+    # =====================================================================
+    $unknown = New-Win -Hwnd '0x77777' -WinPid 7280 -Class 'SomeRandomWindowClass' -Title 'unrelated'
+    $e6 = Classify -Windows @($g2Terminal, $unknown) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E6' -Title 'An unknown second window is UNCLASSIFIED and refused' `
+        -Input 'a second new visible window with an unrelated class, no GW_OWNER link' `
+        -Expected 'Ok=False, unclassified=1' `
+        -Actual ("ok={0} unclassified={1} reason={2}" -f $e6.Ok, $e6.UnclassifiedCount, $e6.Reason) `
+        -Pass ($e6.Ok -eq $false -and $e6.UnclassifiedCount -eq 1 -and $e6.Reason -eq 'unclassified-attributed-window') -Evidence $null
+
+    # =====================================================================
+    # E7: an unrelated Cascadia window (foreign title, foreign pid) is refused
+    # =====================================================================
+    $foreign = New-Win -Hwnd '0x88888' -WinPid 4242 -Title 'someone-elses-terminal'
+    $e7 = Classify -Windows @($g2Terminal, $foreign) -Procs @($g2Procs[0], (New-Proc -ProcId 4242 -Cmd 'wt.exe -w other'))
+    Add-P9HTestResult -Id 'E7' -Title 'An unrelated Cascadia window is refused' `
+        -Input 'second CASCADIA window with a foreign windowId, owned by a process without the pinned argv' `
+        -Expected 'Ok=False, unclassified=1' `
+        -Actual ("ok={0} managed={1} unclassified={2}" -f $e7.Ok, $e7.ManagedTerminalCount, $e7.UnclassifiedCount) `
+        -Pass ($e7.Ok -eq $false -and $e7.ManagedTerminalCount -eq 1 -and $e7.UnclassifiedCount -eq 1) -Evidence $null
+
+    # =====================================================================
+    # E8: PID mismatch on the auxiliary link is refused
+    # =====================================================================
+    # Owner points at the managed terminal, but the owning pid has no process
+    # record at all -> ownership cannot be established.
+    $noProc = New-Win -Hwnd '0x20331' -WinPid 55555 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366'
+    $e8 = Classify -Windows @($g2Terminal, $noProc) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E8' -Title 'An auxiliary window whose owning process is unknown is refused' `
+        -Input 'GW_OWNER link present, but the owning pid has no attributed process record' `
+        -Expected 'Ok=False, unclassified=1' `
+        -Actual ("ok={0} unclassified={1}" -f $e8.Ok, $e8.UnclassifiedCount) `
+        -Pass ($e8.Ok -eq $false -and $e8.UnclassifiedCount -eq 1) -Evidence $null
+
+    # =====================================================================
+    # E9: missing process argv on the auxiliary owner is refused
+    # =====================================================================
+    $noArgv = New-Win -Hwnd '0x20332' -WinPid 10141 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x99999'
+    $e9 = Classify -Windows @($g2Terminal, $noArgv) -Procs @($g2Procs[0], (New-Proc -ProcId 10141 -Name 'pwsh.exe' -Cmd 'pwsh.exe -NoLogo'))
+    Add-P9HTestResult -Id 'E9' -Title 'An auxiliary window with neither ownership nor argv identity is refused' `
+        -Input 'GW_OWNER points elsewhere and the owner argv lacks the pinned identity' `
+        -Expected 'Ok=False, unclassified=1' `
+        -Actual ("ok={0} unclassified={1}" -f $e9.Ok, $e9.UnclassifiedCount) `
+        -Pass ($e9.Ok -eq $false -and $e9.UnclassifiedCount -eq 1) -Evidence $null
+
+    # =====================================================================
+    # E10: incorrect SetId / TerminalId / WindowId do not qualify
+    # =====================================================================
+    $wrongIds = [ordered]@{}
+    foreach ($pair in @(
+            @{ n = 'wrongSetId'; p = (New-Proc -Cmd 'pwsh.exe -SetId otherset -TerminalId n2qualterm -WindowId N2QUAL-n2qualterm') },
+            @{ n = 'wrongTerminalId'; p = (New-Proc -Cmd 'pwsh.exe -SetId n2qual -TerminalId otherterm -WindowId N2QUAL-n2qualterm') },
+            @{ n = 'wrongWindowId'; p = (New-Proc -Cmd 'pwsh.exe -SetId n2qual -TerminalId n2qualterm -WindowId OTHER-win') })) {
+        $pseudo = New-Win -Hwnd '0x20340' -WinPid $pair.p.pid -Class 'PseudoConsoleWindow' -Title '' -Owner '0x99998'
+        $c = Classify -Windows @($g2Terminal, $pseudo) -Procs @($g2Procs[0], $pair.p)
+        $wrongIds[$pair.n] = ($c.Ok -eq $false -and $c.UnclassifiedCount -eq 1)
+    }
+    Add-P9HTestResult -Id 'E10' -Title 'Wrong SetId, TerminalId or WindowId never qualifies an auxiliary' `
+        -Input 'three auxiliary candidates whose owner argv carries one wrong identity field each' `
+        -Expected 'all three refused' `
+        -Actual (($wrongIds.Keys | ForEach-Object { $_ + '=' + $wrongIds[$_] }) -join ' ') `
+        -Pass (@($wrongIds.Values | Where-Object { $_ -ne $true }).Count -eq 0) -Evidence $null
+
+    # =====================================================================
+    # E11: a STALE preexisting HWND is refused by the frozen selector
+    # =====================================================================
+    # The selector is unchanged; this pins that adopting the new contract does not
+    # loosen the "newly created" requirement.
+    $staleSel = Select-P9HAttributableWindow -PreWindowHwnds @('0x50366') `
+        -AfterWindows @($g2Terminal, $g2Pseudo) -CandidatePids @(7280, 10140)
+    Add-P9HTestResult -Id 'E11' -Title 'A stale preexisting HWND is still excluded by the frozen selector' `
+        -Input 'the managed terminal HWND already present in the pre-launch inventory' `
+        -Expected 'only the pseudoconsole remains attributable' `
+        -Actual ("count={0} hwnds={1}" -f $staleSel.Count, (@($staleSel.Windows | ForEach-Object { $_.hwnd }) -join ',')) `
+        -Pass ($staleSel.Count -eq 1 -and [string]$staleSel.Windows[0].hwnd -eq '0x20330') -Evidence $null
+
+    # =====================================================================
+    # E12: a managed terminal with the WRONG title does not qualify
+    # =====================================================================
+    $wrongTitle = New-Win -Hwnd '0x50999' -Title 'not-the-window-id'
+    $e12 = Classify -Windows @($wrongTitle) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E12' -Title 'A managed-class window with the wrong title does not qualify' `
+        -Input 'CASCADIA class and WindowsTerminal owner, but a foreign windowId title' `
+        -Expected 'Ok=False, managed=0' `
+        -Actual ("ok={0} managed={1} unclassified={2}" -f $e12.Ok, $e12.ManagedTerminalCount, $e12.UnclassifiedCount) `
+        -Pass ($e12.Ok -eq $false -and $e12.ManagedTerminalCount -eq 0) -Evidence $null
+
+    # =====================================================================
+    # E13: a managed-class window owned by a NON-terminal process is refused
+    # =====================================================================
+    $wrongOwnerProc = New-Win -Hwnd '0x51000' -WinPid 6060
+    $e13 = Classify -Windows @($wrongOwnerProc) -Procs @((New-Proc -ProcId 6060 -Name 'notepad.exe' -Cmd 'notepad.exe'))
+    Add-P9HTestResult -Id 'E13' -Title 'A managed-class window owned by a non-terminal process is refused' `
+        -Input 'CASCADIA class and correct title, but the owning process is not WindowsTerminal' `
+        -Expected 'Ok=False, managed=0' `
+        -Actual ("ok={0} managed={1} unclassified={2}" -f $e13.Ok, $e13.ManagedTerminalCount, $e13.UnclassifiedCount) `
+        -Pass ($e13.Ok -eq $false -and $e13.ManagedTerminalCount -eq 0) -Evidence $null
+
+    # =====================================================================
+    # E14: MULTIPLE auxiliary candidates are all reported, count stays one
+    # =====================================================================
+    $aux2 = New-Win -Hwnd '0x20350' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x50366'
+    $e14 = Classify -Windows @($g2Terminal, $g2Pseudo, $aux2) -Procs $g2Procs
+    Add-P9HTestResult -Id 'E14' -Title 'Multiple proven auxiliary windows are all reported explicitly' `
+        -Input 'the managed terminal plus two Win32-owned pseudoconsole windows' `
+        -Expected 'managed=1, auxiliary=2, Ok=True, each with its reason' `
+        -Actual ("ok={0} managed={1} aux={2} reasons={3}" -f $e14.Ok, $e14.ManagedTerminalCount, $e14.AuxiliaryCount, (@($e14.Auxiliary | ForEach-Object { $_.hwnd + ':' + $_.reason }) -join ',')) `
+        -Pass ($e14.Ok -eq $true -and $e14.ManagedTerminalCount -eq 1 -and $e14.AuxiliaryCount -eq 2 -and
+            @($e14.Auxiliary | Where-Object { [string]::IsNullOrWhiteSpace([string]$_.reason) }).Count -eq 0) -Evidence $null
+
+    # =====================================================================
+    # E15: ambiguous ownership - a pseudoconsole owned by TWO managed windows
+    # =====================================================================
+    # GW_OWNER names one managed HWND but the set contains two; the classifier
+    # must not silently pick one.
+    $mgA = New-Win -Hwnd '0x60010' -WinPid 9001 -Title 'OTHER-win'
+    $ownedByMany = New-Win -Hwnd '0x20360' -WinPid 10140 -Class 'PseudoConsoleWindow' -Title '' -Owner '0x60010'
+    $e15 = Classify -Windows @($g2Terminal, $mgA, $ownedByMany) -Procs @($g2Procs[0], (New-Proc -ProcId 9001 -Cmd 'wt -w OTHER-win'), $g2Procs[1])
+    Add-P9HTestResult -Id 'E15' -Title 'Ambiguous ownership is reported, never silently resolved' `
+        -Input 'two managed-class windows and an auxiliary owned by one of them' `
+        -Expected 'Ok=False because the managed count is 2; auxiliary still classified with its reason' `
+        -Actual ("ok={0} managed={1} aux={2} unclassified={3}" -f $e15.Ok, $e15.ManagedTerminalCount, $e15.AuxiliaryCount, $e15.UnclassifiedCount) `
+        -Pass ($e15.Ok -eq $false -and $e15.ManagedTerminalCount -eq 1 -and $e15.UnclassifiedCount -ge 1) -Evidence $null
+
+    # =====================================================================
+    # E16-E19: the contract switch cannot weaken the OTHER N2-B predicates
+    # =====================================================================
+    # A full synthetic trial, evaluated under BOTH contracts, proving the switch
+    # touches ONLY the window-identity domain.
+    $tid = 'e-managed-trial'
+    $fxPath = Join-Path $dir 'fixture.json'
+    Write-P9HArtifact -Path $fxPath -Lines @(([ordered]@{
+                itemId = $terminalId; enabledItems = 1; enabledTerminals = 1; totalItems = 1
+                anchorAbsent = $true; layoutFallback = [ordered]@{ x = 9000; y = 9000; w = 640; h = 400 }
+            } | ConvertTo-Json -Depth 4))
+
+    function New-Trace([string]$Path, [switch]$NoSkip, [switch]$NoFinal, [switch]$Uncertain, [int]$EndUtc = 1040) {
+        $planSkipped = if ($NoSkip) { @() } else { @($terminalId) }
+        $null = Add-P9HArtifactLine -Path $Path -Line ((@{ event = 'lifecycle-layout-plan'; utcMs = 1000; set = $setId; skipped = $planSkipped } | ConvertTo-Json -Compress))
+        $null = Add-P9HArtifactLine -Path $Path -Line ((@{ event = 'transaction-start'; utcMs = 1010; set = $setId } | ConvertTo-Json -Compress))
+        $null = Add-P9HArtifactLine -Path $Path -Line ((@{ event = 'stage2-broker-ready'; utcMs = 1020; set = $setId; planId = 'deadbeefcafe' } | ConvertTo-Json -Compress))
+        if (-not $NoFinal) {
+            $null = Add-P9HArtifactLine -Path $Path -Line ((@{ event = 'stage2-terminal-final'; utcMs = 1030; set = $setId; finalized = 1; failures = 0 } | ConvertTo-Json -Compress))
+        }
+        $null = Add-P9HArtifactLine -Path $Path -Line ((@{ event = 'transaction-end'; utcMs = $EndUtc; set = $setId; broker = (-not $Uncertain); uncertain = [bool]$Uncertain; failures = @() } | ConvertTo-Json -Compress))
+    }
+    function New-Exit([string]$Path, [int]$Code = 0, [string]$Trial = $tid) {
+        Write-P9HArtifact -Path $Path -Lines @(([ordered]@{
+                    trialId = $Trial; schema = 'p9h.exit-record.v1'; sequence = 1; outcome = 'exited'; exitCode = $Code
+                    launcherPid = 7000; launcherPath = 'C:\Windows\System32\cmd.exe'
+                    launchedAtUtc = '2026-11-14T18:06:00.0000000Z'; exitedAtUtc = '2026-11-14T18:06:09.0000000Z'
+                } | ConvertTo-Json -Depth 4))
+    }
+    function New-WindowInventory([string]$Path, [object[]]$Windows) {
+        Write-P9HArtifact -Path $Path -Lines @(([ordered]@{ Windows = @($Windows) } | ConvertTo-Json -Depth 6))
+    }
+    # Bind a VARIANT of the shared trial (a different trace and/or stdout) under its
+    # own index, so a case that varies one artifact tests the predicate it names
+    # rather than reporting an unrelated binding gap.
+    function Write-VariantIndex {
+        param(
+            [string]$Name,
+            [string]$TraceOverride = $null,
+            [string]$StdoutOverride = $null,
+            [string]$PostOverride = $null,
+            [string]$NewProcessOverride = $null
+        )
+        $vctx = New-P9HTrialContext -RootDirectory (Join-Path $SandboxRoot $Name) -TrialId $tid -Kind n2
+        $roles = [ordered]@{
+            'fixture'       = $fxPath
+            'stdout'        = $(if ([string]::IsNullOrWhiteSpace($StdoutOverride)) { $soPath } else { $StdoutOverride })
+            'pre-windows'   = $prePath
+            'post-windows'  = $(if ([string]::IsNullOrWhiteSpace($PostOverride)) { $postPath } else { $PostOverride })
+            'exit-record'   = $exitPath
+            'new-processes' = $(if ([string]::IsNullOrWhiteSpace($NewProcessOverride)) { $npPath } else { $NewProcessOverride })
+            'trace'         = $(if ([string]::IsNullOrWhiteSpace($TraceOverride)) { $tracePath } else { $TraceOverride })
+        }
+        foreach ($r in $roles.Keys) { $null = Add-P9HArtifactRole -Context $vctx -Path $roles[$r] -Role $r }
+        $null = Write-P9HArtifactIndex -Context $vctx
+        return (Join-Path $vctx.Directory 'artifact-index.jsonl')
+    }
+
+    function New-NewProcs([string]$Path) {
+        $rows = @()
+        foreach ($p in $g2Procs) {
+            $rows += [ordered]@{
+                pid = $p.pid; ppid = $p.ppid; name = $p.name; sessionId = $p.sessionId
+                startUtc = $p.startUtc; startSource = 'datetime'
+                commandLine = $p.commandLine; commandLength = $p.commandLength
+            }
+        }
+        Write-P9HArtifact -Path $Path -Lines @(([ordered]@{ AddedCount = $rows.Count; Added = @($rows) } | ConvertTo-Json -Depth 6))
+    }
+
+    $soPath = Join-Path $dir 'stdout.txt'
+    Write-P9HArtifact -Path $soPath -Lines @("n2qual/n2qualterm: relative layout has no reachable placement (anchor-target-and-fallback-unreachable); the item will be handled normally but its window position will not be changed.")
+    $prePath = Join-Path $dir 'pre.json'
+    New-WindowInventory $prePath @([ordered]@{ hwnd = '0x100'; pid = 5732; visible = $true; class = 'Shell_TrayWnd'; x = 0; y = 0; width = 10; height = 10; owner = '0x0'; title = 'tray' })
+    $postPath = Join-Path $dir 'post.json'
+    New-WindowInventory $postPath @(
+        [ordered]@{ hwnd = '0x100'; pid = 5732; visible = $true; class = 'Shell_TrayWnd'; x = 0; y = 0; width = 10; height = 10; owner = '0x0'; title = 'tray' }
+        [ordered]@{ hwnd = '0x50366'; pid = 7280; visible = $true; class = $managedClass; x = 18; y = 26; width = 1129; height = 635; owner = '0x0'; title = $windowId }
+        [ordered]@{ hwnd = '0x20330'; pid = 10140; visible = $true; class = 'PseudoConsoleWindow'; x = 0; y = 0; width = 16; height = 16; owner = '0x50366'; title = '' }
+    )
+    $tracePath = Join-Path $dir 'trace.jsonl'
+    New-Trace -Path $tracePath
+    $exitPath = Join-Path $dir 'exit.json'
+    New-Exit -Path $exitPath
+    $npPath = Join-Path $dir 'new-processes.json'
+    New-NewProcs $npPath
+
+    # Bind the shared trial so these cases exercise the IDENTITY domain rather
+    # than repeating an unrelated artifact-binding gap.
+    $sharedCtx = New-P9HTrialContext -RootDirectory (Join-Path $SandboxRoot 'e-shared') -TrialId $tid -Kind n2
+    foreach ($r in @(
+            @{ role = 'fixture'; path = $fxPath }
+            @{ role = 'stdout'; path = $soPath }
+            @{ role = 'pre-windows'; path = $prePath }
+            @{ role = 'post-windows'; path = $postPath }
+            @{ role = 'exit-record'; path = $exitPath }
+            @{ role = 'new-processes'; path = $npPath }
+            @{ role = 'trace'; path = $tracePath })) {
+        $null = Add-P9HArtifactRole -Context $sharedCtx -Path $r.path -Role $r.role
+    }
+    $null = Write-P9HArtifactIndex -Context $sharedCtx
+    $sharedIndex = Join-Path $sharedCtx.Directory 'artifact-index.jsonl'
+
+    function Invoke-Verdict([string]$Contract) {
+        return Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+            -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+            -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+            -ArtifactIndexPath $sharedIndex -WindowIdentityContract $Contract
+    }
+    $vRaw = Invoke-Verdict 'RawAttributedHwndsV1'
+    $vMg = Invoke-Verdict 'ManagedTerminalV1'
+
+    Add-P9HTestResult -Id 'E16' -Title 'The contract switch is the ONLY difference between the two verdicts' `
+        -Input 'the identical synthetic trial evaluated under both contracts' `
+        -Expected 'historical N2-B INCONCLUSIVE, managed-terminal N2-B PASS, N2-A PASS in both' `
+        -Actual ("raw: n2b={0} reason={1} | managed: n2b={2} identities={3} | n2a={4}/{5}" -f
+            $vRaw.N2B.Verdict, $vRaw.N2B.IdentityConsistencyReason, $vMg.N2B.Verdict, $vMg.N2B.IdentityConsistent,
+            $vRaw.N2A.Verdict, $vMg.N2A.Verdict) `
+        -Pass ($vRaw.N2B.Verdict -eq 'INCONCLUSIVE' -and $vRaw.N2B.IdentityConsistencyReason -eq 'attributed-window-count-not-one:2' -and
+            $vMg.N2B.Verdict -eq 'PASS' -and $vMg.N2B.IdentityConsistent -eq $true -and
+            $vRaw.N2A.Verdict -eq 'PASS' -and $vMg.N2A.Verdict -eq 'PASS') -Evidence $dir
+
+    # E17: a nonzero launcher exit still blocks BOTH contracts
+    $exitBad = Join-Path $dir 'exit-nonzero.json'
+    New-Exit -Path $exitBad -Code 1
+    $blocked = [ordered]@{}
+    foreach ($c in @('RawAttributedHwndsV1', 'ManagedTerminalV1')) {
+        $v = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+            -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitBad -NewProcessPath $npPath `
+            -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+            -ArtifactIndexPath $sharedIndex -WindowIdentityContract $c
+        $blocked[$c] = ($v.N2B.Verdict -eq 'FAIL' -and (@($v.N2B.Reasons) -join ';') -match 'exit-code-nonzero')
+    }
+    Add-P9HTestResult -Id 'E17' -Title 'A nonzero launcher exit still blocks N2-B under BOTH contracts' `
+        -Input 'the same trial with exitCode=1' -Expected 'FAIL under both, reason exit-code-nonzero' `
+        -Actual (($blocked.Keys | ForEach-Object { $_ + '=' + $blocked[$_] }) -join ' ') `
+        -Pass (@($blocked.Values | Where-Object { $_ -ne $true }).Count -eq 0) -Evidence $dir
+
+    # E18: a missing placement skip still blocks BOTH contracts
+    $traceNoSkip = Join-Path $dir 'trace-noskip.jsonl'
+    New-Trace -Path $traceNoSkip -NoSkip
+    # Bind THIS variant so an artifact-binding gap cannot be mistaken for the skip.
+    $noSkipIndex = (Write-VariantIndex -Name 'e-noskip' -TraceOverride $traceNoSkip -StdoutOverride $null)
+    $blocked = [ordered]@{}
+    foreach ($contract in @('RawAttributedHwndsV1', 'ManagedTerminalV1')) {
+        $v = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $traceNoSkip -StdoutPath $soPath `
+            -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+            -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+            -ArtifactIndexPath $noSkipIndex -WindowIdentityContract $contract
+        $blocked[$contract] = ($v.N2A.Verdict -ne 'PASS' -and $v.N2B.Verdict -ne 'PASS' -and
+            (@($v.N2A.Reasons) -join ';') -match 'item-not-in-skipped-set')
+    }
+    Add-P9HTestResult -Id 'E18' -Title 'A missing placement skip still blocks N2-A and N2-B under BOTH contracts' `
+        -Input 'the lifecycle trace reports no skipped item' `
+        -Expected 'neither contract reaches PASS; the missing skip is the recorded reason' `
+        -Actual (($blocked.Keys | ForEach-Object { $_ + '=' + $blocked[$_] }) -join ' ') `
+        -Pass (@($blocked.Values | Where-Object { $_ -ne $true }).Count -eq 0) -Evidence $dir
+
+    # E19: a missing warning still blocks N2-A under BOTH contracts
+    $soNoWarn = Join-Path $dir 'stdout-nowarn.txt'
+    Write-P9HArtifact -Path $soNoWarn -Lines @("Workspace 'n2qual' restored.")
+    $noWarnIndex = (Write-VariantIndex -Name 'e-nowarn' -TraceOverride $null -StdoutOverride $soNoWarn)
+    $blocked = [ordered]@{}
+    foreach ($contract in @('RawAttributedHwndsV1', 'ManagedTerminalV1')) {
+        $v = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soNoWarn `
+            -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+            -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+            -ArtifactIndexPath $noWarnIndex -WindowIdentityContract $contract
+        $blocked[$contract] = ($v.N2A.Verdict -ne 'PASS' -and (@($v.N2A.Reasons) -join ';') -match 'deterministic-warning-absent')
+    }
+    Add-P9HTestResult -Id 'E19' -Title 'A missing deterministic warning still blocks N2-A under BOTH contracts' `
+        -Input 'stdout without the placement-skip warning' -Expected 'not PASS under either contract' `
+        -Actual (($blocked.Keys | ForEach-Object { $_ + '=' + $blocked[$_] }) -join ' ') `
+        -Pass (@($blocked.Values | Where-Object { $_ -ne $true }).Count -eq 0) -Evidence $dir
+
+    # E20-E21: missing finalization and tampered binding still block
+    $traceNoFinal = Join-Path $dir 'trace-nofinal.jsonl'
+    New-Trace -Path $traceNoFinal -NoFinal
+    $vF = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $traceNoFinal -StdoutPath $soPath `
+        -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+        -ArtifactIndexPath $sharedIndex -WindowIdentityContract 'ManagedTerminalV1'
+    Add-P9HTestResult -Id 'E20' -Title 'Missing lifecycle finalization still blocks N2-B under the corrected contract' `
+        -Input 'a trace with no stage2-terminal-final event' -Expected 'not PASS' `
+        -Actual ("n2b={0} reasons={1}" -f $vF.N2B.Verdict, (@($vF.N2B.Reasons) -join ';')) `
+        -Pass ($vF.N2B.Verdict -ne 'PASS') -Evidence $dir
+
+    # tampered binding: bind, then append a byte to a bound artifact.
+    #
+    # The context is created under the EVALUATED trial id ($tid) in its own root,
+    # because the verdict binds artifacts BY TRIAL ID: binding under
+    # "$tid-bind" would make every role a trial mismatch and the case would
+    # report `binding-mismatch:trial=...` instead of the digest tamper it names.
+    $ctx = New-P9HTrialContext -RootDirectory (Join-Path $SandboxRoot 'e-tamper') -TrialId $tid -Kind n2
+    $bindRoles = [ordered]@{
+        'fixture' = $fxPath; 'stdout' = $soPath; 'pre-windows' = $prePath
+        'post-windows' = $postPath; 'exit-record' = $exitPath; 'new-processes' = $npPath; 'trace' = $tracePath
+    }
+    foreach ($r in $bindRoles.Keys) { $null = Add-P9HArtifactRole -Context $ctx -Path $bindRoles[$r] -Role $r }
+    $null = Write-P9HArtifactIndex -Context $ctx
+    $idx = Join-Path $ctx.Directory 'artifact-index.jsonl'
+    $vOk = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+        -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+        -ArtifactIndexPath $idx -WindowIdentityContract 'ManagedTerminalV1'
+    $origStdout = [IO.File]::ReadAllText($soPath)
+    [IO.File]::WriteAllText($soPath, $origStdout + "tampered`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    $vBad = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+        -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
+        -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+        -ArtifactIndexPath $idx -WindowIdentityContract 'ManagedTerminalV1'
+    [IO.File]::WriteAllText($soPath, $origStdout, (New-Object System.Text.UTF8Encoding($false)))
+    Add-P9HTestResult -Id 'E21' -Title 'A tampered artifact still blocks N2-B under the corrected contract' `
+        -Input 'bound trial, then one role appended to and re-evaluated' `
+        -Expected 'verified -> PASS, tampered -> not PASS' `
+        -Actual ("verified={0} tampered={1} reason={2}" -f $vOk.N2B.Verdict, $vBad.N2B.Verdict,
+            (@($vBad.N2B.Reasons) -join ';')) `
+        -Pass ($vOk.N2B.Verdict -eq 'PASS' -and $vBad.N2B.Verdict -ne 'PASS' -and
+            (@($vBad.N2B.Reasons) -join ';') -match 'artifact-binding') -Evidence $ctx.Directory
+
+    # E22: previously accepted single-window fixtures remain valid under BOTH
+    #
+    # This is a GENUINE single-attributed-window trial: the only new visible
+    # top-level window is the managed terminal itself (no pseudoconsole). It is the
+    # historical contract's accepted shape, so the corrected contract must not
+    # regress it. (Evaluating the two-window trial here would be E16, not E22.)
+    $singlePost = Join-Path $dir 'post-single.json'
+    New-WindowInventory $singlePost @(
+        [ordered]@{ hwnd = '0x100'; pid = 5732; visible = $true; class = 'Shell_TrayWnd'; x = 0; y = 0; width = 10; height = 10; owner = '0x0'; title = 'tray' }
+        [ordered]@{ hwnd = '0x50366'; pid = 7280; visible = $true; class = $managedClass; x = 18; y = 26; width = 1129; height = 635; owner = '0x0'; title = $windowId }
+    )
+    $singleNp = Join-Path $dir 'new-processes-single.json'
+    Write-P9HArtifact -Path $singleNp -Lines @(([ordered]@{
+                AddedCount = 1
+                Added      = @([ordered]@{
+                        pid = 7280; ppid = 5732; name = 'WindowsTerminal.exe'; sessionId = 2
+                        startUtc = '2026-11-14T18:06:08.5000000Z'; startSource = 'datetime'
+                        commandLine = $g2Procs[0].commandLine; commandLength = $g2Procs[0].commandLength
+                    })
+            } | ConvertTo-Json -Depth 6))
+    $singleIndex = (Write-VariantIndex -Name 'e-single' -PostOverride $singlePost -NewProcessOverride $singleNp)
+
+    $verdicts = [ordered]@{}
+    foreach ($contract in @('RawAttributedHwndsV1', 'ManagedTerminalV1')) {
+        $v = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
+            -PreWindowPath $prePath -PostWindowPath $singlePost -ExitRecordPath $exitPath -NewProcessPath $singleNp `
+            -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
+            -ArtifactIndexPath $singleIndex -WindowIdentityContract $contract
+        $verdicts[$contract] = [pscustomobject]@{
+            N2A = $v.N2A.Verdict; N2B = $v.N2B.Verdict
+            Raw = $v.N2B.RawAttributedHwndCount; Managed = $v.N2B.ManagedTerminalCount
+        }
+    }
+    Add-P9HTestResult -Id 'E22' -Title 'A previously accepted single-window trial remains valid under both contracts' `
+        -Input 'a trial whose ONLY attributed window is the managed terminal, bound and evaluated twice' `
+        -Expected 'N2-A and N2-B PASS under BOTH contracts' `
+        -Actual (($verdicts.Keys | ForEach-Object {
+                    '{0}: n2a={1} n2b={2} raw={3} managed={4}' -f $_, $verdicts[$_].N2A, $verdicts[$_].N2B, $verdicts[$_].Raw, $verdicts[$_].Managed
+                }) -join ' | ') `
+        -Pass ($verdicts['RawAttributedHwndsV1'].N2A -eq 'PASS' -and $verdicts['RawAttributedHwndsV1'].N2B -eq 'PASS' -and
+            $verdicts['ManagedTerminalV1'].N2A -eq 'PASS' -and $verdicts['ManagedTerminalV1'].N2B -eq 'PASS' -and
+            $verdicts['ManagedTerminalV1'].Managed -eq 1) -Evidence $dir
+}
+
+
+function Invoke-P9HParameterBindingTests {
+    # I-series: PowerShell parameter-binding regressions (Stage 3B7G3).
+    #
+    # WHY THIS EXISTS
+    # ---------------
+    # Stage 3B7G2 lost four consecutive launch attempts to a construct equivalent
+    # to:
+    #
+    #     [Parameter(Mandatory)][string]$SettleSeconds = '10'
+    #
+    # A Mandatory parameter makes the default value UNREACHABLE, and when the host
+    # leaves stdin open but empty the binder blocks on an interactive prompt
+    # BEFORE the script body runs. Nothing is written, no artifact appears and no
+    # cmd/trace/exit-record is produced, so the failure looks like a product fault
+    # while it is entirely a harness defect.
+    #
+    # These cases pin both halves: the LANGUAGE BEHAVIOUR (so the rationale cannot
+    # be mistaken for folklore) and an AST SCAN over the stage's own scripts (so
+    # the defect cannot silently return).
+    param([Parameter(Mandatory)][string]$SandboxRoot)
+
+    $dir = Join-Path $SandboxRoot 'i-binding'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+
+    # ------------------------------------------------------------ probes
+    # Every probe is Task-owned and lives in the sandbox.
+    $mandatoryWithDefault = Join-Path $dir 'mandatory-with-default.ps1'
+    Write-P9HArtifact -Path $mandatoryWithDefault -Lines @(
+        'param('
+        "    [Parameter(Mandatory)][string]`$SettleSeconds = '10'"
+        ')'
+        '"  BODY-Settle=$SettleSeconds"'
+    )
+
+    $optionalWithDefault = Join-Path $dir 'optional-with-default.ps1'
+    Write-P9HArtifact -Path $optionalWithDefault -Lines @(
+        'param('
+        "    [string]`$SettleSeconds = '10'"
+        ')'
+        '"  BODY-Settle=$SettleSeconds"'
+    )
+
+    $mandatoryWithoutDefault = Join-Path $dir 'mandatory-no-default.ps1'
+    Write-P9HArtifact -Path $mandatoryWithoutDefault -Lines @(
+        'param('
+        '    [Parameter(Mandatory)][string]$SettleSeconds'
+        ')'
+        '"  BODY-Settle=$SettleSeconds"'
+    )
+
+    $exe = (Get-Process -Id $PID).Path
+    if ([string]::IsNullOrWhiteSpace($exe)) { $exe = 'pwsh.exe' }
+
+    # Build a ProcessStartInfo that works on BOTH hosts. `ArgumentList` is a
+    # .NET Core / PowerShell 7-only property; Windows PowerShell 5.1 only has the
+    # single `Arguments` string. Quoting each token here is exact because every
+    # token is a bare path or switch with no embedded quote.
+    function New-ProbeStartInfo {
+        param([string[]]$Argv)
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $exe
+        $hasArgumentList = $null -ne $psi.PSObject.Properties['ArgumentList']
+        if ($hasArgumentList) {
+            foreach ($a in $Argv) { $psi.ArgumentList.Add($a) }
+        }
+        else {
+            $psi.Arguments = (($Argv | ForEach-Object {
+                        if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+                    }) -join ' ')
+        }
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        return $psi
+    }
+
+    # Run a probe with stdin REDIRECTED BUT OPEN AND EMPTY - the exact shape that
+    # hung Stage 3B7G2 - and report whether the body was reached or the binder
+    # blocked on a prompt.
+    function Invoke-Probe {
+        param([string]$Path, [int]$TimeoutSeconds = 20)
+        $psi = New-ProbeStartInfo -Argv @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Path)
+        $proc = [System.Diagnostics.Process]::Start($psi)
+        # Deliberately DO NOT close stdin: an open empty pipe is what prompts.
+        $finished = $proc.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $finished) { try { $proc.Kill() } catch { } }
+        $out = ''
+        $err = ''
+        try { $out = $proc.StandardOutput.ReadToEnd() } catch { }
+        try { $err = $proc.StandardError.ReadToEnd() } catch { }
+        return [pscustomobject]@{
+            BodyReached = ($out -match 'BODY-Settle=')
+            Prompted    = (-not $finished) -or ($err -match 'missing mandatory parameter')
+            TimedOut    = (-not $finished)
+            ExitCode    = if ($finished) { $proc.ExitCode } else { $null }
+            Stdout      = $out.Trim()
+            Stderr      = $err.Trim()
+        }
+    }
+
+    # =====================================================================
+    # I1: Mandatory + default does NOT apply the default and can block
+    # =====================================================================
+    $r1 = Invoke-Probe -Path $mandatoryWithDefault
+    Add-P9HTestResult -Id 'I1' -Title 'A Mandatory parameter with a default value never uses that default' `
+        -Input 'param([Parameter(Mandatory)][string]$SettleSeconds = "10") invoked with no argument, stdin open and empty' `
+        -Expected 'the default is unreachable: the body is not reached (prompt or fast mandatory failure)' `
+        -Actual ("bodyReached={0} prompted={1} timedOut={2} exited={3}" -f $r1.BodyReached, $r1.Prompted, $r1.TimedOut, $r1.ExitCode) `
+        -Pass ($r1.BodyReached -eq $false) -Evidence $dir
+
+    # =====================================================================
+    # I2: the same script WITH the argument supplied does run
+    # =====================================================================
+    $psi = New-ProbeStartInfo -Argv @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $mandatoryWithDefault, '-SettleSeconds', '3')
+    $psi.RedirectStandardInput = $false
+    $p2 = [System.Diagnostics.Process]::Start($psi)
+    $f2 = $p2.WaitForExit(20000)
+    $so2 = ''
+    if ($f2) { $so2 = $p2.StandardOutput.ReadToEnd().Trim() } else { try { $p2.Kill() } catch { } }
+    Add-P9HTestResult -Id 'I2' -Title 'Supplying the Mandatory argument reaches the body and honours the value' `
+        -Input 'the same script invoked with -SettleSeconds 3' `
+        -Expected 'body runs and reports SettleSeconds=3' `
+        -Actual ("bodyReached={0} stdout=[{1}]" -f ($so2 -match 'BODY-Settle=3'), $so2) `
+        -Pass ($so2 -match 'BODY-Settle=3') -Evidence $dir
+
+    # =====================================================================
+    # I3: OPTIONAL with a default is the correct shape - no prompt, default used
+    # =====================================================================
+    $r3 = Invoke-Probe -Path $optionalWithDefault
+    Add-P9HTestResult -Id 'I3' -Title 'An optional parameter with a default stays non-mandatory and applies its default' `
+        -Input 'param([string]$SettleSeconds = "10") invoked with no argument, stdin open and empty' `
+        -Expected 'body runs immediately with SettleSeconds=10, no prompt' `
+        -Actual ("bodyReached={0} prompted={1} stdout=[{2}]" -f $r3.BodyReached, $r3.Prompted, $r3.Stdout) `
+        -Pass ($r3.BodyReached -eq $true -and $r3.Prompted -eq $false -and $r3.Stdout -match 'BODY-Settle=10') -Evidence $dir
+
+    # =====================================================================
+    # I4: a TRULY mandatory parameter has no misleading default
+    # =====================================================================
+    $r4 = Invoke-Probe -Path $mandatoryWithoutDefault
+    Add-P9HTestResult -Id 'I4' -Title 'A truly Mandatory parameter without a default fails closed rather than inventing a value' `
+        -Input 'param([Parameter(Mandatory)][string]$SettleSeconds) invoked with no argument' `
+        -Expected 'the body never runs and no fabricated value is used' `
+        -Actual ("bodyReached={0} exited={1}" -f $r4.BodyReached, $r4.ExitCode) `
+        -Pass ($r4.BodyReached -eq $false) -Evidence $dir
+
+    # =====================================================================
+    # I5: AST scan of the STAGE'S OWN scripts
+    # =====================================================================
+    # Only qualification/p9h/ is scanned: this correction is qualification-only
+    # and must not rewrite unrelated product source.
+    $stageRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+    $scanned = @(Get-ChildItem -LiteralPath $stageRoot -Recurse -Filter *.ps1 -File -ErrorAction SilentlyContinue)
+    $offenders = [System.Collections.Generic.List[string]]::new()
+    $mandatorySeen = 0
+    $optionalSeen = 0
+
+    foreach ($file in $scanned) {
+        $parseErrors = $null
+        $tokens = $null
+        try {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors)
+        }
+        catch { continue }
+        if ($null -eq $ast) { continue }
+
+        foreach ($p in $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ParameterAst] }, $true)) {
+            $isMandatory = $false
+            foreach ($attr in $p.Attributes) {
+                if ($attr -isnot [System.Management.Automation.Language.AttributeAst]) { continue }
+                if ($attr.TypeName.Name -notmatch '^Parameter') { continue }
+                foreach ($na in @($attr.NamedArguments)) {
+                    if ($null -ne $na -and $na.ArgumentName -eq 'Mandatory') { $isMandatory = $true }
+                }
+                foreach ($pa in @($attr.PositionalArguments)) {
+                    if ($null -ne $pa -and $pa.Extent.Text -match '^\$true$') { $isMandatory = $true }
+                }
+            }
+            if ($null -ne $p.DefaultValue) {
+                if ($isMandatory) {
+                    $offenders.Add(('{0}:{1}:${2}' -f $file.Name, $p.Extent.StartLineNumber, $p.Name.VariablePath.UserPath)) | Out-Null
+                }
+                else { $optionalSeen++ }
+            }
+            elseif ($isMandatory) { $mandatorySeen++ }
+        }
+    }
+
+    Add-P9HTestResult -Id 'I5' -Title 'No stage-owned script declares a Mandatory parameter that also carries a default' `
+        -Input ("AST scan of {0} scripts under qualification/p9h ({1} optional-with-default, {2} mandatory-without-default)" -f $scanned.Count, $optionalSeen, $mandatorySeen) `
+        -Expected 'zero Mandatory+default parameters' `
+        -Actual $(if ($offenders.Count -eq 0) { '0 offenders' } else { ($offenders -join ' | ') }) `
+        -Pass ($offenders.Count -eq 0 -and $scanned.Count -gt 0) -Evidence $stageRoot
+
+    # =====================================================================
+    # I6: the scan actually DETECTS the defect (a scan that cannot fail is worthless)
+    # =====================================================================
+    $canary = Join-Path $dir 'canary-mandatory-default.ps1'
+    Write-P9HArtifact -Path $canary -Lines @(
+        'param('
+        "    [Parameter(Mandatory)][string]`$SettleSeconds = '10'"
+        ')'
+        '"ok"'
+    )
+    $canaryErrors = $null
+    $canaryTokens = $null
+    $canaryAst = [System.Management.Automation.Language.Parser]::ParseFile($canary, [ref]$canaryTokens, [ref]$canaryErrors)
+    $canaryHits = 0
+    foreach ($p in $canaryAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.ParameterAst] }, $true)) {
+        $isMandatory = $false
+        foreach ($attr in $p.Attributes) {
+            if ($attr -isnot [System.Management.Automation.Language.AttributeAst]) { continue }
+            if ($attr.TypeName.Name -notmatch '^Parameter') { continue }
+            foreach ($na in @($attr.NamedArguments)) { if ($null -ne $na -and $na.ArgumentName -eq 'Mandatory') { $isMandatory = $true } }
+            foreach ($pa in @($attr.PositionalArguments)) { if ($null -ne $pa -and $pa.Extent.Text -match '^\$true$') { $isMandatory = $true } }
+        }
+        if ($isMandatory -and $null -ne $p.DefaultValue) { $canaryHits++ }
+    }
+    Add-P9HTestResult -Id 'I6' -Title 'The parser scan detects the defect it is meant to prevent' `
+        -Input 'a canary script containing the exact G2 construct' `
+        -Expected 'the scan reports 1 offender' `
+        -Actual ("offenders={0}" -f $canaryHits) `
+        -Pass ($canaryHits -eq 1) -Evidence $dir
+}
+
 function Invoke-P9HAllSelfTests {
     # Entry point. Returns the result list and exits non-zero on any failure.
     #
@@ -5069,14 +5817,16 @@ function Invoke-P9HAllSelfTests {
     Invoke-P9HHostBoundaryTests -SandboxRoot $SandboxRoot
     Invoke-P9HAtomicArtifactTests -SandboxRoot $SandboxRoot
     Invoke-P9HRelaunchTests -SandboxRoot $SandboxRoot
+    Invoke-P9HManagedTerminalContractTests -SandboxRoot $SandboxRoot
+    Invoke-P9HParameterBindingTests -SandboxRoot $SandboxRoot
 
     $results = @($script:P9HTestResults)
 
     # The registry report is NOT one of the registered cases; it is the guard's
     # own verdict, so its id is computed and is deliberately not a source literal.
     $registryReportId = 'R1'
-    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 274 `
-        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R')
+    $registry = Test-P9HTestRegistry -Results $results -ExpectedCount 303 `
+        -RequiredSeries @('T', 'O', 'A', 'F', 'V', 'N', 'W', 'X', 'M', 'P', 'Q', 'K', 'Y', 'B', 'S', 'U', 'G', 'D', 'L', 'C', 'Z', 'H', 'J', 'R', 'E', 'I')
 
     if (-not $registry.Ok) {
         Add-P9HTestResult -Id $registryReportId -Title 'Registered test registry is complete and unique' `

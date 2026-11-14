@@ -894,6 +894,136 @@ token checked first; pinning preserved; and no `tsdiscon` process created.
 The canonical suite is 261/261 PASS (260 registered cases plus `R1`).
 
 ---
+## Stage 3B7G3: N2-B window identity contract adjudication (offline)
+
+Stage 3B7G2 completed an installed-product N2 launch with exit code 0, a valid
+placement-skip warning, N2-A PASS and full broker lifecycle, yet N2-B returned
+INCONCLUSIVE with
+
+`window-identity-inconsistent-with-plan:attributed-window-count-not-one:2`
+
+Two newly attributed top-level HWNDs were observed. This stage adjudicates that
+discrepancy **offline**. No VM was booted, no RDP session was opened, no product
+was launched and no `tsdiscon` was issued; the retained G2 artifacts were re-read
+byte-identically and the original verdict was preserved exactly.
+
+### What the product actually considers a managed terminal window
+
+The product does not identify its terminal windows by PID association.
+`src/native/devws-terminal-candidates.cs` enumerates them by **exact window
+class**, `CASCADIA_HOSTING_WINDOW_CLASS`, compared ordinally, and
+`src/lib/devws-identity.ps1` additionally requires the owning process to be
+`WindowsTerminal` and the UI-Automation tab names to form a canonical title
+family for the pinned `windowId`.
+
+The historical N2-B cardinality rule counted something different: **every** new
+visible top-level HWND owned by an attributed PID, of any class. Those two
+definitions are not equivalent, and the difference is exactly what G2 measured.
+
+### The two G2 windows
+
+| HWND | Class | Owning process | Rectangle | `GW_OWNER` | Role |
+| --- | --- | --- | --- | --- | --- |
+| `0x50366` | `CASCADIA_HOSTING_WINDOW_CLASS` | `WindowsTerminal.exe` pid 7280 | 1129x635 | `0x0` | **managed terminal** |
+| `0x20330` | `PseudoConsoleWindow` | `pwsh.exe` pid 10140 | 16x16 | **`0x50366`** | **auxiliary** |
+
+The classification is not based on the class name or the 16x16 rectangle. It
+rests on the retained Win32 `GW_OWNER` link from `0x20330` to `0x50366`, which is
+an independent ownership fact recorded by `GetWindow(hwnd, GW_OWNER)`.
+
+### Contract revision, versioned and opt-in
+
+`Get-P9HN2Verdicts` now takes `-WindowIdentityContract`:
+
+| Contract | N2-B identity requirement |
+| --- | --- |
+| `RawAttributedHwndsV1` (default) | exactly one newly attributed visible top-level HWND of any class - the historical rule, unchanged |
+| `ManagedTerminalV1` (opt-in) | exactly one window matching the product's managed-terminal contract, and every other attributed window must be **positively proven auxiliary** |
+
+The default is deliberately the historical rule, so no existing verdict silently
+changes meaning. `ManagedTerminalV1` is a correction to the measured identity
+domain, not a weakening of lifecycle completion:
+
+- the managed terminal count must still be **exactly one**;
+- an auxiliary window is accepted only via a Win32 `GW_OWNER` link to that one
+  managed window, and an owning-process argv naming a different `windowId`
+  disqualifies it;
+- anything not positively proven - an unproven second Cascadia window, an
+  unresolvable owner, a foreign-session window - is `unclassified` and fails
+  closed;
+- it is **not** `Count -ge 1`, and **not** a class-name exclusion list.
+
+A window's owning process must resolve from the attributed process inventory, so
+window identity is evidence rather than assumption.
+
+### Enumeration order is not evidence
+
+The first implementation resolved ownership while walking the window list, and
+the retained G2 evidence proved that wrong: the post inventory lists `0x20330`
+**before** `0x50366`, so a correct auxiliary was reported `unclassified` purely
+because its owner had not been seen yet. Classification is now two passes -
+collect every managed terminal first, then judge auxiliaries against the complete
+managed set. `E2b` pins this by evaluating both orders and requiring identical
+results.
+
+### Offline replay of the retained G2 evidence
+
+The eight artifacts were restored byte-identically to the exact paths the
+unmodified `artifact-index.jsonl` binds (that directory had been cleaned up after
+the package was frozen), each verified by SHA-256 first. The index was used
+without modification.
+
+| Evaluation | N2-A | N2-B | Reason |
+| --- | --- | --- | --- |
+| Historical `RawAttributedHwndsV1` | PASS | **INCONCLUSIVE** | `attributed-window-count-not-one:2` |
+| Revised `ManagedTerminalV1` | PASS | **PASS** | none - all predicates true |
+
+Under the revised contract all eight artifact roles verify, the trial identity
+matches, exit is `exited` code 0, process and window attribution succeed, the
+broker is ready, terminal finalization records zero failures, and exactly one
+managed terminal (`0x50366`, pid 7280) was created with one proven auxiliary
+(`0x20330`). The package digests were re-verified after the replay and are
+unchanged.
+
+### Test coverage (E1-E22, E2b, I1-I6)
+
+The `E` series covers the false-INCONCLUSIVE reproduction, acceptance of one
+managed terminal with and without a proven auxiliary, refusal of two managed
+terminals, auxiliary-only, unknown windows, unrelated Cascadia windows, PID and
+session mismatch, missing argv, wrong `SetId`/`TerminalId`/`WindowId`, stale
+HWNDs, wrong title, non-terminal owner, multiple auxiliaries and ambiguous
+ownership. It also proves the contract switch changes **only** the identity
+domain: nonzero exit, missing placement skip, missing warning, missing
+finalization and tampered artifact binding still block under both contracts, and
+previously accepted single-window trials still pass under both.
+
+The `I` series pins the Stage 3B7G2 parameter-binding defect: a
+`[Parameter(Mandatory)]` parameter that also declares a default **never** uses
+that default, and with stdin open but empty the binder blocks on a prompt before
+the body runs - on both PowerShell 5.1 and 7. `I5` is an AST scan over every
+stage-owned script for that construct, and `I6` proves the scan detects a canary
+containing it. No stage script contains the construct; the scan is
+qualification-only and does not rewrite unrelated source.
+
+### PowerShell 5.1 portability
+
+Running the canonical suite under Windows PowerShell 5.1 exposed two latent
+defects that predate this stage and were fixed here:
+
+1. `Start-Process -PassThru` can return a Process object whose OS handle was not
+   retained, so `.ExitCode` reads `$null` on 5.1 even after `WaitForExit` reports
+   exit, while PowerShell 7 keeps the handle. The recorder now touches `.Handle`
+   once while the process is alive. Nothing about recording or acceptance
+   changes: a null code still fails closed.
+2. `@(fn).Records` wraps the *function result* in an array and then reads
+   `.Records` off that array, which collapses to a bare scalar on 5.1 under
+   `Set-StrictMode -Version Latest`; a later `.Count` then throws. The correct
+   form, `@((fn).Records)`, is used throughout.
+
+The canonical suite is 304/304 PASS under **both** PowerShell 7.6.9 and Windows
+PowerShell 5.1 (303 registered cases plus `R1`).
+
+---
 ## Stage 3B7G0: guest execution boundary, atomic replacement, and N2 readiness
 
 Stage 3B7F-R2's strict physical E1 result is preserved. This stage fixes the two
