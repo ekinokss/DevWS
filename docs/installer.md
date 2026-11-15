@@ -135,6 +135,19 @@ attestation or WinGet catalog package exists.
 
 ### Release state
 
+**v0.4.0 RELEASE CANDIDATE (IN PREPARATION, NOT PUBLISHED):**
+
+- The source version is `0.4.0`, but **no v0.4.0 tag, GitHub release or installer asset exists**.
+- A v0.4.0 setup payload embeds the self-contained native editor payload installed under
+  `app\editor\`. The editor is therefore part of **packaged** installations and is not present
+  in an ordinary source-layout installation.
+- v0.4.0 remains unsigned and Windows 11 x64 only. No MSI/MSIX, self-update, WinGet catalog
+  package or attestation is added.
+- The final publishable bundle must be built from the post-integration, approved source commit;
+  a bundle built from a preparation branch is a candidate only.
+- Qualification scope and outstanding gates are recorded in
+  [v0.4.0-release-readiness.md](v0.4.0-release-readiness.md).
+
 **PUBLISHED v0.3.0 GITHUB PRE-RELEASE:**
 
 - https://github.com/ekinokss/DevWS/releases/tag/v0.3.0, annotated tag `v0.3.0` at source
@@ -531,6 +544,17 @@ origins, mixed-DPI, physical EDID and monitor-topology-change scenarios remain d
 backlog items; they are not claimed as passed. See the v0.3.0 release notes for the full
 known-limitations list.
 
-Behaviour that cannot be covered by automated tests — real windows, real tasks, real
-monitor topologies — is listed in
+Behaviour that cannot be covered by automated tests - real windows, real tasks, real
+monitor topologies - is listed in
 [windows-integration-checklist.md](windows-integration-checklist.md).
+
+For v0.4.0, the editor/installed-product lifecycle passed in a disposable Windows guest
+(P8-R: install, Medium-integrity launch, edit, preview, save, independent verification,
+reload, repair, uninstall), single-display installed acceptance passed (D1), and the editor
+layer passed a physical negative-origin rearrangement that was fully restored (D2 editor
+layer). Installed multi-monitor relative placement was qualified only within a
+remote-desktop guest scope using the Microsoft Remote Display Adapter, not independent
+physical panels. Mixed-DPI, physical EDID identity, primary-monitor changes and physical
+display disconnect/reconnect remain **NOT QUALIFIED**, and **v0.4.0 is not published**. The
+source-installation to packaged-installation upgrade path has not yet been executed. See
+[v0.4.0-release-readiness.md](v0.4.0-release-readiness.md).

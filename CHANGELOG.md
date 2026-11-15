@@ -5,6 +5,76 @@ All notable changes to DevWS are recorded here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions and
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - UNRELEASED (pre-release preparation)
+
+> **Status: release candidate in preparation. Not tagged and not published.** The source
+> version is `0.4.0`. The stable published binary remains `v0.2.0`, and the published
+> `v0.3.0` pre-release is unchanged. No v0.4.0 tag, GitHub release, installer asset or WinGet
+> manifest exists yet.
+
+### Added
+
+- **Native WPF visual layout editor** - a separate `DevWS.Editor.exe` process that reads the
+  canonical configuration, renders the monitor/workspace geometry, and edits layout
+  rectangles in memory. It reuses the existing DevWS resolver for placement semantics rather
+  than reimplementing them, and it never launches, focuses, moves or closes a live window.
+- **Monitor and workspace visualization** - the editor canvas draws the current monitor
+  topology (including negative and non-contiguous origins) with work areas overlaid, so an
+  item's rectangle can be judged against the actual display arrangement instead of raw
+  numbers.
+- **In-memory drag and resize** - layout rectangles can be dragged and resized directly on the
+  canvas. Edits accumulate in a draft document and are only candidates until an explicit save;
+  nothing is written to the configuration during interaction.
+- **Absolute, relative and topology-profile editing** - the editor authors the absolute
+  fallback rectangle (`item.layout`), the monitor-relative intent (`layoutMode` with
+  `layoutRelative`), and existing topology-profile entries (`layoutProfiles[].layouts`).
+- **Authoritative preview** - preview resolves the draft through the same resolver the runtime
+  uses, so the reported effective rectangle and fallback/anchor state match what `ws` would
+  apply. Preview is a projection, not a launch, and has no lifecycle side effects.
+- **Guarded, atomic configuration saving** - save is revision-bound and topology-bound, detects
+  an external configuration change and refuses instead of overwriting it, requires stale
+  warning-review tokens to be re-acknowledged, and performs one atomic canonical write. A
+  server-side geometry-only mutation allowlist rejects out-of-scope changes even if the GUI
+  sends them.
+- **Packaged self-contained editor payload** - the editor ships as a self-contained,
+  manifest-hashed payload embedded in the packaged setup, installed under
+  `app\editor\`, covered by the installer manifest, repaired and uninstalled with the rest of
+  the product. The editor is part of the **packaged** installation; an ordinary source-layout
+  installation does not include it.
+
+### Changed
+
+- **`ws.cmd` argument forwarding** - the installed shim forwards caller arguments without
+  reinterpreting them, so arguments containing spaces, metacharacters or quotes reach the CLI
+  intact instead of being mangled by `cmd.exe` expansion. The legacy shim migration path
+  recognizes and preserves the corrected form.
+
+### Notes
+
+- **Configuration schema is unchanged.** The editor reads and writes schema version 3 and adds
+  no new schema version. Existing v0.2 and v0.3 configurations remain valid, and nothing in
+  this release requires a migration.
+- **The editor is a geometry authoring tool, not a window manager.** There is no automatic
+  live-window reflow, no general-purpose tiling, snapping, named zones, monitor watching or
+  background daemon, and the editor never contacts the coordinator, broker or elevated
+  workers.
+- **No MSI/MSIX, self-update, WinGet catalog publication or attestation** is added. DevWS
+  remains distributed only as an unsigned Windows x64 setup executable from official GitHub
+  Releases, and remains unsigned unless an actual signing process is performed.
+- **Windows 11 x64 only**; same-account administrator elevation is required for installation.
+- **Qualification scope is narrower than the feature set.** See
+  [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md) for the per-scenario
+  PASS / INCONCLUSIVE / NOT QUALIFIED matrix. In particular, the qualified installed
+  multi-monitor and negative-origin evidence comes from a **remote-desktop guest session**
+  using virtual display adapters, not from independent physical panels, and mixed-DPI,
+  physical EDID identity, primary-monitor changes and physical display disconnect/reconnect
+  remain **NOT QUALIFIED**.
+- **Maintenance (not end-user features):** the P9-H qualification harness and its
+  window-identity contract were corrected and consolidated; the auxiliary-window role
+  contract is now explicit (`p9h.auxiliary-window.v3`) and the managed-terminal classifier is
+  deterministic with respect to window enumeration order. This work is qualification
+  instrumentation and changes no product behavior.
+
 ## [0.3.0] - 2026-10-30
 
 ### Added
@@ -53,6 +123,10 @@ uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   gates. Path identities are validated; physical EDID behavior is not claimed.
 - Windows 11 x64 only; unsigned; same-account administrator elevation required. No WinGet
   catalog package, MSI/MSIX identity, self-update or attestation is available.
+- **Status update (recorded 2026-11-15 during v0.4.0 preparation; the v0.3.0 record above is
+  preserved unchanged):** v0.3.0 was published as the unsigned `v0.3.0` GitHub pre-release on
+  2026-11-03. It remains a pre-release and does not replace `v0.2.0` as the latest stable
+  release. The release gates named above are still not claimed as passed.
 
 ## [0.2.0] - 2026-10-27
 

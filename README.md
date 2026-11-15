@@ -10,8 +10,8 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-1.0, with an unsigned stable Windows binary release and a published
-> v0.3.0 pre-release.**
+> **Status: pre-1.0, with an unsigned stable Windows binary release, a published
+> v0.3.0 pre-release, and a v0.4.0 release candidate in preparation.**
 >
 > The current stable binary is **v0.2.0**, an unsigned Windows x64 setup:
 > [GitHub stable release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0).
@@ -20,6 +20,10 @@ You describe the workspace once; DevWS brings it back on demand.
 > it does not replace `v0.2.0` as the latest stable release. The earlier
 > `v0.2.0-rc.1` pre-release remains available:
 > [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
+>
+> **v0.4.0 is being prepared and is NOT published.** The source version is now `0.4.0`, but
+> no v0.4.0 tag, GitHub release or installer asset exists. v0.2.0 remains the stable binary
+> and v0.3.0 remains an existing pre-release until an explicit later release decision.
 > Verify the published SHA-256 before running any installer. No WinGet catalog package
 > exists; the prepared WinGet submission is blocked by the installer's same-account
 > elevation requirement. The frozen v0.1.0 source release remains available, and source
@@ -106,6 +110,17 @@ disconnect/reconnect or other topology-change scenarios remain deferred backlog 
 are not claimed as passed. See [docs/installer.md](docs/installer.md) §13 and the v0.3.0
 release notes for the full record.
 
+For v0.4.0, the native WPF layout editor was qualified through an installed lifecycle in a
+disposable Windows guest, single-display installed acceptance passed, and a physical
+negative-origin editor-layer pass was completed on real hardware. Installed multi-monitor
+placement was qualified **only** within a remote-desktop guest scope using virtual display
+adapters; that evidence does not establish independent physical-panel behavior. Mixed-DPI,
+physical EDID identity, primary-monitor changes and physical display disconnect/reconnect
+remain **NOT QUALIFIED**, and v0.4.0 is **not published**. See
+[docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md) for the per-scenario
+matrix and the outstanding release gates.
+
+
 ## Prerequisites
 
 | Requirement | Notes |
@@ -144,6 +159,10 @@ The unsigned `v0.3.0` pre-release is published at
 [GitHub v0.3.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.3.0). It does
 not replace `v0.2.0` as the latest stable release. Download only from the official release
 and verify the published SHA-256; do not obtain DevWS from an unofficial source.
+
+**v0.4.0 is being prepared and is not available for download.** No v0.4.0 tag, release or
+installer asset exists. When it is published, its packaged setup will include the native
+visual layout editor; see [Visual layout editor](#visual-layout-editor) below.
 
 See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
 
@@ -333,6 +352,29 @@ layout per monitor arrangement, while `item.layout` remains the universal fallba
 with no profiles and no relative items has no monitor dependency at all; a targeted relative
 item resolves its anchor with one topology snapshot per launch or reset.
 
+## Visual layout editor
+
+The packaged v0.4.0 setup includes a native WPF layout editor at
+`%LOCALAPPDATA%\DevWS\app\editor\DevWS.Editor.exe`. It is part of the **packaged**
+installation only; an ordinary source-layout installation does not include it, and no Start
+Menu shortcut is created. Run it at normal integrity — the editor refuses to start elevated.
+
+The editor reads the canonical configuration and draws the current monitor topology with
+each item's rectangle on it. You can drag and resize rectangles directly, and edit absolute
+geometry, monitor-relative intent and existing topology-profile entries. Edits are held in an
+in-memory draft; nothing is written until you save.
+
+Preview resolves the draft through the same resolver the runtime uses, so the reported
+effective rectangle, anchor state and fallback reporting match what `ws` would apply. Saving
+is deliberately guarded: it is bound to the configuration revision and topology you loaded,
+refuses instead of overwriting an external change, and writes the canonical configuration
+atomically in one operation. Unsaved drafts are never applied.
+
+The editor is a geometry authoring tool, not a window manager. It does not launch, focus, move
+or close live windows, and it does not contact the coordinator, broker or elevated workers.
+There is no automatic reflow, tiling, snapping or background monitor watching, and the
+configuration schema remains version 3.
+
 ## Hotkeys
 
 DevWS manages one AutoHotkey v2 script in your Startup folder. One shortcut is built in
@@ -408,6 +450,17 @@ Both forms require elevation, and `-Force` skips the confirmation prompt. See
 - Durable `path:` identities and a runtime relative-placement probe on a matching anchor are
   validated. Physical EDID behavior is not claimed from path-only evidence, and the deferred
   scenarios above still require real-host or guest qualification before any broader claim.
+- **v0.4.0 is a release candidate in preparation, not a published release.** It remains
+  Windows 11 x64 only, unsigned, and dependent on same-account administrator elevation for
+  installation. There is no WinGet catalog package, MSI/MSIX identity, self-update or
+  attestation, and no automatic live-window reflow or general-purpose tiling.
+- The v0.4.0 editor lifecycle passed in a disposable guest, and single-display installed
+  acceptance passed. Installed multi-monitor relative placement and negative origins were
+  qualified **only** in a remote-desktop guest scope driven by virtual display adapters, so
+  independent physical-panel behavior is not established by that evidence. Mixed-DPI,
+  physical EDID identity, primary-monitor changes and physical display disconnect/reconnect
+  remain **NOT QUALIFIED**. See
+  [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md).
 
 ## Documentation
 
@@ -417,6 +470,7 @@ Both forms require elevation, and `-Force` skips the confirmation prompt. See
 | [docs/cli.md](docs/cli.md) | Complete command reference |
 | [docs/configuration.md](docs/configuration.md) | Configuration schema and validation rules |
 | [docs/installer.md](docs/installer.md) | Installer and uninstaller contract |
+| [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md) | v0.4.0 release-candidate qualification matrix, evidence scope and outstanding gates |
 | [docs/workspace-sets-design.md](docs/workspace-sets-design.md) | The workspace-set product model |
 | [docs/future-work.md](docs/future-work.md) | Known limitations and deliberately deferred work |
 | [docs/roadmap.md](docs/roadmap.md) | Proposed long-term product direction, release sequence and acceptance gates |

@@ -25,7 +25,7 @@ rollback remain owned by the existing PowerShell installer.
 | Product ID / ARP key | `ekinokss.DevWS` |
 | Display name | `DevWS` |
 | Publisher | `ekinokss` |
-| Current source version | `0.3.0` |
+| Current source version | `0.4.0` |
 | ARP hive/view | `HKCU` 64-bit uninstall view |
 | Persisted setup | `%ProgramFiles%\DevWS\setup\<current-user-SID>\DevWS-Setup.exe` |
 
@@ -152,6 +152,22 @@ no GitHub Release, tag, WinGet submission, attestation or binary publication.
 The candidate is unsigned by default; Authenticode status is reported by the verifier and
 must not be treated as signed. Native AOT output is not claimed to be byte-reproducible.
 
+### v0.4.0 release candidate (prepared, not published)
+
+The source version is `0.4.0`. **No v0.4.0 tag, GitHub release, installer asset or WinGet
+manifest exists**, and none is authorized by this preparation. `v0.2.0` remains the latest
+stable release and `v0.3.0` remains an existing pre-release.
+
+The v0.4.0 setup payload additionally embeds the self-contained native editor payload produced
+by `build-editor-payload.ps1`, installed under `app\editor\`. The editor is therefore present
+in **packaged** installations and absent from ordinary source-layout installations.
+
+A v0.4.0 candidate build requires the **.NET 10 SDK** for the Native AOT bootstrapper and a
+.NET 8 Windows Desktop runtime for the editor payload; `build-setup.ps1` refuses to run on any
+other SDK major. The resulting bundle is bound to the exact source commit in `provenance.json`.
+A bundle built from a preparation branch is a candidate, not a publishable release artifact:
+the final published bundle must be built from the post-integration, approved source commit.
+
 The setup executable metadata is asserted during the build and release verification:
 `ProductName=DevWS`, `CompanyName=ekinokss`, and `FileDescription=DevWS setup`. The
 executable filename remains `DevWS-Setup.exe`.
@@ -189,7 +205,8 @@ The prepared three-file package manifest and the finalization/submission checkli
 template: the final `v0.2.0` asset URL is expected, while the installer hash and release
 metadata must be updated after publication. The public `v0.2.0-rc.1` binary is used only as a
 local validation reference, not as the final package. No v0.3.0 WinGet manifest is prepared,
-and the v0.2.0 template must not be reused for v0.3.0.
+and the v0.2.0 template must not be reused for v0.3.0. No v0.4.0 WinGet manifest is prepared
+either.
 
 **The template is not submitted and is not ready for submission.** WinGet's unattended
 validation runs the installer without elevation and rejects blocking UAC prompts. DevWS

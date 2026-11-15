@@ -41503,7 +41503,7 @@ exit 0
         Assert-Contains $product '"productId": "ekinokss.DevWS"' "the production product id is fixed"
         Assert-Contains $product '"displayName": "DevWS"' "the production display name is fixed"
         Assert-Contains $product '"publisher": "ekinokss"' "the production publisher is fixed"
-        Assert-Contains $product '"version": "0.3.0"' "the production version is 0.3.0"
+        Assert-Contains $product '"version": "0.4.0"' "the production version is 0.4.0"
         Assert-Contains $product '"programFilesRootLeaf": "DevWS"' "the production Program Files root is fixed"
 
         $build = Get-SourceOf "packaging\build-setup.ps1"
@@ -41700,7 +41700,7 @@ exit 0
         Assert-Contains $packagingReadme 'Release-candidate bundle' "the release-candidate pipeline is documented"
         Assert-Contains $packagingReadme 'git cat-file' "the commit-derived LICENSE provenance is documented"
         Assert-Contains $packagingReadme 'not ready for submission' "the packaging guide records the blocked WinGet submission"
-        Assert-Contains $packagingReadme 'Current source version | `0.3.0`' "the packaging guide records the candidate version"
+        Assert-Contains $packagingReadme 'Current source version | `0.4.0`' "the packaging guide records the candidate version"
         Assert-Contains $packagingReadme 'published unsigned `v0.3.0` GitHub pre-release' "the packaging guide records the published v0.3.0 pre-release"
         Assert-Contains $packagingReadme 'does not replace' "the packaging guide keeps the stable release distinct"
         Assert-Contains $packagingReadme 'latest stable' "the packaging guide names the stable channel"
