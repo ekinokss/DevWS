@@ -1405,6 +1405,10 @@ function Get-P9HN2Verdicts {
             AuxiliaryContract = if ($null -ne $terminalClass) { $terminalClass.AuxiliaryContract } else { $null }
             IdentityProxy = if ($null -ne $terminalClass) { $terminalClass.IdentityProxy } else { $null }
             ManagedTerminalSchema = if ($null -ne $terminalClass) { $terminalClass.Schema } else { $null }
+            # Stage 3B7G4-E1: N2-A must carry the SAME combined identity as N2-B.
+            # G4 emitted it only on N2-B, so a reader of the placement verdict alone
+            # could not tell which auxiliary predicate had been applied.
+            CombinedContract = ('{0}+{1}' -f $WindowIdentityContract, $(if ($null -ne $terminalClass) { $terminalClass.AuxiliaryContract } else { 'none' }))
             EvidenceGaps = if ($null -ne $terminalClass) { @($terminalClass.EvidenceGaps) } else { @() }
             Reasons = @($reasonsA)
         }

@@ -5736,24 +5736,49 @@ function Invoke-P9HManagedTerminalContractTests {
             @($rev.AuxiliaryRoleClasses) -contains 'PseudoConsoleWindow' -and
             $rev.Schema -eq 'p9h.managed-terminals.v3') -Evidence $null
 
-    # R3-16: the SELECTOR name alone is ambiguous. `ManagedTerminalV1` has meant
-    # three different predicates across G3, C1 and C2, so each verdict must also
-    # carry the auxiliary role contract, the schema and the combined identity.
-    # Two results are comparable only when all of those agree.
+    # R3-16 (strengthened in 3B7G4-E1): the SELECTOR name alone is ambiguous.
+    # `ManagedTerminalV1` has meant three different predicates across G3, C1 and C2,
+    # so each verdict must also carry the auxiliary role contract, the schema and the
+    # combined identity, and the TWO verdicts must AGREE on all of them.
+    #
+    # The earlier form of this case passed even when the trial's prerequisites had
+    # failed, because it asserted only that the metadata existed. It now requires:
+    #   * the bound trial's artifact binding to be VERIFIED (not merely supplied);
+    #   * identity consistency to hold;
+    #   * N2-A and N2-B to expose the SAME CombinedContract;
+    #   * AuxiliaryContract / IdentityProxy / ManagedTerminalSchema to agree;
+    # so a metadata check cannot be satisfied by an unrelated failure.
+    # The index must be bound to the SAME artifacts this evaluation consumes.
+    # `$singleIndex` binds the single-window variant, so evaluating against the
+    # two-window $postPath/$npPath produced `binding-mismatch:post-windows:path`
+    # and the metadata assertions were satisfied only because the trial failed for
+    # an unrelated reason. Bind a variant that matches this exact input set.
+    $combinedIndex = (Write-VariantIndex -Name 'e-combined' -TraceOverride $null -StdoutOverride $null)
     $vCombined = Get-P9HN2Verdicts -FixturePath $fxPath -TracePath $tracePath -StdoutPath $soPath `
         -PreWindowPath $prePath -PostWindowPath $postPath -ExitRecordPath $exitPath -NewProcessPath $npPath `
         -TrialId $tid -ExpectedWindowId $windowId -ExpectedTerminalId $terminalId -ExpectedSetId $setId `
-        -ArtifactIndexPath $singleIndex -WindowIdentityContract 'ManagedTerminalV1'
-    Add-P9HTestResult -Id 'R316' -Title 'Both verdicts expose a combined contract identity' `
-        -Input 'a verdict evaluated under ManagedTerminalV1' `
-        -Expected 'N2-A and N2-B each carry AuxiliaryContract, ManagedTerminalSchema and a matching CombinedContract' `
-        -Actual ("n2a=(aux={0} schema={1}) n2b=(aux={2} schema={3}) combined={4}" -f
-            $vCombined.N2A.AuxiliaryContract, $vCombined.N2A.ManagedTerminalSchema,
-            $vCombined.N2B.AuxiliaryContract, $vCombined.N2B.ManagedTerminalSchema, $vCombined.N2B.CombinedContract) `
-        -Pass ($vCombined.N2A.AuxiliaryContract -eq 'p9h.auxiliary-window.v3' -and
-            $vCombined.N2B.AuxiliaryContract -eq 'p9h.auxiliary-window.v3' -and
-            $vCombined.N2B.ManagedTerminalSchema -eq 'p9h.managed-terminals.v3' -and
-            $vCombined.N2B.CombinedContract -eq 'ManagedTerminalV1+p9h.auxiliary-window.v3') -Evidence $null
+        -ArtifactIndexPath $combinedIndex -WindowIdentityContract 'ManagedTerminalV1'
+    $r316SameCombined = ($vCombined.N2A.CombinedContract -eq $vCombined.N2B.CombinedContract)
+    $r316SameAux = ($vCombined.N2A.AuxiliaryContract -eq $vCombined.N2B.AuxiliaryContract)
+    $r316SameProxy = ($vCombined.N2A.IdentityProxy -eq $vCombined.N2B.IdentityProxy)
+    $r316SameSchema = ($vCombined.N2A.ManagedTerminalSchema -eq $vCombined.N2B.ManagedTerminalSchema)
+    $r316PrereqsOk = ($vCombined.N2B.ArtifactBindingOk -eq $true -and
+        $vCombined.N2B.ArtifactBindingReason -eq 'verified' -and
+        $vCombined.N2B.IdentityConsistent -eq $true -and
+        $vCombined.N2A.Verdict -eq 'PASS' -and $vCombined.N2B.Verdict -eq 'PASS')
+    Add-P9HTestResult -Id 'R316' -Title 'Both verdicts expose the SAME combined contract identity' `
+        -Input 'a bound single-window trial evaluated under ManagedTerminalV1' `
+        -Expected 'N2-A and N2-B agree on CombinedContract/AuxiliaryContract/IdentityProxy/schema AND the trial prerequisites genuinely pass' `
+        -Actual ("n2a=({0}|{1}|{2}) n2b=({3}|{4}|{5}) same=({6},{7},{8},{9}) prereqs={10} binding={11}" -f
+            $vCombined.N2A.CombinedContract, $vCombined.N2A.AuxiliaryContract, $vCombined.N2A.ManagedTerminalSchema,
+            $vCombined.N2B.CombinedContract, $vCombined.N2B.AuxiliaryContract, $vCombined.N2B.ManagedTerminalSchema,
+            $r316SameCombined, $r316SameAux, $r316SameProxy, $r316SameSchema,
+            $r316PrereqsOk, $vCombined.N2B.ArtifactBindingReason) `
+        -Pass ($r316SameCombined -and $r316SameAux -and $r316SameProxy -and $r316SameSchema -and
+            $r316PrereqsOk -and
+            $vCombined.N2A.CombinedContract -eq 'ManagedTerminalV1+p9h.auxiliary-window.v3' -and
+            $vCombined.N2A.AuxiliaryContract -eq 'p9h.auxiliary-window.v3' -and
+            $vCombined.N2A.ManagedTerminalSchema -eq 'p9h.managed-terminals.v3') -Evidence $null
 
     # R3-17: the historical selector must carry NO auxiliary contract, so it can
     # never be mistaken for a managed-terminal evaluation.
