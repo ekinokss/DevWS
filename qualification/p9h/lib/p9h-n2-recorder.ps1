@@ -368,10 +368,20 @@ function Invoke-P9HProcessRecorded {
         return [pscustomobject][ordered]@{ Ok = $false; Reason = 'start-failed'; Detail = $_.Exception.Message; ExitRecord = $written }
     }
 
-    $exited = $false
-    try { $exited = $proc.WaitForExit($TimeoutMs) }
-    catch { $exited = $false }
-    finally { $stopwatch.Stop() }
+      $exited = $false
+      # PowerShell 5.1 portability (Stage 3B7G3): `Start-Process -PassThru` can
+      # return a Process object whose OS handle was not retained. On 5.1 that makes
+      # `.ExitCode` return $null even after WaitForExit reports the process exited,
+      # while PowerShell 7 keeps the handle and returns the real code. Touching
+      # `.Handle` once while the process is still alive pins the handle so the exit
+      # code stays readable on both hosts.
+      #
+      # HOST-COMPATIBILITY ONLY: this changes nothing about what is recorded or
+      # accepted. A null code still fails closed in New-P9HExitRecord below.
+      try { $null = $proc.Handle } catch { }
+      try { $exited = $proc.WaitForExit($TimeoutMs) }
+      catch { $exited = $false }
+      finally { $stopwatch.Stop() }
 
     $exitedAt = Get-P9HUtcStamp
 
