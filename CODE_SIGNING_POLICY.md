@@ -10,6 +10,8 @@ Optional future signing, if accepted, would be provided by [SignPath.io](https:/
 - Source repository: https://github.com/ekinokss/DevWS
 - Public pre-release: https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1
 - Published stable release: https://github.com/ekinokss/DevWS/releases/tag/v0.2.0 (unsigned)
+- Published v0.3.0 pre-release: https://github.com/ekinokss/DevWS/releases/tag/v0.3.0 (unsigned; a pre-release, not the latest stable)
+- v0.4.0 release candidate: in preparation only; no tag, release asset or signature exists
 - License: [MIT](LICENSE)
 - Platform: Windows 11 x64
 

@@ -1,9 +1,10 @@
 # DevWS Setup Bootstrapper and Release Candidate
 
 This directory contains the source for the Windows x64 setup lifecycle used to build the
-public `v0.2.0-rc.1` pre-release and the published stable unsigned `v0.2.0` GitHub release.
-The setup executable is published only through official GitHub Releases, not from this
-directory.
+public `v0.2.0-rc.1` pre-release, the published stable unsigned `v0.2.0` GitHub release and
+the published unsigned `v0.3.0` GitHub pre-release
+(https://github.com/ekinokss/DevWS/releases/tag/v0.3.0). The setup executable is published
+only through official GitHub Releases, not from this directory.
 
 The bootstrapper embeds the tracked DevWS installation payload and invokes the accepted
 Phase-1 contracts:
@@ -24,7 +25,7 @@ rollback remain owned by the existing PowerShell installer.
 | Product ID / ARP key | `ekinokss.DevWS` |
 | Display name | `DevWS` |
 | Publisher | `ekinokss` |
-| Current source version | `0.2.0` |
+| Current source version | `0.4.0` |
 | ARP hive/view | `HKCU` 64-bit uninstall view |
 | Persisted setup | `%ProgramFiles%\DevWS\setup\<current-user-SID>\DevWS-Setup.exe` |
 
@@ -143,11 +144,29 @@ source bytes.
 
 The verified bundle is retained only as a GitHub Actions artifact on a manually dispatched
 run of the bootstrapper workflow. Ordinary feature-branch pushes run the fixture lifecycle
-only and do not upload a production candidate. No GitHub Release, tag, WinGet submission,
-attestation or binary publication is produced by this pipeline.
+only and do not upload a production candidate. The v0.3.0 bundle was built and verified
+locally outside the repository and then published as the unsigned `v0.3.0` GitHub
+pre-release after an independent uploaded-asset verification. The pipeline itself produces
+no GitHub Release, tag, WinGet submission, attestation or binary publication.
 
 The candidate is unsigned by default; Authenticode status is reported by the verifier and
 must not be treated as signed. Native AOT output is not claimed to be byte-reproducible.
+
+### v0.4.0 release candidate (prepared, not published)
+
+The source version is `0.4.0`. **No v0.4.0 tag, GitHub release, installer asset or WinGet
+manifest exists**, and none is authorized by this preparation. `v0.2.0` remains the latest
+stable release and `v0.3.0` remains an existing pre-release.
+
+The v0.4.0 setup payload additionally embeds the self-contained native editor payload produced
+by `build-editor-payload.ps1`, installed under `app\editor\`. The editor is therefore present
+in **packaged** installations and absent from ordinary source-layout installations.
+
+A v0.4.0 candidate build requires the **.NET 10 SDK** for the Native AOT bootstrapper and a
+.NET 8 Windows Desktop runtime for the editor payload; `build-setup.ps1` refuses to run on any
+other SDK major. The resulting bundle is bound to the exact source commit in `provenance.json`.
+A bundle built from a preparation branch is a candidate, not a publishable release artifact:
+the final published bundle must be built from the post-integration, approved source commit.
 
 The setup executable metadata is asserted during the build and release verification:
 `ProductName=DevWS`, `CompanyName=ekinokss`, and `FileDescription=DevWS setup`. The
@@ -182,10 +201,12 @@ source-commit check still requires the executable's embedded source SHA to match
 ## WinGet submission preparation
 
 The prepared three-file package manifest and the finalization/submission checklist are in
-[`winget/README.md`](winget/README.md). The committed manifest is a template: the final
-`v0.2.0` asset URL is expected, while the installer hash and release metadata must be
-updated after publication. The public `v0.2.0-rc.1` binary is used only as a local
-validation reference, not as the final package.
+[`winget/README.md`](winget/README.md). The committed manifest is a historical v0.2.0
+template: the final `v0.2.0` asset URL is expected, while the installer hash and release
+metadata must be updated after publication. The public `v0.2.0-rc.1` binary is used only as a
+local validation reference, not as the final package. No v0.3.0 WinGet manifest is prepared,
+and the v0.2.0 template must not be reused for v0.3.0. No v0.4.0 WinGet manifest is prepared
+either.
 
 **The template is not submitted and is not ready for submission.** WinGet's unattended
 validation runs the installer without elevation and rejects blocking UAC prompts. DevWS
@@ -201,8 +222,9 @@ per-user package lifecycle paths, under build-time-only fixture identities):
 pwsh -NoLogo -NoProfile -File packaging\test-bootstrapper.ps1
 ```
 
-The test builds disposable Native AOT executables for fixture versions `0.2.0` and `0.2.1`.
-It proves fresh install, same-version reinstall, upgrade, downgrade refusal, install and
+The test builds disposable Native AOT executables for fixture identity versions `0.2.0` and
+`0.2.1`; those are test fixtures, not the product version. It proves fresh install,
+same-version reinstall, upgrade, downgrade refusal, install and
 uninstall failure preservation, ARP registration, protected SID-qualified setup persistence,
 ACL semantics, successful self-removing uninstall, user-data preservation and final residue
 cleanup. It also runs the pure archive/trust/version/ARP checks. It never invokes the real
@@ -218,9 +240,14 @@ DevWS installer or touches the production `ekinokss.DevWS` registration/lifecycl
 - Package-mode setup may acquire AutoHotkey v2 for all users through the registered WinGet
   package. It never uses or removes a current-user-only AutoHotkey installation.
 - No MSI/MSIX or Windows Installer product codes, and no WinGet catalog package. The unsigned
-  `v0.2.0-rc.1` setup pre-release and the stable `v0.2.0` GitHub release are public.
+  `v0.2.0-rc.1` and `v0.3.0` pre-releases, and the stable `v0.2.0` GitHub release, are public.
 - The release-candidate Actions artifact is retained for verification. The stable `v0.2.0`
-  release is the current published binary; the `v0.2.0-rc.1` pre-release remains available.
+  release is the current stable published binary; the `v0.3.0` pre-release does not replace
+  it as latest stable.
+- The `v0.3.0` release is published as an unsigned GitHub pre-release at
+  https://github.com/ekinokss/DevWS/releases/tag/v0.3.0. Verify `DevWS-Setup.exe` against
+  `SHA256SUMS.txt` before running it. Installed-lifecycle relative placement and advanced
+  multi-monitor, mixed-DPI and physical-EDID qualification remain deferred backlog items.
 
 ## Security boundaries
 

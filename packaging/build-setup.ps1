@@ -5,6 +5,7 @@ param(
     [string]$OutputDir = '',
     [string]$PayloadZip = '',
     [switch]$Fixture,
+    [switch]$RequireEditor,
     [string]$ProductVersion = '',
     [string]$ProductId = '',
     [string]$DisplayName = '',
@@ -105,8 +106,9 @@ try {
     }
     else {
         $payloadFile = Join-Path $payloadRoot 'payload.zip'
-        & git -C $RepoRoot archive --format=zip --output=$payloadFile HEAD -- install.ps1 uninstall.ps1 LICENSE src config
-        Assert-Condition ($LASTEXITCODE -eq 0) 'git archive failed while building the setup payload.'
+        & (Join-Path $PSScriptRoot 'build-editor-payload.ps1') -RepoRoot $RepoRoot -OutputZip $payloadFile -DotNetPath $DotNetPath
+        Assert-Condition ($LASTEXITCODE -eq 0) 'The production editor payload build failed.'
+        $RequireEditor = $true
     }
 
     # Read the payload to prove the payload allowlist and required installer
@@ -128,6 +130,14 @@ try {
     }
     foreach ($forbiddenPrefix in @('.git/', '.github/', 'tests/', 'docs/')) {
         Assert-Condition (@($names | Where-Object { $_.StartsWith($forbiddenPrefix, [StringComparison]::Ordinal) }).Count -eq 0) "The payload unexpectedly contains $forbiddenPrefix."
+    }
+    if ($RequireEditor) {
+        foreach ($requiredEditorFile in @('editor/DevWS.Editor.exe', 'editor/DevWS.Editor.dll', 'editor/ws-editor-backend.ps1', 'editor/editor-projection.ps1', 'editor/editor-payload.json')) {
+            Assert-Condition ($names -contains $requiredEditorFile) "The payload does not contain required editor file '$requiredEditorFile'."
+        }
+        foreach ($forbiddenEditorPrefix in @('editor/tests/', 'editor/docs/', 'editor/bin/', 'editor/obj/')) {
+            Assert-Condition (@($names | Where-Object { $_.StartsWith($forbiddenEditorPrefix, [StringComparison]::Ordinal) }).Count -eq 0) "The payload unexpectedly contains $forbiddenEditorPrefix."
+        }
     }
 
     $sourceIdentity = if ($isFixture) { $sourceSha + '-fixture' } else { $sourceSha }

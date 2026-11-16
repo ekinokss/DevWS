@@ -1,0 +1,50 @@
+{
+  "capturedUtc": "2026-11-04T15:35:47Z",
+  "os": {
+    "caption": "Microsoft Windows 11 Pro",
+    "version": "10.0.26200",
+    "build": "26200",
+    "architecture": "64-bit"
+  },
+  "dotnet": {
+    "sdk": "8.0.427",
+    "runtimes": [
+      "Microsoft.NETCore.App 8.0.33",
+      "Microsoft.NETCore.App 9.0.22",
+      "Microsoft.NETCore.App 10.0.14",
+      "Microsoft.WindowsDesktop.App 8.0.33",
+      "Microsoft.WindowsDesktop.App 9.0.22",
+      "Microsoft.WindowsDesktop.App 10.0.14"
+    ]
+  },
+  "integrity": {
+    "captureShell": "High",
+    "prototypeLaunch": "explorer.exe batch wrapper",
+    "prototype": "Medium"
+  },
+  "display": {
+    "virtualScreenRect": { "x": 0, "y": 0, "w": 4480, "h": 1440 },
+    "monitors": [
+      {
+        "primary": true,
+        "monitorRect": { "x": 0, "y": 0, "w": 2560, "h": 1440 },
+        "workRect": { "x": 0, "y": 0, "w": 2560, "h": 1400 },
+        "scalePercent": 100
+      },
+      {
+        "primary": false,
+        "monitorRect": { "x": 2560, "y": 355, "w": 1920, "h": 1080 },
+        "workRect": { "x": 2560, "y": 355, "w": 1920, "h": 1040 },
+        "scalePercent": 100
+      }
+    ],
+    "wpfDpiScaleX": 1.0,
+    "wpfDpiScaleY": 1.0,
+    "wpfPrimaryScreen": { "w": 2560, "h": 1440 }
+  },
+  "notes": [
+    "Both physical monitors report 100% scaling; mixed-DPI physical behavior was not executed.",
+    "The host topology has no negative monitor origin; negative origins were exercised with synthetic fixtures.",
+    "The prototype was launched through explorer.exe so it inherited the interactive user's medium token."
+  ]
+}

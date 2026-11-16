@@ -10,16 +10,24 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-1.0, with an unsigned stable Windows binary release.**
+> **Status: pre-1.0, with an unsigned stable Windows binary release, a published
+> v0.3.0 pre-release, and a v0.4.0 release candidate in preparation.**
 >
 > The current stable binary is **v0.2.0**, an unsigned Windows x64 setup:
 > [GitHub stable release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0).
-> The earlier `v0.2.0-rc.1` pre-release remains available:
+> The unsigned **v0.3.0** pre-release is published at
+> [GitHub v0.3.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.3.0);
+> it does not replace `v0.2.0` as the latest stable release. The earlier
+> `v0.2.0-rc.1` pre-release remains available:
 > [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
-> The stable **v0.2.0** GitHub release is published. No WinGet catalog package exists; the
-> prepared WinGet submission is blocked by the installer's same-account elevation requirement.
-> Verify the published SHA-256 before running the installer. The frozen v0.1.0 source release
-> remains available, and source installation remains supported.
+>
+> **v0.4.0 is being prepared and is NOT published.** The source version is now `0.4.0`, but
+> no v0.4.0 tag, GitHub release or installer asset exists. v0.2.0 remains the stable binary
+> and v0.3.0 remains an existing pre-release until an explicit later release decision.
+> Verify the published SHA-256 before running any installer. No WinGet catalog package
+> exists; the prepared WinGet submission is blocked by the installer's same-account
+> elevation requirement. The frozen v0.1.0 source release remains available, and source
+> installation remains supported.
 >
 > [Code signing policy](CODE_SIGNING_POLICY.md) · [Privacy information](PRIVACY.md)
 
@@ -45,13 +53,17 @@ tedious and error-prone. DevWS replaces the manual work with configuration:
   separate project), each a complete definition, each launchable on its own.
 - **Managed terminals** — Windows Terminal windows and tabs created from configuration,
   with per-tab working directories and startup commands, and a stable named-window
-  identity so live windows are recognised rather than duplicated.
+  identity so live windows are recognised rather than duplicated. Presence observation
+  distinguishes an inaccessible elevated window from a genuinely missing one, so an
+  inconclusive read does not create a duplicate.
 - **Managed applications** — desktop applications matched by executable or process path,
   launched when missing, and placed at their saved geometry.
 - **Layout capture** — save the real on-screen rectangles after arranging windows by
   hand, then restore them later.
 - **Topology layout profiles** — optional per-set layouts keyed to an exact monitor
   topology, with a universal fallback layout for everything else.
+- **Monitor-relative layouts** — optional normalized geometry anchored to a durable monitor
+  identity, with exact topology profiles and a mandatory absolute fallback.
 - **Live-state saving** — persist window geometry plus the reliable tracked working
   directory and active tab of each managed terminal.
 - **Global hotkeys** — a managed AutoHotkey host plus generated per-set launch hotkeys.
@@ -84,9 +96,30 @@ The strict local release gate is stronger: it must pass with zero failures, zero
 skips and zero filter exclusions on a UAC-enabled, elevated Windows environment, where the
 positive linked-Medium path executes.
 
-The installer lifecycle was acceptance-tested on a disposable Windows 11 VM: clean install,
-25/25 installed health, genuine linked-Medium protected-state validation, the exact five-task
-topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall and purge.
+For v0.2.0, the installer lifecycle was acceptance-tested on a disposable Windows 11 VM: clean
+install, 25/25 installed health, genuine linked-Medium protected-state validation, the exact
+five-task topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall and
+purge.
+
+For v0.3.0, the guest cross-version upgrade, live Medium/High terminal-presence,
+elevated-reset and installer-lifecycle acceptance completed, plus a runtime
+relative-placement probe on a matching `path:` anchor. The release decision was
+CONDITIONAL GO. Installed-lifecycle relative placement, multi-monitor selection and
+negative monitor origins, mixed-DPI, physical EDID, primary-monitor changes, and monitor
+disconnect/reconnect or other topology-change scenarios remain deferred backlog items; they
+are not claimed as passed. See [docs/installer.md](docs/installer.md) §13 and the v0.3.0
+release notes for the full record.
+
+For v0.4.0, the native WPF layout editor was qualified through an installed lifecycle in a
+disposable Windows guest, single-display installed acceptance passed, and a physical
+negative-origin editor-layer pass was completed on real hardware. Installed multi-monitor
+placement was qualified **only** within a remote-desktop guest scope using virtual display
+adapters; that evidence does not establish independent physical-panel behavior. Mixed-DPI,
+physical EDID identity, primary-monitor changes and physical display disconnect/reconnect
+remain **NOT QUALIFIED**, and v0.4.0 is **not published**. See
+[docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md) for the per-scenario
+matrix and the outstanding release gates.
+
 
 ## Prerequisites
 
@@ -121,6 +154,15 @@ Microsoft Defender SmartScreen. Installation requires administrator elevation un
 Windows account that starts setup; UAC elevation using a different administrator account is
 intentionally rejected. The packaged setup can acquire a trusted machine-wide AutoHotkey v2
 installation through WinGet when it is missing, which requires network connectivity.
+
+The unsigned `v0.3.0` pre-release is published at
+[GitHub v0.3.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.3.0). It does
+not replace `v0.2.0` as the latest stable release. Download only from the official release
+and verify the published SHA-256; do not obtain DevWS from an unofficial source.
+
+**v0.4.0 is being prepared and is not available for download.** No v0.4.0 tag, release or
+installer asset exists. When it is published, its packaged setup will include the native
+visual layout editor; see [Visual layout editor](#visual-layout-editor) below.
 
 See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
 
@@ -310,6 +352,29 @@ layout per monitor arrangement, while `item.layout` remains the universal fallba
 with no profiles and no relative items has no monitor dependency at all; a targeted relative
 item resolves its anchor with one topology snapshot per launch or reset.
 
+## Visual layout editor
+
+The packaged v0.4.0 setup includes a native WPF layout editor at
+`%LOCALAPPDATA%\DevWS\app\editor\DevWS.Editor.exe`. It is part of the **packaged**
+installation only; an ordinary source-layout installation does not include it, and no Start
+Menu shortcut is created. Run it at normal integrity — the editor refuses to start elevated.
+
+The editor reads the canonical configuration and draws the current monitor topology with
+each item's rectangle on it. You can drag and resize rectangles directly, and edit absolute
+geometry, monitor-relative intent and existing topology-profile entries. Edits are held in an
+in-memory draft; nothing is written until you save.
+
+Preview resolves the draft through the same resolver the runtime uses, so the reported
+effective rectangle, anchor state and fallback reporting match what `ws` would apply. Saving
+is deliberately guarded: it is bound to the configuration revision and topology you loaded,
+refuses instead of overwriting an external change, and writes the canonical configuration
+atomically in one operation. Unsaved drafts are never applied.
+
+The editor is a geometry authoring tool, not a window manager. It does not launch, focus, move
+or close live windows, and it does not contact the coordinator, broker or elevated workers.
+There is no automatic reflow, tiling, snapping or background monitor watching, and the
+configuration schema remains version 3.
+
 ## Hotkeys
 
 DevWS manages one AutoHotkey v2 script in your Startup folder. One shortcut is built in
@@ -368,6 +433,35 @@ Add `-Purge` to remove the canonical configuration and disposable state/backups 
 Both forms require elevation, and `-Force` skips the confirmation prompt. See
 [docs/installer.md](docs/installer.md) §10.
 
+## Compatibility and acceptance limits
+
+- Schema version 3 remains the only runtime schema. Relative layout fields are additive; an
+  existing absolute configuration needs no migration.
+- v0.2 binaries do not understand relative-layout semantics. They may preserve the fields as
+  opaque data or drop them on clone/save, so relative intent is not downgrade-safe.
+- v0.3.0 remains Windows 11 x64 only, unsigned, and dependent on same-account administrator
+  elevation for installation. There is no WinGet catalog package, MSI/MSIX identity,
+  self-update or attestation.
+- The v0.3.0 pre-release was accepted for release under CONDITIONAL GO. The following
+  qualifications remain deferred and are not claimed as passed: installed-lifecycle relative
+  placement; multi-monitor selection and negative monitor origins; mixed-DPI configurations
+  (including RH-03, mixed 150%/100% scaling); physical EDID-based monitor identity;
+  primary-monitor changes (RH-05); and monitor disconnect/reconnect or other topology changes.
+- Durable `path:` identities and a runtime relative-placement probe on a matching anchor are
+  validated. Physical EDID behavior is not claimed from path-only evidence, and the deferred
+  scenarios above still require real-host or guest qualification before any broader claim.
+- **v0.4.0 is a release candidate in preparation, not a published release.** It remains
+  Windows 11 x64 only, unsigned, and dependent on same-account administrator elevation for
+  installation. There is no WinGet catalog package, MSI/MSIX identity, self-update or
+  attestation, and no automatic live-window reflow or general-purpose tiling.
+- The v0.4.0 editor lifecycle passed in a disposable guest, and single-display installed
+  acceptance passed. Installed multi-monitor relative placement and negative origins were
+  qualified **only** in a remote-desktop guest scope driven by virtual display adapters, so
+  independent physical-panel behavior is not established by that evidence. Mixed-DPI,
+  physical EDID identity, primary-monitor changes and physical display disconnect/reconnect
+  remain **NOT QUALIFIED**. See
+  [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md).
+
 ## Documentation
 
 | Document | Contents |
@@ -376,8 +470,10 @@ Both forms require elevation, and `-Force` skips the confirmation prompt. See
 | [docs/cli.md](docs/cli.md) | Complete command reference |
 | [docs/configuration.md](docs/configuration.md) | Configuration schema and validation rules |
 | [docs/installer.md](docs/installer.md) | Installer and uninstaller contract |
+| [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md) | v0.4.0 release-candidate qualification matrix, evidence scope and outstanding gates |
 | [docs/workspace-sets-design.md](docs/workspace-sets-design.md) | The workspace-set product model |
 | [docs/future-work.md](docs/future-work.md) | Known limitations and deliberately deferred work |
+| [docs/roadmap.md](docs/roadmap.md) | Proposed long-term product direction, release sequence and acceptance gates |
 | [docs/windows-integration-checklist.md](docs/windows-integration-checklist.md) | Manual validation checklist for behaviour that cannot be unit-tested |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development environment, tests and contribution guidance |
 | [SECURITY.md](SECURITY.md) | Security model summary and how to report a problem |

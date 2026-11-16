@@ -1,0 +1,182 @@
+{
+  "generatedUtc": "2026-11-04T15:30:50.6293228Z",
+  "mode": "startup",
+  "exe": "<repo>\\spikes\\v0.4-wpf\\bin\\Release\\net8.0-windows\\win-x64\\DevWS.WpfSpike.exe",
+  "fixture": "<repo>\\spikes\\v0.4-wpf\\Fixtures\\host-topology.json",
+  "launch": "explorer.exe batch wrapper (interactive user token)",
+  "runs": 1,
+  "exitAfterMs": 800,
+  "frames": null,
+  "firstRun": {
+    "mode": "startup",
+    "fixture": "host-topology-redacted",
+    "fixturePath": "<repo>\\spikes\\v0.4-wpf\\Fixtures\\host-topology.json",
+    "monitorCount": 2,
+    "itemCount": 4,
+    "processStartUtc": "2026-11-04T15:30:46.4199361Z",
+    "appStartupMs": 1534.9,
+    "windowLoadedMs": 660,
+    "canvasReadyMs": 730.2,
+    "processReadyMs": 949.1,
+    "idleDelayMs": 800,
+    "workingSetBytes": 145158144,
+    "workingSetMB": 138.43,
+    "cpuTotalMs": 1359.4,
+    "dpiScaleX": 1,
+    "dpiScaleY": 1,
+    "primaryScreenWidth": 2560,
+    "primaryScreenHeight": 1440,
+    "virtualScreenRect": {
+      "x": 0,
+      "y": 0,
+      "w": 4480,
+      "h": 1440
+    },
+    "monitors": [
+      {
+        "Id": "monitor-1",
+        "Name": "Monitor 1",
+        "Primary": true,
+        "ScalePercent": 100,
+        "monitorRect": {
+          "x": 0,
+          "y": 0,
+          "w": 2560,
+          "h": 1440
+        },
+        "workRect": {
+          "x": 0,
+          "y": 0,
+          "w": 2560,
+          "h": 1400
+        }
+      },
+      {
+        "Id": "monitor-2",
+        "Name": "Monitor 2",
+        "Primary": false,
+        "ScalePercent": 100,
+        "monitorRect": {
+          "x": 2560,
+          "y": 355,
+          "w": 1920,
+          "h": 1080
+        },
+        "workRect": {
+          "x": 2560,
+          "y": 355,
+          "w": 1920,
+          "h": 1040
+        }
+      }
+    ],
+    "integrity": "Medium",
+    "processArchitecture": "X64",
+    "osDescription": "Microsoft Windows 10.0.26200",
+    "runtimeVersion": "8.0.33",
+    "interaction": null,
+    "index": 0,
+    "ok": true,
+    "runRoot": "<temp>\\devws-wpf-run-1f5ffd2abe7843a9b85c840b3efdcbac"
+  },
+  "measurements": [
+    {
+      "mode": "startup",
+      "fixture": "host-topology-redacted",
+      "fixturePath": "<repo>\\spikes\\v0.4-wpf\\Fixtures\\host-topology.json",
+      "monitorCount": 2,
+      "itemCount": 4,
+      "processStartUtc": "2026-11-04T15:30:48.8882506Z",
+      "appStartupMs": 1490.2,
+      "windowLoadedMs": 659.3,
+      "canvasReadyMs": 675.5,
+      "processReadyMs": 790.2,
+      "idleDelayMs": 800,
+      "workingSetBytes": 143097856,
+      "workingSetMB": 136.47,
+      "cpuTotalMs": 1375,
+      "dpiScaleX": 1,
+      "dpiScaleY": 1,
+      "primaryScreenWidth": 2560,
+      "primaryScreenHeight": 1440,
+      "virtualScreenRect": {
+        "x": 0,
+        "y": 0,
+        "w": 4480,
+        "h": 1440
+      },
+      "monitors": [
+        {
+          "Id": "monitor-1",
+          "Name": "Monitor 1",
+          "Primary": true,
+          "ScalePercent": 100,
+          "monitorRect": {
+            "x": 0,
+            "y": 0,
+            "w": 2560,
+            "h": 1440
+          },
+          "workRect": {
+            "x": 0,
+            "y": 0,
+            "w": 2560,
+            "h": 1400
+          }
+        },
+        {
+          "Id": "monitor-2",
+          "Name": "Monitor 2",
+          "Primary": false,
+          "ScalePercent": 100,
+          "monitorRect": {
+            "x": 2560,
+            "y": 355,
+            "w": 1920,
+            "h": 1080
+          },
+          "workRect": {
+            "x": 2560,
+            "y": 355,
+            "w": 1920,
+            "h": 1040
+          }
+        }
+      ],
+      "integrity": "Medium",
+      "processArchitecture": "X64",
+      "osDescription": "Microsoft Windows 10.0.26200",
+      "runtimeVersion": "8.0.33",
+      "interaction": null,
+      "index": 1,
+      "ok": true,
+      "runRoot": "<temp>\\devws-wpf-run-5c22a26190214c588e6f4df35e9d9d89"
+    }
+  ],
+  "summary": {
+    "processReadyMs": {
+      "count": 1,
+      "median": 790.2,
+      "min": 790.2,
+      "max": 790.2
+    },
+    "canvasReadyMs": {
+      "count": 1,
+      "median": 675.5,
+      "min": 675.5,
+      "max": 675.5
+    },
+    "workingSetMB": {
+      "count": 1,
+      "median": 136.47,
+      "min": 136.47,
+      "max": 136.47
+    },
+    "cpuTotalMs": {
+      "count": 1,
+      "median": 1375.0,
+      "min": 1375.0,
+      "max": 1375.0
+    }
+  }
+}

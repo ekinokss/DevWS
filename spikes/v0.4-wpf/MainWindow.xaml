@@ -1,0 +1,134 @@
+<Window x:Class="DevWS.WpfSpike.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:DevWS.WpfSpike"
+        Title="DevWS v0.4 WPF Spike — Experimental"
+        Width="1280" Height="820"
+        MinWidth="900" MinHeight="600"
+        Background="#18181C" Foreground="#EBEBF0"
+        WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True">
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,8">
+            <TextBlock Text="Fixture:" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <ComboBox x:Name="FixtureCombo" Width="300" Margin="0,0,6,0"
+                      AutomationProperties.Name="Fixture selector"
+                      AutomationProperties.HelpText="Selects a synthetic or host-derived JSON fixture." />
+            <Button x:Name="LoadButton" Content="Load" Width="70" Margin="0,0,12,0"
+                    Click="LoadButton_Click" AutomationProperties.Name="Load fixture" />
+            <Button x:Name="FitButton" Content="Fit" Width="60" Margin="0,0,6,0"
+                    Click="FitButton_Click" AutomationProperties.Name="Fit canvas" />
+            <Button x:Name="ZoomOutButton" Content="−" Width="36" Margin="0,0,4,0"
+                    Click="ZoomOutButton_Click" AutomationProperties.Name="Zoom out" />
+            <Button x:Name="ZoomInButton" Content="+" Width="36" Margin="0,0,6,0"
+                    Click="ZoomInButton_Click" AutomationProperties.Name="Zoom in" />
+            <Button x:Name="ResetButton" Content="Reset view" Width="90" Margin="0,0,12,0"
+                    Click="ResetButton_Click" AutomationProperties.Name="Reset canvas view" />
+            <TextBlock x:Name="ZoomText" VerticalAlignment="Center" Foreground="#A5AAB4" />
+            <TextBlock x:Name="IntegrityText" VerticalAlignment="Center" Margin="24,0,0,0"
+                       Foreground="#A5AAB4" />
+            <TextBlock x:Name="DpiText" VerticalAlignment="Center" Margin="24,0,0,0"
+                       Foreground="#A5AAB4" />
+        </DockPanel>
+
+        <Grid Grid.Row="1">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="320" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <Grid Grid.Column="0" Margin="0,0,10,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="150" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0" Text="Monitors" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <ListBox x:Name="MonitorList" Grid.Row="1" Margin="0,0,0,8"
+                         SelectionMode="Single" SelectionChanged="MonitorList_SelectionChanged"
+                         AutomationProperties.Name="Monitor list"
+                         AutomationProperties.HelpText="Use arrow keys to select a monitor.">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Display}" />
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <TextBlock Grid.Row="2" Text="Configured items" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <ListBox x:Name="ItemList" Grid.Row="3" Margin="0,0,0,8"
+                         SelectionMode="Single" SelectionChanged="ItemList_SelectionChanged"
+                         AutomationProperties.Name="Configured item list"
+                         AutomationProperties.HelpText="Use arrow keys to select an item; the numeric fields provide a non-mouse editor.">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Display}" />
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+
+                <Border Grid.Row="4" BorderBrush="#3A3A42" BorderThickness="1" Padding="8" CornerRadius="3">
+                    <StackPanel>
+                        <TextBlock Text="Selected item geometry (DevWS virtual-screen pixels)"
+                                   FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,0,0,6" />
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="24" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="24" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="X" VerticalAlignment="Center" />
+                            <TextBox x:Name="XBox" Grid.Row="0" Grid.Column="1" Margin="2"
+                                     AutomationProperties.Name="Selected item X coordinate" />
+                            <TextBlock Grid.Row="0" Grid.Column="2" Text="Y" VerticalAlignment="Center" Margin="6,0,0,0" />
+                            <TextBox x:Name="YBox" Grid.Row="0" Grid.Column="3" Margin="2"
+                                     AutomationProperties.Name="Selected item Y coordinate" />
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="W" VerticalAlignment="Center" />
+                            <TextBox x:Name="WBox" Grid.Row="1" Grid.Column="1" Margin="2"
+                                     AutomationProperties.Name="Selected item width" />
+                            <TextBlock Grid.Row="1" Grid.Column="2" Text="H" VerticalAlignment="Center" Margin="6,0,0,0" />
+                            <TextBox x:Name="HBox" Grid.Row="1" Grid.Column="3" Margin="2"
+                                     AutomationProperties.Name="Selected item height" />
+                        </Grid>
+                        <Button x:Name="ApplyButton" Content="Apply geometry" Margin="0,8,0,0"
+                                Click="ApplyButton_Click"
+                                AutomationProperties.Name="Apply numeric geometry" />
+                        <TextBlock Text="Arrow keys nudge the selected item by 1 px; Shift+Arrow by 10 px. Mouse wheel zooms; middle/right drag pans."
+                                   Foreground="#A5AAB4" TextWrapping="Wrap" Margin="0,8,0,0" FontSize="11" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <Border Grid.Column="1" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="3">
+                <local:WorkspaceCanvas x:Name="Canvas" />
+            </Border>
+        </Grid>
+
+        <StatusBar Grid.Row="2" Margin="0,8,0,0" Background="#202026" Foreground="#EBEBF0">
+            <StatusBarItem>
+                <TextBlock x:Name="StatusText" Text="Ready." />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock x:Name="PointerText" Text="Pointer: —" />
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

@@ -58,27 +58,31 @@ with `-Purge` or `-Force`, before any machine mutation.
 
 Direct source/interactive use of `install.ps1` and `uninstall.ps1` remains supported and
 unchanged. The v0.2 source and the public `v0.2.0-rc.1` pre-release contain a
-`DevWS-Setup.exe` build. The unsigned stable `v0.2.0` GitHub release is published. A WinGet
-submission template exists under `packaging/winget`, but no WinGet catalog package exists and
-the template is not submitted. This contract fixes the arguments,
+`DevWS-Setup.exe` build. The unsigned stable `v0.2.0` GitHub release is published, and the
+unsigned `v0.3.0` GitHub pre-release is published at
+https://github.com/ekinokss/DevWS/releases/tag/v0.3.0. A WinGet submission template exists
+under `packaging/winget`, but no WinGet catalog package exists and the template is not
+submitted. This contract fixes the arguments,
 non-interactive behavior and exit status the setup wrapper uses. Exit code `0` means the
 requested package-mode operation completed; any nonzero exit means it did not.
 
 ### Setup bootstrapper source
 
-The v0.2 integration branch contains the source for a thin Windows x64 setup bootstrapper at
-`packaging/bootstrapper`. It embeds the DevWS installation payload and invokes
-`install.ps1 -PackageMode`; it does not replace the PowerShell installer's semantics. It
-does not install PowerShell 7 or Windows Terminal, but package mode can acquire the
-machine-wide AutoHotkey v2 prerequisite through WinGet, and it does not ship a WinGet
-package. The setup source provides install, same-version reinstall/repair, upgrade,
+The v0.2 integration branch and the `release/v0.3.0-preparation` branch contain the same thin
+Windows x64 setup bootstrapper source at `packaging/bootstrapper`. It embeds the DevWS
+installation payload and invokes `install.ps1 -PackageMode`; it does not replace the PowerShell
+installer's semantics. It does not install PowerShell 7 or Windows Terminal, but package mode
+can acquire the machine-wide AutoHotkey v2 prerequisite through WinGet, and it does not ship a
+WinGet package. The setup source provides install, same-version reinstall/repair, upgrade,
 downgrade refusal, HKCU Add/Remove Programs registration, setup-driven package uninstall,
 and a protected persisted setup; see the lifecycle section below. The current build is
 x64-only.
 
 The unsigned Windows x64 setup is published as the stable `v0.2.0` GitHub release:
 https://github.com/ekinokss/DevWS/releases/tag/v0.2.0. The `v0.2.0-rc.1` pre-release remains
-available. No WinGet catalog package is available; the prepared WinGet template is blocked by
+available. The unsigned `v0.3.0` pre-release is published at
+https://github.com/ekinokss/DevWS/releases/tag/v0.3.0; the stable public binary remains
+`v0.2.0`. No WinGet catalog package is available; the prepared WinGet template is blocked by
 WinGet's unattended validation and is not submitted. See
 [`packaging/README.md`](../packaging/README.md) for build and fixture-test instructions.
 
@@ -88,11 +92,11 @@ UAC elevation using another administrator account is therefore intentionally rej
 Running setup from an already-elevated process installs for that elevated account; the setup
 does not claim a different interactive caller in that case.
 
-### v0.2 package lifecycle
+### Package lifecycle
 
-The setup source models a per-user Windows package lifecycle. Its stable
-identity is `ekinokss.DevWS`, display name `DevWS`, publisher `ekinokss`, and current version
-`0.2.0`. Discovery state is written to the 64-bit current-user uninstall key; no HKLM
+The setup source models a per-user Windows package lifecycle. Its stable identity is
+`ekinokss.DevWS`, display name `DevWS`, publisher `ekinokss`, and current candidate version
+`0.3.0`. Discovery state is written to the 64-bit current-user uninstall key; no HKLM
 registration or Windows Installer product code is used.
 
 A successful install persists the setup executable at
@@ -107,27 +111,56 @@ as executable authority.
 protected post-exit helper to remove the per-SID setup directory without a reboot. Package
 uninstall preserves canonical configuration, state/backups, `%USERPROFILE%\.ws` and unrelated
 resources exactly as the frozen Phase-1 contract requires. The unsigned v0.2.0 setup is
-publicly available as the stable GitHub release; the v0.2.0-rc.1 pre-release remains
-available. No WinGet catalog package is available. Self-update and MSI/MSIX/Windows Installer
-identity are not implemented.
+publicly available as the stable GitHub release; the v0.2.0-rc.1 and v0.3.0 pre-releases
+remain available. No WinGet catalog package is available. Self-update and MSI/MSIX/Windows
+Installer identity are not implemented.
 
 ### Release-candidate artifact pipeline
 
-The v0.2 branch uses `packaging/build-release.ps1` to wrap `build-setup.ps1` and assemble a
-commit-bound release candidate containing exactly `DevWS-Setup.exe`, `LICENSE`,
-`provenance.json` and `SHA256SUMS.txt`. `packaging/verify-release.ps1` independently verifies
-the bundle, source SHA, version, checksums, provenance and privacy/path hygiene, and runs only
-the non-mutating `--version` and `--help` surfaces.
+The v0.2 branch and the `release/v0.3.0-preparation` branch use
+`packaging/build-release.ps1` to wrap `build-setup.ps1` and assemble a commit-bound release
+candidate containing exactly `DevWS-Setup.exe`, `LICENSE`, `provenance.json` and
+`SHA256SUMS.txt`. `packaging/verify-release.ps1` independently verifies the bundle, source SHA,
+version, checksums, provenance and privacy/path hygiene, and runs only the non-mutating
+`--version` and `--help` surfaces.
 
 A manually dispatched bootstrapper workflow validates and retains this candidate as an Actions
 artifact for 30 days, then downloads and re-verifies the exact artifact in a separate job.
 Normal feature-branch pushes run only fixture lifecycle validation. The candidate is unsigned
 and no Native AOT reproducibility is claimed. The workflow produced the unsigned
-`v0.2.0-rc.1` pre-release and prepares the stable unsigned `v0.2.0` GitHub candidate. No
-`v0.2.0` GitHub Release, Windows Installer identity, attestation or WinGet catalog package is
-published.
+`v0.2.0-rc.1` pre-release, the stable unsigned `v0.2.0` GitHub release and the unsigned
+`v0.3.0` GitHub pre-release. The v0.3.0 bundle was published from the verified frozen
+candidate after an independent uploaded-asset verification. No Windows Installer identity,
+attestation or WinGet catalog package exists.
 
 ### Release state
+
+**v0.4.0 RELEASE CANDIDATE (IN PREPARATION, NOT PUBLISHED):**
+
+- The source version is `0.4.0`, but **no v0.4.0 tag, GitHub release or installer asset exists**.
+- A v0.4.0 setup payload embeds the self-contained native editor payload installed under
+  `app\editor\`. The editor is therefore part of **packaged** installations and is not present
+  in an ordinary source-layout installation.
+- v0.4.0 remains unsigned and Windows 11 x64 only. No MSI/MSIX, self-update, WinGet catalog
+  package or attestation is added.
+- The final publishable bundle must be built from the post-integration, approved source commit;
+  a bundle built from a preparation branch is a candidate only.
+- Qualification scope and outstanding gates are recorded in
+  [v0.4.0-release-readiness.md](v0.4.0-release-readiness.md).
+
+**PUBLISHED v0.3.0 GITHUB PRE-RELEASE:**
+
+- https://github.com/ekinokss/DevWS/releases/tag/v0.3.0, annotated tag `v0.3.0` at source
+  commit `5b5d8f67191ed2f61bacbb76e6803f0e6b958f38`
+- four-file bundle containing `DevWS-Setup.exe`, `LICENSE`, `provenance.json` and
+  `SHA256SUMS.txt`
+- product version `0.3.0`, Native AOT Windows x64, commit-bound provenance
+- unsigned; verify `DevWS-Setup.exe` SHA-256
+  `c0fdff83f9ecac2d1963aa4f289a4454e91588e32dab565c8959afcd3a6a135a`
+  against `SHA256SUMS.txt` before running it
+- accepted for release under CONDITIONAL GO; installed-lifecycle relative placement and
+  advanced multi-monitor, mixed-DPI and physical-EDID qualification are deferred backlog
+  items
 
 **PUBLIC v0.2.0-rc.1 PRE-RELEASE:**
 
@@ -141,7 +174,7 @@ published.
 - protected persisted setup
 - release-candidate Actions artifact pipeline
 
-**PREPARED STABLE v0.2.0 GITHUB RELEASE (PUBLISHED):**
+**PUBLISHED STABLE v0.2.0 GITHUB RELEASE:**
 
 - unsigned Windows 11 x64 GitHub release bundle
 - the same install, reinstall/repair, upgrade, downgrade-refusal, HKCU ARP, package-uninstall
@@ -150,7 +183,9 @@ published.
 
 **NOT PUBLISHED OR NOT AVAILABLE:**
 
-- signed `v0.2.0` installer
+- stable `v0.3.0` release: `v0.3.0` is published as a pre-release, not as the latest stable
+  release
+- signed `v0.2.0` or `v0.3.0` installer
 - WinGet catalog package: the submission template is prepared but blocked by WinGet's
   unattended-elevation validation and is not submitted
 
@@ -159,8 +194,9 @@ published.
 - self-update
 - MSI/MSIX or Windows Installer identity
 
-The currently published v0.1.0 remains source-only. The unsigned `v0.2.0` GitHub release is
-the current stable public binary; the `v0.2.0-rc.1` pre-release remains available.
+The published v0.1.0 remains a historical source release. The unsigned `v0.2.0` GitHub release
+is the current stable public binary; the `v0.2.0-rc.1` and `v0.3.0` pre-releases remain
+available.
 
 ## 2. Prerequisites
 
@@ -198,6 +234,14 @@ installation. There is no onboarding wizard.
 | `state\` | Disposable state: installer metadata, backups, generated hotkeys, the terminal handle cache and other runtime artefacts. |
 
 The source-managed manifest for this root contains **39 entries**.
+
+The `bin\ws.cmd` shim disables inherited delayed expansion, forwards the caller's arguments
+unchanged, and returns the CLI process exit code. Arguments containing `cmd.exe`
+metacharacters (`&`, `|`, `<`, `>`, `^`) must be quoted by the caller: `cmd.exe` parses
+those characters before a batch file can receive them, so no `.cmd` shim can recover an
+unquoted metacharacter. Quoting keeps the value as one token, for example
+`ws set-geometry item --relative --anchor "path:...&..." ...`. The same quoting rule
+applies when PowerShell 5.1 launches a `.cmd` with native arguments.
 
 ### Administrator-protected privileged runtime — `%ProgramFiles%\DevWS\privileged`
 
@@ -486,12 +530,31 @@ It never contains the workspace configuration itself.
 
 ## 13. Acceptance and manual validation
 
-The installer lifecycle was acceptance-tested on a disposable Windows 11 VM: clean install,
-25/25 installed health, genuine linked-Medium protected-state validation, the exact five-task
-topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall, purge, and a
-final residue/ownership audit. The optional real-window lifecycle smoke was **not observed**
-in that environment and is not claimed as passed.
+For v0.2.0, the installer lifecycle was acceptance-tested on a disposable Windows 11 VM:
+clean install, 25/25 installed health, genuine linked-Medium protected-state validation, the
+exact five-task topology, idempotent update, real `-RepairTasks`, default uninstall, reinstall,
+purge, and a final residue/ownership audit. The optional real-window lifecycle smoke was
+**not observed** in that environment and is not claimed as passed.
 
-Behaviour that cannot be covered by automated tests — real windows, real tasks, real
-monitor topologies — is listed in
+The v0.3.0 candidate completed its guest cross-version upgrade, live Medium/High
+terminal-presence, elevated-reset and installer-lifecycle acceptance, plus a runtime
+relative-placement probe on a matching `path:` anchor. The release decision was CONDITIONAL
+GO. Installed-lifecycle relative-placement qualification, multi-monitor selection and negative
+origins, mixed-DPI, physical EDID and monitor-topology-change scenarios remain deferred
+backlog items; they are not claimed as passed. See the v0.3.0 release notes for the full
+known-limitations list.
+
+Behaviour that cannot be covered by automated tests - real windows, real tasks, real
+monitor topologies - is listed in
 [windows-integration-checklist.md](windows-integration-checklist.md).
+
+For v0.4.0, the editor/installed-product lifecycle passed in a disposable Windows guest
+(P8-R: install, Medium-integrity launch, edit, preview, save, independent verification,
+reload, repair, uninstall), single-display installed acceptance passed (D1), and the editor
+layer passed a physical negative-origin rearrangement that was fully restored (D2 editor
+layer). Installed multi-monitor relative placement was qualified only within a
+remote-desktop guest scope using the Microsoft Remote Display Adapter, not independent
+physical panels. Mixed-DPI, physical EDID identity, primary-monitor changes and physical
+display disconnect/reconnect remain **NOT QUALIFIED**, and **v0.4.0 is not published**. The
+source-installation to packaged-installation upgrade path has not yet been executed. See
+[v0.4.0-release-readiness.md](v0.4.0-release-readiness.md).

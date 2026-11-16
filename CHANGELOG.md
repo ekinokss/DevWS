@@ -5,7 +5,130 @@ All notable changes to DevWS are recorded here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions and
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - UNRELEASED (pre-release preparation)
+
+> **Status: release candidate in preparation. Not tagged and not published.** The source
+> version is `0.4.0`. The stable published binary remains `v0.2.0`, and the published
+> `v0.3.0` pre-release is unchanged. No v0.4.0 tag, GitHub release, installer asset or WinGet
+> manifest exists yet.
+
+### Added
+
+- **Native WPF visual layout editor** - a separate `DevWS.Editor.exe` process that reads the
+  canonical configuration, renders the monitor/workspace geometry, and edits layout
+  rectangles in memory. It reuses the existing DevWS resolver for placement semantics rather
+  than reimplementing them, and it never launches, focuses, moves or closes a live window.
+- **Monitor and workspace visualization** - the editor canvas draws the current monitor
+  topology (including negative and non-contiguous origins) with work areas overlaid, so an
+  item's rectangle can be judged against the actual display arrangement instead of raw
+  numbers.
+- **In-memory drag and resize** - layout rectangles can be dragged and resized directly on the
+  canvas. Edits accumulate in a draft document and are only candidates until an explicit save;
+  nothing is written to the configuration during interaction.
+- **Absolute, relative and topology-profile editing** - the editor authors the absolute
+  fallback rectangle (`item.layout`), the monitor-relative intent (`layoutMode` with
+  `layoutRelative`), and existing topology-profile entries (`layoutProfiles[].layouts`).
+- **Authoritative preview** - preview resolves the draft through the same resolver the runtime
+  uses, so the reported effective rectangle and fallback/anchor state match what `ws` would
+  apply. Preview is a projection, not a launch, and has no lifecycle side effects.
+- **Guarded, atomic configuration saving** - save is revision-bound and topology-bound, detects
+  an external configuration change and refuses instead of overwriting it, requires stale
+  warning-review tokens to be re-acknowledged, and performs one atomic canonical write. A
+  server-side geometry-only mutation allowlist rejects out-of-scope changes even if the GUI
+  sends them.
+- **Packaged self-contained editor payload** - the editor ships as a self-contained,
+  manifest-hashed payload embedded in the packaged setup, installed under
+  `app\editor\`, covered by the installer manifest, repaired and uninstalled with the rest of
+  the product. The editor is part of the **packaged** installation; an ordinary source-layout
+  installation does not include it.
+
+### Changed
+
+- **`ws.cmd` argument forwarding** - the installed shim forwards caller arguments without
+  reinterpreting them, so arguments containing spaces, metacharacters or quotes reach the CLI
+  intact instead of being mangled by `cmd.exe` expansion. The legacy shim migration path
+  recognizes and preserves the corrected form.
+
+### Notes
+
+- **Configuration schema is unchanged.** The editor reads and writes schema version 3 and adds
+  no new schema version. Existing v0.2 and v0.3 configurations remain valid, and nothing in
+  this release requires a migration.
+- **The editor is a geometry authoring tool, not a window manager.** There is no automatic
+  live-window reflow, no general-purpose tiling, snapping, named zones, monitor watching or
+  background daemon, and the editor never contacts the coordinator, broker or elevated
+  workers.
+- **No MSI/MSIX, self-update, WinGet catalog publication or attestation** is added. DevWS
+  remains distributed only as an unsigned Windows x64 setup executable from official GitHub
+  Releases, and remains unsigned unless an actual signing process is performed.
+- **Windows 11 x64 only**; same-account administrator elevation is required for installation.
+- **Qualification scope is narrower than the feature set.** See
+  [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md) for the per-scenario
+  PASS / INCONCLUSIVE / NOT QUALIFIED matrix. In particular, the qualified installed
+  multi-monitor and negative-origin evidence comes from a **remote-desktop guest session**
+  using virtual display adapters, not from independent physical panels, and mixed-DPI,
+  physical EDID identity, primary-monitor changes and physical display disconnect/reconnect
+  remain **NOT QUALIFIED**.
+- **Maintenance (not end-user features):** the P9-H qualification harness and its
+  window-identity contract were corrected and consolidated; the auxiliary-window role
+  contract is now explicit (`p9h.auxiliary-window.v3`) and the managed-terminal classifier is
+  deterministic with respect to window enumeration order. This work is qualification
+  instrumentation and changes no product behavior.
+
+## [0.3.0] - 2026-10-30
+
+### Added
+
+- **Monitor-relative layouts** — schema-v3 items may set `layoutMode: "relative"` and
+  `layoutRelative` with a durable monitor identity (`edid:` or `path:`), an optional instance
+  tie-breaker, a `workArea` or `monitor` basis, and nontrivial normalized `x`/`y`/`w`/`h`
+  fractions. Exact topology profiles still win; otherwise a relative item resolves its anchor
+  and falls back to the mandatory absolute `item.layout` when the anchor is absent or
+  unreachable. `ws set-geometry --relative`, `ws show-layout`, fallback-scope save, targeted
+  reset and clone operations preserve the relative intent. The schema version remains 3.
+- **Terminal presence observability** — structured UI Automation reads retain the raw tab
+  element count (including duplicate names), report per-tab name-read failures, and distinguish
+  missing, inaccessible, ambiguous and failed observations. A present-but-inaccessible window
+  is no longer treated as missing, and an inconclusive observation does not trigger a duplicate
+  creation kick. `ws status` and launch planning expose the source, diagnostic and counts.
+- **Native terminal method-surface validation** — generated native assemblies must expose
+  `DevWSTerminalNative.IsWindowsTerminalTopLevelHwnd(long)`. Installer candidate validation and
+  installed-runtime loading fail closed with `install.ps1` guidance when an older or partial
+  assembly is present.
+
+### Changed
+
+- **Presence source reporting** — state, snapshot and UIA associations carry their actual source
+  and structured diagnostics; an empty successful UIA read remains distinct from an access
+  failure.
+- **Configuration compatibility** — relative layout fields are additive to schema version 3.
+  Existing absolute configurations remain valid without migration. v0.2 binaries treat the new
+  fields as opaque and can drop or ignore relative intent on clone or save; relative semantics
+  are not downgrade-safe.
+
+### Fixed
+
+- The presence model now distinguishes an inaccessible elevated Windows Terminal from a missing
+  window; `ws status` reports `inaccessible` and the launch plan does not create a duplicate
+  window when observation is inconclusive.
+- A failed per-tab `Current.Name` getter is counted as an incomplete read instead of being
+  silently converted to an empty name.
+
+### Notes
+
+- This is a v0.3.0 release candidate prepared from the approved terminal-presence reliability
+  fix. It is not tagged or published. The stable binary remains v0.2.0.
+- Guest upgrade/repair/uninstall acceptance, live Medium/High terminal observation and the
+  hardware scenarios RH-03 (mixed scaling) and RH-05 (primary-monitor change) remain release
+  gates. Path identities are validated; physical EDID behavior is not claimed.
+- Windows 11 x64 only; unsigned; same-account administrator elevation required. No WinGet
+  catalog package, MSI/MSIX identity, self-update or attestation is available.
+- **Status update (recorded 2026-11-15 during v0.4.0 preparation; the v0.3.0 record above is
+  preserved unchanged):** v0.3.0 was published as the unsigned `v0.3.0` GitHub pre-release on
+  2026-11-03. It remains a pre-release and does not replace `v0.2.0` as the latest stable
+  release. The release gates named above are still not claimed as passed.
+
+## [0.2.0] - 2026-10-27
 
 ### Added
 

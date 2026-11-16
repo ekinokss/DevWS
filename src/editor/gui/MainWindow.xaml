@@ -1,0 +1,461 @@
+<Window x:Class="DevWS.Editor.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:DevWS.Editor"
+        Title="DevWS Workspace Editor — In-memory draft"
+        Width="1560" Height="1000"
+        MinWidth="1150" MinHeight="800"
+        Background="#18181C" Foreground="#EBEBF0"
+        WindowStartupLocation="CenterScreen"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        <DataTemplate x:Key="DetailRowTemplate">
+            <Grid Margin="0,2">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="132" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding Label}" Foreground="#A5AAB4" TextWrapping="Wrap" />
+                <TextBlock Grid.Column="1" Text="{Binding Value}" TextWrapping="Wrap" />
+            </Grid>
+        </DataTemplate>
+        <Style TargetType="Button">
+            <Setter Property="Padding" Value="10,4" />
+            <Setter Property="Margin" Value="0,0,6,0" />
+        </Style>
+        <Style TargetType="ListBox">
+            <Setter Property="Background" Value="#202026" />
+            <Setter Property="Foreground" Value="#EBEBF0" />
+            <Setter Property="BorderBrush" Value="#3A3A42" />
+            <Setter Property="BorderThickness" Value="1" />
+        </Style>
+        <Style TargetType="TabControl">
+            <Setter Property="Background" Value="#202026" />
+            <Setter Property="Foreground" Value="#EBEBF0" />
+            <Setter Property="BorderBrush" Value="#3A3A42" />
+        </Style>
+        <Style TargetType="TabItem">
+            <Setter Property="Background" Value="#202026" />
+            <Setter Property="Foreground" Value="#EBEBF0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="TabBorder" Background="{TemplateBinding Background}"
+                                BorderBrush="#3A3A42" BorderThickness="0,0,1,1" Padding="9,4">
+                            <ContentPresenter ContentSource="Header" TextElement.Foreground="#EBEBF0" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="TabBorder" Property="Background" Value="#243434" />
+                                <Setter TargetName="TabBorder" Property="BorderBrush" Value="#80DCD7" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#202026" />
+            <Setter Property="Foreground" Value="#EBEBF0" />
+            <Setter Property="BorderBrush" Value="#4A4A54" />
+            <Setter Property="Padding" Value="4,3" />
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#202026" />
+            <Setter Property="Foreground" Value="#EBEBF0" />
+            <Setter Property="BorderBrush" Value="#4A4A54" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton x:Name="ToggleButton" Focusable="False" ClickMode="Press"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}">
+                                <ToggleButton.Template>
+                                    <ControlTemplate TargetType="ToggleButton">
+                                        <Border Background="{Binding Background, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                                                BorderBrush="{Binding BorderBrush, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                                                BorderThickness="1" CornerRadius="2">
+                                            <Path Data="M 0 0 L 4 4 L 8 0 Z" Fill="#EBEBF0"
+                                                  HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                        </Border>
+                                    </ControlTemplate>
+                                </ToggleButton.Template>
+                            </ToggleButton>
+                            <ContentPresenter Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}"
+                                              Margin="6,0,24,0" VerticalAlignment="Center" IsHitTestVisible="False"
+                                              TextElement.Foreground="#EBEBF0" />
+                            <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
+                                   AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
+                                <Border Background="#202026" BorderBrush="#4A4A54" BorderThickness="1"
+                                        MinWidth="{TemplateBinding ActualWidth}"
+                                        MaxHeight="{TemplateBinding MaxDropDownHeight}">
+                                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                                        <ItemsPresenter />
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+            <Setter Property="ItemContainerStyle">
+                <Setter.Value>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="Background" Value="#202026" />
+                        <Setter Property="Foreground" Value="#EBEBF0" />
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ComboBoxItem">
+                                    <Border x:Name="ItemBorder" Background="{TemplateBinding Background}" Padding="6,3">
+                                        <ContentPresenter TextElement.Foreground="#EBEBF0" />
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsHighlighted" Value="True">
+                                            <Setter TargetName="ItemBorder" Property="Background" Value="#3A3A42" />
+                                        </Trigger>
+                                        <Trigger Property="IsSelected" Value="True">
+                                            <Setter TargetName="ItemBorder" Property="Background" Value="#4A3A18" />
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="10">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,8">
+            <StackPanel DockPanel.Dock="Left" Orientation="Horizontal" VerticalAlignment="Center">
+                <TextBlock Text="DevWS Workspace Editor" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" />
+                <Border Background="#183A28" BorderBrush="#2F7D4E" BorderThickness="1" CornerRadius="3"
+                        Padding="7,3" Margin="12,0,0,0">
+                    <TextBlock Text="{Binding ReadOnlyBadge}" FontWeight="SemiBold" Foreground="#9BE7B7" />
+                </Border>
+                <Border Background="#3A2E10" BorderBrush="#A17D2A" BorderThickness="1" CornerRadius="3"
+                        Padding="7,3" Margin="8,0,0,0"
+                        Visibility="{Binding IsDevelopmentConfig, Converter={StaticResource BoolToVisibility}}">
+                    <TextBlock Text="{Binding DevelopmentBadge}" FontWeight="SemiBold" Foreground="#FFD479" />
+                </Border>
+                <Border Background="#2A2F3A" BorderBrush="#4C5A70" BorderThickness="1" CornerRadius="3"
+                        Padding="7,3" Margin="8,0,0,0"
+                        Visibility="{Binding IsBundledDefault, Converter={StaticResource BoolToVisibility}}">
+                    <TextBlock Text="BUNDLED DEFAULT" FontWeight="SemiBold" Foreground="#B9CBE8" />
+                </Border>
+                <Border Background="#4A2E10" BorderBrush="#C08020" BorderThickness="1" CornerRadius="3"
+                        Padding="7,3" Margin="8,0,0,0"
+                        Visibility="{Binding IsDraftDirty, Converter={StaticResource BoolToVisibility}}">
+                    <TextBlock Text="{Binding DraftBadgeText}" FontWeight="SemiBold" Foreground="#FFD479" />
+                </Border>
+                <TextBlock Text="{Binding ConfigText}" Foreground="#A5AAB4" VerticalAlignment="Center" Margin="12,0,0,0" />
+            </StackPanel>
+
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+                <Button Content="_Save" Click="SaveButton_Click" IsEnabled="{Binding CanSave}"
+                        ToolTip="{Binding SaveAvailabilityText}"
+                        AutomationProperties.Name="Save previewed configuration" />
+                <Button Content="_Preview" Click="PreviewButton_Click" IsEnabled="{Binding CanPreview}"
+                        AutomationProperties.Name="Request authoritative preview" />
+                <Button Content="_Refresh" Click="RefreshButton_Click" IsEnabled="{Binding IsNotBusy}"
+                        AutomationProperties.Name="Refresh saved projection" />
+                <Button Content="_Fit" Click="FitButton_Click" AutomationProperties.Name="Fit canvas to view" />
+                <Button Content="−" Width="34" Click="ZoomOutButton_Click" AutomationProperties.Name="Zoom out" />
+                <Button Content="+" Width="34" Click="ZoomInButton_Click" AutomationProperties.Name="Zoom in" />
+                <Button Content="Reset _view" Click="ResetViewButton_Click" AutomationProperties.Name="Reset canvas view" />
+                <TextBlock x:Name="ZoomText" VerticalAlignment="Center" Foreground="#A5AAB4" Margin="8,0,12,0" />
+                <TextBlock Text="{Binding PreviewSummaryText}" VerticalAlignment="Center" Foreground="#80DCD7" Margin="0,0,12,0" />
+                <TextBlock Text="{Binding IntegrityText}" VerticalAlignment="Center" Foreground="#A5AAB4" />
+                <ProgressBar Width="80" Height="6" IsIndeterminate="{Binding IsBusy}" Margin="12,0,0,0"
+                             Visibility="{Binding IsBusy, Converter={StaticResource BoolToVisibility}}" />
+            </StackPanel>
+        </DockPanel>
+
+        <StackPanel Grid.Row="1">
+            <Border Background="#3A1C1C" BorderBrush="#A34C4C" BorderThickness="1"
+                    Padding="10" Margin="0,0,0,8"
+                    Visibility="{Binding HasError, Converter={StaticResource BoolToVisibility}}">
+                <DockPanel LastChildFill="True">
+                    <Button DockPanel.Dock="Right" Content="_Refresh" Click="RefreshButton_Click"
+                            AutomationProperties.Name="Refresh after error" />
+                    <TextBlock Text="{Binding ErrorText}" TextWrapping="Wrap" Foreground="#FFD0D0" />
+                </DockPanel>
+            </Border>
+
+            <Border Background="#3A2A10" BorderBrush="#B8862C" BorderThickness="1"
+                    Padding="10" Margin="0,0,0,8"
+                    Visibility="{Binding HasDraftConflict, Converter={StaticResource BoolToVisibility}}">
+                <DockPanel LastChildFill="True">
+                    <Button DockPanel.Dock="Right" Content="Discard draft &amp; reload"
+                            Click="DiscardAndReloadButton_Click"
+                            AutomationProperties.Name="Discard draft and reload" />
+                    <TextBlock Text="{Binding DraftConflictText}" TextWrapping="Wrap" Foreground="#FFE0A0" />
+                </DockPanel>
+            </Border>
+        </StackPanel>
+
+        <Grid Grid.Row="2">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="520" />
+                <ColumnDefinition Width="6" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <Grid Grid.Column="0" Margin="0,0,8,0">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="72" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="76" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="140" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="0" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Grid.Row="0" Text="Workspace sets" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <ListBox x:Name="SetList" Grid.Row="1" Margin="0,0,0,8" IsEnabled="{Binding IsNotBusy}"
+                         ItemsSource="{Binding Sets}" SelectionChanged="SetList_SelectionChanged"
+                         AutomationProperties.Name="Workspace set list"
+                         AutomationProperties.HelpText="Use arrow keys to select a configured workspace set." />
+
+                <TextBlock Grid.Row="2" Text="Monitors" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <ListBox x:Name="MonitorList" Grid.Row="3" Margin="0,0,0,8"
+                         ItemsSource="{Binding Monitors}" SelectionChanged="MonitorList_SelectionChanged"
+                         AutomationProperties.Name="Monitor list"
+                         AutomationProperties.HelpText="Use arrow keys to select a reported monitor." />
+
+                <TextBlock Grid.Row="4" Text="Configured items" FontWeight="SemiBold" Margin="0,0,0,4" />
+                <ListBox x:Name="ItemList" Grid.Row="5" Margin="0,0,0,8"
+                         ItemsSource="{Binding Items}" SelectionChanged="ItemList_SelectionChanged"
+                         AutomationProperties.Name="Configured item list"
+                         AutomationProperties.HelpText="Use arrow keys to select an item; select an item to inspect and edit its geometry." />
+
+                <GroupBox Grid.Row="6" Header="Edit geometry — in-memory draft only"
+                          BorderBrush="#3A3A42" Foreground="#EBEBF0" Padding="6" Margin="0,0,0,6">
+                    <StackPanel>
+                        <DockPanel Margin="0,0,0,4">
+                            <TextBlock Text="Scope" Width="46" VerticalAlignment="Center" />
+                            <ComboBox x:Name="ScopeCombo" ItemsSource="{Binding GeometryScopes}"
+                                      DisplayMemberPath="Display"
+                                      SelectionChanged="ScopeCombo_SelectionChanged"
+                                      AutomationProperties.Name="Geometry scope"
+                                      AutomationProperties.HelpText="Choose the stored geometry field to edit: absolute fallback, an existing profile entry, or relative placement." />
+                        </DockPanel>
+                        <TextBlock Text="{Binding ScopeDescription}" Foreground="#A5AAB4" TextWrapping="Wrap"
+                                   Margin="0,0,0,6" AutomationProperties.Name="Geometry scope description" />
+
+                        <Grid Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="86" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="86" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="86" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="86" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="X" VerticalAlignment="Center" Margin="0,0,4,0" />
+                            <TextBox x:Name="EditXBox" Grid.Column="1" Text="{Binding EditX, UpdateSourceTrigger=PropertyChanged}"
+                                     IsEnabled="{Binding CanEditSelectedScope}"
+                                     AutomationProperties.Name="Geometry X"
+                                     PreviewKeyDown="GeometryField_PreviewKeyDown" />
+                            <TextBlock Grid.Column="2" Text="Y" VerticalAlignment="Center" Margin="8,0,4,0" />
+                            <TextBox x:Name="EditYBox" Grid.Column="3" Text="{Binding EditY, UpdateSourceTrigger=PropertyChanged}"
+                                     IsEnabled="{Binding CanEditSelectedScope}"
+                                     AutomationProperties.Name="Geometry Y"
+                                     PreviewKeyDown="GeometryField_PreviewKeyDown" />
+                            <TextBlock Grid.Column="4" Text="W" VerticalAlignment="Center" Margin="8,0,4,0" />
+                            <TextBox x:Name="EditWBox" Grid.Column="5" Text="{Binding EditW, UpdateSourceTrigger=PropertyChanged}"
+                                     IsEnabled="{Binding CanEditSelectedScope}"
+                                     AutomationProperties.Name="Geometry width"
+                                     PreviewKeyDown="GeometryField_PreviewKeyDown" />
+                            <TextBlock Grid.Column="6" Text="H" VerticalAlignment="Center" Margin="8,0,4,0" />
+                            <TextBox x:Name="EditHBox" Grid.Column="7" Text="{Binding EditH, UpdateSourceTrigger=PropertyChanged}"
+                                     IsEnabled="{Binding CanEditSelectedScope}"
+                                     AutomationProperties.Name="Geometry height"
+                                     PreviewKeyDown="GeometryField_PreviewKeyDown" />
+                        </Grid>
+
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                            <Button Content="_Apply" Click="ApplyGeometryButton_Click"
+                                    IsEnabled="{Binding CanEditSelectedScope}"
+                                    AutomationProperties.Name="Apply geometry to in-memory draft" />
+                            <Button Content="_Revert item" Click="RevertItemButton_Click"
+                                    IsEnabled="{Binding IsDraftDirty}"
+                                    AutomationProperties.Name="Revert selected item draft changes" />
+                            <Button Content="Discard _all" Click="DiscardDraftButton_Click"
+                                    IsEnabled="{Binding CanDiscardDraft}"
+                                    AutomationProperties.Name="Discard all draft changes" />
+                        </StackPanel>
+
+                        <DockPanel Margin="0,0,0,4">
+                            <TextBlock Text="Basis" Width="46" VerticalAlignment="Center" />
+                            <ComboBox x:Name="BasisCombo" ItemsSource="{Binding BasisOptions}" SelectedItem="{Binding SelectedBasis}"
+                                      Width="110" HorizontalAlignment="Left"
+                                      AutomationProperties.Name="Relative conversion basis" />
+                            <Button Content="Convert to relative" Click="ConvertToRelativeButton_Click"
+                                    IsEnabled="{Binding CanConvertToRelative}" Margin="8,0,6,0"
+                                    AutomationProperties.Name="Convert item mode to relative" />
+                            <Button Content="Convert to absolute" Click="ConvertToAbsoluteButton_Click"
+                                    IsEnabled="{Binding CanConvertToAbsolute}"
+                                    AutomationProperties.Name="Convert item mode to absolute" />
+                        </DockPanel>
+                        <TextBlock Text="Mode conversion changes item.layout/layoutMode; an existing matched profile entry still takes precedence."
+                                   Foreground="#A5AAB4" TextWrapping="Wrap" FontSize="11" Margin="0,0,0,4" />
+
+                        <TextBlock Text="{Binding DraftValidationText}" Foreground="#A5AAB4" TextWrapping="Wrap" />
+                        <TextBlock Text="{Binding PreviewErrorText}" Foreground="#FF9A9A" TextWrapping="Wrap"
+                                   Visibility="{Binding HasPreviewError, Converter={StaticResource BoolToVisibility}}" />
+                        <TextBlock Text="{Binding EditErrorText}" Foreground="#FF9A9A" TextWrapping="Wrap"
+                                   Visibility="{Binding HasEditError, Converter={StaticResource BoolToVisibility}}" />
+                        <ScrollViewer MaxHeight="54" VerticalScrollBarVisibility="Auto" Margin="0,4,0,0">
+                            <ItemsControl ItemsSource="{Binding DraftErrors}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#FFC457" FontSize="11" />
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </StackPanel>
+                </GroupBox>
+
+                <TextBlock Grid.Row="8" Text="Selected item — saved projection and draft details"
+                           FontWeight="SemiBold" Margin="0,0,0,4" />
+                <Border Grid.Row="9" BorderBrush="#3A3A42" BorderThickness="1" Padding="8" CornerRadius="3">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel>
+                            <ItemsControl ItemsSource="{Binding DetailRows}" ItemTemplate="{StaticResource DetailRowTemplate}" />
+                            <TextBlock Text="Relevant warnings" FontWeight="SemiBold" Margin="0,10,0,3" />
+                            <ItemsControl ItemsSource="{Binding ItemWarnings}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#FFC457" Margin="0,2" />
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </ScrollViewer>
+                </Border>
+            </Grid>
+
+            <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch" Background="#2A2A30" />
+
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="238" />
+                </Grid.RowDefinitions>
+
+                <Border Grid.Row="0" BorderBrush="#3A3A42" BorderThickness="1" CornerRadius="3">
+                    <local:WorkspaceCanvas x:Name="Canvas" />
+                </Border>
+
+                <TabControl x:Name="PreviewTabControl" Grid.Row="1" Margin="0,8,0,0"
+                            Background="#202026" Foreground="#EBEBF0" BorderBrush="#3A3A42">
+                    <TabItem Header="Saved warnings">
+                        <ListBox x:Name="WarningList" ItemsSource="{Binding Warnings}"
+                                 AutomationProperties.Name="Saved projection warnings"
+                                 AutomationProperties.HelpText="Warnings reported by the saved projection."
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#FFC457" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </TabItem>
+
+                    <TabItem Header="Preview diff">
+                        <ListBox x:Name="PreviewDiffList" ItemsSource="{Binding PreviewDiffs}"
+                                 AutomationProperties.Name="Semantic preview diff"
+                                 AutomationProperties.HelpText="Stored configuration changes between the saved and proposed documents."
+                                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#80DCD7" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </TabItem>
+
+                    <TabItem Header="Preview warnings &amp; review">
+                        <DockPanel LastChildFill="True">
+                            <Border DockPanel.Dock="Bottom" Background="#202026" BorderBrush="#3A3A42"
+                                    BorderThickness="0,1,0,0" Padding="6">
+                                <StackPanel>
+                                    <TextBlock Text="{Binding ReviewStatusText}" TextWrapping="Wrap" Foreground="#EBEBF0" />
+                                    <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                                        <Button Content="Review warnings" Click="ReviewWarningsButton_Click"
+                                                IsEnabled="{Binding CanAcknowledgePreview}"
+                                                AutomationProperties.Name="Acknowledge displayed preview warnings" />
+                                        <TextBlock Text="Live windows are not changed by saving the configuration." VerticalAlignment="Center"
+                                                   Foreground="#A5AAB4" Margin="8,0,0,0" />
+                                    </StackPanel>
+                                    <TextBlock Text="{Binding PreviewSummaryText}" Foreground="#80DCD7" Margin="0,3,0,0" />
+                                    <TextBlock Text="{Binding SaveStatusText}" Foreground="#D7D9E0" TextWrapping="Wrap" Margin="0,3,0,0" />
+                                    <TextBlock Text="{Binding SaveObservedRevisionText}" Foreground="#FFC457" TextWrapping="Wrap"
+                                               Visibility="{Binding SaveOutcomeUncertain, Converter={StaticResource BoolToVisibility}}" />
+                                    <TextBlock Text="{Binding SaveErrorText}" Foreground="#FF9A9A" TextWrapping="Wrap"
+                                               Visibility="{Binding HasSaveError, Converter={StaticResource BoolToVisibility}}" />
+                                </StackPanel>
+                            </Border>
+                            <ListBox x:Name="PreviewWarningList" ItemsSource="{Binding PreviewWarnings}"
+                                     AutomationProperties.Name="Preview warnings"
+                                     AutomationProperties.HelpText="Warnings and consequences reported by the authoritative preview. Acknowledgement requires the explicit review action."
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <TextBlock Text="{Binding Display}" TextWrapping="Wrap" Foreground="#FFC457" />
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </DockPanel>
+                    </TabItem>
+                </TabControl>
+            </Grid>
+        </Grid>
+
+        <StatusBar Grid.Row="3" Margin="0,8,0,0" Background="#202026" Foreground="#EBEBF0">
+            <StatusBarItem>
+                <TextBlock x:Name="StatusText" Text="{Binding StatusMessage}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Text="{Binding CountsText}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Text="{Binding DraftBadgeText}" Foreground="#FFC457" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Text="{Binding BackendText}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock Text="{Binding RevisionText}" />
+            </StatusBarItem>
+            <Separator />
+            <StatusBarItem>
+                <TextBlock x:Name="PointerText" Text="Pointer: —" />
+            </StatusBarItem>
+        </StatusBar>
+    </Grid>
+</Window>

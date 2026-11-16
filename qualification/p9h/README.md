@@ -1,0 +1,1581 @@
+# DevWS P9-H replay instrumentation
+
+Isolated measurement tooling for the P9-H acceptance replay. **This is not product code.**
+Nothing here is installed, imported by `src/`, or referenced by the product manifest.
+
+## Why it exists
+
+The P9-G replay produced two verdict-impacting instrumentation failures. Both were
+bookkeeping defects, not product defects, and each is closed structurally here.
+
+| P9-G defect | Root cause | Closed by |
+| --- | --- | --- |
+| E1-1 | `disc-proof.ps1` began with `Set-Content`, truncating the previous run's records | Append-only writes (`Add-P9HArtifactLine`), never truncating |
+| E1-2 | `CloseMainWindow` treated as a completed disconnect (it raises a confirmation dialog) | `tsdiscon <id>` behind an authorization gate |
+| E1-3 | The decisive observation was lost before archiving | Records are flushed and read back before any verdict |
+| E1-4 | Session 0 `Services` state 4 read as session 3 disconnected | `Test-P9HTargetDisconnected` keys on session id **and** user **and** logon time |
+| E1-5 | E1 PASS expression had no disconnect term | `Get-P9HE1Verdict` requires `DisconnectProven` |
+| E1-6 | Reconnect permitted after the command was issued | `Assert-P9HReconnectPermitted` re-derives proof from the persisted log |
+| N2-1/2 | Exit code held only in memory | `Write-P9HExitRecord` runs before any inventory |
+| N2-3/4 | `ManagementDateTimeConverter.ToDateTime` on a `DateTime` blanked every start time | `ConvertTo-P9HProcessStartUtc` + inventory `Outcome=degraded` classification |
+| N2-5 | Post-launch serialization hung | Stages are bounded and independently journaled |
+| N2-6 | Final result file never written | Exit record is the first artifact, atomically persisted |
+
+### Stage 2.1 corrections (independent review of PR #21)
+
+Stage 2 passed 42 synthetic tests yet contained paths where the instrumentation either could
+not execute the intended sequence or could issue an unsupported verdict. Each is fixed and
+guarded by a test that fails when the defect is reintroduced.
+
+| Defect | Consequence in Stage 2 | Correction |
+| --- | --- | --- |
+| Circular reconnect gate | `Assert-P9HReconnectPermitted` used the FINAL proof, which required the post-reconnect record — impossible before reconnecting. The replay could never pass its own gate. | Proof split into A (pre-reconnect authorization: pre Active + target state 4, no post required) and B (final transition proof). Verified: reintroducing the defect makes `A1` fail while `F1` still passes. |
+| Session identity not end to end | The matcher understood a logon time, but the parser produced only 4 fields, so real records never carried one and identity silently degraded to (session, user). | Raw line carries an optional `logon=` field; the v2 observation schema persists the observed logon **and its source**; matching, persistence, readback, authorization and verdict all consume the same pinned identity. Missing/unverifiable logon **fails closed**. |
+| `negativeOrigin` not in the predicate | A topology with no negative-origin monitor could still PASS. | Added to `$tokensSatisfied`, computed from per-monitor rectangles on both sides. |
+| Session check only "not 0" | Captures from an unrelated non-zero session could PASS. | Captures must bind to the target session id and to each other; `sessionMatchesTarget` and `sessionConsistent` are required. |
+| Asserted booleans trusted | `tokenSetBytes`/`tokenRectBytes`/`identityComplete` were accepted without the raw observations. | Capture schema validated; tokens must be present and non-empty; rect/negative-origin derived from `parsedMonitors` when available; timestamp and trial provenance are blocking. |
+| `windowsAttributed` unused + `.Count -ge 0` | The tautology meant N2-B could PASS with no attributable window or process. | Process attribution (new process with a recovered start time) and window attribution (`Select-P9HAttributableWindow`) are now first-class PASS inputs. |
+| N2-A `$fallbackApplied = $false` initialiser | An unreadable post-window artifact read as "fallback not applied", allowing PASS on absent evidence. | Tri-state (`$null` = not observed) plus `PostStateObserved`; nothing is inferred from a missing observation. |
+| Malformed trace lines silently skipped | A partial trace could be claimed as a whole transaction. | Any malformed trace line fails the trace as a whole. |
+| Foreign trace trial id recorded but not blocking | A trace from another trial could contribute to a PASS. | `trace-trial-mismatch` is now a blocking condition. |
+
+Two defects were found while *writing* these fixes, and are also covered:
+
+- `ConvertFrom-Json` reconstructs ISO-8601 text as `DateTime`, so string-only comparisons produced
+  a false `pre-logon-mismatch` and a false `disconnect-timestamp-invalid`. Logon and timestamp
+  comparisons now normalize `DateTime`/`DateTimeOffset`/string before comparing.
+- `[Parameter(Mandatory)]` with a default value **prompts** interactively instead of failing. Three
+  such parameters were reintroduced during this correction and were removed again.
+
+### Stage 2.2 corrections (independent review of PR #21 @ 75ed689)
+
+Stage 2.1 fixed the circular gate, but several verdict predicates still allowed an authoritative
+PASS without the evidence they claimed to require. Each counterexample below was reproduced against
+`75ed689` and now rejects.
+
+| False-PASS path on 2.1 | Reproduction | Correction |
+| --- | --- | --- |
+| `$traceOk` computed but never required by the N2-B predicate | all required events valid + one malformed line → **N2B=PASS** | `Test-P9HLaunchTrace` validates the whole trace (parse, required-event presence and uniqueness, causal order, single planId, single trialId, clean completion) and `trace.Ok` is a required PASS term |
+| Duplicate / contradicting finalization events | two `stage2-terminal-final` with different outcomes → **PASS** | a repeated lifecycle event fails as `trace-duplicate-event` |
+| Invalid event order | `terminal-final` before `broker-ready` → **PASS** | rank-ordered causal check → `trace-order-invalid` |
+| Incompatible plan ids | four different `planId` values → **PASS** | one planId required → `trace-plan-id-conflict` |
+| Process attribution by "new non-cmd process with a start time" | unrelated `WindowsTerminal.exe` opened by the user → **PASS** | `Get-P9HLaunchAttribution` requires the launch identity in argv (`-SetId`, `-TerminalId`, `-WindowId`) **and** a recovered start time |
+| `-WindowRequired 'no'` caller bypass | zero observed windows still → **PASS** | parameter removed; window evidence is unconditional |
+| E1 fell back to asserted `tokenRectBytes` | fabricated `x=-9999` summary, no monitor records → **PASS** | `parsedMonitors` are the authoritative source; a summary-only capture is rejected |
+| Capture omitting `trialId` bypassed provenance | absent field on both captures → **PASS** | trial id is required, identical across pre/post/observer, and must match the trial under test |
+| No capture↔transition chronology | pre-capture timestamped three hours in the future → **PASS** | the pre-capture must precede the persisted disconnect and the post-capture must follow the post-reconnect observation |
+
+**Attribution model (source-backed).** A terminal is created through the elevated broker, so it is
+*not* a direct child of the `cmd.exe` launcher; parentage is neither assumed nor inferred from
+process names. The product itself supplies the authoritative links
+(`src/lib/devws-terminal.ps1`, `devws-terminal-launch.ps1`): the broker plans each terminal by its
+`windowId`, and the child shell is launched with explicit
+`-SetId / -TerminalId / -WindowId / -SessionId / -PublicationPath` arguments — the same identity the
+product validates before trusting a tracked tab. Attribution therefore requires all three ids in the
+observed command line plus a recovered creation time; the window must then belong to that attributed
+PID and be absent from the pre-launch inventory.
+
+**Test totals: 70 → 87.** New: W1–W14 (trace validity and causal attribution, including the positive
+detached-terminal case) and X1–X12 (window-omission, raw-monitor contract, trial and timestamp
+provenance). All 70 Stage 2.1 cases are retained unchanged.
+
+## Layout
+
+```
+qualification/p9h/
+  Invoke-SelfTests.ps1        runner: synthetic validation, cleanup, non-zero on failure
+  lib/
+    p9h.ps1                   loader (side-effect free)
+    p9h-core.ps1              time, trial ids, atomic/append-only IO, artifact readers
+    p9h-e1-observer.ps1       WTS table parsing, strict target matching, disconnect proof
+    p9h-e1-state.ps1          disconnect plan, tsdiscon gate, wait-for-proof, reconnect gate
+    p9h-n2-recorder.ps1       launcher spec, exit record, process-recorded launch
+    p9h-n2-inventory.ps1      process/window inventory, delta, attribution
+    p9h-verdict.ps1           E1 and N2-A/N2-B verdict rules
+    p9h-evidence.ps1          trial context, stage journal, artifact index
+    p9h-wts-provider.ps1      WTSINFO/WTS_SESSION_INFO layout, enumeration, decode, provider lines
+    p9h-collector.ps1         trial collector: seven N2 roles, origin model, E1 provenance
+    p9h-fault.ps1             fault-injection harness
+    p9h-selftest.ps1          the test cases
+```
+
+## Safety model
+
+- **Importing is inert.** `. lib/p9h.ps1` starts no process and touches no VM.
+- **Real actions need a literal token.** `Invoke-P9HControlledDisconnect` and
+  `Invoke-P9HProductLaunchRecorded` throw unless given the exact authorization phrase.
+  Stage 2 never supplies it.
+- **No implicit session targets.** A missing session id is an error, never "current session".
+- **Bounded waits everywhere.** Timeouts are their own outcome and never become exit code 0.
+- **Append-only evidence.** No function deletes or truncates a prior record.
+- **Atomic persistence.** Artifacts are written temp-then-renamed in the same directory, then
+  read back and validated before a caller may rely on them.
+
+## Running the self-tests
+
+```powershell
+pwsh -NoLogo -NoProfile -File .\qualification\p9h\Invoke-SelfTests.ps1
+```
+
+Add `-KeepSandbox` to retain the evidence tree. The runner exits non-zero if any case fails,
+and removes only the sandbox it created.
+
+The tests use trivial `cmd.exe` batch files in a unique temp directory. They never launch the
+installed product, never contact Hyper-V, never disconnect a session, and never change host
+configuration.
+
+## What is verified, and what is not
+
+- **IMPLEMENTED:** every component above.
+- **SYNTHETICALLY VERIFIED:** exit recording (0, 7, nonzero, timeout, detached child, large
+  output, spaces, unicode, quoted args), fault containment (throwing inventory, hanging
+  serializer, malformed and missing records), WTS predicate strictness (12 cases), verdict
+  rules (8 cases), cross-trial evidence binding (8 cases), shared provenance and artifact-index
+  integrity (11 cases), date handling (3 cases).
+- **NOT YET PHYSICALLY VERIFIED:** `tsdiscon` behaviour against a real session, PowerShell
+  Direct capture from a Hyper-V host, real Terminal Services event delivery, and real
+  installed-`ws` launch behaviour. Those require a separately authorized guest replay.
+
+## Known limitations
+
+- The WTS observer consumes a provider-supplied table. In a real replay that provider queries
+  WTS through PowerShell Direct; that path is unimplemented here and unproven.
+- Logon-time matching depends on the provider supplying a per-record logon timestamp. If a real
+  WTS query cannot supply one, the identity tuple degrades to (session id, user) and the
+  limitation must be recorded rather than silently accepted.
+- Evidence durability is bounded by the OS filesystem. A catastrophic host failure can still
+  lose artifacts; the design states this rather than claiming otherwise.
+
+### Stage 2.3 corrections (independent review of PR #21 @ 8e0f156)
+
+Two of these are verdict weaknesses; one is a **lost-regression** finding that matters as much as
+the code fixes.
+
+#### The N-series was silently dropped (70 -> 87 instead of 70 -> 96)
+
+Stage 2.2 replaced the whole verdict test function, so the nine N-series cases disappeared while the
+total *rose*. Nothing complained. Restored in full, with N8's expectation adapted to the stricter
+contract below. The registry is now guarded automatically:
+
+- `Test-P9HTestRegistry` checks the **runtime** results (unique ids, exact count, every series
+  present) **and** the **source** literals in the test file, and fails as a case (`R1`) if a
+  registered case never ran or a series vanished.
+- Registered total is **100** (96 + W15, W16, X13, X14 for the new corrections).
+
+#### N2-A accepted an empty window inventory
+
+`Windows=[]` satisfied every N2-A predicate, so "no window was observed" passed a criterion that
+requires **positively observed window creation and attribution**.
+
+| Counterexample | Then | Now |
+| --- | --- | --- |
+| Valid but empty post-window inventory | **N2A=PASS** | `no-newly-observed-attributed-window` |
+| Missing pre-window inventory | synthesized an empty baseline | `pre-window-observation-unavailable` |
+
+N2-A now needs a readable **pre and post** inventory, a newly observed HWND whose PID is causally
+attributed, and the fallback rectangle absent from *that* window.
+
+#### Attribution ignored the launch window
+
+`Get-P9HLaunchAttribution` received `LauncherPid`/`LaunchedAtUtc` but never used them, so a **stale**
+process carrying the matching `-WindowId/-TerminalId/-SetId` argv from an earlier run counted as
+newly created.
+
+| Counterexample | Then | Now |
+| --- | --- | --- |
+| Same argv, created 5 h before the launch | **ProcessAttributed=True** | `creation-time-outside-launch-window` |
+
+Attribution now requires: launch identity in argv **and** a recovered creation time **and** that time
+inside `[launchedAt - tolerance, exitedAt + tolerance]` **and** a PID different from the launcher.
+Parentage is still never inferred - the terminal is created by the elevated broker.
+
+#### Trace identity requirements were invented, then hardened
+
+Stage 2.2 required a per-event `trialId`. **DevWS never emits one** - verified by reading
+`src/lib/devws-paths.ps1` and every `Write-DevWSLaunchTrace` call site: zero occurrences of any trial
+identifier, and `planId` appears only on `stage2-broker-ready`/`stage2-broker-replanned`. That made
+every **real** production trace invalid.
+
+`Test-P9HLaunchTrace` now validates using only fields the product emits:
+
+| Requirement | Source |
+| --- | --- |
+| Framework fields `event`, `utcMs`, `pid` | `Write-DevWSLaunchTrace` |
+| Non-empty `planId` on `stage2-broker-ready` | `devws-launch.ps1:650` |
+| Consistent `planId` on `stage2-broker-replanned` | `devws-launch.ps1:698` |
+| Transaction identity `set` consistent across the plan and `transaction-end` | `devws-launch.ps1:569,901` |
+| Causal order: event rank **and** monotonic `utcMs` | emitted by every event |
+| Clean completion: `finalized=1`, `failures=0`, `broker=true`, `uncertain=false` | `devws-launch.ps1:770,901` |
+
+| Counterexample | Then | Now |
+| --- | --- | --- |
+| Production-shaped trace (no `trialId`) | **INCONCLUSIVE** (real traces rejected) | eligible for PASS |
+| Trace with no `planId` anywhere | PASS | `trace-plan-id-missing` |
+
+#### Two further defects found while writing the fixes
+
+- `ConvertFrom-Json` turns an ISO-8601 `Z` string into a `DateTime` with `Kind=Local` whose ticks are
+  **local** wall-clock ticks. Unconditional `ToUniversalTime()` double-applied the offset and pushed
+  valid process start times out of the launch window. `ConvertTo-P9HUtcOrNull` now honours `Kind`.
+- `$null -ne $value` is **not** a presence test when `$value` is an array: comparing `$null` with
+  `@()` yields `@()` (falsy). A valid but empty `Windows` array therefore looked like a missing
+  inventory and blocked every attribution path. Presence is now tested on the property object
+  (`Test-P9HHasProperty`).
+
+### Stage 2.4 corrections (cross-trial evidence binding)
+
+`Test-P9HExitRecord` verified that an exit record **has** a `trialId` field, never that it equals the
+trial being evaluated. A verdict about trial B could therefore PASS on trial A's exit record.
+
+| Counterexample | Stage 2.3 | Now |
+| --- | --- | --- |
+| Exit record from trial A, evaluating trial B | **N2B=PASS** | `exit-record-trial-mismatch:<id>` |
+| `TrialId` omitted from the invocation | **N2B=PASS** | refused by the binder / `trial-id-missing` |
+
+`TrialId` is now `[Parameter(Mandatory)]` on the N2 verdict, and the exit record's own id is compared
+explicitly.
+
+#### Binding a product trace that carries no trial identity
+
+DevWS emits **no** per-event `trialId` (verified against every `Write-DevWSLaunchTrace` call site).
+Rather than invent a product field, the binding is authored by the **collector** in the artifact index
+that already exists for each trial — there is no second manifest:
+
+```
+Add-P9HArtifactRole -Context <trial> -Path <artifact> -Role fixture|stdout|pre-windows|
+                                                  post-windows|exit-record|new-processes|trace
+```
+
+Each entry records the role, the **absolute path**, the byte count and the SHA-256 of the captured
+bytes. Before a verdict can PASS, `Get-P9HArtifactBinding` re-reads that index and requires, for all
+seven roles:
+
+1. the role is recorded;
+2. the record belongs to **this** trial;
+3. the caller is using the **recorded path** (`ExpectedPaths` pinning);
+4. the file still exists; and
+5. its current SHA-256 **equals** the recorded digest.
+
+| Counterexample | Result |
+| --- | --- |
+| Trace substituted from another trial | `binding-mismatch:trace:path` or `digest` |
+| Artifact rewritten after binding | `binding-mismatch:trace:digest` |
+| Another trial's artifact index supplied | `binding-mismatch:*:trial` |
+| No index supplied | `artifact-index-not-supplied` → INCONCLUSIVE |
+
+A missing, incomplete or mismatched binding yields **INCONCLUSIVE**, never PASS. Existing source-backed
+correlation (`planId` on `stage2-broker-ready` vs `stage2-broker-replanned`, `set` across the plan and
+`transaction-end`, `-SetId`/`-TerminalId`/`-WindowId` in the child argv, creation time inside the launch
+window) remains required; the binding adds provenance, not a replacement.
+
+**Limitation, stated plainly:** this proves the artifacts a verdict reads are the ones the collector
+captured for that trial. It does **not** prove they were captured from a live guest — that is the
+Stage 3 live collector's job, which must write the same index through `Add-P9HArtifactRole`.
+
+### Stage 2.4.1 corrections (shared provenance, fail-closed)
+
+Three narrow defects remained after Stage 2.4. Each is a false-PASS path, so each is closed rather
+than documented.
+
+#### N2-A did not consult the binding
+
+Stage 2.4 gated **N2-B** on `$binding.Ok`, but the **N2-A** (placement) chain never read it. A
+placement result could therefore become authoritative on artifacts that were never attributed to
+the trial.
+
+```
+N2-A measurement otherwise valid, artifact index ABSENT
+  before: N2A=PASS
+  after : N2A=INCONCLUSIVE  artifact-binding:artifact-index-not-supplied
+
+N2-A measurement otherwise valid, artifact index from ANOTHER trial
+  before: N2A=PASS
+  after : N2A=INCONCLUSIVE  artifact-binding:binding-mismatch:<role>:trial=<foreign-id>
+```
+
+Both verdicts now consult **one** shared gate, `Get-P9HTrialProvenance`, instead of duplicating
+slightly different trial-binding logic. The gate checks provenance and trial identity **only** — it
+never reads the exit code, terminal finalization or any other lifecycle success signal. That is what
+keeps the two measurements independent:
+
+```
+N2-A measurement valid, captured exit code 3, complete same-trial binding
+  N2A=PASS   (placement is still independently evaluated)
+  N2B=FAIL   (lifecycle outcome is not success)
+```
+
+An exit-record outcome other than success therefore never automatically implies a failed placement
+measurement. Historical P9-G measurements are **not** retroactively reclassified.
+
+#### An empty `trialId` in a required index entry was not a mismatch
+
+The verifier compared the recorded trial id only when it was non-empty, so a blank id silently
+satisfied the binding. Every required entry must now carry a **nonempty** id that equals the
+requested trial exactly:
+
+| Recorded `trialId` | Before | Now |
+| --- | --- | --- |
+| property absent | accepted | `trial-id-missing` |
+| `""` | accepted | `trial-id-missing` |
+| `"   "` | accepted | `trial-id-missing` |
+| another trial's id | rejected | `foreign-trial` |
+| exactly the requested id | accepted | accepted |
+
+Each surfaces as `binding-mismatch:<role>:trial-missing` or `binding-mismatch:<role>:trial=<id>`.
+
+#### Malformed index records were skipped silently
+
+The parser caught a malformed JSONL record and continued, so uninterpretable provenance disappeared
+from a verdict. A malformed record is now an explicit failure that names the line and the reason:
+
+```
+artifact-index-malformed:line 1
+```
+
+The raw index is preserved byte-for-byte. Nothing is truncated, rewritten or repaired, so a
+historical index is evidence rather than an input to be sanitized.
+
+| Counterexample | Result |
+| --- | --- |
+| Truncated JSON before the seven valid entries | `artifact-index-malformed:line 1` |
+| Truncated JSON appended after the valid entries | `artifact-index-malformed:line 8` |
+| A required role absent | `binding-incomplete:trace` |
+| All seven roles valid and same-trial | accepted, 7/7 verified |
+
+These are covered by the P-series (P1-P11), which also proves the N2-A/N2-B independence above and
+retains the N2-B cross-trial protection.
+
+## Stage 3A — offline WTS provider and collector integration
+
+Stage 3A connects a native `WTSINFO` provider to the frozen evidence contract. **No live session
+query, RDP action, `tsdiscon`, PowerShell Direct call or installed-product launch occurs in this
+stage**; every assertion runs from synthetic bytes or synthetic facts.
+
+### Provider contract (documented APIs only)
+
+| API | Use |
+| --- | --- |
+| `WTSEnumerateSessionsW` | session ids and station names |
+| `WTSQuerySessionInformationW` (`WTSInfo`, class 24) | one `WTSINFO` structure |
+| `WTSFreeMemory` | release every buffer the API allocated |
+
+`WTSINFO` is modelled with the documented field order and the `winsrv.h` array lengths *including*
+their terminators (`WINSTATIONNAME_LENGTH` 32, `DOMAIN_LENGTH` 17, `USERNAME_LENGTH + 1` 21). On x64
+that is **216 bytes**, with `State` at 0, `SessionId` at 4, `WinStationName` at 32, `Domain` at 96,
+`UserName` at 130, `ConnectTime` at 176 and `LogonTime` at 200.
+
+The layout is cross-checked rather than assumed: `Test-P9HWtsInfoLayout` compares the published
+offsets against `Marshal.SizeOf` / `Marshal.OffsetOf` results for the *current* process architecture
+and distinguishes three failures — `layout-unsupported`, `layout-size-mismatch` and
+`layout-offset-mismatch`. A host that cannot describe `WTSINFO` reports an explicit capability gap
+(`Get-P9HWtsProviderCapability` → `Capability = 'unsupported'`) instead of inventing a logon time.
+
+### FILETIME conversion
+
+`LogonTime` is a `FILETIME`: 100-nanosecond intervals since 1601-01-01Z. **Zero is the Win32
+"not available" sentinel, not the epoch.** Converting it blindly would turn a missing logon time into
+a plausible 1601 timestamp and defeat the identity check, so zero, negative and out-of-range values
+are rejected explicitly and the record carries `LogonSource = 'wtsinfo-zero'` (or the specific
+reason) rather than a fabricated value.
+
+### Provider → observer integration
+
+`ConvertTo-P9HWtsProviderLine` is the only integration point. It emits the line format the frozen
+observer has always parsed:
+
+```
+<id>|<station>|state=<n>|user=<account>[|logon=<ISO-8601 UTC>]
+```
+
+When a logon time is unavailable the trailing `|logon=` segment is **omitted**, which
+`ConvertFrom-P9HLogonTimeField` already reports as `absent`. That keeps the capability gap visible.
+No observer function was modified: `ConvertFrom-P9HWtsLine`, `Get-P9HTargetSessionRecord`,
+`New-P9HObserverRecord`, `Get-P9HReconnectAuthorizationProof` and `Get-P9HDisconnectProof` are
+unchanged, and every E1 predicate still fails closed on missing provider evidence.
+
+### Collector integration
+
+`Add-P9HCollectorArtifactRoles` binds the seven required N2 roles through the **existing**
+`Add-P9HArtifactRole` mechanism — no second manifest, no new binding rule, same schema and digests:
+
+```
+fixture, stdout, pre-windows, post-windows, exit-record, new-processes, trace
+```
+
+Two provenance classes are kept distinct and reported by `New-P9HCollectorManifest`:
+
+- **product** — bytes the product emitted. The collector records only role/path/digest; it never
+  rewrites them, never invents a product event, and never invents a product trial id.
+- **collector** — metadata the collector authors about the trial.
+
+The E1 observation log is bound as **supporting provenance only**, into a separate
+`e1-observation-index.jsonl`. It is deliberately *not* written into `artifact-index.jsonl`, whose
+seven-role contract is closed: a separate file makes it structurally impossible for an E1 record to
+be counted as N2 evidence.
+
+A trial with any missing artifact is refused **before** anything is written
+(`collector-artifacts-incomplete`), so a partial index can never be mistaken for a complete binding.
+
+### Tests: Q1–Q15 (provider) and K1–K15 (collector)
+
+| Series | Coverage |
+| --- | --- |
+| Q1–Q2 | valid payload with nonzero logon; exact UTC round-trip |
+| Q3–Q6 | zero, negative, empty payload, struct-size mismatch |
+| Q7 | published layout vs measured native mirror |
+| Q8 | provider line round-trips through the frozen parser |
+| Q9–Q11 | duplicate ids (ambiguous), wrong user, reused id with different logon |
+| Q12 | missing provider logon fails closed for authoritative matching |
+| Q13–Q14 | live query refused without authorization; Win32 error preserved |
+| Q15 | capability reported explicitly |
+| K1–K3 | seven roles bound; verified by the frozen gate; tamper detected |
+| K4–K5 | incomplete trial refused; E1 log never enters the N2 index |
+| K6–K7 | manifest separates provenance; product bytes never rewritten |
+| K8–K9 | Active → Disconnected → Active proven; session 0 cannot substitute |
+| K10–K13 | no authorization without persisted evidence; provider error and interrupted writes preserved; cross-trial refused |
+| K14–K15 | collector-bound trial preserves N2-A independence and can satisfy both verdicts |
+
+The registry guard now covers **149** registered cases; the full run executes 150 including `R1`.
+All Stage 2.x cases are retained unchanged.
+
+## Stage 3A.1 — complete enumeration and provenance corrections
+
+Independent review of Stage 3A found three defects. All three are closed.
+
+### 1. `WTSEnumerateSessionsW` was documented but not implemented
+
+Stage 3A declared the enumeration API in prose and implemented only the single-session query. The
+E1 contract needs the **complete** session table, because a table containing only the target cannot
+demonstrate that session 0's disconnected state is not the target's state.
+
+`Invoke-P9HWtsSessionEnumerate` now implements it against the documented `WTS_SESSION_INFO` record:
+
+```
+DWORD SessionId;
+LPWSTR pWinStationName;          // pointer: 8 bytes on x64, 4 on x86
+WTS_CONNECTSTATE_CLASS State;
+```
+
+The pointer forces 8-byte alignment, so the record is **24 bytes on x64** (`SessionId` 0,
+`pWinStationName` 8, `State` 16) and **12 bytes on x86**. The stride is derived from the pointer size
+and then **measured** with `Marshal.SizeOf`/`OffsetOf`; `Test-P9HWtsSessionInfoLayout` distinguishes
+`layout-unsupported`, `layout-size-mismatch` and `layout-offset-mismatch`.
+
+Decoding rejects, explicitly: a zero or negative count, a buffer too small for the reported count, a
+station-name pointer outside the buffer, and an unreadable name. A malformed record makes the **whole
+capture** unusable rather than silently dropping the entry a verdict might depend on.
+
+`Resolve-P9HWtsSessionTable` correlates the enumeration with per-session `WTSINFO` results:
+
+| Rule | Failure |
+| --- | --- |
+| Enumerated id must equal its `WTSINFO` id | `target-session-id-mismatch` |
+| Duplicate ids make the table ambiguous | `ambiguous-enumeration` |
+| A failed per-session query is recorded, never dropped | `incomplete-session-table` |
+| The target must be present | `no-target` |
+| A state that moved between enumeration and query | `state-changed-during-collection` |
+
+**Stated limitation:** a sequence of sequential WTS queries is **not** an atomic Windows session
+snapshot. `IsAtomicSnapshot` is always `false`, and a state change is classified as an **evidence
+gap**, never as a successful transition. The observer is therefore required to treat instability as
+instability.
+
+`Get-P9HWtsProviderTableCapture` emits one provider line for **every** enumerated session, so the
+frozen parser sees the same table a live observation would — including session 0.
+
+### 2. Layout verification now gates the live query
+
+Stage 3A had `Test-P9HWtsInfoLayout` but the live path never called it. `Invoke-P9HWtsSessionQuery`
+now:
+
+1. validates the layout **before** any interop and refuses with an explicit capability status;
+2. rejects a returned byte count that does not equal the measured `WTSINFO` size **before** decode;
+3. rejects a decoded `SessionId` that does not equal the requested id;
+4. distinguishes a native failure (Win32 code preserved) from a successful-but-empty response
+   (`empty-native-response`).
+
+Passing the local layout check is **not** evidence that the live API works; it only proves this build
+can describe the structure. Zero, negative and out-of-range FILETIME rejection is unchanged.
+
+### 3. Artifact origin was misclassified
+
+Stage 3A labelled all seven N2 roles `product`, which is factually wrong: the exit record is written
+by the qualification recorder, the inventories are OS facts the qualification tooling observes, and
+the fixture is a qualification-defined input.
+
+The model now separates **who produced** the content from **who captured** it:
+
+| Role | `origin` | `capturedBy` |
+| --- | --- | --- |
+| `fixture` | `fixture` | `qualification-launcher` |
+| `stdout` | `product` | `qualification-launcher` |
+| `pre-windows` | `operating-system` | `qualification-observer` |
+| `post-windows` | `operating-system` | `qualification-observer` |
+| `exit-record` | `qualification` | `qualification-recorder` |
+| `new-processes` | `operating-system` | `qualification-observer` |
+| `trace` | `product` | `qualification-capture` |
+
+This is a **reporting** correction only. The seven required roles, their SHA-256 binding and their
+acceptance meaning are unchanged, and no verdict reads these fields. `New-P9HCollectorManifest`
+reports the classification per role and grouped by origin, and K6 now asserts each role's origin
+instead of a bare count — including the specific proof that a collector-authored exit record is never
+described as product-generated.
+
+### Tests: Y1–Y16 (plus a rewritten K6)
+
+| ID | Coverage |
+| --- | --- |
+| Y1 | full two-session enumeration with session 0 present |
+| Y2 | target Active + session 0 Disconnected yields no target disconnect proof |
+| Y3 | genuinely disconnected target yields correct target evidence |
+| Y4 | enumeration failure preserves the Win32 error |
+| Y5 | duplicate target session ids rejected as ambiguous |
+| Y6 | enumerated/`WTSINFO` session-id mismatch fails closed |
+| Y7 | missing target logon time still blocks authoritative matching |
+| Y8 | per-session query failure preserved without losing other observations |
+| Y9 | a state change during collection is an evidence gap |
+| Y10 | layout mismatch prevents the native path |
+| Y11 | empty/invalid successful buffers are explicit, distinct failures |
+| Y12 | exact per-role origin classification |
+| Y13 | the collector exit record is never described as product |
+| Y14 | E1/N2 index separation with the seven-role digest binding intact |
+| Y15 | live enumeration refuses without authorization |
+| Y16 | full-table output drives the frozen E1 proofs end to end |
+| K6 | per-role origin assertions (replacing the count-only check) |
+
+The registry guard now covers **165** registered cases; the full run executes 166 including `R1`.
+All 149 Stage 3A cases are retained unchanged.
+
+## Stage 3A.2 — session-table evidence authority gate
+
+Independent review found that a **rejected** session table could still become authoritative
+transition evidence. This is the most serious finding since Stage 2.4.1, because it is a false
+reconnect authorization rather than a reporting inaccuracy.
+
+### The defect, reproduced
+
+`Get-P9HWtsProviderTableCapture` accepted only `-Rows`, and `New-P9HObserverRecord` took
+`captureOutcome` as an unconditional `'ok'`. So a resolver result with `Ok = $false` still produced a
+clean-looking provider line table, and Proof A/B accepted it.
+
+Reproduced against `969e362`:
+
+| Counterexample | Before | Now |
+| --- | --- | --- |
+| Enumerated Active, queried Disconnected (table moved) | **Proof A proven** | `disconnect-capture-state-changed` |
+| Non-target session query failed (Win32 5) | **Proof A proven** | rejected, Win32 preserved |
+| `captureOutcome='provider-error'` with a valid target line | **Proof A proven** | `disconnect-capture-not-authoritative` |
+| `provider-error` on the post observation | **Proof B proven** | `post-capture-not-authoritative` |
+| Target absent from a successful enumeration | **resolver `Ok=true`** | `target-not-resolved:no-target` |
+
+### Authority propagation
+
+The capture now consumes the **complete resolved result**, not just its rows, and carries the verdict
+forward:
+
+```
+Resolve-P9HWtsSessionTable  ->  Get-P9HWtsProviderTableCapture -Result
+                            ->  New-P9HObserverRecordFromTableCapture
+                            ->  Get-P9HReconnectAuthorizationProof / Get-P9HDisconnectProof
+```
+
+Three properties are now distinct and all are preserved:
+
+- **raw observations** (`Lines`, `rawWts`) — every fact actually seen, kept even when rejected;
+- **accepted facts** (`Authoritative`) — whether those observations may be used as evidence;
+- **diagnostics** (`RejectionReason`, `Win32Errors`, `ResolverReason`) — why not.
+
+A rejected capture is never discarded and never upgraded. `-Rows` alone is explicitly **not**
+authoritative (`capture-rows-without-resolver-status`), because without the resolver verdict there is
+no evidence the table was complete or consistent.
+
+### The gate at Proof A and Proof B
+
+Both proofs now require the observation's capture to be authoritative:
+
+| Proof | New rejection |
+| --- | --- |
+| A | `pre-capture-not-authoritative`, and non-authoritative disconnect records are excluded from candidacy |
+| B | `post-capture-not-authoritative` |
+
+`Wait-P9HTargetDisconnected` previously hardcoded `-CaptureOutcome 'ok'`; it now consumes the
+provider's `Authoritative`/`RejectionReason`/`CaptureOutcome`/`Win32Errors`, persists rejected samples
+with their diagnostics, and keeps polling rather than authorizing on a rejected reading.
+
+**Deliberately excluded from `captureAuthoritative`:** target matching. "Was this capture accepted?"
+and "does it describe the pinned target?" are separate questions; folding them together would mask
+the precise downstream diagnostics (`pre-not-active`, `logon-unavailable`, `user-mismatch`). This is
+why A10 still reports `pre-not-active`/`logon-unavailable` rather than a generic authority failure.
+
+No E1 acceptance threshold was relaxed. Every change **rejects** evidence that previously qualified.
+
+### Tests: B1–B9 (authority) and S1–S6 (capture contract)
+
+| ID | Coverage |
+| --- | --- |
+| B1–B3 | inconsistent state, failed per-session query, ambiguous table cannot authorize |
+| B4–B5 | provider-error records cannot satisfy Proof A or Proof B |
+| B6 | missing target yields explicit non-success |
+| B7–B8 | **positive controls**: valid Active→Disc authorizes; Active→Disc→Active satisfies Proof B |
+| B9 | raw diagnostics survive a rejected evaluation byte-for-byte |
+| S1–S3 | accepted capture authoritative; rows-alone never; rejected capture keeps raw table |
+| S4 | five distinct, non-authoritative rejection reasons |
+| S5–S6 | the wait gate persists rejected samples without upgrading them and is never satisfied by them |
+
+The registry guard now covers **180** registered cases; the full run executes 181 including `R1`.
+All 165 Stage 3A.1 cases are retained unchanged.
+
+## Stage 3B0 — read-only host WTS preflight
+
+The first authorized **read-only** native WTS preflight on the Windows host. No session or VM was
+modified: no `tsdiscon`, no session connect/disconnect, no token manipulation, no service restart, no
+PowerShell Direct, no guest query.
+
+### Host WTS capability — HOST VERIFIED
+
+| Check | Result |
+| --- | --- |
+| `WTSINFO` layout | **216 bytes on x64**, offsets 0/4/32/96/130/176/184/192/200/208 |
+| `WTS_SESSION_INFO` layout | **24 bytes on x64**, `SessionId` 0, `pWinStationName` 8, `State` 16 |
+| `WTSEnumerateSessionsW` | succeeded, `Win32 0`, 2 sessions reported |
+| Returned session count | valid (2), matched the enumerated set |
+| Per-session `WTSINFO` | 2/2 succeeded, returned 216/216 bytes |
+| Session-ID consistency | 2/2 returned ids matched the enumerated ids |
+| State agreement | 2/2 enumeration states matched `WTSINFO` states |
+| `LogonTime` populated | yes for the interactive session (`0x01DB…`) |
+| `LogonTime` unavailable | session 0 reported `logonRaw=0`, reason `zero` — explicitly absent, never 1601 |
+| Native exceptions / crashes | none |
+| Buffers released | `WTSFreeMemory` in `finally` on every path; no leak or crash observed |
+
+Two sessions were observed consistently across **5 bounded read-only observations**: session 0
+(`Services`, Disconnected, no logon) and session 1 (`Console`, Active, logon present).
+
+### Exact conversion validation
+
+```
+rawTicks          134388962797932344
+arithmetic UTC    2026-11-11T18:44:39.7932344Z   (1601 epoch + ticks, independent of adapter)
+FromFileTimeUtc   2026-11-11T18:44:39.7932344Z
+adapter           2026-11-11T18:44:39.7932344Z
+local equivalent  2026-11-11 21:44:39  (Turkey Standard Time, +03:00)
+quser reported    2026-11-11 21:44        -> minute-precision agreement
+```
+
+Sentinel handling re-verified live: `0` → `zero`, `-1` → `negative`, `1` → `epoch-invalid`;
+`116444736000000000` → `1970-01-01T00:00:00Z` (a legitimate FILETIME, correctly accepted).
+
+### Non-atomic snapshot limitation
+
+`IsAtomicSnapshot` is always `false`: a sequence of sequential WTS queries is **not** an atomic
+session snapshot, and a state change between the enumeration and a query is an evidence gap — not a
+transition. Recorded in the preflight report.
+
+### The omitted-authority defect (synthetic-only reproduction)
+
+Stage 3A.2 covered only an **explicit** `CaptureAuthoritative=$false`. Review identified that
+**omitting** the flag left a record authoritative:
+
+| Reproduced case | Before | After |
+| --- | --- | --- |
+| `captureOutcome='provider-error'`, authority flag omitted | **Proof A proven** | authority derived `false` |
+| Same omission on the post observation | **Proof B proven** | `post-capture-not-authoritative` |
+| `Wait-P9HTargetDisconnected`, provider omits `Authoritative` + reports error | **wait proven** | 0 authoritative records, times out |
+
+Two minimal corrections:
+
+1. `New-P9HObserverRecord`: `CaptureAuthoritative` is now nullable. Omitted ⇒ **derived** from
+   `CaptureOutcome`; asserted ⇒ ANDed with the observed outcome, so an explicit `$true` can never
+   override a failed capture. Reason surfaces as `capture-outcome-<outcome>`.
+2. `Wait-P9HTargetDisconnected`: passes the provider's outcome through instead of assuming
+   authoritative when `Authoritative` is absent.
+
+The positive path is preserved: a clean capture with an omitted flag still derives `true` (`U3`, `U6`).
+
+### Tests: U1–U6
+
+| ID | Coverage |
+| --- | --- |
+| U1–U2 | omitted authority + provider error cannot satisfy Proof A / Proof B |
+| U3 | omitted authority + clean capture still derives authoritative |
+| U4 | explicit `true` cannot override a failed capture outcome |
+| U5–U6 | wait gate refuses a silent failing provider, accepts a silent clean one |
+
+The registry guard now covers **274** registered cases; the full run executes 275 including `R1`.
+All 221 prior cases and `R1` are retained unchanged.
+
+---
+
+## Stage 3B7F-R1-A: fail-closed lower-bound chronology for the E1 verdict
+
+An audit of the retained Stage 3B7F-R1 evidence found that the E1 evaluator bounded
+the monitor captures only from ABOVE (PRE before the disconnect) and the POST
+capture only from BELOW (after the post observation). **Nothing bounded the PRE
+capture from below**, so a PRE capture timestamped before the very RDP session it
+claimed to describe still satisfied the complete predicate.
+
+Reproduced synthetically against the unmodified evaluator: a PRE capture stamped
+five hours BEFORE the pinned target logon returned `Verdict=PASS` with an empty
+`Reasons` array. An internally impossible evidence timeline was accepted.
+
+### Correction
+
+Two lower bounds are now evaluated, with deliberately different strengths:
+
+| Bound | Default | Rationale |
+| --- | --- | --- |
+| PRE capture must not predate the **pinned target logon** | **always enforced** | a monitor snapshot of a session cannot have been taken before that session existed - an evidential impossibility |
+| PRE capture must not predate the **authoritative `pre` observation** | opt-in via `-RequirePreCaptureAfterPreObservation` | the ordering is a *procedural* requirement of some trial contracts; capture-then-observe is still truthful because both precede the disconnect |
+
+Both are conditioned on the bound being present and parseable. An absent pinned
+logon, or an unparseable bound, is reported as its own reason rather than silently
+skipped, so the predicate cannot be satisfied by omitting evidence.
+
+New sub-observations: `preCaptureNotBeforeTargetLogon`,
+`preCaptureAfterPreObservationRequired`, `preCaptureNotBeforePreObservation`,
+`preCaptureLowerBoundOk`. The result object also exposes
+`PreCaptureLowerBoundOk`. The lower bound is part of the acceptance predicate:
+`PASS` now requires `preLowerBoundOk` in addition to the previous conditions.
+
+Existing behaviour is preserved: the PRE-before-disconnect and
+POST-after-observation checks are untouched, and the opt-in bound defaults off so
+no prior positive case changes meaning.
+
+### Test coverage (Z1-Z10)
+
+| ID | Coverage |
+| --- | --- |
+| Z1 | genuine ordering (preObs < preCapture < disconnect < postObs < postCapture) still PASSES |
+| Z2 | PRE capture before the target logon is rejected |
+| Z3 | with the flag, PRE capture before the pre observation is rejected |
+| Z4 | without the flag the same ordering is tolerated and the relationship is still reported |
+| Z5 | an absent pinned logon fails closed instead of skipping the bound |
+| Z6 | an unparseable PRE capture timestamp is rejected |
+| Z7 | the existing upper bound (PRE before disconnect) is preserved |
+| Z8 | the existing POST lower bound is preserved |
+| Z9 | a failed transition still yields NOT FULLY EVIDENCED |
+| Z10 | the bound uses the caller's pinned logon, not the log line's own value |
+
+---
+
+## Stage 3B7G2: N2 fixture correction and elevated attribution
+
+Stage 3B7G1 left two independently measured blockers. Both are resolved here, and
+the second one was a **fixture defect, not a product defect**.
+
+### Root cause: the G1 fixture never asked for relative placement
+
+The retained G1 trace reads `source:"fallback"`, `profileId:""`, `skipped:[]` and
+an empty warning list. The product's planner explains it exactly:
+
+```
+if (-not $profileAware -and -not $relativeTarget) {   # legacy absolute fast path
+    ... ApplyGeometry = $true ... Warnings = @()
+}
+```
+
+`$relativeTarget` is true only when a targeted window declares
+`layoutMode: "relative"`. The G1 fixture declared **neither** `layoutMode` nor
+`layoutRelative` - it only *claimed* `anchorAbsent: true` in its own descriptor.
+The descriptor was never evidence of anything; the runtime planner had no
+relative request at all, so the skip branch was unreachable by construction.
+
+A corrected fixture therefore needs: `layoutMode: "relative"`, a
+`layoutRelative` object with `monitor.identity` (durable `path:`/`edid:`
+syntax), `basis` (`monitor`|`workArea`) and a normalized `rect`, plus an
+absolute fallback at `x=9000,y=9000`. An **absent configuration anchor** is
+legitimate test input; a fabricated monitor *observation* would not be.
+
+### Elevated process attribution
+
+Stage 3B7G1 measured that a Medium-integrity inventory recovered command lines
+for 41/56 session processes but not for the product's own elevated ones. The
+division of responsibility is now explicit and enforced:
+
+| Context | Responsibility |
+| --- | --- |
+| Medium | launches the installed product, collects its authentic lifecycle trace |
+| **High** | reads process metadata for attribution (`p9h-elevated-inventory.ps1`) |
+| Interactive | collects real top-level HWNDs and rectangles |
+| Host | orchestration and byte-preserving retention |
+
+`Get-P9HElevatedProcessInventory` is strictly read-only and records **provenance
+per row**: collecting user, integrity label, collector pid/session/computer,
+query success and query source. Command lines of unrelated processes are
+redacted rather than retained. `ConvertTo-P9HAttributionInventory` derives the
+`new-processes` artifact transparently from real post-minus-pre measurements and
+reports `SkippedNoCommandLine` / `SkippedOtherSession` so exclusions stay
+auditable instead of silently dropped.
+
+`Get-P9HLaunchAttribution` was **not** relaxed: it still requires independent
+argv identity (`-SetId`/`-TerminalId`/`-WindowId`), a recovered creation time
+inside the launch window, and a non-launcher pid.
+
+### N2-B diagnostics (§7)
+
+The N2-B identity predicate is unchanged - `skipped AND exactly one attributed
+window`. Only the reason is now specific: `IdentityConsistencyReason` reports
+`item-not-reported-skipped-by-lifecycle-trace`,
+`attributed-window-count-not-one:<n>`, or `identity-inconsistent`, and the
+N2-A/N2-B reasons surfaces carry those names instead of an opaque failure.
+
+### Coverage (R0-R13)
+
+legacy fast path reproduces the G1 trace; absent anchor + unreachable fallback is
+skipped deterministically; reachable fallback is *applied* not skipped; a
+matching profile makes no false skip claim; unavailable topology advertises no
+fallback; Medium argv refuses attribution; High argv attributes; launcher pid,
+stale time, wrong session and wrong identity all refuse; one window eligible and
+two not; a missing skip blocks N2-A and N2-B; **the same artifacts become
+PASS-eligible once the skip and warning are genuinely present**; two attributed
+windows break N2-B; and the seven-role binding plus post-binding digest rules
+remain enforced.
+
+The canonical suite is 275/275 PASS (274 registered cases plus `R1`).
+
+---
+## Stage 3B7G1: non-spoofable guest boundary and real Hyper-V identity binding
+
+Stage 3B7G0 added a guest boundary, but every function - including the one that
+starts a process - accepted an injected `-LocalContext`. A caller could hand it a
+fabricated `ComputerName = <guest>` object and the control was defeated on the
+host. This stage removes that hole.
+
+### Split into a pure decision procedure and a live gate
+
+| Function | Injection | Starts a process |
+| --- | --- | --- |
+| `Assert-P9HGuestExecutionContext` | `-LocalContext` (pure) | **never** |
+| `Test-P9HGuestDisconnectEligible` | `-LocalContext` (pure) | **never** |
+| `Assert-P9HLiveGuestBoundary` | **none** | via its caller |
+| `Invoke-P9HControlledDisconnect` | **none** | yes |
+| `Invoke-P9HGuestControlledDisconnect` | **none** | yes (remote) |
+
+The live gate takes no context parameter at all, so there is nothing to forge: it
+re-reads the real machine identity immediately before process creation and
+delegates every rule to the pure helper so the two cannot drift apart. The
+orchestration's "am I already inside the guest?" branch is now gated on the
+OS-supplied identity only, never on a caller-supplied object.
+
+### Real Hyper-V identity binding
+
+Two matching caller-supplied strings are not independent evidence.
+`Resolve-P9HAuthorizedVm` resolves the VM by NAME from Hyper-V, reads the actual
+VM object id, and requires it to equal the authorized candidate VM id before any
+PowerShell Direct dispatch. It refuses a missing, ambiguous or mismatched VM.
+Dispatch now uses `Invoke-Command -VMId` with the verified id, and the guest
+re-verifies its own computer name inside the execution context.
+
+### Listener classification corrected
+
+`session id >= 65536 means listener` was wrong in both directions: it would refuse
+a legitimate logged-on user session that happens to have a high id, and accept a
+low-id listener. Classification is now by the **enumerated** WTS state
+(`WTSListen = 6`) plus **positive** identity resolution:
+
+- session 0 - always refused;
+- an enumerated `WTSListen` entry - refused regardless of its numeric id;
+- an unresolved, non-authoritative, failed, absent or moved target - refused;
+- a wrong user or logon identity - refused.
+
+`Test-P9HResolvedGuestTarget` performs the resolution against a real
+`Resolve-P9HWtsSessionTable` result, and `New-P9HDisconnectPlan` consumes it.
+
+### Coverage (H1-H19)
+
+spoofed context cannot reach process creation; live gate refuses on this machine;
+parameter surfaces verify only the pure helpers are injectable; omitted identity;
+unbound plan; session 0; `WTSListen` by state at low id **and** with the listener
+flag absent; a 70000 id correctly treated as a real session; unresolved target;
+non-authoritative/failed/absent/moved targets; wrong user and wrong logon;
+correct guest accepted by the non-executing path; incorrect Hyper-V id; missing
+and ambiguous VM; correct name/id verified; orchestration refusing to dispatch;
+token checked first; pinning preserved; and no `tsdiscon` process created.
+
+The canonical suite is 261/261 PASS (260 registered cases plus `R1`).
+
+## Stage 3B7G3-C2: positive auxiliary-role semantics and evidence adjudication
+
+Stage 3B7G3-C1 was **CHANGES REQUIRED**. This stage corrects C1's auxiliary
+contract and adjudicates whether the existing G2 evidence can support a defensible
+N2-B verdict. It is offline-only: no VM was booted, no product launched, no
+`tsdiscon`, and no historical artifact or artifact index was modified.
+
+### Finding 1: the C1 starting-probe contradiction
+
+The C1 report claimed six false acceptances reproduced against `3da88e6`, but the
+retained `gdrive:devws/p9h/3b7g3c1/starting-probe.log` recorded
+`false acceptances reproduced: NONE` with C1-era rejection reasons.
+
+**Cause:** the C1 probe wrote its log and JSON from a `finally` block to FIXED
+paths with no run identifier, and it was executed four times. Only the LAST run
+survived, and that run executed against the already-corrected classifier. The
+claim was true when measured; the artifact could not evidence it. That is a real
+harness provenance defect.
+
+**Correction:** the claim is now re-established without trusting any Git label.
+Commit `3da88e6` (tree `0fbc556e…`) is extracted to an immutable tree; the
+classifier file's SHA-256 as extracted is
+`c9c3e15dbe1c183898849556d8add64951dfcdfa6b191f99501c81f669adfb79`; the function
+is loaded FROM that file and its `ScriptBlock.File` must hash to the same value;
+the extracted text and the loaded function body are both asserted to lack every C1
+marker. Result: **six defects confirmed** (A, B1, B2, B4, B5, C; B3 correctly
+refused). The C1 claim is substantiated, and the original contradictory files are
+preserved unmodified.
+
+### Finding 2: C1's remaining false acceptance
+
+C1's factor A8 required `WS_EX_TOOLWINDOW` and exempted nothing else. Reproduced
+against `b069f0b`, an arbitrary class at 1200x800 with a valid owner, genuine
+descendant ancestry, exact identity argv and `exStyle=0x00000080` was
+**accepted as auxiliary**. Real-world classes carrying the same bit
+(`MozillaDropShadowWindowClass`, `ForegroundStaging`, `ThumbnailDeviceHelperWnd`)
+were accepted too. C1's own AW1 negative uses `WS_EX_APPWINDOW`, so it never
+exercised this path.
+
+**Cause:** a generic presentation bit was treated as a universal auxiliary-role
+certificate.
+
+### Finding 3: `WS_EX_TOOLWINDOW` does not establish an auxiliary role
+
+Microsoft documents `WS_EX_TOOLWINDOW` as a *presentation* style: "a floating
+toolbar ... does not appear in the taskbar or in the dialog that appears when the
+user presses ALT+TAB". It says nothing about the window being noninteractive,
+harmless or internal. It is also set by `Shell_TrayWnd`, `SystemTray_Main` and
+`tooltips_class32`.
+
+Conversely, the bit is **not** promised for the ConPTY helper. A Windows Terminal
+maintainer describes it as "the fake `PseudoConsoleWindow` ... basically just a
+`0*0` pixel sized `WS_POPUP` window, which is owned by Windows Terminal", and
+`winconpty` documents `ConptyReparentPseudoConsole` as making the pseudo window
+owned by "the actual hosting terminal's HWND". Neither statement mentions
+`WS_EX_TOOLWINDOW`.
+
+So C1's A8 was wrong in **both** directions: too permissive for arbitrary classes
+and potentially too strict for the genuine helper.
+
+| Property | Status |
+| --- | --- |
+| Owned by the hosting terminal (`GW_OWNER`) | **Documented and reproduced** |
+| `WS_POPUP`, hidden/zero-size presentation | **Documented and reproduced** |
+| `WS_EX_TOOLWINDOW` present | **Typical only** — observed on this host, never guaranteed |
+| `WS_CHILD` | Not applicable — `EnumWindows` yields top-level windows only |
+| Exact rectangle | Version-dependent (G2 recorded 16x16; host showed 0x0) |
+
+### The corrected contract: `p9h.auxiliary-window.v3`
+
+A non-managed attributed window is `auxiliary` only when ALL of these hold:
+
+| Factor | Requirement |
+| --- | --- |
+| A1 | `GW_OWNER` names exactly one managed terminal in this set |
+| A2/A8 | its CLASS is a positively identified auxiliary ROLE class |
+| A3 | owning process record resolves |
+| A4 | same session as the managed terminal |
+| A5 | owning process is a **strict** descendant |
+| A6 | all three pinned values present and exactly equal |
+| A7 | does not claim a managed terminal title |
+
+The role class is `PseudoConsoleWindow`, justified independently as the ConPTY
+pseudo-console window whose owner is the hosting terminal. This is **not** a
+class-name exclusion list: membership is NECESSARY and never sufficient, because
+A1 and A3-A7 must hold for the same window.
+
+`WS_EX_TOOLWINDOW` is demoted to **corroboration**: recorded as
+`styleCorroboratesRole` (a tri-state — `true`, `false`, or `null` when the field
+was absent or unreadable). It can never accept or reject on its own.
+
+Contract history, each result keeping its version:
+
+| Contract | Stage | Status |
+| --- | --- | --- |
+| `p9h.auxiliary-window.v1` | G3 | **refuted** — six false acceptances |
+| `p9h.auxiliary-window.v2` | C1 | **refuted** — arbitrary tool window accepted; genuine helper potentially rejected |
+| `p9h.auxiliary-window.v3` | C2 | class participates in a positive role argument |
+
+### Replay of the immutable G2 evidence
+
+All eight roles re-verified before and after; the artifact index used unmodified.
+
+| Evaluation | N2-A | N2-B | Reason |
+| --- | --- | --- | --- |
+| Historical `RawAttributedHwndsV1` | PASS | **INCONCLUSIVE** | `attributed-window-count-not-one:2` |
+| `ManagedTerminalV1` + `auxiliary-window.v3` | PASS | **PASS** | none |
+
+`raw=2 managed=1 auxiliary=1 unclassified=0 competing=0`; qualifying terminal
+`0x50366` (pid 7280); auxiliary `0x20330` (`PseudoConsoleWindow`, pid 10140) with
+`auxiliaryRoleClass=true` and `styleCorroboratesRole=null` because G2 never
+recorded the style. Every predicate is true: exit `exited` code 0, trace valid,
+process and window attribution succeed, trial identity matches, artifact binding
+verifies, broker ready, terminal finalized with zero failures.
+
+The verdict no longer depends on the absent style field, because v3 does not
+require it. The historical INCONCLUSIVE remains unchanged.
+
+### UI Automation limitation
+
+The product's `Test-DevWSHwndAssociation` validates a managed window using UI
+Automation **tab names** and the canonical `<windowId>[#DevWS:<N>]` family. The
+qualification classifier uses the **top-level title** plus exact class, process
+name and launch attribution. That is a narrower check, declared as
+`IdentityProxy`, with `ui-automation-tab-title-family` listed in
+`UnprovenProperties`. No UIA record was fabricated. Full product-equivalent UIA
+identity is **not** proven by this evidence set and is not claimed.
+
+### Test coverage
+
+The `R3` series (R301-R315) pins the v3 contract: arbitrary tool windows refused,
+the genuine helper accepted with **and** without a style field, foreign ownership,
+non-descendant owners, session mismatch, managed-title claims, contradictory
+identity, multiple helpers, helper-only sets, two managed terminals, both
+enumeration orders, contract self-identification, fallback-rectangle helpers, and
+helpers owned by a competing managed UI. Each negative asserts its own reason.
+
+Existing `AW` cases were updated where v3 changes the correct outcome (AW1, AW2,
+AW3, AW18); all other coverage is retained.
+
+The canonical suite is 342/342 PASS under **both** PowerShell 7.6.9 and Windows
+PowerShell 5.1 with a controlled module path (341 registered cases plus `R1`).
+
+---
+## Stage 3B7G3-C1: fail-closed auxiliary contract and evidence sufficiency
+
+> **Superseded by Stage 3B7G3-C2.** C1's A8 (requiring `WS_EX_TOOLWINDOW`) was
+> refuted in both directions, and its starting-probe artifacts were overwritten by
+> later runs of the same probe. See the C2 section above.
+
+
+Stage 3B7G3 introduced `ManagedTerminalV1` and was accepted on a replay that
+returned N2-B **PASS**. Independent review found that verdict unsound. This stage
+corrects the contract, and the corrected contract returns **INCONCLUSIVE** on the
+same immutable G2 evidence.
+
+No VM was booted, no RDP session opened, no product launched, no `tsdiscon`
+issued, and no historical artifact or artifact index was modified.
+
+### The six false acceptances in Stage 3B7G3
+
+Stage 3B7G3 treated `GW_OWNER == managed terminal` plus a nonempty process name as
+**sufficient** for `auxiliary`. Reproduced against `3da88e6`, before any change:
+
+| Case | Fixture | 3B7G3 result |
+| --- | --- | --- |
+| A | arbitrary-class UI-sized window, `GW_OWNER=0x50366` | accepted as auxiliary |
+| B1 | helper, valid owner, `-SetId WRONGSET` | accepted as auxiliary |
+| B2 | helper, valid owner, `-TerminalId wrongterm` | accepted as auxiliary |
+| B4 | helper, valid owner, no identity flags | accepted as auxiliary |
+| B5 | helper, valid owner, command line unreadable | accepted as auxiliary |
+| C | second `CASCADIA` window, `GW_OWNER=0x50366` | absorbed as auxiliary |
+
+Case B3 (`-WindowId OTHER-window`) was already refused, but only because a
+`-WindowId` contradiction was the single check the old code performed. Stage
+3B7G3's E10 was additionally **misleading**: it used a fake owner (`0x99998`), so
+its rejection came from ownership, never from the identity requirement.
+
+### Root cause
+
+`GW_OWNER` is a **relationship** fact, not a **role** fact. The old classifier
+therefore had no way to distinguish an owned helper from an owned application
+window, and it never examined identity at all beyond one `-WindowId` comparison.
+
+### The corrected auxiliary contract (`p9h.auxiliary-window.v2`)
+
+A non-managed attributed window is `auxiliary` only when **every** factor is
+positively established:
+
+| Factor | Requirement |
+| --- | --- |
+| A1 | `GW_OWNER` names exactly one managed terminal in this set |
+| A2 | its class is not the managed terminal class |
+| A3 | its owning process record resolves from the attributed inventory |
+| A4 | the owning process shares the managed terminal's session |
+| A5 | the owning process is a **strict** descendant of the managed terminal |
+| A6 | the owner command line carries all three pinned values, each exactly equal |
+| A7 | it does not claim a managed terminal title |
+| A8 | its window style positively marks it as non-user-facing (`WS_EX_TOOLWINDOW`) |
+
+A window claiming the managed class **or** the managed title family is routed to a
+separate `competing-managed-ui` bucket and can never be absorbed as harmless.
+
+### Why A8 is the decisive factor
+
+Factors A1-A7 are **all satisfiable by a user-facing application window** that the
+pinned shell happened to launch: argv identity is *process*-level, not
+*window*-level, so every window of a shell process shares one command line. That
+case (residual R1) was reproduced and was still absorbed without A8. A tool window
+is the documented positive marker of a non-user-facing helper: absent from the
+taskbar, not activatable as a normal application window.
+
+### Ordinal replay of the immutable G2 evidence
+
+All eight artifact roles re-verified before and after; the artifact index was used
+unmodified.
+
+| Evaluation | N2-A | N2-B | Reason |
+| --- | --- | --- | --- |
+| Historical `RawAttributedHwndsV1` | PASS | **INCONCLUSIVE** | `attributed-window-count-not-one:2` |
+| Corrected `ManagedTerminalV1` | PASS | **INCONCLUSIVE** | `unclassified-attributed-window:1` |
+
+The historical result reproduces G2 exactly. The corrected result is INCONCLUSIVE
+because the frozen window record has no `GWL_EXSTYLE`, so factor A8 is undecidable
+for `0x20330`. The classifier reports `EvidenceGaps =
+window-style-not-recorded` rather than assuming a value.
+
+Every other predicate is true: exit `exited` code 0, trace valid, process and
+window attribution succeed, trial identity matches, artifact binding verifies,
+broker ready, terminal finalized with zero failures.
+
+### Counterfactual: exactly one missing observation
+
+Adding **only** `exStyle = 0x00000080` to the recorded helper flips the corrected
+verdict to PASS, with nothing else changed. No other lifecycle, identity or
+provenance predicate is missing. The gap is precisely one observable fact.
+
+### Product contract versus the qualification proxy
+
+The product's `Test-DevWSHwndAssociation` validates a managed window using UI
+Automation **tab names** and the canonical `<windowId>[#DevWS:<N>]` title family.
+The qualification classifier uses the **top-level window title** instead. That is a
+narrower check and does not implement the product validator. It is named explicitly
+as `IdentityProxy = top-level-window-title-equals-windowId`, and
+`UnprovenProperties` lists `ui-automation-tab-title-family`. No UIA record was
+fabricated.
+
+### What a future acquisition must add
+
+`Get-P9HWindowInventory` **already** records `GetWindow(hwnd, GW_OWNER)` on every
+enumerated window, so re-requesting it would add nothing. The genuinely absent
+fields are `GWL_STYLE`, `GWL_EXSTYLE` (where `WS_EX_TOOLWINDOW` lives), and the UIA
+tab-name set.
+
+The smallest complete addition is **one field** on the existing per-window record:
+
+```
+exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE)
+```
+
+A read-only preflight validated that read live on this host (362 top-level windows,
+73 genuine tool windows observed, `MozillaDropShadowWindowClass` among them). No
+physical acquisition was performed in this stage.
+
+### Test coverage
+
+The `AW` series (AW1-AW20) contains the C1 adversarial cases required by review:
+unknown UI-sized owned window, unknown class with valid owner, competing Cascadia
+window with valid owner, wrong `SetId`/`TerminalId`/`WindowId`/missing flags with a
+**valid** owner, unreadable style, absent ownership link, session mismatch, managed
+title at the forbidden fallback coordinates, both enumeration orders, auxiliary-only,
+two managed terminals, multiple proven auxiliaries, and an ambiguous window beside
+valid lifecycle evidence. Each negative asserts its **own** rejection reason, so no
+pass can be credited to an unrelated prerequisite.
+
+The `E` series was updated where the stronger contract changed the correct outcome
+(E7 now expects the competing bucket). The `I` series now distinguishes four
+outcomes: body executed, blocked on a prompt (`I4b`, a timeout), timely
+noninteractive refusal (`I4`, `I4c`), and a correct optional script under
+`-NonInteractive` (`I4d`). `I4` previously could pass on a hang; it now requires a
+timely exit that names the missing mandatory parameter.
+
+The canonical suite is 327/327 PASS under **both** PowerShell 7.6.9 and Windows
+PowerShell 5.1 (326 registered cases plus `R1`).
+
+---
+## Stage 3B7G3: N2-B window identity contract adjudication (offline)
+
+Stage 3B7G2 completed an installed-product N2 launch with exit code 0, a valid
+placement-skip warning, N2-A PASS and full broker lifecycle, yet N2-B returned
+INCONCLUSIVE with
+
+`window-identity-inconsistent-with-plan:attributed-window-count-not-one:2`
+
+Two newly attributed top-level HWNDs were observed. This stage adjudicates that
+discrepancy **offline**. No VM was booted, no RDP session was opened, no product
+was launched and no `tsdiscon` was issued; the retained G2 artifacts were re-read
+byte-identically and the original verdict was preserved exactly.
+
+### What the product actually considers a managed terminal window
+
+The product does not identify its terminal windows by PID association.
+`src/native/devws-terminal-candidates.cs` enumerates them by **exact window
+class**, `CASCADIA_HOSTING_WINDOW_CLASS`, compared ordinally, and
+`src/lib/devws-identity.ps1` additionally requires the owning process to be
+`WindowsTerminal` and the UI-Automation tab names to form a canonical title
+family for the pinned `windowId`.
+
+The historical N2-B cardinality rule counted something different: **every** new
+visible top-level HWND owned by an attributed PID, of any class. Those two
+definitions are not equivalent, and the difference is exactly what G2 measured.
+
+### The two G2 windows
+
+| HWND | Class | Owning process | Rectangle | `GW_OWNER` | Role |
+| --- | --- | --- | --- | --- | --- |
+| `0x50366` | `CASCADIA_HOSTING_WINDOW_CLASS` | `WindowsTerminal.exe` pid 7280 | 1129x635 | `0x0` | **managed terminal** |
+| `0x20330` | `PseudoConsoleWindow` | `pwsh.exe` pid 10140 | 16x16 | **`0x50366`** | **auxiliary** |
+
+The classification is not based on the class name or the 16x16 rectangle. It
+rests on the retained Win32 `GW_OWNER` link from `0x20330` to `0x50366`, which is
+an independent ownership fact recorded by `GetWindow(hwnd, GW_OWNER)`.
+
+### Contract revision, versioned and opt-in
+
+`Get-P9HN2Verdicts` now takes `-WindowIdentityContract`:
+
+| Contract | N2-B identity requirement |
+| --- | --- |
+| `RawAttributedHwndsV1` (default) | exactly one newly attributed visible top-level HWND of any class - the historical rule, unchanged |
+| `ManagedTerminalV1` (opt-in) | exactly one window matching the product's managed-terminal contract, and every other attributed window must be **positively proven auxiliary** |
+
+The default is deliberately the historical rule, so no existing verdict silently
+changes meaning. `ManagedTerminalV1` is a correction to the measured identity
+domain, not a weakening of lifecycle completion:
+
+- the managed terminal count must still be **exactly one**;
+- an auxiliary window is accepted only via a Win32 `GW_OWNER` link to that one
+  managed window, and an owning-process argv naming a different `windowId`
+  disqualifies it;
+- anything not positively proven - an unproven second Cascadia window, an
+  unresolvable owner, a foreign-session window - is `unclassified` and fails
+  closed;
+- it is **not** `Count -ge 1`, and **not** a class-name exclusion list.
+
+A window's owning process must resolve from the attributed process inventory, so
+window identity is evidence rather than assumption.
+
+### Enumeration order is not evidence
+
+The first implementation resolved ownership while walking the window list, and
+the retained G2 evidence proved that wrong: the post inventory lists `0x20330`
+**before** `0x50366`, so a correct auxiliary was reported `unclassified` purely
+because its owner had not been seen yet. Classification is now two passes -
+collect every managed terminal first, then judge auxiliaries against the complete
+managed set. `E2b` pins this by evaluating both orders and requiring identical
+results.
+
+### Offline replay of the retained G2 evidence
+
+> **Superseded by Stage 3B7G3-C1.** The replay below was evaluated with the
+> original 3B7G3 auxiliary rule, which review found unsound (see the C1 section
+> above). Its PASS is preserved as a record of what that rule returned; the
+> corrected contract returns INCONCLUSIVE on the same bytes.
+> 
+
+The eight artifacts were restored byte-identically to the exact paths the
+unmodified `artifact-index.jsonl` binds (that directory had been cleaned up after
+the package was frozen), each verified by SHA-256 first. The index was used
+without modification.
+
+| Evaluation | N2-A | N2-B | Reason |
+| --- | --- | --- | --- |
+| Historical `RawAttributedHwndsV1` | PASS | **INCONCLUSIVE** | `attributed-window-count-not-one:2` |
+| Revised `ManagedTerminalV1` | PASS | **PASS** | none - all predicates true |
+
+Under the revised contract all eight artifact roles verify, the trial identity
+matches, exit is `exited` code 0, process and window attribution succeed, the
+broker is ready, terminal finalization records zero failures, and exactly one
+managed terminal (`0x50366`, pid 7280) was created with one proven auxiliary
+(`0x20330`). The package digests were re-verified after the replay and are
+unchanged.
+
+### Test coverage (E1-E22, E2b, I1-I6)
+
+The `E` series covers the false-INCONCLUSIVE reproduction, acceptance of one
+managed terminal with and without a proven auxiliary, refusal of two managed
+terminals, auxiliary-only, unknown windows, unrelated Cascadia windows, PID and
+session mismatch, missing argv, wrong `SetId`/`TerminalId`/`WindowId`, stale
+HWNDs, wrong title, non-terminal owner, multiple auxiliaries and ambiguous
+ownership. It also proves the contract switch changes **only** the identity
+domain: nonzero exit, missing placement skip, missing warning, missing
+finalization and tampered artifact binding still block under both contracts, and
+previously accepted single-window trials still pass under both.
+
+The `I` series pins the Stage 3B7G2 parameter-binding defect: a
+`[Parameter(Mandatory)]` parameter that also declares a default **never** uses
+that default, and with stdin open but empty the binder blocks on a prompt before
+the body runs - on both PowerShell 5.1 and 7. `I5` is an AST scan over every
+stage-owned script for that construct, and `I6` proves the scan detects a canary
+containing it. No stage script contains the construct; the scan is
+qualification-only and does not rewrite unrelated source.
+
+### PowerShell 5.1 portability
+
+Running the canonical suite under Windows PowerShell 5.1 exposed two latent
+defects that predate this stage and were fixed here:
+
+1. `Start-Process -PassThru` can return a Process object whose OS handle was not
+   retained, so `.ExitCode` reads `$null` on 5.1 even after `WaitForExit` reports
+   exit, while PowerShell 7 keeps the handle. The recorder now touches `.Handle`
+   once while the process is alive. Nothing about recording or acceptance
+   changes: a null code still fails closed.
+2. `@(fn).Records` wraps the *function result* in an array and then reads
+   `.Records` off that array, which collapses to a bare scalar on 5.1 under
+   `Set-StrictMode -Version Latest`; a later `.Count` then throws. The correct
+   form, `@((fn).Records)`, is used throughout.
+
+The canonical suite is 304/304 PASS under **both** PowerShell 7.6.9 and Windows
+PowerShell 5.1 (303 registered cases plus `R1`).
+
+---
+## Stage 3B7G0: guest execution boundary, atomic replacement, and N2 readiness
+
+Stage 3B7F-R2's strict physical E1 result is preserved. This stage fixes the two
+safety defects that trial exposed, and assesses N2 readiness read-only.
+
+### Defect 1: a guest disconnect could execute on the host
+
+`tsdiscon` was invoked on the WINDOWS HOST while the plan named a GUEST session,
+so `tsdiscon 2` addressed the host's own session 2. The root cause was not a
+wrong session id: **nothing bound a plan to a machine**, so `session 2` was
+equally valid on any computer and the primitive had no way to notice it was in
+the wrong place.
+
+Correction - a fail-closed boundary with no bypass:
+
+| Check | Enforced |
+| --- | --- |
+| plan must name its guest computer | always |
+| plan must name the authorized VM id | always |
+| caller must supply the expected guest (no default) | always |
+| caller must supply the expected VM id | always |
+| ACTUAL local computer must equal the expected guest | always |
+| plan guest/VM must equal the caller's expectation | always |
+| target must not be session 0 | always (plan AND boundary) |
+| target must not be a listener | always (plan AND boundary) |
+| real-execution token | preserved, checked first |
+
+`Get-P9HExecutionContext` reports identity read-only.
+`Assert-P9HGuestExecutionContext` performs the refusal before any process exists.
+`Test-P9HGuestDisconnectEligible` is the non-executing validation path.
+`Invoke-P9HGuestControlledDisconnect` orchestrates PowerShell Direct and
+re-verifies the guest's own computer name **inside** the execution context.
+
+### Defect 2: "atomic" replacement was not atomic on PowerShell 5.1
+
+The 5.1 branch deleted the destination and *then* moved the temporary file into
+place. Between those two steps the destination does not exist, and if the move
+fails the previous valid artifact is already gone.
+
+The writer now uses `[System.IO.File]::Replace(src, dst, backup, true)` for the
+existing-file case - a single atomic swap available on .NET Framework and .NET -
+and a plain same-directory rename for a genuinely new artifact. A failed
+replacement now leaves the old destination byte-identical.
+
+### Test coverage
+
+| Series | Coverage |
+| --- | --- |
+| H1-H12 | host/guest context, omitted identity, VM mismatch, session 0, listener, refusal before process start, accepted guest, pinned identity, token-first |
+| J1-J7 | new creation, replacement, failure preserving the destination, no residue, BOM-free CRLF bytes, hash stability, append-only logging intact |
+
+The canonical suite is 254/254 PASS (253 registered cases plus `R1`).
+
+### Verification on both runtimes
+
+Both defects were reproduced and both fixes proven under **Windows PowerShell
+5.1** and **PowerShell 7**: identical results, identical SHA-256, identical
+boundary decisions, zero temporary residue.
+
+### N2 readiness (read-only)
+
+All eleven listed capabilities are implemented and synthetically verified; seven
+of them still require a **physical** observation to be claimed, because the
+remaining claims are about the INSTALLED product rather than the qualification
+observer. Critically, E1 proved the **native** monitor API directly in-guest; it
+did **not** exercise the installed `ws.ps1`/`coordinator.ps1` entry point, so E1
+acceptance cannot be substituted for N2 evidence.
+
+---
+## Stage 3B7F-R2: strict chronology physical acceptance and a PowerShell 5.1 portability defect
+
+The Stage 3B7F-R2 physical trial replayed E1 with the contract order corrected:
+the authoritative `pre` WTS observation is persisted and read back BEFORE the
+PRE monitor capture is taken. The strict verdict
+(`-RequirePreCaptureAfterPreObservation`) is PASS with zero rejection reasons,
+and the same verdict is independently reproducible on the host from the retained
+original bytes alone.
+
+That trial also exposed a genuine portability defect in this library.
+
+### Defect
+
+`Write-P9HArtifact` finalized its atomic rename with
+`[System.IO.File]::Move($tmp, $Path, $true)`. The three-argument overload is a
+.NET Core / PowerShell 7+ API. It does **not** exist on Windows PowerShell 5.1
+(.NET Framework), which is the only PowerShell available on the qualification
+guest. In-guest the call failed with
+
+```
+Cannot find an overload for "Move" and the argument count: "3".
+```
+
+so **no monitor capture could be persisted in the guest at all** - the physical
+trial could not produce evidence, even though every predicate was satisfied in
+principle.
+
+### Correction
+
+`Write-P9HArtifact` now branches on `$PSVersionTable.PSVersion.Major`. On 7+ it
+keeps the overwrite overload; on 5.1 it deletes the destination first and then
+performs the two-argument rename. Both paths keep the same-directory-rename
+atomicity: a reader never sees a half-written artifact, and a failed rename
+never leaves a truncated file.
+
+### Test coverage (Z11-Z13)
+
+| ID | Coverage |
+| --- | --- |
+| Z11 | writing a non-existent artifact creates it with exact content and no `.tmp` residue |
+| Z12 | writing an EXISTING artifact atomically replaces it - the exact path that failed on 5.1 |
+| Z13 | artifact bytes are BOM-free UTF-8 with CRLF terminators, so hashes are host-stable |
+
+The canonical suite is 235/235 PASS (234 registered cases plus `R1`).
+
+### Re-evaluation of the R1 trial
+
+The Stage 3B7F-R1 final report stated a PRE capture of `2026-11-14T04:06:48.964Z`,
+nearly five hours BEFORE the target logon. The retained original artifact
+(`pre-monitor.json`, sha256 `dfee403b...`) actually contains
+`2026-11-14T09:06:48.9644082Z`. **The five-hour figure was a report transcription
+error; the artifact is correct and the capture post-dates the logon by 1.54 min.**
+The R1 trial satisfies the mandatory lower bound.
+
+Its measured ordering is `preCapture 09:06:48.964` then `preObs 09:09:07.575`
+(capture-then-observe, 2.31 min apart), so under the OPT-IN flag the trial would
+be reported NOT FULLY EVIDENCED. Under the default contract it remains PASS.
+
+---
+
+## Stage 3B7C: real-observation bridge for controlled disconnect/reconnect
+
+Stage 3B7C executes one physical Active → Disconnected → Active RDP transition.
+Before that could be attempted, the **real data path** had to be auditable end to
+end. Two defects were found in it and corrected within `qualification/p9h/`.
+
+### Defect 1: no production adapter into `Wait-P9HTargetDisconnected`
+
+`Wait-P9HTargetDisconnected` consumes a `-Provider` scriptblock and reads
+`RawWtsLines`, `CaptureOutcome`, `CaptureError`, `RejectionReason`,
+`AuthorityReason`, `Win32Errors` and `Authoritative` from it. Nothing in the
+product projected `Get-P9HWtsProviderTableCapture` into that shape, so a caller
+had to hand-write a scriptblock - and a hand-written scriptblock is exactly how an
+invented `CaptureOutcome = 'ok'` default could make a rejected capture look
+authoritative.
+
+**Correction.** `ConvertTo-P9HWtsObserverProviderSample` derives every field from
+the resolved result and its capture and invents none:
+
+| Field | Source |
+| --- | --- |
+| `RawWtsLines` | `Capture.Lines` |
+| `CaptureOutcome` | `'provider-error'` **iff** the capture recorded a failed query, else `'ok'` |
+| `Authoritative` | `Capture.Authoritative` (the resolver verdict) |
+| `RejectionReason` | `Capture.RejectionReason` |
+| `AuthorityReason` | rejection when not authoritative, else `null` |
+| `Win32Errors` | `Capture.Win32Errors` (nonzero only) |
+
+Listener inventory (`ListenerCount`, `EnumeratedCount`, `IdentityCoveredCount`)
+stays auditable through the adapter.
+
+### Defect 2: `StateName` omitted from the polled record
+
+`Wait-P9HTargetDisconnected` built a synthetic record for
+`Test-P9HTargetDisconnected` without `StateName`. The disconnected path never
+touches it, so synthetic tests passed - but the **non-disconnected** path
+formats its reason as `'target-state-' + $match.Record.StateName` and threw
+`PropertyNotFoundException`. The first real poll while the target was still
+Active would have crashed the wait loop instead of polling again.
+
+**Correction.** The projected record now carries `StateName` from the persisted
+`targetStateName`.
+
+### Test coverage (C1-C12)
+
+| ID | Coverage |
+| --- | --- |
+| C1 | clean authoritative capture projects to an authoritative sample |
+| C2 | rejected resolver result stays non-authoritative; nonzero Win32 preserved |
+| C3 | rows-only capture keeps outcome `ok` but is never authoritative |
+| C4 | the adapter derives `provider-error` from the capture, never a default |
+| C5 | listener inventory stays auditable through the adapter |
+| C6 | a disconnected session 0 cannot satisfy Proof A |
+| C7 | the adapter drives `Wait` and `Assert-P9HReconnectPermitted` end to end |
+| C8 | a failed non-listener query cannot become authoritative |
+| C9 | a Win32 zero is never reported as a failure |
+| C10 | every polled sample is persisted and read back with increasing sequence |
+| C11 | a listener line can never stand in for a target disconnect |
+| C12 | a different logon time on the same session id cannot prove a disconnect |
+
+---
+
+## Stage 3B7B-C1: listener-aware WTS authority and Win32-zero classification
+
+Stage 3B7B physically established a genuine authenticated RDP session (session 2,
+`RDP-Tcp#0`, Active, verified logon time) but could not make the capture
+authoritative. Two independent defects were responsible, and both are corrected
+here inside `qualification/p9h/` only.
+
+### Defect 1: WTSListen pseudo-sessions rejected the whole table
+
+Windows enumerates connection listeners (`WTSListen`, state 6) that accept
+sessions but have no logged-on user. `WTSQuerySessionInformationW(WTSInfo)`
+cannot describe them, so they answer with a non-matching record. The resolver
+required a matching identity for **every** enumerated id, so two unqueryable
+listener rows rejected an otherwise complete, consistent table containing a
+real user session. Capture authority was `False` for a correct observation.
+
+**Correction.** Listeners are now a distinct correlation class, classified by the
+**enumerated WTS state** - not by session-id range and not by station name, both
+of which would excuse genuine failures of real sessions:
+
+* no WTSINFO identity is required for a listener, because none exists;
+* listener query outcomes are preserved in `ListenerDiagnostics` and do **not**
+  enter `Errors`, so an expected limitation cannot fail the table;
+* each listener keeps its id, station name, enumerated state and
+  `QuerySource='enumeration'`, so its provenance is never implied to be WTSINFO;
+* a listener can never resolve as the target (`target-is-listener`), and is
+  never rendered as a user session line;
+* duplicate ids are still rejected across the **entire** enumeration, listeners
+  included.
+
+`EnumeratedCount` (complete inventory) is reported separately from
+`IdentityCoveredCount` (sessions that actually produced a WTSINFO identity), so
+"we saw every session" is never conflated with "we have an identity for every
+user session". The observer record carries `listenerCount`,
+`enumeratedCount`, `identityCoveredCount`, `enumeratedCountExceedsIdentity` and
+`listenerDiagnostics` as an additive metadata extension. None of these fields is
+consulted by the authority predicate, so no acceptance rule is weakened.
+
+### Defect 2: a successful query's Win32 zero was treated as a provider error
+
+`Invoke-P9HWtsSessionQuery` returns `Win32Error = 0` when the native query
+**succeeds**. The capture collected every non-null `Win32Error`, including
+zeros, and `New-P9HObserverRecordFromTableCapture` treats a nonempty
+`Win32Errors` array as a provider failure. A perfectly clean, authoritative
+capture therefore produced `captureOutcome='provider-error'` and denied
+authority - which in turn blocked Proof A on a genuine Active to Disconnected
+transition.
+
+**Correction.** Only **failed** queries (`QueryOk = false`) are consulted, and
+within those only a **nonzero** code is recorded. Zero means "no error". A failed
+query carrying Win32 0 still fails closed through `QueryOk`/`FailedCount`, and a
+nonzero code is never dropped. This is a source-aware rule, not a blanket filter
+of the error array.
+
+### Test coverage (L1-L23)
+
+| ID | Coverage |
+| --- | --- |
+| L1-L4 | complete listener-aware table resolves; listeners are diagnostics; provenance preserved; enumeration vs identity counting |
+| L5-L6 | Active and genuinely Disconnected targets both resolve with listeners present |
+| L7-L8 | a listener cannot be the target and cannot authorize reconnect |
+| L9-L10 | duplicate ids involving a listener, and an absent target, both fail closed |
+| L11-L12 | a failed session-0 query and a failed non-target non-listener query both still reject |
+| L13-L14 | wrong user/logon identity and a genuine target state change still reject |
+| L15-L17 | successful Win32 zero is not an error; failed Win32 zero still fails; nonzero preserved and blocking |
+| L18 | listener metadata and raw enumeration survive serialization and read-back |
+| L19-L20 | positive and negative Proof A / Proof B over listener-aware tables |
+| L21 | rows without a resolved result never become authoritative |
+| L22-L23 | session 0 keeps its own state; no listener is rendered as a user line |
+
+The offline probe `PROBE-PRE-FIX.log` / `PROBE-POST-FIX.log` replays identical
+synthetic native-shaped inputs against the pre-fix sources (both defects present)
+and the corrected sources (both absent).

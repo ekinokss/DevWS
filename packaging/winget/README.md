@@ -1,8 +1,9 @@
 # WinGet submission preparation (blocked)
 
-This directory contains the three-file WinGet manifest for `ekinokss.DevWS` version
-`0.2.0`, plus the finalization procedure. It is **not submitted** to
-`microsoft/winget-pkgs`.
+This directory contains the historical three-file WinGet manifest for `ekinokss.DevWS`
+version `0.2.0`, plus the finalization procedure. It is **not submitted** to
+`microsoft/winget-pkgs`. No v0.3.0 WinGet manifest is prepared; do not adapt or submit this
+template for the v0.3.0 release candidate.
 
 **Current disposition: blocked. Do not submit this template for the v0.2.0 release.**
 WinGet's unattended installation validation runs without elevation and rejects blocking UAC

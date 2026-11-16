@@ -128,6 +128,7 @@ $script:TestGroupCatalog = [ordered]@{
     'relative-authoring'  = 'Relative layout authoring and mutation (v0.3 Phase 5)'
     'trace-temp-hardening' = 'Public Security Phase 2-E trace and temporary-file hardening'
     'packaging'           = 'Packaging / setup bootstrapper'
+    'editor-backend'      = 'Guarded editor backend (v0.4 P3/P7)'
     'test-harness'        = 'Test harness'
 }
 
@@ -736,6 +737,43 @@ function Get-SourceOf {
     param([string]$RelativePath)
 
     return (Get-Content -LiteralPath (Join-Path $RepoRoot $RelativePath) -Raw)
+}
+
+function Import-DevWSWorkerFunction {
+    # Loads ONE production function definition from a worker script without
+    # executing the worker's top-level pipe code. The suite uses this to run
+    # the REAL reset execution path with injected side-effect providers. The
+    # definition is installed under a TEST-ONLY name so it cannot shadow an
+    # identically named CLI orchestration function.
+    param(
+        [Parameter(Mandatory)][string]$RelativePath,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$As
+    )
+
+    $source = Get-SourceOf $RelativePath
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseInput($source, [ref]$tokens, [ref]$errors)
+
+    if ($errors.Count -gt 0) {
+        throw "Worker source '$RelativePath' does not parse: $($errors[0].Message)"
+    }
+
+    $definitions = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $Name
+    }, $true))
+
+    if ($definitions.Count -ne 1) {
+        throw "Expected exactly one '$Name' definition in '$RelativePath', found $($definitions.Count)."
+    }
+
+    # Install at script scope so test cases (and nested helper functions) see
+    # the real production body for the rest of the suite. The body AST is
+    # compiled directly: a full `function Name { ... }` text would become a
+    # nested declaration instead of the function body.
+    Set-Item -Path ("function:script:" + $As) -Value $definitions[0].Body.GetScriptBlock()
 }
 
 function New-WritableConfigCopy {
@@ -2110,6 +2148,27 @@ function Get-DevWSWindows {
     param($Config, [string]$Type, [switch]$EnabledOnly, $Set)
     return @($Set.windows | Where-Object { $_.type -eq $Type -and $_.enabled -ne $false })
 }
+function Resolve-DevWSTerminalTabTitle {
+    param([string]$WindowId, [AllowNull()][AllowEmptyString()][string]$Title)
+    $unmanaged = [pscustomobject]@{ IsManaged = $false; TabIndex = $null }
+    if ([string]::IsNullOrWhiteSpace($WindowId) -or [string]::IsNullOrWhiteSpace($Title)) { return $unmanaged }
+    if ($Title -ieq $WindowId) { return [pscustomobject]@{ IsManaged = $true; TabIndex = 0 } }
+    $prefix = $WindowId + '#DevWS:'
+    if ($Title.Length -le $prefix.Length -or -not $Title.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $unmanaged }
+    $suffix = $Title.Substring($prefix.Length)
+    if ($suffix -notmatch '^[1-9][0-9]*$') { return $unmanaged }
+    $tabIndex = 0
+    if (-not [int]::TryParse($suffix, [ref]$tabIndex)) { return $unmanaged }
+    return [pscustomobject]@{ IsManaged = $true; TabIndex = $tabIndex }
+}
+function Test-DevWSTerminalTitleFamily {
+    param([string]$WindowId, $TabNames)
+    if ($null -eq $TabNames) { return $false }
+    foreach ($name in @($TabNames)) {
+        if ([bool](Resolve-DevWSTerminalTabTitle -WindowId $WindowId -Title ([string]$name)).IsManaged) { return $true }
+    }
+    return $false
+}
 function Test-DevWSProperty {
     param($Object, [string]$Name)
     if ($null -eq $Object) { return $false }
@@ -2330,7 +2389,7 @@ function Select-DevWSTerminalHwndCandidate {
         if ($null -eq $candidate) { continue }
         if (-not [string]::IsNullOrWhiteSpace([string]$candidate.ExpectedWindowId) -and ([string]$candidate.ExpectedWindowId -ine $WindowId)) { continue }
         if ($RequireProcess -and -not (Test-DevWSProcessNameIsWindowsTerminal -ProcessName ([string]$candidate.ProcessName))) { continue }
-        if ($null -ne $candidate.TabNames -and $candidate.TabNames.Contains($WindowId)) {
+        if ($null -ne $candidate.TabNames -and (Test-DevWSTerminalTitleFamily -WindowId $WindowId -TabNames $candidate.TabNames)) {
             return [pscustomobject]@{ Hwnd = [long]$candidate.Hwnd; ProcessName = [string]$candidate.ProcessName }
         }
     }
@@ -5269,20 +5328,141 @@ try {
         Assert-NotContains $focusSource "Get-DevWSWindowsTerminalPath" "focus must not even resolve wt"
     }
 
-    Test-Case "reset recreates configured tabs and cleans up locators" {
+    Test-Case "reset verifies managed identity before close and recreates configured tabs" {
         $source = Get-SourceOf "src\workers\elevated-reset.ps1"
 
+        Assert-Contains $source "Get-DevWSTerminalPresenceSnapshot" "pre-close structured presence snapshot"
+        Assert-Contains $source "Get-DevWSResetPreflightDecision" "pre-close identity decision"
+        Assert-Contains $source "Get-DevWSResetIdentityConflict" "pre-close duplicate-identity check"
         Assert-Contains $source "New-DevWSTerminalCreateArguments" "recreate from config"
         Assert-Contains $source "Close-DevWSWindowHwnd" "proven close-all flow"
         Assert-Contains $source "Wait-DevWSWindowHwndGone" "close is confirmed"
-        Assert-Contains $source "Start-DevWSLocator" "locator-assisted attach"
-        Assert-Contains $source "Remove-DevWSLocator" "locator cleanup"
-        Assert-Contains $source "finally" "cleanup in finally path"
+        Assert-Contains $source "Wait-DevWSResetTerminalPresence" "structured post-recreation identity wait"
         Assert-Contains $source "Update-DevWSRuntimeTerminal" "runtime state updated"
         Assert-Contains $source "Wait-DevWSTabCountFromHwnd" "reset waits for the raw tab count"
         Assert-Contains $source "Test-DevWSCreatedTabCount -ActualCount" "reset guard uses raw counts"
+        Assert-NotContains $source "Start-DevWSLocator" "reset never attaches a locator before close"
+        Assert-NotContains $source "Remove-DevWSLocator" "reset never cleans up a locator by closing a parent"
+        Assert-NotContains $source "OwnsWindow" "verified multi-tab presence does not depend on locator ownership"
+        Assert-NotContains $source "Resolve-DevWSTerminalHwnd" "reset uses the structured presence decision"
         Assert-NotContains $source "Get-DevWSPresentTabNamesFromHwnd" "reset must not count tabs from a deduplicated name set"
         Assert-NotContains $source "focus-tab" "no redundant post-create wt focus-tab"
+        Assert-Contains $source 'if ($decision.Action -eq "close-recreate")' "only verified present enters the close branch"
+        Assert-Contains $source 'Send-DevWSWorkerAccepted' "ACCEPTED boundary remains"
+        Assert-Contains $source '-Ok $false' "post-ACCEPTED refusal sends an unsuccessful FINAL"
+
+        $decisionIndex = $source.IndexOf("Get-DevWSResetPreflightDecision")
+        $refuseIndex   = $source.IndexOf('if ($decision.Action -eq "refuse")')
+        $conflictIndex = $source.IndexOf('& $ConflictProvider')
+        $identityIndex = $source.IndexOf('& $IdentityProvider')
+        $closeIndex    = $source.IndexOf('& $CloseProvider')
+        $createIndex   = $source.IndexOf('& $CreateProvider')
+        $recoveryIndex = $source.IndexOf('& $RecoveryProvider')
+        $updateIndex   = $source.IndexOf('& $StatePublisher')
+
+        Assert-True ($decisionIndex -ge 0 -and $refuseIndex -gt $decisionIndex) "refusal is checked immediately after the decision"
+        Assert-True ($conflictIndex -gt $refuseIndex) "duplicate-identity check follows the refusal gate"
+        Assert-True ($identityIndex -gt $conflictIndex) "TOCTOU revalidation follows the duplicate check"
+        Assert-True ($closeIndex -gt $identityIndex) "the destructive close follows every pre-close gate"
+        Assert-True ($createIndex -gt $closeIndex) "recreation follows the close decision"
+        Assert-True ($recoveryIndex -gt $createIndex) "identity recovery follows recreation"
+        Assert-True ($updateIndex -gt $recoveryIndex) "runtime state is published only after identity recovery"
+        Assert-Equal 1 ([regex]::Matches($source, 'Close-DevWSWindowHwnd').Count) "there is exactly one destructive close primitive"
+        Assert-Equal 1 ([regex]::Matches($source, '& \$CloseProvider').Count) "there is exactly one destructive close call site"
+    }
+
+    Test-Case "reset preflight accepts only verified present or genuine missing" {
+        $present = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'state'; Hwnd = 123; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "close-recreate" $present.Action "verified present may close and recreate"
+        Assert-Equal 123 $present.Hwnd "verified present keeps its exact HWND"
+
+        $missing = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'missing'; Source = 'fast-missing'; Hwnd = 0; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "recreate" $missing.Action "genuine missing may recreate without a close"
+
+        $inaccessible = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'inaccessible'; Source = 'state'; Hwnd = 123; Diagnostic = 'empty-tab-observation'
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $inaccessible.Action "inaccessible refuses before close"
+        Assert-Contains $inaccessible.Message "empty-tab-observation" "inaccessible diagnostic is preserved"
+
+        $ambiguous = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'ambiguous'; Source = 'snapshot'; Hwnd = 0; Diagnostic = 'two candidate windows'
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $ambiguous.Action "ambiguous refuses before close"
+
+        $failed = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'failed'; Source = $null; Hwnd = 0; Diagnostic = 'uia-findall-failed'
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $failed.Action "failed observation refuses before close"
+
+        $noHwnd = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'state'; Hwnd = 0; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $noHwnd.Action "present without an HWND refuses"
+
+        $mismatch = Get-DevWSResetPreflightDecision -Observation ([pscustomobject]@{
+            TerminalId = 'other'; WindowId = 'w1'; State = 'present'; Source = 'state'; Hwnd = 123; Diagnostic = $null
+        }) -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $mismatch.Action "correlation mismatch refuses"
+
+        $none = Get-DevWSResetPreflightDecision -Observation $null -TerminalId 't1' -WindowId 'w1'
+        Assert-Equal "refuse" $none.Action "missing observation refuses"
+    }
+
+    Test-Case "reset presence wait distinguishes retry, timeout, zero-tab and exception" {
+        $terminal = [pscustomobject]@{ id = 't1'; windowId = 'w1' }
+        $baseArgs = @{
+            Config = [pscustomobject]@{}
+            SetId = 'main'
+            State = $null
+            Terminal = $terminal
+            TimeoutSeconds = 1
+        }
+
+        $script:presenceCalls = 0
+        $retryProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            $script:presenceCalls++
+            $state = if ($script:presenceCalls -lt 2) { 'inaccessible' } else { 'present' }
+            $hwnd = if ($state -eq 'present') { 456 } else { 0 }
+            [pscustomobject]@{ Terminals = @([pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = $state; Source = 'snapshot'; Hwnd = $hwnd; Diagnostic = $(if ($state -eq 'inaccessible') { 'empty-tab-observation' } else { $null }) }) }
+        }
+        $retry = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $retryProvider
+        Assert-True $retry.Ok "transient inaccessible observation retries to present"
+        Assert-Equal 456 $retry.Hwnd "retry returns the verified HWND"
+
+        $zeroProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            [pscustomobject]@{ Terminals = @([pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = 'inaccessible'; Source = 'snapshot'; Hwnd = 0; Diagnostic = 'empty-tab-observation' }) }
+        }
+        $zero = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $zeroProvider
+        Assert-Equal $false $zero.Ok "zero-tab observation times out"
+        Assert-Equal "inaccessible" $zero.State "zero-tab state is retained"
+        Assert-Contains ([string]$zero.Diagnostic) "empty-tab-observation" "zero-tab diagnostic is retained"
+
+        $exceptionProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            throw [System.Runtime.InteropServices.COMException]::new('findall-failed')
+        }
+        $exception = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $exceptionProvider
+        Assert-Equal $false $exception.Ok "FindAll exception times out"
+        Assert-Equal "failed" $exception.State "FindAll exception state is failed"
+        Assert-Contains ([string]$exception.Diagnostic) "findall-failed" "FindAll diagnostic is retained"
+
+        $duplicateProvider = {
+            param($Config, $SetId, $State, $Terminal)
+            [pscustomobject]@{ Terminals = @(
+                [pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'snapshot'; Hwnd = 1; Diagnostic = $null },
+                [pscustomobject]@{ TerminalId = 't1'; WindowId = 'w1'; State = 'present'; Source = 'snapshot'; Hwnd = 2; Diagnostic = $null }
+            ) }
+        }
+        $duplicate = Wait-DevWSResetTerminalPresence @baseArgs -PresenceProvider $duplicateProvider
+        Assert-Equal $false $duplicate.Ok "duplicate observations time out"
+        Assert-Contains ([string]$duplicate.Diagnostic) "returned 2 records" "duplicate observation diagnostic is retained"
     }
 
     Test-Case "lifecycle no longer uses a permanent stable tab index" {
@@ -5435,6 +5615,157 @@ try {
         }
     }
 
+    function New-DevWSFamilyPresenceFixture {
+        # Production presence classifier over an injected exact-HWND read map.
+        # The reader is closed over the supplied map so the test controls every
+        # candidate result without touching a real window.
+        param(
+            [Parameter(Mandatory)][string]$WindowId,
+            [long[]]$WtHwnds = @(),
+            [hashtable]$Reads = @{},
+            $State = $null,
+            [string]$TerminalId = 'family-term'
+        )
+
+        $terminal = New-TerminalDefinition -Id $TerminalId -WindowId $WindowId -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+        $reader   = { param($h) $Reads[[int]$h] }.GetNewClosure()
+
+        $snapshot = Get-DevWSTerminalPresenceSnapshot `
+            -Config $config `
+            -SetId 'main' `
+            -State $State `
+            -Terminals @($terminal) `
+            -WtHwnds $WtHwnds `
+            -CandidateReader $reader `
+            -ProcessNameProvider { param($h) 'WindowsTerminal' } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true }
+
+        return [pscustomobject]@{
+            Snapshot = $snapshot
+            Terminal = $terminal
+            Config   = $config
+        }
+    }
+
+    function New-DevWSResetHarness {
+        # Real Reset-DevWSTerminal from the elevated worker, with recording
+        # providers for every side effect. Run(State, Hwnd, Diagnostic,
+        # Overrides) returns Threw/Message plus the recorded close, creation,
+        # revalidation and runtime-publication calls.
+        param(
+            [Parameter(Mandatory)]$Terminal,
+            [Parameter(Mandatory)]$Config,
+            [Parameter(Mandatory)][object[]]$Tracking
+        )
+
+        Import-DevWSWorkerFunction -RelativePath "src\workers\elevated-reset.ps1" -Name "Reset-DevWSTerminal" -As "ResetWorker-DevWSTestTerminal"
+
+        $script:resetHarnessCloseCalls = [System.Collections.Generic.List[long]]::new()
+        $script:resetHarnessPublishedHwnds = [System.Collections.Generic.List[long]]::new()
+        $script:resetHarnessCreateCalls = 0
+        $script:resetHarnessStateCalls = 0
+        $script:resetHarnessIdentityCalls = 0
+        $script:resetHarnessScenarioState = $null
+        $script:resetHarnessScenarioHwnd = 0
+        $script:resetHarnessScenarioDiagnostic = $null
+        $script:resetHarnessTracking = @($Tracking)
+
+        $script:resetHarnessBase = @{
+            Config = $Config
+            Terminal = $Terminal
+            State = $null
+            SetId = "main"
+            ApplyGeometry = $false
+            PresenceProvider = {
+                param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+                [pscustomobject]@{
+                    Terminals = @([pscustomobject]@{
+                        TerminalId = [string]$TargetTerminal.id
+                        WindowId = [string]$TargetTerminal.windowId
+                        State = [string]$script:resetHarnessScenarioState
+                        Source = "snapshot"
+                        Hwnd = [long]$script:resetHarnessScenarioHwnd
+                        Diagnostic = $script:resetHarnessScenarioDiagnostic
+                    })
+                    WtHwnds = @([long]700001, [long]700002)
+                }
+            }
+            ConflictProvider = {
+                param([long]$SelectedHwnd, $WtHwnds, [string]$TargetWindowId)
+                [pscustomobject]@{ Conflict = $false; Hwnds = @(); Diagnostic = $null }
+            }
+            IdentityProvider = {
+                param([long]$TargetHwnd, [string]$TargetWindowId)
+                $script:resetHarnessIdentityCalls++
+                [pscustomobject]@{ Ok = $true; Reason = "verified"; Diagnostic = $null }
+            }
+            CloseProvider = {
+                param([long]$TargetHwnd, [string]$TargetContext)
+                $script:resetHarnessCloseCalls.Add([long]$TargetHwnd) | Out-Null
+            }
+            WaitGoneProvider = { param([long]$TargetHwnd) $true }
+            TrackingProvider = {
+                param($TargetSetId, $TargetTerminalId, $TargetWindowId, $TargetTerminal, $TargetBootstrapPath)
+                $script:resetHarnessTracking
+            }
+            CreateProvider = {
+                param([string[]]$CreateArguments)
+                $script:resetHarnessCreateCalls++
+            }
+            RecoveryProvider = {
+                param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+                [pscustomobject]@{ Ok = $true; Hwnd = [long]900001; State = "present"; Source = "snapshot"; Diagnostic = $null; Attempts = 1 }
+            }
+            TabCountProvider = { param([long]$TargetHwnd, [int]$MinimumCount) 2 }
+            StatePublisher = {
+                param($TargetSetId, $TargetTerminalId, $TargetWindowId, [long]$TargetHwnd)
+                $script:resetHarnessStateCalls++
+                $script:resetHarnessPublishedHwnds.Add([long]$TargetHwnd) | Out-Null
+            }
+        }
+
+        return {
+            param($State, $Hwnd, $Diagnostic, [hashtable]$Overrides = @{})
+
+            $script:resetHarnessCloseCalls.Clear()
+            $script:resetHarnessPublishedHwnds.Clear()
+            $script:resetHarnessCreateCalls = 0
+            $script:resetHarnessStateCalls = 0
+            $script:resetHarnessIdentityCalls = 0
+            $script:resetHarnessScenarioState = [string]$State
+            $script:resetHarnessScenarioHwnd = [long]$Hwnd
+            $script:resetHarnessScenarioDiagnostic = $Diagnostic
+
+            $providers = $script:resetHarnessBase.Clone()
+
+            foreach ($key in $Overrides.Keys) {
+                $providers[$key] = $Overrides[$key]
+            }
+
+            try {
+                ResetWorker-DevWSTestTerminal @providers
+                $threw = $false
+                $message = $null
+            }
+            catch {
+                $threw = $true
+                $message = $_.Exception.Message
+            }
+
+            return [pscustomobject]@{
+                Threw          = $threw
+                Message        = $message
+                CloseCalls     = @($script:resetHarnessCloseCalls)
+                CreateCalls    = $script:resetHarnessCreateCalls
+                StateCalls     = $script:resetHarnessStateCalls
+                IdentityCalls  = $script:resetHarnessIdentityCalls
+                PublishedHwnds = @($script:resetHarnessPublishedHwnds)
+            }
+        }
+    }
+
     Test-Case "UIA read records FromHandle and FindAll failures as data" {
         $from = Get-DevWSTabReadResultFromHwnd -Hwnd 101 -HwndExistsProvider { param($h) $true } -RootProvider {
             param($h)
@@ -5457,6 +5788,26 @@ try {
         Assert-Equal "uia-findall-failed" $find.ErrorKind "FindAll error category"
         Assert-Contains ([string]$find.Error) "findall denied" "FindAll diagnostic is preserved"
         Assert-Equal 0 $find.RawCount "FindAll failure returns no fabricated tab count"
+    }
+
+    Test-Case "legacy tab-name read degrades a FindAll failure to an empty name set" {
+        $fakeElement = [pscustomobject]@{}
+        $fakeElement | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
+            throw [System.Runtime.InteropServices.COMException]::new('findall-catastrophic')
+        }
+
+        $names = Get-DevWSPresentTabNamesFromElement -Element $fakeElement
+        Assert-Equal 0 @($names).Count "transient FindAll failure does not escape the legacy name read"
+    }
+
+    Test-Case "terminal discovery treats a root FindAll failure as temporarily absent" {
+        $fakeRoot = [pscustomobject]@{}
+        $fakeRoot | Add-Member -MemberType ScriptMethod -Name FindAll -Value {
+            throw [System.Runtime.InteropServices.COMException]::new('root-findall-catastrophic')
+        }
+
+        $hwnd = Find-DevWSTerminalTopLevelHwnd -WindowId 'DevWS-root-failure' -RootProvider { $fakeRoot }
+        Assert-Equal 0 $hwnd "root FindAll failure does not escape terminal discovery"
     }
 
     Test-Case "per-tab name-read failure is incomplete, not an access failure" {
@@ -5711,6 +6062,443 @@ public sealed class DevWSPhase61BFakeTabCollection
 
         Assert-Equal "ambiguous" $snapshot.Terminals[0].State "duplicate identities refuse"
         Assert-Equal 0 ([int]$snapshot.Counts.Present) "no first-match substitution"
+    }
+
+    Test-Case "presence accepts the canonical managed title family without cached state" {
+        $windowId = "OBS-FAM"
+
+        foreach ($case in @(
+            @{ Label = "base"; Hwnd = 6101; Names = @($windowId) },
+            @{ Label = "number 1"; Hwnd = 6102; Names = @("$windowId#DevWS:1") },
+            @{ Label = "number 2"; Hwnd = 6103; Names = @("$windowId#DevWS:2") },
+            @{ Label = "case-insensitive"; Hwnd = 6104; Names = @("obs-fam#DevWS:7") }
+        )) {
+            $reads = @{}
+            $reads[[int]$case.Hwnd] = New-TerminalPresenceTestRead -Hwnd $case.Hwnd -Names $case.Names
+            $fixture = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @($case.Hwnd) -Reads $reads
+
+            Assert-Equal "present" $fixture.Snapshot.Terminals[0].State "$($case.Label) family member is present"
+            Assert-Equal ([long]$case.Hwnd) ([long]$fixture.Snapshot.Terminals[0].Hwnd) "$($case.Label) family member keeps its HWND"
+            Assert-Equal "snapshot" $fixture.Snapshot.Terminals[0].Source "$($case.Label) family member is snapshot-sourced"
+        }
+
+        $ambiguousReads = @{
+            6110 = New-TerminalPresenceTestRead -Hwnd 6110 -Names @("$windowId#DevWS:1")
+            6111 = New-TerminalPresenceTestRead -Hwnd 6111 -Names @("$windowId#DevWS:2")
+        }
+        $ambiguous = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6110, 6111) -Reads $ambiguousReads
+
+        Assert-Equal "ambiguous" $ambiguous.Snapshot.Terminals[0].State "two family members on different HWNDs are ambiguous"
+        Assert-Equal 0 ([int]$ambiguous.Snapshot.Counts.Present) "ambiguous family members are never a first-match present"
+        Assert-Equal 1 ([int]$ambiguous.Snapshot.Counts.Ambiguous) "ambiguous family count"
+
+        $uniqueReads = @{
+            6112 = New-TerminalPresenceTestRead -Hwnd 6112 -Names @("OBS-OTHER")
+            6113 = New-TerminalPresenceTestRead -Hwnd 6113 -Names @("$windowId#DevWS:2")
+        }
+        $unique = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6112, 6113) -Reads $uniqueReads
+
+        Assert-Equal "present" $unique.Snapshot.Terminals[0].State "unrelated readable candidate does not block unique association"
+        Assert-Equal 6113 ([long]$unique.Snapshot.Terminals[0].Hwnd) "the canonical family candidate is selected"
+
+        $state = New-DevWSRuntimeState
+        Set-DevWSRuntimeTerminal -State $state -SetId "main" -Id "family-state" -WindowId $windowId -Hwnd 6114
+        $stateReads = @{
+            6114 = New-TerminalPresenceTestRead -Hwnd 6114 -Names @("$windowId#DevWS:1")
+        }
+        $cached = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6114) -Reads $stateReads -State $state -TerminalId "family-state"
+
+        Assert-Equal "present" $cached.Snapshot.Terminals[0].State "valid cached state with a numbered member is present"
+        Assert-Equal "state" $cached.Snapshot.Terminals[0].Source "cached state source"
+        Assert-Equal 6114 ([long]$cached.Snapshot.Terminals[0].Hwnd) "cached state HWND retained"
+
+        $missing = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @() -Reads @{}
+
+        Assert-Equal "missing" $missing.Snapshot.Terminals[0].State "no cached state and no matching candidate is missing"
+        Assert-Equal "fast-missing" $missing.Snapshot.Terminals[0].Source "genuine absence keeps the fast-missing source"
+    }
+
+    Test-Case "presence rejects malformed managed titles and keeps unreadable candidates uncertain" {
+        $windowId = "OBS-FAM2"
+        $badNames = @(
+            "$windowId#DevWS:01",
+            "$windowId#DevWS:0",
+            "$windowId-extra",
+            "X$windowId",
+            "$windowId#DevWS:1x",
+            "$windowId#DevWS:1#DevWS:2"
+        )
+
+        foreach ($name in $badNames) {
+            $reads = @{}
+            $reads[6121] = New-TerminalPresenceTestRead -Hwnd 6121 -Names @($name)
+            $fixture = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6121) -Reads $reads
+
+            Assert-Equal "missing" $fixture.Snapshot.Terminals[0].State "malformed/lookalike '$name' is not a positive match"
+            Assert-Equal 0 ([int]$fixture.Snapshot.Counts.Present) "malformed/lookalike '$name' is never present"
+        }
+
+        $unreadableReads = @{
+            6122 = New-TerminalPresenceTestRead -Hwnd 6122 -HwndPresent $true -ReadOk $false -Complete $false -RawCount 0 -ErrorKind "uia-from-handle-failed" -Error "denied"
+        }
+        $unreadable = New-DevWSFamilyPresenceFixture -WindowId $windowId -WtHwnds @(6122) -Reads $unreadableReads
+
+        Assert-Equal "inaccessible" $unreadable.Snapshot.Terminals[0].State "live unreadable candidate is inaccessible, not missing"
+        Assert-Equal 0 ([int]$unreadable.Snapshot.Counts.Missing) "unreadable candidate is never genuinely missing"
+        Assert-Contains ([string]$unreadable.Snapshot.Terminals[0].Diagnostic) "could not be verified" "unreadable diagnostic is retained"
+    }
+
+    Test-Case "numbered-only managed window is present for launch and reset preflight" {
+        $windowId = "OBS-FAM3"
+        $terminal = New-TerminalDefinition -Id "family-launch" -WindowId $windowId -Path $TestRoot
+        $config   = ConvertTo-TestConfig -Windows @($terminal)
+
+        $script:familyTrackingCalls = 0
+        $script:familyCreateCalls = 0
+        $script:familyKicks = 0
+        $reader = { param($h) New-TerminalPresenceTestRead -Hwnd $h -Names @("$windowId#DevWS:1") }.GetNewClosure()
+
+        $plan = Get-DevWSTerminalLaunchPlan `
+            -Config $config `
+            -SetId "main" `
+            -Terminals @($terminal) `
+            -WtHwnds @(6201) `
+            -CandidateReader $reader `
+            -ProcessNameProvider { param($h) "WindowsTerminal" } `
+            -HwndExistsProvider { param($h) $true } `
+            -HwndValidator { param($h) $true } `
+            -TrackingContextFactory { param($t) $script:familyTrackingCalls++; throw "tracking must not run for a present numbered-only window" } `
+            -CreateArgumentsFactory { param($t, $c) $script:familyCreateCalls++; throw "creation arguments must not run for a present numbered-only window" }
+
+        Assert-Equal "present" $plan.Terminals[0].State "numbered-only plan entry is present"
+        Assert-Equal 0 ([int]$plan.Counts.Missing) "numbered-only plan does not count as missing"
+        Assert-Equal 0 $script:familyTrackingCalls "no tracking context for a present numbered-only window"
+        Assert-Equal 0 $script:familyCreateCalls "no creation arguments for a present numbered-only window"
+
+        $kick = Start-DevWSTerminalLaunchPlan -Plan $plan -WtPath "C:\Test\wt.exe" -ProcessStarter { param($record) $script:familyKicks++ }
+
+        Assert-Equal 0 $script:familyKicks "numbered-only present window produces zero creation kicks"
+        Assert-Equal 0 @($kick.Kicks).Count "numbered-only present window has no kick records"
+
+        $decision = Get-DevWSResetPreflightDecision -Observation $plan.Terminals[0] -TerminalId $terminal.id -WindowId $windowId
+
+        Assert-Equal "close-recreate" $decision.Action "numbered-only present window enters the verified close/recreate path"
+        Assert-True ($decision.Action -ne "recreate") "numbered-only present window never enters the missing direct-recreation path"
+    }
+
+    Test-Case "post-launch completion uses the canonical family and refuses ambiguous or wrong names" {
+        $windowId = "OBS-COMPLETE"
+        $terminal = New-TerminalDefinition -Id "family-complete" -WindowId $windowId -Path $TestRoot
+        $script:familyPublished = [System.Collections.Generic.List[long]]::new()
+
+        function Update-DevWSRuntimeTerminal {
+            param($SetId, $Id, $WindowId, [long]$Hwnd)
+            $script:familyPublished.Add([long]$Hwnd) | Out-Null
+        }
+
+        $record = New-DevWSTerminalPlanRecord `
+            -Order 0 `
+            -Terminal $terminal `
+            -SetId "main" `
+            -State "missing" `
+            -Source "fast-missing" `
+            -CreateArguments ([string[]]@("x")) `
+            -ApplyGeometry $false
+
+        $plan = [pscustomobject]@{
+            PlanId    = "family-completion"
+            SetId     = "main"
+            WtHwnds   = @()
+            WtToken   = ""
+            Terminals = @($record)
+        }
+
+        $kick = [pscustomobject]@{
+            Kicks = @([pscustomobject]@{
+                Order           = 0
+                TerminalId      = $terminal.id
+                WindowId        = $windowId
+                CreateArguments = @("x")
+                StartedAtUtc    = [DateTimeOffset]::UtcNow
+                DeadlineUtc     = [DateTimeOffset]::UtcNow.AddSeconds(30)
+            })
+            Failures = @()
+        }
+
+        $numbered = @([pscustomobject]@{
+            Hwnd        = [long]6301
+            ProcessName = "WindowsTerminal"
+            TabNames    = (New-DevWSPresentTabNameSet -Names @("$windowId#DevWS:1"))
+            RawCount    = 2
+        })
+
+        $completed = Complete-DevWSTerminalLaunchPlan `
+            -Plan $plan `
+            -KickResult $kick `
+            -SnapshotProvider ({ $numbered }.GetNewClosure()) `
+            -PollMilliseconds 1
+
+        Assert-Equal 1 @($completed.Finalized).Count "numbered-only completion finalizes"
+        Assert-Equal 0 @($completed.Failures).Count "numbered-only completion has no failure"
+        Assert-Equal 1 $script:familyPublished.Count "numbered-only completion publishes runtime state"
+        Assert-Equal 6301 ([long]$script:familyPublished[0]) "completion publishes the canonical family HWND"
+
+        $ambiguous = @(
+            [pscustomobject]@{ Hwnd = [long]6302; ProcessName = "WindowsTerminal"; TabNames = (New-DevWSPresentTabNameSet -Names @($windowId)); RawCount = 1 },
+            [pscustomobject]@{ Hwnd = [long]6303; ProcessName = "WindowsTerminal"; TabNames = (New-DevWSPresentTabNameSet -Names @("$windowId#DevWS:1")); RawCount = 1 }
+        )
+
+        $beforeAmbiguous = $script:familyPublished.Count
+        $ambiguousResult = Complete-DevWSTerminalLaunchPlan `
+            -Plan $plan `
+            -KickResult $kick `
+            -SnapshotProvider ({ $ambiguous }.GetNewClosure()) `
+            -PollMilliseconds 1
+
+        Assert-Equal 0 @($ambiguousResult.Finalized).Count "ambiguous completion refuses to finalize"
+        Assert-Equal $beforeAmbiguous $script:familyPublished.Count "ambiguous completion publishes nothing"
+        Assert-Contains ([string]$ambiguousResult.Failures[0]) "exposed by 2" "ambiguous completion reports both candidates"
+
+        $wrong = @([pscustomobject]@{
+            Hwnd        = [long]6304
+            ProcessName = "WindowsTerminal"
+            TabNames    = (New-DevWSPresentTabNameSet -Names @("OBS-OTHER"))
+            RawCount    = 1
+        })
+
+        $pastKick = [pscustomobject]@{
+            Kicks = @([pscustomobject]@{
+                Order           = 0
+                TerminalId      = $terminal.id
+                WindowId        = $windowId
+                CreateArguments = @("x")
+                StartedAtUtc    = [DateTimeOffset]::UtcNow
+                DeadlineUtc     = [DateTimeOffset]::UtcNow.AddSeconds(-1)
+            })
+            Failures = @()
+        }
+
+        $beforeWrong = $script:familyPublished.Count
+        $wrongResult = Complete-DevWSTerminalLaunchPlan `
+            -Plan $plan `
+            -KickResult $pastKick `
+            -SnapshotProvider ({ $wrong }.GetNewClosure()) `
+            -PollMilliseconds 1
+
+        Assert-Equal 0 @($wrongResult.Finalized).Count "wrong-named completion refuses to finalize"
+        Assert-Equal $beforeWrong $script:familyPublished.Count "wrong-named completion publishes nothing"
+        Assert-Contains ([string]$wrongResult.Failures[0]) "could not be identified" "wrong-named completion reports non-identification"
+    }
+
+    Test-Case "reset duplicate-identity preflight uses the canonical title family" {
+        $reader = {
+            param($h)
+            if ($script:conflictUnreadable) {
+                New-TerminalPresenceTestRead -Hwnd $h -ReadOk $false -Names @()
+            }
+            else {
+                New-TerminalPresenceTestRead -Hwnd $h -Names @($script:conflictNames[[int]$h])
+            }
+        }
+
+        $probe = {
+            param($names, $hwnds = @(100, 200))
+            $script:conflictUnreadable = $false
+            $script:conflictNames = @{ 200 = @($names) }
+            Get-DevWSResetIdentityConflict `
+                -SelectedHwnd 100 `
+                -WtHwnds $hwnds `
+                -WindowId "W1" `
+                -CandidateReader $reader `
+                -ProcessNameProvider { param($h) "WindowsTerminal" }
+        }
+
+        Assert-True (& $probe @("W1")).Conflict "exact base title conflicts"
+        Assert-True (& $probe @("W1#DevWS:1")).Conflict "number 1 family member conflicts"
+        Assert-True (& $probe @("W1#DevWS:2")).Conflict "number 2 family member conflicts"
+        Assert-True (& $probe @("W1#devws:7")).Conflict "family matching is case-insensitive"
+
+        Assert-Equal $false (& $probe @("W2")).Conflict "different base windowId does not conflict"
+        Assert-Equal $false (& $probe @("W2#DevWS:1")).Conflict "different numbered family does not conflict"
+        Assert-Equal $false (& $probe @("W1#DevWS:01")).Conflict "leading-zero suffix is not canonical"
+        Assert-Equal $false (& $probe @("W1#DevWS:0")).Conflict "zero suffix is not canonical"
+        Assert-Equal $false (& $probe @("W1#DevWS:")).Conflict "empty suffix is not canonical"
+        Assert-Equal $false (& $probe @("W1#DevWS:1x")).Conflict "trailing text is not canonical"
+        Assert-Equal $false (& $probe @("W1-extra", "W10#DevWS:1", "XW1", "W1#DevWS:1#DevWS:2")).Conflict "lookalikes and prefix collisions do not conflict"
+
+        $script:conflictUnreadable = $false
+        $script:conflictNames = @{
+            200 = @("W1#DevWS:2")
+            300 = @("W1#DevWS:1")
+        }
+        $multiple = Get-DevWSResetIdentityConflict `
+            -SelectedHwnd 100 `
+            -WtHwnds @(100, 200, 300) `
+            -WindowId "W1" `
+            -CandidateReader $reader `
+            -ProcessNameProvider { param($h) "WindowsTerminal" }
+        Assert-True $multiple.Conflict "multiple family members conflict"
+        Assert-Equal 2 @($multiple.Hwnds).Count "both conflicting HWNDs are reported"
+        Assert-Equal 200 ([long]$multiple.Hwnds[0]) "conflicting HWNDs are sorted: first"
+        Assert-Equal 300 ([long]$multiple.Hwnds[1]) "conflicting HWNDs are sorted: second"
+
+        $script:conflictUnreadable = $true
+        $script:conflictNames = @{ 200 = @("W1#DevWS:1") }
+        $unreadable = Get-DevWSResetIdentityConflict `
+            -SelectedHwnd 100 `
+            -WtHwnds @(100, 200) `
+            -WindowId "W1" `
+            -CandidateReader $reader `
+            -ProcessNameProvider { param($h) "WindowsTerminal" }
+        Assert-Equal $false $unreadable.Conflict "an unreadable other candidate is not positive conflict"
+    }
+
+    Test-Case "reset execution refuses before close for unverified identity states" {
+        $terminal  = New-TerminalDefinition -Id "reset-guard" -WindowId "RESET-W1" -Path $TestRoot
+        $config    = ConvertTo-TestConfig -Windows @($terminal)
+        $bootstrap = Get-DevWSCwdBootstrapPath
+        $tracking  = @(
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-guard"; WindowId = "RESET-W1"; SessionId = "s0"; PublicationPath = (Join-Path $TestRoot "reset-pub-0"); ChildSpecBase64 = "e30="; TabIndex = 0 }
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-guard"; WindowId = "RESET-W1"; SessionId = "s1"; PublicationPath = (Join-Path $TestRoot "reset-pub-1"); ChildSpecBase64 = "e30="; TabIndex = 1 }
+        )
+        $run = New-DevWSResetHarness -Terminal $terminal -Config $config -Tracking $tracking
+
+        foreach ($refusal in @(
+            @{ State = "inaccessible"; Hwnd = 700001; Diagnostic = "empty-tab-observation" },
+            @{ State = "ambiguous"; Hwnd = 0; Diagnostic = "two candidate windows" },
+            @{ State = "failed"; Hwnd = 0; Diagnostic = "uia-findall-failed" }
+        )) {
+            $result = & $run $refusal.State $refusal.Hwnd $refusal.Diagnostic
+
+            Assert-True $result.Threw "$($refusal.State) observation refuses the reset"
+            Assert-Equal 0 $result.CloseCalls.Count "$($refusal.State) performs zero close calls"
+            Assert-Equal 0 $result.CreateCalls "$($refusal.State) performs zero creation calls"
+            Assert-Equal 0 $result.StateCalls "$($refusal.State) publishes no runtime state"
+            Assert-Equal 0 $result.IdentityCalls "$($refusal.State) never reaches target revalidation"
+        }
+
+        $duplicate = & $run "present" 700001 $null @{
+            ConflictProvider = {
+                param([long]$SelectedHwnd, $WtHwnds, [string]$TargetWindowId)
+                [pscustomobject]@{ Conflict = $true; Hwnds = @([long]700002); Diagnostic = "duplicate managed identity" }
+            }
+        }
+
+        Assert-True $duplicate.Threw "positive duplicate identity refuses the reset"
+        Assert-Contains ([string]$duplicate.Message) "duplicate managed identity" "duplicate diagnostic is reported"
+        Assert-Equal 0 $duplicate.CloseCalls.Count "duplicate conflict performs zero close calls"
+        Assert-Equal 0 $duplicate.CreateCalls "duplicate conflict performs zero creation calls"
+        Assert-Equal 0 $duplicate.StateCalls "duplicate conflict publishes no runtime state"
+        Assert-Equal 0 $duplicate.IdentityCalls "duplicate conflict never reaches target revalidation"
+
+        $changed = & $run "present" 700001 $null @{
+            IdentityProvider = {
+                param([long]$TargetHwnd, [string]$TargetWindowId)
+                $script:resetHarnessIdentityCalls++
+                [pscustomobject]@{ Ok = $false; Reason = "title-family-mismatch"; Diagnostic = "identity changed" }
+            }
+        }
+
+        Assert-True $changed.Threw "identity change immediately before close refuses"
+        Assert-Contains ([string]$changed.Message) "title-family-mismatch" "TOCTOU reason is reported"
+        Assert-Equal 1 $changed.IdentityCalls "the exact target is revalidated once"
+        Assert-Equal 0 $changed.CloseCalls.Count "identity change performs zero close calls"
+        Assert-Equal 0 $changed.CreateCalls "identity change performs zero creation calls"
+        Assert-Equal 0 $changed.StateCalls "identity change publishes no runtime state"
+
+        $notGone = & $run "present" 700001 $null @{
+            WaitGoneProvider = { param([long]$TargetHwnd) $false }
+        }
+
+        Assert-True $notGone.Threw "an unconfirmed close fails the reset"
+        Assert-Equal 1 $notGone.CloseCalls.Count "the close was attempted once"
+        Assert-Equal 700001 ([long]$notGone.CloseCalls[0]) "the close targeted the verified HWND"
+        Assert-Equal 0 $notGone.CreateCalls "no recreation follows an unconfirmed close"
+        Assert-Equal 0 $notGone.StateCalls "no runtime state follows an unconfirmed close"
+    }
+
+    Test-Case "reset execution closes only verified present targets and recreates missing ones" {
+        $terminal  = New-TerminalDefinition -Id "reset-run" -WindowId "RESET-W2" -Path $TestRoot
+        $config    = ConvertTo-TestConfig -Windows @($terminal)
+        $bootstrap = Get-DevWSCwdBootstrapPath
+        $tracking  = @(
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-run"; WindowId = "RESET-W2"; SessionId = "s0"; PublicationPath = (Join-Path $TestRoot "reset-run-pub-0"); ChildSpecBase64 = "e30="; TabIndex = 0 }
+            [pscustomobject]@{ BootstrapPath = $bootstrap; SetId = "main"; TerminalId = "reset-run"; WindowId = "RESET-W2"; SessionId = "s1"; PublicationPath = (Join-Path $TestRoot "reset-run-pub-1"); ChildSpecBase64 = "e30="; TabIndex = 1 }
+        )
+        $run = New-DevWSResetHarness -Terminal $terminal -Config $config -Tracking $tracking
+
+        $present = & $run "present" 700001 $null
+
+        Assert-Equal $false $present.Threw "verified present reset succeeds"
+        Assert-Equal 1 $present.CloseCalls.Count "verified present performs exactly one close"
+        Assert-Equal 700001 ([long]$present.CloseCalls[0]) "the verified HWND is the one closed"
+        Assert-Equal 1 $present.IdentityCalls "verified present is revalidated once"
+        Assert-Equal 1 $present.CreateCalls "verified present recreates once"
+        Assert-Equal 1 $present.StateCalls "verified present publishes runtime state once"
+        Assert-Equal 900001 ([long]$present.PublishedHwnds[0]) "runtime state publishes the recreated HWND"
+
+        $missing = & $run "missing" 0 $null
+
+        Assert-Equal $false $missing.Threw "genuine missing reset succeeds"
+        Assert-Equal 0 $missing.CloseCalls.Count "genuine missing performs zero close calls"
+        Assert-Equal 0 $missing.IdentityCalls "genuine missing never revalidates a close target"
+        Assert-Equal 1 $missing.CreateCalls "genuine missing recreates once"
+        Assert-Equal 1 $missing.StateCalls "genuine missing publishes runtime state"
+
+        $recoveryFailure = & $run "present" 700001 $null @{
+            RecoveryProvider = {
+                param($TargetConfig, $TargetSetId, $TargetState, $TargetTerminal)
+                [pscustomobject]@{ Ok = $false; Hwnd = [long]0; State = "inaccessible"; Source = "snapshot"; Diagnostic = "empty-tab-observation"; Attempts = 3 }
+            }
+        }
+
+        Assert-True $recoveryFailure.Threw "post-recreation identity failure fails the reset"
+        Assert-Contains ([string]$recoveryFailure.Message) "empty-tab-observation" "post-recreation diagnostic is reported"
+        Assert-Equal 1 $recoveryFailure.CloseCalls.Count "no second destructive close after recreation"
+        Assert-Equal 1 $recoveryFailure.CreateCalls "recreation is not retried automatically"
+        Assert-Equal 0 $recoveryFailure.StateCalls "an unverified replacement publishes no runtime state"
+    }
+
+    Test-Case "reset target revalidation preserves strict HWND process and title identity" {
+        $exists    = { param([long]$Target) $true }
+        $wtProcess = { param([long]$Target) "WindowsTerminal" }
+        $read      = {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -Names @("RESET-W3#DevWS:2")
+        }
+
+        $verified = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider $read
+        Assert-Equal $true $verified.Ok "canonical family member revalidates the exact HWND"
+        Assert-Equal "verified" $verified.Reason "verified reason is returned"
+
+        $gone = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider { param([long]$Target) $false } -ProcessNameProvider $wtProcess -TabReadProvider $read
+        Assert-Equal $false $gone.Ok "a disappeared HWND refuses the close"
+        Assert-Equal "hwnd-gone" $gone.Reason "disappearance reason is returned"
+
+        $foreign = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider { param([long]$Target) "Notepad" } -TabReadProvider $read
+        Assert-Equal $false $foreign.Ok "a foreign process refuses the close"
+        Assert-Equal "process-mismatch" $foreign.Reason "process mismatch reason is returned"
+
+        $unreadable = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -ReadOk $false -ErrorKind "uia-findall-failed" -Error "denied"
+        }
+        Assert-Equal $false $unreadable.Ok "an unreadable tab list refuses the close"
+        Assert-Equal "unreadable" $unreadable.Reason "unreadable reason is returned"
+        Assert-Contains ([string]$unreadable.Diagnostic) "uia-findall-failed" "UIA failure category is preserved"
+
+        $vanished = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -HwndPresent $false -ReadOk $false
+        }
+        Assert-Equal "hwnd-gone" $vanished.Reason "an HWND that disappears during the read is gone"
+
+        $lookalike = Test-DevWSResetTargetIdentity -Hwnd 4242 -WindowId "RESET-W3" -HwndExistsProvider $exists -ProcessNameProvider $wtProcess -TabReadProvider {
+            param([long]$Target)
+            New-TerminalPresenceTestRead -Hwnd $Target -Names @("RESET-W3#DevWS:01", "RESET-W30#DevWS:1")
+        }
+        Assert-Equal $false $lookalike.Ok "malformed and prefix lookalikes never revalidate"
+        Assert-Equal "title-family-mismatch" $lookalike.Reason "title family mismatch reason is returned"
     }
 
     Test-Case "inaccessible launch plan entry produces zero creation kicks" {
@@ -7320,6 +8108,37 @@ function Find-DevWSReversiblyEncodedPrintableContent {
 
     return $null
 }
+
+    Test-Case "editor backend loads only the approved six libraries and no privileged symbols" {
+        $editorRoot = Join-Path $RepoRoot 'src\editor'
+        $backend = Get-Content -LiteralPath (Join-Path $editorRoot 'ws-editor-backend.ps1') -Raw
+        $projection = Get-Content -LiteralPath (Join-Path $editorRoot 'editor-projection.ps1') -Raw
+        $allowlist = @(
+            'devws-paths.ps1',
+            'devws-config.ps1',
+            'devws-native.ps1',
+            'devws-monitor.ps1',
+            'devws-relative-layout.ps1',
+            'devws-layout-profile.ps1'
+        )
+        $libraryBlock = [regex]::Match($backend, '(?s)foreach \(\$library in @\((.*?)\)\) \{').Groups[1].Value
+        $loadedLibraries = @([regex]::Matches($libraryBlock, "'([^']+\.ps1)'") | ForEach-Object { $_.Groups[1].Value })
+        Assert-Equal ($allowlist -join ',') ($loadedLibraries -join ',') "the editor backend dot-sources exactly the approved six libraries"
+
+        foreach ($forbidden in @(
+            'NamedPipeClientStream',
+            'DevWorkspace-Elevated',
+            'DevWS.Coordinator',
+            'Invoke-DevWSWorkerRequest',
+            'Start-Process',
+            'SetWindowPos',
+            'GetWindowRect',
+            'Invoke-Expression'
+        )) {
+            Assert-NotContains $backend $forbidden "the editor backend does not reference $forbidden"
+            Assert-NotContains $projection $forbidden "the editor projection helper does not reference $forbidden"
+        }
+    }
 
     Test-Case "repository artifacts carry no publication-forbidden content" {
         # GENERIC publication invariants. These forbid content CLASSES, never a
@@ -13666,6 +14485,96 @@ public static class DevWSAppCandidateTestWindow
         }
     }
 
+    Test-Case "ws.cmd shim forwards quoted meta-character arguments intact and propagates exit codes" {
+        $shim = Join-Path $RepoRoot "src\shim\ws.cmd"
+        $root = Join-Path $TestRoot "p9br shim root"
+        $app  = Join-Path $root "DevWS\app"
+        New-Item -ItemType Directory -Path $app -Force | Out-Null
+        $stub = Join-Path $app "ws.ps1"
+        $argsFile = Join-Path $root "args.json"
+
+        Set-Content -LiteralPath $stub -Encoding utf8 -Value @'
+$args | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:P9BR_ARGS_FILE -Encoding utf8
+if (-not [string]::IsNullOrEmpty($env:P9BR_EXIT_CODE)) { exit [int]$env:P9BR_EXIT_CODE }
+exit 0
+'@
+
+        $savedLocal = $env:LOCALAPPDATA
+        $savedArgs  = $env:P9BR_ARGS_FILE
+        $savedExit  = $env:P9BR_EXIT_CODE
+        $env:LOCALAPPDATA = $root
+        $env:P9BR_ARGS_FILE = $argsFile
+        Remove-Item Env:\P9BR_EXIT_CODE -ErrorAction SilentlyContinue
+
+        function Quote-ShimArg([string]$Value) {
+            return '"' + ($Value -replace '"', '\"') + '"'
+        }
+
+        function Invoke-ShimLine([string]$ArgumentsLine, [switch]$DelayedExpansion) {
+            if (Test-Path -LiteralPath $argsFile) { Remove-Item -LiteralPath $argsFile -Force }
+            $line = '"' + $shim + '" ' + $ArgumentsLine
+            if ($DelayedExpansion) {
+                & cmd.exe /d /v:on /c $line 2>&1 | Out-Null
+            }
+            else {
+                & cmd.exe /d /c $line 2>&1 | Out-Null
+            }
+            $code = $LASTEXITCODE
+            $received = @()
+            if (Test-Path -LiteralPath $argsFile) {
+                $received = @((Get-Content -LiteralPath $argsFile -Raw | ConvertFrom-Json))
+            }
+            return [pscustomobject]@{ Code = $code; Arguments = $received }
+        }
+
+        try {
+            $identity = 'path:MSH062E/5&1A097CD8&0&UID5527112'
+            $quoted = (@('set-geometry', 'd1-item', '--anchor', $identity, '--x', '0.5') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal 0 $result.Code "quoted identity exit code"
+            Assert-Equal ("set-geometry|d1-item|--anchor|$identity|--x|0.5") ($result.Arguments -join '|') "quoted path identity arrives intact through the actual shim"
+
+            $quoted = (@('--path', 'C:\Program Files\DevWS') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal ("--path|C:\Program Files\DevWS") ($result.Arguments -join '|') "argument with spaces survives a spaced install path"
+
+            $quoted = (@('--pipe', 'a|b', '--caret', 'a^b', '--percent', '100%') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal ("--pipe|a|b|--caret|a^b|--percent|100%") ($result.Arguments -join '|') "quoted |, ^ and % arrive intact"
+
+            $quoted = (@('--value', 'a!b') | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted -DelayedExpansion
+            Assert-Equal ("--value|a!b") ($result.Arguments -join '|') "inherited delayed expansion no longer eats !"
+
+            $marker = Join-Path $root 'pwned.txt'
+            $payload = 'x& echo PWNED > ' + $marker
+            $quoted = (@('--value', $payload) | ForEach-Object { Quote-ShimArg $_ }) -join ' '
+            $result = Invoke-ShimLine $quoted
+            Assert-Equal ("--value|$payload") ($result.Arguments -join '|') "quoted metacharacters are not interpreted as commands"
+            Assert-True (-not (Test-Path -LiteralPath $marker)) "quoted argument did not execute a second-stage command"
+
+            $env:P9BR_EXIT_CODE = '42'
+            try {
+                $result = Invoke-ShimLine (Quote-ShimArg 'exit-check')
+                Assert-Equal 42 $result.Code "exit code propagates through the shim"
+            }
+            finally {
+                Remove-Item Env:\P9BR_EXIT_CODE -ErrorAction SilentlyContinue
+            }
+
+            # Documented shell requirement: cmd.exe parses unquoted & before any
+            # batch shim can receive it, so the argument is split at the caller.
+            $result = Invoke-ShimLine ('--anchor ' + $identity)
+            Assert-True (($result.Arguments -join '|') -ne ("--anchor|$identity")) "unquoted & is split by cmd before the shim (caller must quote)"
+        }
+        finally {
+            $env:LOCALAPPDATA = $savedLocal
+            if ($null -eq $savedArgs) { Remove-Item Env:\P9BR_ARGS_FILE -ErrorAction SilentlyContinue } else { $env:P9BR_ARGS_FILE = $savedArgs }
+            if ($null -eq $savedExit) { Remove-Item Env:\P9BR_EXIT_CODE -ErrorAction SilentlyContinue } else { $env:P9BR_EXIT_CODE = $savedExit }
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     Test-Case "shim and hotkey templates match generated installed content" {
         $shimTemplate = Get-Content -LiteralPath (Join-Path $RepoRoot "src\shim\ws.cmd") -Raw
         $shimGenerated = New-DevWSShimContent
@@ -15246,6 +16155,19 @@ foreach ($entry in $argv) { Write-Output ("ARG:" + $entry) }
         Assert-True (-not (Test-DevWSLegacyShimContent -Content "@echo off`r`npwsh.exe -NoLogo -NoProfile -File `"%LOCALAPPDATA%\DevWS\app\ws.ps1`" %*")) "forwarding shim is not legacy"
         Assert-True (-not (Test-DevWSLegacyShimContent -Content "@echo off`r`npwsh.exe -NoLogo -NoProfile -File `"%USERPROFILE%\.ws\other.ps1`" %*")) "near miss rejected"
         Assert-True (-not (Test-DevWSLegacyShimContent -Content "@echo off`r`necho extra`r`npwsh.exe -NoLogo -NoProfile -File `"%USERPROFILE%\.ws\ws.ps1`" %*")) "extra line rejected"
+    }
+
+    Test-Case "forwarding shim recognition accepts the pre-fix and hardened forms" {
+        $fixture = New-InstallFixture "shim-forwarding-forms"
+        $oldLine = 'pwsh.exe -NoLogo -NoProfile -File "' + (Join-Path $fixture.Root 'app\ws.ps1') + '" %*'
+        $oldContent = "@echo off`r`n$oldLine`r`n"
+        Assert-True (Test-DevWSForwardingShimContent -Content $oldContent -InstallRoot $fixture.Root) "pre-fix forwarding shim is recognized"
+
+        $newContent = New-DevWSShimContent -InstallRoot $fixture.Root
+        Assert-True (Test-DevWSForwardingShimContent -Content $newContent -InstallRoot $fixture.Root) "hardened forwarding shim is recognized"
+
+        $wrong = "@echo off`r`npwsh.exe -NoLogo -NoProfile -File `"$($fixture.Root)\app\other.ps1`" %*`r`n"
+        Assert-True (-not (Test-DevWSForwardingShimContent -Content $wrong -InstallRoot $fixture.Root)) "near miss is not a forwarding shim"
     }
 
     Test-Case "legacy shim migration only replaces the recognized shim once" {
@@ -23240,7 +24162,7 @@ Write-Output "REPLACEMENT-LOADED"
         $summary = Invoke-DevWSHealthCheck -Context $context
         $byId = Get-NativeHealthById $summary
 
-        Assert-Equal 25 @($summary.Results).Count "health keeps exactly 25 checks"
+        Assert-Equal 26 @($summary.Results).Count "health keeps exactly 26 checks"
         Assert-Equal $true $byId["app-libs"].Ok "valid native runtime passes app-libs"
 
         # Missing DLL fails app-libs with the installer guidance.
@@ -23494,7 +24416,7 @@ Write-Output "REPLACEMENT-LOADED"
             $byId[$result.Id] = $result
         }
 
-        Assert-Equal 25 @($summary.Results).Count "health check count includes the privileged-runtime checks"
+        Assert-Equal 26 @($summary.Results).Count "health check count includes the editor and privileged-runtime checks"
 
         foreach ($id in @(
             "os-windows", "powershell-7", "windows-terminal", "autohotkey",
@@ -23612,7 +24534,7 @@ Write-Output "REPLACEMENT-LOADED"
         $byId = @{}
         foreach ($result in @($summary.Results)) { $byId[$result.Id] = $result }
 
-        Assert-Equal 25 @($summary.Results).Count "the whole health run still completes"
+        Assert-Equal 26 @($summary.Results).Count "the whole health run still completes"
         Assert-Equal $false $byId["autohotkey"].Ok "the AutoHotkey check fails"
         Assert-Contains $byId["autohotkey"].Message "machine-wide AutoHotkey v2 installation" "the reason is actionable"
 
@@ -24749,12 +25671,14 @@ $stream.Close()
         Assert-True ($completeIndex -gt $kickIndex) "completion follows kickoff in the canonical library"
 
         # Reset: bootstrap checked before the close, generation written only
-        # after the old window is confirmed gone, recreation follows.
+        # after the old window is confirmed gone, recreation follows. The
+        # destructive/creation primitives are invoked through the injectable
+        # provider call sites, which are the production execution path.
         $bootstrapIndex = $reset.IndexOf('Get-DevWSCwdBootstrapPath')
-        $closeIndex     = $reset.IndexOf('Close-DevWSWindowHwnd')
-        $goneIndex      = $reset.IndexOf('Wait-DevWSWindowHwndGone')
-        $resetTracking  = $reset.IndexOf('New-DevWSCwdTrackingContext')
-        $resetLaunch    = $reset.IndexOf('& $Wt @createArguments')
+        $closeIndex     = $reset.IndexOf('& $CloseProvider')
+        $goneIndex      = $reset.IndexOf('& $WaitGoneProvider')
+        $resetTracking  = $reset.IndexOf('& $TrackingProvider')
+        $resetLaunch    = $reset.IndexOf('& $CreateProvider')
 
         Assert-True ($bootstrapIndex -ge 0) "reset resolves the bootstrap helper"
         Assert-True ($bootstrapIndex -lt $closeIndex) "reset refuses before closing when the bootstrap is missing"
@@ -40324,7 +41248,7 @@ exit 0
         $context = New-P2EHealthStubContext -Name "flood" -ChildBody $floodBody
         $run = Invoke-P2EHealthRun -Context $context -TempDir $tempDir
 
-        Assert-Equal 25 @($run.Summary.Results).Count "health check count is unchanged"
+        Assert-Equal 26 @($run.Summary.Results).Count "health check count includes the editor payload check"
         Assert-Equal $true $run.ById["ws-list"].Ok "a flooding ws list still passes"
         Assert-Equal (Join-Path (Split-Path -Parent $context.CanonicalPath) "sentinel-config.json") $run.ConfigAfter "DEVWS_CONFIG is restored"
         Assert-Equal 0 @(Get-ChildItem -LiteralPath $tempDir -Recurse -File -ErrorAction SilentlyContinue).Count "no temporary files are created by the health check"
@@ -40579,11 +41503,13 @@ exit 0
         Assert-Contains $product '"productId": "ekinokss.DevWS"' "the production product id is fixed"
         Assert-Contains $product '"displayName": "DevWS"' "the production display name is fixed"
         Assert-Contains $product '"publisher": "ekinokss"' "the production publisher is fixed"
-        Assert-Contains $product '"version": "0.2.0"' "the production version is 0.2.0"
+        Assert-Contains $product '"version": "0.4.0"' "the production version is 0.4.0"
         Assert-Contains $product '"programFilesRootLeaf": "DevWS"' "the production Program Files root is fixed"
 
         $build = Get-SourceOf "packaging\build-setup.ps1"
-        Assert-Contains $build 'git -C $RepoRoot archive --format=zip --output=$payloadFile HEAD -- install.ps1 uninstall.ps1 LICENSE src config' "the payload is generated from tracked source"
+        Assert-Contains $build 'build-editor-payload.ps1' "the production payload uses the editor payload builder"
+        $payloadBuilder = Get-SourceOf "packaging\build-editor-payload.ps1"
+        Assert-Contains $payloadBuilder 'git -C $repo archive --format=zip --output=$baseZip HEAD -- install.ps1 uninstall.ps1 LICENSE src config' "the payload is generated from tracked source"
         Assert-Contains $build "'-p:PublishAot=true'" "the build publishes Native AOT"
         Assert-Contains $build 'Get-FileHash -LiteralPath $artifact -Algorithm SHA256' "the artifact hash is reported"
         Assert-Contains $build 'source commit' "the source commit is reported"
@@ -40593,8 +41519,24 @@ exit 0
 
         $readme = Get-SourceOf "README.md"
         Assert-Contains $readme 'https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1' "the public README links the published pre-release"
-        Assert-Contains $readme 'stable **v0.2.0** GitHub release' "the public README names the stable release target"
-        Assert-Contains $readme 'No WinGet catalog package exists' "the public README states that no WinGet catalog package exists"
+        Assert-Contains $readme 'current stable binary is **v0.2.0**' "the public README names the stable release target"
+        Assert-Contains $readme 'https://github.com/ekinokss/DevWS/releases/tag/v0.3.0' "the public README links the published v0.3.0 pre-release"
+        Assert-Contains $readme 'not replace `v0.2.0` as the latest stable release' "the public README keeps v0.2.0 as latest stable"
+        Assert-Contains $readme 'unsigned **v0.3.0** pre-release' "the public README records the unsigned status"
+        Assert-Contains $readme 'verify the published SHA-256' "the public README requires checksum verification"
+        Assert-Contains $readme 'Monitor-relative layouts' "the public README documents monitor-relative layouts"
+        Assert-Contains $readme 'CONDITIONAL GO' "the public README records the accepted release judgment"
+        Assert-Contains $readme 'Installed-lifecycle relative placement' "the public README preserves deferred installed-lifecycle qualification"
+        Assert-Contains $readme 'multi-monitor selection' "the public README preserves deferred multi-monitor qualification"
+        Assert-Contains $readme 'negative monitor origins' "the public README preserves deferred negative-origin qualification"
+        Assert-Contains $readme 'mixed-DPI' "the public README preserves deferred mixed-DPI qualification"
+        Assert-Contains $readme 'physical EDID' "the public README preserves deferred physical-EDID qualification"
+        Assert-Contains $readme 'primary-monitor changes' "the public README preserves deferred primary-monitor qualification"
+        Assert-Contains $readme 'disconnect/reconnect' "the public README preserves deferred topology-change qualification"
+        Assert-Contains $readme 'are not claimed as passed' "the public README does not claim deferred qualification"
+        Assert-NotContains $readme 'is not published' "the stale v0.3.0 unpublished claim is gone"
+        Assert-NotContains $readme 'no v0.3.0 download is available' "the stale v0.3.0 no-download claim is gone"
+        Assert-Contains $readme 'No WinGet catalog package' "the public README states that no WinGet catalog package exists"
         Assert-Contains $readme 'different administrator account is intentionally rejected' "the public README documents same-account elevation"
         Assert-Contains $readme 'CODE_SIGNING_POLICY.md' "the public README links the code signing policy"
         Assert-Contains $readme 'PRIVACY.md' "the public README links the privacy information"
@@ -40758,16 +41700,39 @@ exit 0
         Assert-Contains $packagingReadme 'Release-candidate bundle' "the release-candidate pipeline is documented"
         Assert-Contains $packagingReadme 'git cat-file' "the commit-derived LICENSE provenance is documented"
         Assert-Contains $packagingReadme 'not ready for submission' "the packaging guide records the blocked WinGet submission"
+        Assert-Contains $packagingReadme 'Current source version | `0.4.0`' "the packaging guide records the candidate version"
+        Assert-Contains $packagingReadme 'published unsigned `v0.3.0` GitHub pre-release' "the packaging guide records the published v0.3.0 pre-release"
+        Assert-Contains $packagingReadme 'does not replace' "the packaging guide keeps the stable release distinct"
+        Assert-Contains $packagingReadme 'latest stable' "the packaging guide names the stable channel"
+        Assert-Contains $packagingReadme 'Verify `DevWS-Setup.exe` against' "the packaging guide requires checksum verification"
+        Assert-Contains $packagingReadme 'SHA256SUMS.txt' "the packaging guide names the checksum file"
+        Assert-Contains $packagingReadme 'Installed-lifecycle relative placement' "the packaging guide preserves deferred installed-lifecycle qualification"
+        Assert-Contains $packagingReadme 'multi-monitor, mixed-DPI and physical-EDID' "the packaging guide preserves deferred monitor qualification"
+        Assert-Contains $packagingReadme 'remain deferred backlog items' "the packaging guide keeps deferred qualification unclaimed"
+        Assert-NotContains $packagingReadme 'local, unpublished release candidate' "the stale unpublished candidate claim is gone"
         Assert-NotContains $packagingReadme 'No setup uninstall, repair, upgrade, Add/Remove Programs registration' "the stale Phase-2 scope claim is gone"
 
         $installerDoc = Get-SourceOf "docs\installer.md"
         Assert-NotContains $installerDoc 'At this phase there is **no `DevWS-Setup.exe`' "the stale no-setup claim is gone"
         Assert-NotContains $installerDoc 'provide an uninstall/repair/Add-Remove-Programs lifecycle' "the stale no-lifecycle claim is gone"
+        Assert-Contains $installerDoc 'PUBLISHED v0.3.0 GITHUB PRE-RELEASE' "the published v0.3.0 pre-release is documented"
+        Assert-Contains $installerDoc 'annotated tag `v0.3.0` at source' "the annotated release tag is documented"
+        Assert-Contains $installerDoc '5b5d8f67191ed2f61bacbb76e6803f0e6b958f38' "the frozen source commit is documented"
+        Assert-Contains $installerDoc 'https://github.com/ekinokss/DevWS/releases/tag/v0.3.0' "the release URL is documented"
+        Assert-Contains $installerDoc 'c0fdff83f9ecac2d1963aa4f289a4454e91588e32dab565c8959afcd3a6a135a' "the installer checksum is documented"
+        Assert-Contains $installerDoc 'CONDITIONAL GO' "the accepted release judgment is documented"
+        Assert-Contains $installerDoc 'not as the latest stable' "the stable-release distinction is documented"
+        Assert-NotContains $installerDoc 'CURRENT v0.3.0 RELEASE CANDIDATE (UNPUBLISHED)' "the stale unpublished candidate heading is gone"
         Assert-Contains $installerDoc 'PUBLIC v0.2.0-rc.1 PRE-RELEASE' "the published setup pre-release is documented"
-        Assert-Contains $installerDoc 'PREPARED STABLE v0.2.0 GITHUB RELEASE' "the prepared stable release is documented"
+        Assert-Contains $installerDoc 'PUBLISHED STABLE v0.2.0 GITHUB RELEASE' "the published stable release is documented"
         Assert-Contains $installerDoc 'NOT PUBLISHED OR NOT AVAILABLE' "the public-release boundary is documented"
         Assert-Contains $installerDoc 'NOT IMPLEMENTED' "the unimplemented installer scope is documented"
-        Assert-Contains $installerDoc 'currently published v0.1.0 remains source-only' "the public release truth is preserved"
+        Assert-Contains $installerDoc 'published v0.1.0 remains a historical source release' "the public release truth is preserved"
+        Assert-Contains $installerDoc 'Installed-lifecycle relative-placement qualification' "the setup docs record the deferred installed-lifecycle scenario"
+        Assert-Contains $installerDoc 'multi-monitor selection and negative' "the setup docs record the deferred multi-monitor and negative-origin scenario"
+        Assert-Contains $installerDoc 'mixed-DPI, physical EDID and monitor-topology-change' "the setup docs record the deferred display and topology scenarios"
+        Assert-Contains $installerDoc 'remain deferred' "the setup docs keep the qualification deferred"
+        Assert-Contains $installerDoc 'they are not claimed as passed' "the setup docs do not claim deferred qualification"
         Assert-Contains $installerDoc 'different Windows account' "the setup docs preserve same-account elevation"
         Assert-Contains $installerDoc 'WinGet template is blocked' "the setup docs record the blocked WinGet template"
 
@@ -41121,6 +42086,22 @@ exit 0
     }
 
     Write-Host ""
+    Start-TestGroup -Name 'editor-backend' -Title 'Read-only editor backend (v0.4 P3)'
+
+    Test-Case "read-only editor backend protocol suite passes end to end" {
+        $focused = Join-Path $RepoRoot 'tests\editor-backend.tests.ps1'
+        Assert-True (Test-Path -LiteralPath $focused -PathType Leaf) "the focused P3 suite exists"
+
+        # The focused suite owns its process fixtures and assertion accounting;
+        # the canonical harness requires a clean exit and no reported failures.
+        $output = & pwsh -NoLogo -NoProfile -File $focused -RepoRoot $RepoRoot 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+
+        Assert-Equal 0 $exitCode "the focused P3 suite exits successfully`n$output"
+        Assert-Contains $output 'failed: 0' "the focused P3 suite reports no failures`n$output"
+    }
+
+    Write-Host ""
     Start-TestGroup -Name 'test-harness' -Title 'Test harness'
 
     Test-Case "suite broker isolation is installed and never connects to the production broker pipe" {
@@ -41134,8 +42115,8 @@ exit 0
     }
 
     Test-Case "test group catalog is complete, ordered, and fully registered" {
-        Assert-Equal 68 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
-        Assert-Equal 68 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
+        Assert-Equal 69 $script:TestGroupCatalog.Count "catalog covers every section group including the harness"
+        Assert-Equal 69 $script:TestGroupsStarted.Count "every catalog group was started exactly once"
         Assert-Equal (($script:TestGroupCatalog.Keys) -join ",") ($script:TestGroupsStarted -join ",") "group execution order matches the catalog"
     }
 

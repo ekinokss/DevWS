@@ -1,0 +1,97 @@
+{
+  "name": "host-topology-redacted",
+  "virtualScreenRect": {
+    "x": 0,
+    "y": 0,
+    "w": 4480,
+    "h": 1440
+  },
+  "monitors": [
+    {
+      "id": "monitor-1",
+      "name": "Monitor 1",
+      "primary": true,
+      "monitorRect": {
+        "x": 0,
+        "y": 0,
+        "w": 2560,
+        "h": 1440
+      },
+      "workRect": {
+        "x": 0,
+        "y": 0,
+        "w": 2560,
+        "h": 1400
+      },
+      "scalePercent": 100
+    },
+    {
+      "id": "monitor-2",
+      "name": "Monitor 2",
+      "primary": false,
+      "monitorRect": {
+        "x": 2560,
+        "y": 355,
+        "w": 1920,
+        "h": 1080
+      },
+      "workRect": {
+        "x": 2560,
+        "y": 355,
+        "w": 1920,
+        "h": 1040
+      },
+      "scalePercent": 100
+    }
+  ],
+  "items": [
+    {
+      "id": "host-item-1-1",
+      "kind": "terminal",
+      "monitorId": "monitor-1",
+      "enabled": true,
+      "rect": {
+        "x": 40,
+        "y": 40,
+        "w": 720,
+        "h": 520
+      }
+    },
+    {
+      "id": "host-item-1-2",
+      "kind": "app",
+      "monitorId": "monitor-1",
+      "enabled": true,
+      "rect": {
+        "x": 780,
+        "y": 40,
+        "w": 720,
+        "h": 520
+      }
+    },
+    {
+      "id": "host-item-2-1",
+      "kind": "terminal",
+      "monitorId": "monitor-2",
+      "enabled": true,
+      "rect": {
+        "x": 2600,
+        "y": 395,
+        "w": 720,
+        "h": 460
+      }
+    },
+    {
+      "id": "host-item-2-2",
+      "kind": "app",
+      "monitorId": "monitor-2",
+      "enabled": true,
+      "rect": {
+        "x": 3340,
+        "y": 395,
+        "w": 720,
+        "h": 460
+      }
+    }
+  ]
+}
