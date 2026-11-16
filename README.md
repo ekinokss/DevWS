@@ -10,8 +10,8 @@ from a single declarative configuration file.
 
 You describe the workspace once; DevWS brings it back on demand.
 
-> **Status: pre-1.0, with an unsigned stable Windows binary release, a published
-> v0.3.0 pre-release, and a v0.4.0 release candidate in preparation.**
+> **Status: pre-1.0, with an unsigned stable Windows binary release, published
+> v0.3.0 and v0.4.0 pre-releases.**
 >
 > The current stable binary is **v0.2.0**, an unsigned Windows x64 setup:
 > [GitHub stable release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0).
@@ -21,9 +21,13 @@ You describe the workspace once; DevWS brings it back on demand.
 > `v0.2.0-rc.1` pre-release remains available:
 > [GitHub pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.2.0-rc.1).
 >
-> **v0.4.0 is being prepared and is NOT published.** The source version is now `0.4.0`, but
-> no v0.4.0 tag, GitHub release or installer asset exists. v0.2.0 remains the stable binary
-> and v0.3.0 remains an existing pre-release until an explicit later release decision.
+> **v0.4.0 is published as an unsigned pre-release** at
+> [GitHub v0.4.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.4.0). It adds
+> the native visual layout editor. It does **not** replace `v0.2.0` as the latest stable
+> release, and physical installed-product multi-monitor behavior is **not** comprehensively
+> qualified — see [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md).
+> Earlier: **v0.4.0 was published from** source version `0.4.0`. v0.2.0 remains the stable
+> binary and v0.3.0 remains an existing pre-release.
 > Verify the published SHA-256 before running any installer. No WinGet catalog package
 > exists; the prepared WinGet submission is blocked by the installer's same-account
 > elevation requirement. The frozen v0.1.0 source release remains available, and source
@@ -116,7 +120,7 @@ negative-origin editor-layer pass was completed on real hardware. Installed mult
 placement was qualified **only** within a remote-desktop guest scope using virtual display
 adapters; that evidence does not establish independent physical-panel behavior. Mixed-DPI,
 physical EDID identity, primary-monitor changes and physical display disconnect/reconnect
-remain **NOT QUALIFIED**, and v0.4.0 is **not published**. See
+remain **NOT QUALIFIED**, and v0.4.0 is published as an **unsigned pre-release**. See
 [docs/v0.4.0-release-readiness.md](docs/v0.4.0-release-readiness.md) for the per-scenario
 matrix and the outstanding release gates.
 
@@ -160,9 +164,12 @@ The unsigned `v0.3.0` pre-release is published at
 not replace `v0.2.0` as the latest stable release. Download only from the official release
 and verify the published SHA-256; do not obtain DevWS from an unofficial source.
 
-**v0.4.0 is being prepared and is not available for download.** No v0.4.0 tag, release or
-installer asset exists. When it is published, its packaged setup will include the native
-visual layout editor; see [Visual layout editor](#visual-layout-editor) below.
+The unsigned **`v0.4.0`** pre-release is published at
+[GitHub v0.4.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.4.0). Its packaged
+setup includes the native visual layout editor; see
+[Visual layout editor](#visual-layout-editor) below. It does not replace `v0.2.0` as the latest
+stable release, and physical installed-product multi-monitor behavior is not comprehensively
+qualified.
 
 See the [code signing policy](CODE_SIGNING_POLICY.md) and [privacy information](PRIVACY.md).
 
@@ -450,9 +457,9 @@ Both forms require elevation, and `-Force` skips the confirmation prompt. See
 - Durable `path:` identities and a runtime relative-placement probe on a matching anchor are
   validated. Physical EDID behavior is not claimed from path-only evidence, and the deferred
   scenarios above still require real-host or guest qualification before any broader claim.
-- **v0.4.0 is a release candidate in preparation, not a published release.** It remains
-  Windows 11 x64 only, unsigned, and dependent on same-account administrator elevation for
-  installation. There is no WinGet catalog package, MSI/MSIX identity, self-update or
+- **v0.4.0 is published as an unsigned pre-release**, not as the latest stable release. It
+  remains Windows 11 x64 only, unsigned, and dependent on same-account administrator elevation
+  for installation. There is no WinGet catalog package, MSI/MSIX identity, self-update or
   attestation, and no automatic live-window reflow or general-purpose tiling.
 - The v0.4.0 editor lifecycle passed in a disposable guest, and single-display installed
   acceptance passed. Installed multi-monitor relative placement and negative origins were

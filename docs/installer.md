@@ -135,9 +135,12 @@ attestation or WinGet catalog package exists.
 
 ### Release state
 
-**v0.4.0 RELEASE CANDIDATE (IN PREPARATION, NOT PUBLISHED):**
+**v0.4.0 PUBLISHED GITHUB PRE-RELEASE:**
 
-- The source version is `0.4.0`, but **no v0.4.0 tag, GitHub release or installer asset exists**.
+- Published as an unsigned pre-release at
+  https://github.com/ekinokss/DevWS/releases/tag/v0.4.0, tagged from the merged `main`
+  commit `9dea27776e4fa1896506ad1ea733eab0791ba5a3`.
+- It does **not** replace `v0.2.0` as the latest stable release.
 - A v0.4.0 setup payload embeds the self-contained native editor payload installed under
   `app\editor\`. The editor is therefore part of **packaged** installations and is not present
   in an ordinary source-layout installation.
@@ -185,7 +188,9 @@ attestation or WinGet catalog package exists.
 
 - stable `v0.3.0` release: `v0.3.0` is published as a pre-release, not as the latest stable
   release
-- signed `v0.2.0` or `v0.3.0` installer
+- stable `v0.4.0` release: `v0.4.0` is published as a pre-release, not as the latest stable
+  release
+- signed `v0.2.0`, `v0.3.0` or `v0.4.0` installer
 - WinGet catalog package: the submission template is prepared but blocked by WinGet's
   unattended-elevation validation and is not submitted
 
@@ -555,6 +560,7 @@ layer passed a physical negative-origin rearrangement that was fully restored (D
 layer). Installed multi-monitor relative placement was qualified only within a
 remote-desktop guest scope using the Microsoft Remote Display Adapter, not independent
 physical panels. Mixed-DPI, physical EDID identity, primary-monitor changes and physical
-display disconnect/reconnect remain **NOT QUALIFIED**, and **v0.4.0 is not published**. The
+display disconnect/reconnect remain **NOT QUALIFIED**, and **v0.4.0 is published as an
+unsigned pre-release**. The
 source-installation to packaged-installation upgrade path has not yet been executed. See
 [v0.4.0-release-readiness.md](v0.4.0-release-readiness.md).

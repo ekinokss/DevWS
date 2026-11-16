@@ -5,12 +5,13 @@ All notable changes to DevWS are recorded here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) conventions and
 uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - UNRELEASED (pre-release preparation)
+## [0.4.0] - 2026-11-16
 
-> **Status: release candidate in preparation. Not tagged and not published.** The source
-> version is `0.4.0`. The stable published binary remains `v0.2.0`, and the published
-> `v0.3.0` pre-release is unchanged. No v0.4.0 tag, GitHub release, installer asset or WinGet
-> manifest exists yet.
+> **Status: published as an unsigned GitHub pre-release.** The source version is `0.4.0`,
+> tagged `v0.4.0` and published at
+> [GitHub v0.4.0 pre-release](https://github.com/ekinokss/DevWS/releases/tag/v0.4.0). The
+> stable published binary remains `v0.2.0`, and the published `v0.3.0` pre-release is
+> unchanged. No v0.4.0 WinGet manifest exists.
 
 ### Added
 

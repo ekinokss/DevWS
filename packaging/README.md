@@ -152,11 +152,12 @@ no GitHub Release, tag, WinGet submission, attestation or binary publication.
 The candidate is unsigned by default; Authenticode status is reported by the verifier and
 must not be treated as signed. Native AOT output is not claimed to be byte-reproducible.
 
-### v0.4.0 release candidate (prepared, not published)
+### v0.4.0 published pre-release
 
-The source version is `0.4.0`. **No v0.4.0 tag, GitHub release, installer asset or WinGet
-manifest exists**, and none is authorized by this preparation. `v0.2.0` remains the latest
-stable release and `v0.3.0` remains an existing pre-release.
+The source version is `0.4.0`. **`v0.4.0` is published as an unsigned GitHub pre-release** at
+https://github.com/ekinokss/DevWS/releases/tag/v0.4.0, built from the merged `main` commit
+`9dea27776e4fa1896506ad1ea733eab0791ba5a3`. No v0.4.0 WinGet manifest exists. `v0.2.0` remains
+the latest stable release and `v0.3.0` remains an existing pre-release.
 
 The v0.4.0 setup payload additionally embeds the self-contained native editor payload produced
 by `build-editor-payload.ps1`, installed under `app\editor\`. The editor is therefore present
